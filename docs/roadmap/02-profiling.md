@@ -87,7 +87,9 @@ Two things to know when reading one:
   (`shadow_directional_light_<light>_cascade_<cascade>`, `shadow_point_light_<light>_<face>`,
   `shadow_spot_light_<light>`), but Bevy's standard shadow node does not open a diagnostic span for
   them (only its meshlet path does), so those passes are normally absent from the report rather than
-  zero. A missing row means "not measured here".
+  zero. A missing row means "not measured here". Bevy 0.20 (release candidate, October 2026) adds a
+  GPU span around the point and spot shadow loop (bevy PR #25398) but still none for directional
+  cascades, so cascade GPU time needs a frame capture (RenderDoc or PIX) until Bevy measures it.
 
 When the device cannot time GPU work — any backend but Vulkan and DX12 — `passes` is empty and
 `unavailable.elapsed_gpu` carries the reason; a run with no renderer at all gets "no renderer in
@@ -278,7 +280,7 @@ the run could not measure it.
   on; a run with no renderer gets "no renderer in this run" as the `pipeline_statistics` reason.
   `draw_calls` is always `null`:
   `unavailable["draw_calls"]` says "Bevy 0.19 exposes no draw-call count", because no Bevy, wgpu or
-  engine API counts them.
+  engine API counts them (bevy issue #17445 asks for one; Bevy 0.20 does not add it).
 - **`cpu`** — where the frame's CPU time went, in milliseconds. `schedules` is one summary per Bevy
   main schedule (`main_schedule/<name>`, the eight `schedule_timing` times), `spans` is one per
   span the engine records by hand, the `streaming/*` spans among them (the schedule summaries are
