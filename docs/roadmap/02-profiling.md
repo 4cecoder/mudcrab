@@ -123,8 +123,9 @@ Split by where the memory is:
   instance). Counters are never zero-filled.
 
 `gpu.mesh_allocator_*` and `gpu.render_asset_counts` come from Bevy's mesh-allocator and
-render-asset diagnostic plugins, which are installed only for measured runs; sampling keeps their
-last value of the run. The process-level memory figures stay where they were
+render-asset diagnostic plugins, which are installed only for measured runs. They are gauges, not
+distributions: the report keeps their last value in the measured window, and only once the render
+world has measured them (until then they are `null`, as above). The process-level memory figures stay where they were
 (`peak_process_memory_gib`, `process_memory_growth_gib` and the bundle's `memory.json`).
 
 ## Reproducible campaign
