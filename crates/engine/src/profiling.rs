@@ -3,7 +3,7 @@ use crate::{
     streaming::StreamingMetrics,
 };
 use bevy::{
-    diagnostic::{DiagnosticPath, DiagnosticsStore},
+    diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore},
     prelude::*,
     render::{
         diagnostic::{
@@ -76,6 +76,20 @@ const RENDER_WORLD_PREP_UNAVAILABLE: &str = "Bevy 0.19 records no per-schedule t
 /// Why `cpu.spans` is empty: nothing was recorded, which only an aborted run does.
 const NO_CPU_SPANS: &str = "the run recorded no CPU spans";
 
+/// Where the sampling of one render-diagnostic path got to: the time of the last measurement taken
+/// from it, and how many measurements at exactly that time were taken.
+///
+/// Bevy's `sync_diagnostics` adds a whole readback batch with one `Instant::now()`, so measurements
+/// that share a time belong to one batch, and one batch can hold several observations of the same
+/// path — one per camera that ran the pass. The count is what makes taking each of them exactly
+/// once possible without taking a batch twice next frame; two batches cannot share a time unless
+/// the clock steps backwards, and `Instant` is monotonic.
+#[derive(Clone, Copy)]
+struct RenderCursor {
+    time: Instant,
+    taken_at_time: usize,
+}
+
 pub struct ProfilingPlugin;
 
 impl Plugin for ProfilingPlugin {
@@ -91,6 +105,9 @@ pub struct ProfilingState {
     frame: u64,
     cpu_spans_ms: BTreeMap<String, Vec<f64>>,
     render_metrics: BTreeMap<String, Vec<f64>>,
+    /// How far the sampling of each render-diagnostic path has got, so every measurement is taken
+    /// exactly once however many cameras wrote it and however the GPU readback lags.
+    render_cursors: BTreeMap<String, RenderCursor>,
     /// The last value sampled for each GPU-memory diagnostic (the mesh allocator's counters and the
     /// live render-asset counts). These are gauges, not distributions: only the value at the end of
     /// the run is reported.
@@ -108,6 +125,7 @@ impl Default for ProfilingState {
             frame: 0,
             cpu_spans_ms: BTreeMap::new(),
             render_metrics: BTreeMap::new(),
+            render_cursors: BTreeMap::new(),
             memory_metrics: BTreeMap::new(),
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
@@ -169,6 +187,12 @@ impl ProfilingState {
         });
     }
 
+    /// Samples a frame: the process memory every frame, and the GPU diagnostics from Bevy's stores.
+    ///
+    /// Every render-diagnostic measurement is taken exactly once, however many cameras wrote it and
+    /// however long the GPU readback takes: [`take_render_measurements`] advances a cursor per path
+    /// rather than resampling Bevy's latest value. The process-memory timeline stays whole-run: it
+    /// is a growth curve, not one of the frame statistics.
     pub fn sample_frame(
         &mut self,
         diagnostics: &DiagnosticsStore,
@@ -177,17 +201,19 @@ impl ProfilingState {
         self.frame = self.frame.saturating_add(1);
         for diagnostic in diagnostics.iter() {
             let path = diagnostic.path().as_str();
-            if let Some(value) = diagnostic.value() {
-                if path.starts_with("render/") {
-                    push_bounded(
-                        self.render_metrics.entry(path.to_owned()).or_default(),
-                        value,
-                    );
-                }
-                // The GPU-memory diagnostics do not sit under `render/`, so they are matched by
-                // their own names, deliberately: the mesh allocator's counters and the live
-                // render-asset counts, the only paths the report's memory section reads.
-                else if is_gpu_memory_path(path) {
+            if path.starts_with("render/") {
+                take_render_measurements(
+                    diagnostic,
+                    &mut self.render_metrics,
+                    &mut self.render_cursors,
+                );
+            }
+            // The GPU-memory diagnostics do not sit under `render/`, so they are matched by their
+            // own names, deliberately: the mesh allocator's counters and the live render-asset
+            // counts, the only paths the report's memory section reads. They are gauges, so the
+            // last value of the run is what is kept.
+            else if is_gpu_memory_path(path) {
+                if let Some(value) = diagnostic.value() {
                     self.memory_metrics.insert(path.to_owned(), value);
                 }
             }
@@ -492,6 +518,55 @@ impl ProfilingState {
     }
 }
 
+/// Takes the measurements of one render diagnostic that no earlier sample saw, advancing its cursor.
+///
+/// Bevy's [`Diagnostic::value`] is only the latest measurement, and its history is a bounded deque
+/// (`DEFAULT_MAX_HISTORY_LENGTH`, 120), so this walks the history and takes everything newer than
+/// the cursor: several cameras' observations of one pass in one readback batch are all kept, and a
+/// frame whose readback has not arrived yet adds nothing. More than 120 observations of one path
+/// between two samples would lose the oldest — that takes more than 120 cameras running one pass in
+/// a single batch, and Bevy itself would have dropped them.
+///
+/// Bevy records no camera with a measurement (`RenderDiagnostic` is a path, a suffix and a value),
+/// so a path's samples mix every camera that ran that pass; there is no way to tell them apart.
+fn take_render_measurements(
+    diagnostic: &Diagnostic,
+    metrics: &mut BTreeMap<String, Vec<f64>>,
+    cursors: &mut BTreeMap<String, RenderCursor>,
+) {
+    let path = diagnostic.path().as_str();
+    let cursor = cursors.get(path).copied();
+    let mut seen_at_cursor_time = 0;
+    let mut next = cursor;
+    for measurement in diagnostic.measurements() {
+        if let Some(cursor) = cursor {
+            if measurement.time < cursor.time {
+                continue;
+            }
+            if measurement.time == cursor.time {
+                seen_at_cursor_time += 1;
+                if seen_at_cursor_time <= cursor.taken_at_time {
+                    continue;
+                }
+            }
+        }
+        push_bounded(metrics.entry(path.to_owned()).or_default(), measurement.value);
+        next = Some(match next {
+            Some(next) if next.time == measurement.time => RenderCursor {
+                taken_at_time: next.taken_at_time.saturating_add(1),
+                ..next
+            },
+            _ => RenderCursor {
+                time: measurement.time,
+                taken_at_time: 1,
+            },
+        });
+    }
+    if let Some(next) = next {
+        cursors.insert(path.to_owned(), next);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sample_scene_inventory(
     mut profiler: ResMut<ProfilingState>,
@@ -580,9 +655,12 @@ pub struct MetricSummary {
 ///
 /// The paths are Bevy's own: `render/<pass>/elapsed_gpu`, where `<pass>` is the label the render
 /// pass was created with (`main_opaque_pass_3d`, `tonemapping`, `shadow_directional_light_0_cascade_1`,
-/// …). Several cameras that run the same pass write the same path, so a summary covers every camera
-/// that ran it. When the device cannot time GPU work the passes are left empty and `unavailable`
-/// says why, rather than reporting zeros.
+/// …). Several cameras that run the same pass write the same path and Bevy records no camera with a
+/// measurement, so a summary covers every camera that ran it and its samples mix them; compare
+/// cameras by running them separately. Every sample is taken once from Bevy's own history, not
+/// resampled from its latest value, so `count` is the number of pass observations kept — never more
+/// than the frames they were read in. When the device cannot time GPU work the passes are left
+/// empty and `unavailable` says why, rather than reporting zeros.
 #[derive(Debug, Clone, Serialize)]
 pub struct GpuPassReport {
     pub timestamp_queries_supported: bool,
@@ -967,10 +1045,18 @@ fn push_bounded(values: &mut Vec<f64>, value: f64) {
 mod tests {
     use super::*;
     use bevy::diagnostic::{Diagnostic, DiagnosticMeasurement};
+    use std::time::Duration;
 
     /// Feeds a diagnostic store with one measurement of a path, the way a diagnostic plugin's own
     /// system does, so the tests drive the real sampling rather than a shortcut.
     fn feed(diagnostics: &mut DiagnosticsStore, path: &str, value: f64) {
+        feed_at(diagnostics, path, value, Instant::now());
+    }
+
+    /// Feeds a measurement with an explicit time. Bevy's `sync_diagnostics` stamps a whole readback
+    /// batch with one `Instant::now()`, so a test that wants several observations in one batch —
+    /// several cameras running one pass — feeds them with the same time.
+    fn feed_at(diagnostics: &mut DiagnosticsStore, path: &str, value: f64, time: Instant) {
         let path = DiagnosticPath::new(path.to_owned());
         if diagnostics.get(&path).is_none() {
             diagnostics.add(Diagnostic::new(path.clone()));
@@ -978,10 +1064,7 @@ mod tests {
         diagnostics
             .get_mut(&path)
             .expect("the diagnostic was just added")
-            .add_measurement(DiagnosticMeasurement {
-                time: Instant::now(),
-                value,
-            });
+            .add_measurement(DiagnosticMeasurement { time, value });
     }
 
     /// Per-pass GPU time is summarised over every measured frame, and the pipeline-statistics
@@ -1027,8 +1110,51 @@ mod tests {
         );
     }
 
+    /// Every observation Bevy recorded is taken exactly once: two cameras running one pass in one
+    /// readback batch both count, a frame whose readback has not changed adds nothing, and a pass
+    /// that stops running adds nothing further.
+    #[test]
+    fn takes_every_new_render_measurement_once() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        let path = "render/main_opaque_pass_3d/elapsed_gpu";
+        let batch = Instant::now();
+        feed_at(&mut diagnostics, path, 4.0, batch);
+        feed_at(&mut diagnostics, path, 6.0, batch);
+        profiler.sample_frame(&diagnostics, None);
+        let report = profiler.gpu_passes(true, true);
+        assert_eq!(
+            report.passes[path].count, 2,
+            "both cameras' observations of the pass are kept"
+        );
+        assert_eq!(report.passes[path].total, 10.0);
+
+        // The readback has not arrived: the store is unchanged and nothing may be resampled.
+        profiler.sample_frame(&diagnostics, None);
+        let report = profiler.gpu_passes(true, true);
+        assert_eq!(
+            report.passes[path].count, 2,
+            "an unchanged store adds no sample"
+        );
+
+        // A later frame: another pass keeps producing, this one has stopped running.
+        let later = batch + Duration::from_millis(16);
+        feed_at(&mut diagnostics, "render/tonemapping/elapsed_gpu", 3.0, later);
+        profiler.sample_frame(&diagnostics, None);
+        let report = profiler.gpu_passes(true, true);
+        assert_eq!(
+            report.passes[path].count, 2,
+            "a pass that stopped running adds no further sample"
+        );
+        assert_eq!(
+            report.passes["render/tonemapping/elapsed_gpu"].count,
+            1,
+            "a pass that is still running does"
+        );
+    }
+
     /// A backend without timestamp queries reports the reason and no pass times — never zeros, and
-    /// never a stray sample from somewhere else.
+    /// never a stray sample from somewhere else. A run with no renderer says that instead.
     #[test]
     fn gpu_passes_say_why_they_are_empty_instead_of_reporting_zeros() {
         let mut diagnostics = DiagnosticsStore::default();
@@ -1044,8 +1170,14 @@ mod tests {
         assert!(unsupported.passes.is_empty());
         assert!(!unsupported.timestamp_queries_supported);
         assert!(!unsupported.pipeline_statistics_supported);
-        assert!(unsupported.unavailable.contains_key("elapsed_gpu"));
-        assert!(unsupported.unavailable.contains_key("pipeline_statistics"));
+        assert_eq!(
+            unsupported.unavailable["elapsed_gpu"],
+            TIMESTAMP_QUERIES_UNAVAILABLE
+        );
+        assert_eq!(
+            unsupported.unavailable["pipeline_statistics"],
+            PIPELINE_STATISTICS_UNAVAILABLE
+        );
 
         // A device that can time GPU work, but a run in which no pass was recorded.
         let empty = ProfilingState::default().gpu_passes(true, true);
@@ -1056,6 +1188,7 @@ mod tests {
             empty.unavailable
         );
     }
+
 
     /// The memory section reports the last sample of each counter, counts assets as counts, and
     /// names a reason for every counter the run did not sample.
@@ -1094,13 +1227,16 @@ mod tests {
         let unsampled = ProfilingState::default().gpu_memory();
         assert_eq!(unsampled.mesh_allocator_slab_bytes, None);
         assert!(unsampled.render_asset_counts.is_empty());
-        assert!(
-            unsampled
-                .unavailable
-                .contains_key("mesh_allocator_slab_bytes")
+        assert_eq!(
+            unsampled.unavailable["mesh_allocator_slab_bytes"],
+            MESH_ALLOCATOR_UNAVAILABLE
         );
-        assert!(unsampled.unavailable.contains_key("gpu_asset_counts/mesh"));
+        assert_eq!(
+            unsampled.unavailable["gpu_asset_counts/mesh"],
+            RENDER_ASSET_UNAVAILABLE
+        );
     }
+
 
     /// The CPU-side bytes count each mesh's attributes and indices and each image's pixels; a mesh
     /// Bevy extracted without a main-world copy is counted but contributes no bytes.
@@ -1258,7 +1394,10 @@ mod tests {
         assert!(!scene.pipeline_statistics_supported);
         assert!(scene.vertex_shader_invocations.is_empty());
         assert!(scene.clipper_primitives_out.is_empty());
-        assert!(scene.unavailable.contains_key("pipeline_statistics"));
+        assert_eq!(
+            scene.unavailable["pipeline_statistics"],
+            PIPELINE_STATISTICS_UNAVAILABLE
+        );
         assert_eq!(scene.entity_count, None);
         assert!(scene.unavailable.contains_key("entity_count"));
         for field in ["mesh_entities", "terrain_patches", "water_surfaces"] {
@@ -1266,7 +1405,8 @@ mod tests {
         }
 
         // A supported backend that recorded no counter says that instead of blaming the backend.
-        let unsampled = ProfilingState::default().scene_report(Some(1), true);
+        let unsampled =
+            ProfilingState::default().scene_report(Some(1), true);
         assert!(unsampled.vertex_shader_invocations.is_empty());
         assert_eq!(
             unsampled.unavailable["pipeline_statistics"],
