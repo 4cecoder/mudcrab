@@ -3,8 +3,8 @@ use crate::{
     fingerprint::{RunFingerprint, records_measurements},
     pacing::{PacingReport, PacingTracker},
     profiling::{
-        CpuReport, GpuPassReport, MemoryReport, MetricSummary, ProfilingState, SceneReport,
-        SystemMetadata, cpu_asset_bytes, summarize,
+        CpuReport, GpuPassReport, MemoryReport, MetricSummary, ProfilingState,
+        RenderMeasurementProbe, SceneReport, SystemMetadata, cpu_asset_bytes, summarize,
     },
     render::RendererMetrics,
     render_timing::{PipelineActivity, RenderTimingPlugin, RenderTimings},
@@ -17,6 +17,7 @@ use bevy::{
     },
     prelude::*,
     render::{
+        ExtractSchedule, RenderApp,
         diagnostic::{
             ErasedRenderAssetDiagnosticPlugin, MeshAllocatorDiagnosticPlugin,
             RenderAssetDiagnosticPlugin,
@@ -66,6 +67,12 @@ impl Plugin for AcceptanceMetricsPlugin {
 /// ordinary play session installs none of them. Materials are counted through the erased
 /// render-asset diagnostic: every material type prepares into the same `PreparedMaterial` map, so
 /// the one count covers all of them (see `profiling::gpu_asset_diagnostics`).
+///
+/// The probe is what tells the report those counters are real. Bevy's plugins add a main-world
+/// `PreUpdate` system that publishes their atomics from the first frame, and the atomics are zero
+/// until the render world's `ExtractSchedule` writes them, so the stored value alone cannot say
+/// whether the render world has measured anything. The probe is the same shape as the plugins' own
+/// handoff: one `Arc<AtomicBool>` in both worlds, set by an extract system and read by the report.
 fn install_gpu_memory_diagnostics(app: &mut App, records_measurements: Option<bool>) {
     if records_measurements != Some(true) {
         return;
@@ -76,6 +83,19 @@ fn install_gpu_memory_diagnostics(app: &mut App, records_measurements: Option<bo
         RenderAssetDiagnosticPlugin::<GpuImage>::new(" images"),
         ErasedRenderAssetDiagnosticPlugin::<MeshMaterial3d<StandardMaterial>>::new(" materials"),
     ));
+    let probe = RenderMeasurementProbe::default();
+    app.insert_resource(probe.clone());
+    if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+        render_app
+            .insert_resource(probe)
+            .add_systems(ExtractSchedule, mark_render_world_measured);
+    }
+}
+
+/// Marks the run's [`RenderMeasurementProbe`] from the render world, in the schedule whose systems
+/// fill Bevy's GPU-memory counters.
+fn mark_render_world_measured(probe: Res<RenderMeasurementProbe>) {
+    probe.mark_measured();
 }
 
 /// Adds the schedule-timing plugin (which also counts asset arrivals) only when the run measures
@@ -182,6 +202,7 @@ fn collect_and_finish(
     render_timings: Res<RenderTimings>,
     pacing: Option<Res<PacingTracker>>,
     fingerprint: Option<Res<RunFingerprint>>,
+    render_measurement_probe: Option<Res<RenderMeasurementProbe>>,
     meshes: Res<Assets<Mesh>>,
     images: Res<Assets<Image>>,
     mut samples: ResMut<BenchmarkSamples>,
@@ -198,10 +219,17 @@ fn collect_and_finish(
             &SystemInformationDiagnosticsPlugin::PROCESS_MEM_USAGE,
         );
         // The profiler samples every frame — its process-memory timeline is whole-run — but only
-        // keeps the GPU diagnostics of the measured frames, after the warm-up a benchmark leaves
-        // out (see `ProfilingState::sample_frame`).
+        // keeps the GPU diagnostics of the measured frames, and the GPU-memory counters only once
+        // the render world has measured them (see `ProfilingState::sample_frame`).
         let measured = samples.frames_seen > config.benchmark_warmup_frames;
-        profiler.sample_frame(&diagnostics, process_memory, measured);
+        profiler.sample_frame(
+            &diagnostics,
+            process_memory,
+            measured,
+            render_measurement_probe
+                .as_deref()
+                .is_some_and(RenderMeasurementProbe::measured),
+        );
         if measured {
             render_timings.set_recording(true);
             let milliseconds = time.delta_secs_f64() * 1000.0;
@@ -307,25 +335,21 @@ fn collect_and_finish(
         && renderer_path_active
         && screenshot_captured;
     // Whether the device can time GPU work is the device's own answer, recorded in the fingerprint
-    // at startup; a run with no renderer at all cannot, so the passes stay absent with a reason.
-    let renderer_capabilities = fingerprint
+    // at startup. The GPU sections take the fingerprint whole, so a run with no renderer says so
+    // rather than blaming a backend it never had.
+    let renderer_fingerprint = fingerprint
         .as_deref()
         .and_then(|value| value.renderer.as_ref());
-    let pipeline_statistics_supported =
-        renderer_capabilities.is_some_and(|value| value.pipeline_statistics_supported);
-    let gpu_passes = profiler.gpu_passes(
-        renderer_capabilities.is_some_and(|value| value.timestamp_queries_supported),
-        pipeline_statistics_supported,
-    );
+    let gpu_passes = profiler.gpu_passes(renderer_fingerprint);
     let memory = MemoryReport {
         cpu: cpu_asset_bytes(&meshes, &images),
-        gpu: profiler.gpu_memory(),
+        gpu: profiler.gpu_memory(renderer_fingerprint),
     };
     // Both sections report what the run measured, so a count that was never sampled stays `null`
     // with a reason rather than becoming a zero (see `profiling::SceneReport`).
     let entity_count = diagnostic_value(&diagnostics, &EntityCountDiagnosticsPlugin::ENTITY_COUNT)
         .map(|value| value as u64);
-    let scene = profiler.scene_report(entity_count, pipeline_statistics_supported);
+    let scene = profiler.scene_report(entity_count, renderer_fingerprint);
     let cpu = profiler.cpu_report();
     let system_snapshot = system.map(|value| SystemSnapshot {
         os: value.os.clone(),
@@ -663,6 +687,47 @@ mod tests {
                 ..EngineConfig::default()
             }),
             (true, true, true, true)
+        );
+    }
+
+    /// A run with no render world never measures the GPU-memory counters, and the report must not
+    /// turn the zeros Bevy's plugins publish into counts.
+    ///
+    /// This drives the real install: Bevy's own main-world `PreUpdate` systems run every frame even
+    /// with no render app and publish their atomics at their initial zero, which is why a stored
+    /// `Some(0.0)` cannot be read as a measurement.
+    #[test]
+    fn gpu_memory_counters_are_not_measured_without_a_render_world() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        install_gpu_memory_diagnostics(&mut app, Some(true));
+        app.update();
+
+        let probe = app.world().resource::<RenderMeasurementProbe>();
+        assert!(
+            !probe.measured(),
+            "with no render app there is no extraction to mark the probe"
+        );
+        let diagnostics = app.world().resource::<DiagnosticsStore>();
+        assert_eq!(
+            diagnostics
+                .get(MeshAllocatorDiagnosticPlugin::slabs_diagnostic_path())
+                .and_then(|diagnostic| diagnostic.value()),
+            Some(0.0),
+            "Bevy publishes the counter's initial zero whether or not anything measured it"
+        );
+
+        let mut profiler = ProfilingState::default();
+        profiler.sample_frame(diagnostics, None, true, probe.measured());
+        let gpu = profiler.gpu_memory(None);
+        assert_eq!(
+            gpu.mesh_allocator_slabs, None,
+            "a zero the render world never produced is not a count"
+        );
+        assert_eq!(gpu.measured_frames, 0);
+        assert_eq!(
+            gpu.unavailable["mesh_allocator_slabs"],
+            "no renderer in this run"
         );
     }
 

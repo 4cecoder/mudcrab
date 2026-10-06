@@ -1,5 +1,7 @@
 use crate::{
-    config::EngineConfig, fingerprint::RunFingerprint, render::RendererMetrics,
+    config::EngineConfig,
+    fingerprint::{RendererFingerprint, RunFingerprint},
+    render::RendererMetrics,
     streaming::StreamingMetrics,
 };
 use bevy::{
@@ -19,11 +21,20 @@ use std::{
     collections::BTreeMap,
     fs,
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAX_SAMPLES_PER_METRIC: usize = 200_000;
 const MAX_TIMELINE_EVENTS: usize = 100_000;
+
+/// Why the report has no per-pass GPU times or counters: the run had no renderer, so no device
+/// measured anything. This is not the same as a device that lacks the feature, and a report must
+/// not blame the backend for work that never happened.
+const NO_RENDERER: &str = "no renderer in this run";
 
 /// Why the report has no per-pass GPU times: Bevy's render diagnostics can time GPU work only on a
 /// backend with timestamp queries (Vulkan and DX12), and record nothing on the others.
@@ -35,15 +46,19 @@ const TIMESTAMP_QUERIES_UNAVAILABLE: &str =
 const PIPELINE_STATISTICS_UNAVAILABLE: &str =
     "the graphics backend does not support pipeline statistics queries";
 
-/// Why a mesh-allocator counter is `null`: the diagnostic is installed only for measured runs, and
-/// only a rendered frame samples it.
+/// Why a mesh-allocator counter is `null`: the render world has not measured the allocator in this
+/// run.
+///
+/// Bevy's own plugin publishes these counters in the main world's `PreUpdate` every frame and they
+/// start at zero, before any extraction has run; `Some(0.0)` from the store therefore proves
+/// nothing, and the report waits for [`RenderMeasurementProbe`] instead.
 const MESH_ALLOCATOR_UNAVAILABLE: &str =
-    "Bevy's mesh-allocator diagnostic was not sampled in this run";
+    "the render world has not measured Bevy's mesh allocator in this run";
 
-/// Why a render-asset count is missing: the diagnostic is installed only for measured runs, and
-/// only a rendered frame samples it.
+/// Why a render-asset count is missing: the render world has not measured that asset type in this
+/// run. The same zero-before-extraction caveat as [`MESH_ALLOCATOR_UNAVAILABLE`] applies.
 const RENDER_ASSET_UNAVAILABLE: &str =
-    "Bevy's render-asset diagnostic for this type was not sampled in this run";
+    "the render world has not measured the live GPU-side count for this asset type in this run";
 
 /// Why a scene count is `null`: the inventory is sampled every 60th frame, so a run that rendered
 /// no sampled frame has none.
@@ -75,6 +90,34 @@ const RENDER_WORLD_PREP_UNAVAILABLE: &str = "Bevy 0.19 records no per-schedule t
 
 /// Why `cpu.spans` is empty: nothing was recorded, which only an aborted run does.
 const NO_CPU_SPANS: &str = "the run recorded no CPU spans";
+
+/// Whether the render world has run the extraction systems that fill Bevy's GPU-memory counters.
+///
+/// Bevy's mesh-allocator and render-asset diagnostics publish atomics in the main world's
+/// `PreUpdate` from the first frame — `bevy_render/src/diagnostic/mesh_allocator_diagnostic_plugin.rs`
+/// and `render_asset_diagnostic_plugin.rs` — and those atomics start at zero. What puts a real
+/// value in them is each plugin's system in the render world's `ExtractSchedule`. A diagnostic
+/// value of zero therefore cannot be told from a value the render world never produced, so the
+/// report waits for this flag, which only that extraction sets.
+///
+/// One `Arc<AtomicBool>` is shared between the worlds the way the engine's other cross-world
+/// resources are (`render::RendererProofBridge`): the main world holds it as this resource and the
+/// render app is given a clone plus the system that sets it.
+#[derive(Resource, Clone, Default)]
+pub struct RenderMeasurementProbe(Arc<AtomicBool>);
+
+impl RenderMeasurementProbe {
+    /// Whether the render world's extraction systems have run at least once, which is the first
+    /// moment its counters describe anything.
+    pub fn measured(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Records that the render world has measured, called from the render app's `ExtractSchedule`.
+    pub fn mark_measured(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 
 /// Where the sampling of one render-diagnostic path got to: the time of the last measurement taken
 /// from it, and how many measurements at exactly that time were taken.
@@ -115,6 +158,9 @@ pub struct ProfilingState {
     /// The frames of the measured window this state sampled: the frames every GPU and
     /// pipeline-statistics number in the report rests on.
     measured_frames: u64,
+    /// The measured frames in which the render world's GPU-memory counters were recorded. Zero when
+    /// the render world never measured them, whatever zeros the diagnostics store published.
+    gpu_memory_frames: u64,
     counters: BTreeMap<String, u64>,
     gauges: BTreeMap<String, f64>,
     timeline: Vec<TimelineEvent>,
@@ -131,6 +177,7 @@ impl Default for ProfilingState {
             render_cursors: BTreeMap::new(),
             memory_metrics: BTreeMap::new(),
             measured_frames: 0,
+            gpu_memory_frames: 0,
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
             timeline: Vec::new(),
@@ -194,7 +241,9 @@ impl ProfilingState {
     /// Samples a frame: the process memory every frame, and the GPU diagnostics when `measured`.
     ///
     /// `measured` is whether this frame is inside the measured window — after the warm-up frames a
-    /// benchmark leaves out. The caller knows the warm-up gate; this state cannot see it.
+    /// benchmark leaves out — and `gpu_memory_measured` is whether the render world has produced
+    /// its counters at all ([`RenderMeasurementProbe`]). Both are the caller's answer; this state
+    /// cannot see the warm-up gate or the render world itself.
     ///
     /// Every render-diagnostic measurement is taken exactly once, however many cameras wrote it and
     /// however long the GPU readback takes: [`take_render_measurements`] advances a cursor per path
@@ -210,10 +259,14 @@ impl ProfilingState {
         diagnostics: &DiagnosticsStore,
         process_memory_gib: Option<f64>,
         measured: bool,
+        gpu_memory_measured: bool,
     ) {
         self.frame = self.frame.saturating_add(1);
         if measured {
             self.measured_frames = self.measured_frames.saturating_add(1);
+            if gpu_memory_measured {
+                self.gpu_memory_frames = self.gpu_memory_frames.saturating_add(1);
+            }
         }
         for diagnostic in diagnostics.iter() {
             let path = diagnostic.path().as_str();
@@ -228,11 +281,14 @@ impl ProfilingState {
             // The GPU-memory diagnostics do not sit under `render/`, so they are matched by their
             // own names, deliberately: the mesh allocator's counters and the live render-asset
             // counts, the only paths the report's memory section reads. They are gauges, so the
-            // last value of the measured window is what is kept.
-            else if measured && is_gpu_memory_path(path) {
-                if let Some(value) = diagnostic.value() {
-                    self.memory_metrics.insert(path.to_owned(), value);
-                }
+            // last value of the measured window is what is kept — and only once the render world
+            // has measured them, never the zero Bevy publishes before its first extraction.
+            else if measured
+                && gpu_memory_measured
+                && is_gpu_memory_path(path)
+                && let Some(value) = diagnostic.value()
+            {
+                self.memory_metrics.insert(path.to_owned(), value);
             }
         }
         if self.frame.is_multiple_of(60)
@@ -246,11 +302,15 @@ impl ProfilingState {
     }
 
     /// The per-pass GPU times, summarised over the measured window (see [`GpuPassReport`]).
-    pub fn gpu_passes(
-        &self,
-        timestamp_queries_supported: bool,
-        pipeline_statistics_supported: bool,
-    ) -> GpuPassReport {
+    ///
+    /// `renderer` is the run's renderer fingerprint, or `None` for a run that had no renderer; it
+    /// is where the device's capabilities come from, so a renderer-less run says so rather than
+    /// blaming a backend that never ran.
+    pub fn gpu_passes(&self, renderer: Option<&RendererFingerprint>) -> GpuPassReport {
+        let timestamp_queries_supported =
+            renderer.is_some_and(|value| value.timestamp_queries_supported);
+        let pipeline_statistics_supported =
+            renderer.is_some_and(|value| value.pipeline_statistics_supported);
         // Without timestamp queries no such sample can be real, so a stray one (a diagnostic left
         // over from another device, say) is dropped rather than reported as a pass time.
         let passes: BTreeMap<String, MetricSummary> = if timestamp_queries_supported {
@@ -263,22 +323,27 @@ impl ProfilingState {
             BTreeMap::new()
         };
         let mut unavailable = BTreeMap::new();
-        if !timestamp_queries_supported {
-            unavailable.insert(
-                "elapsed_gpu".to_owned(),
-                TIMESTAMP_QUERIES_UNAVAILABLE.to_owned(),
-            );
-        } else if passes.is_empty() {
-            unavailable.insert(
-                "elapsed_gpu".to_owned(),
-                "no per-pass GPU time was recorded for this run".to_owned(),
-            );
-        }
-        if !pipeline_statistics_supported {
-            unavailable.insert(
-                "pipeline_statistics".to_owned(),
-                PIPELINE_STATISTICS_UNAVAILABLE.to_owned(),
-            );
+        if renderer.is_none() {
+            unavailable.insert("elapsed_gpu".to_owned(), NO_RENDERER.to_owned());
+            unavailable.insert("pipeline_statistics".to_owned(), NO_RENDERER.to_owned());
+        } else {
+            if !timestamp_queries_supported {
+                unavailable.insert(
+                    "elapsed_gpu".to_owned(),
+                    TIMESTAMP_QUERIES_UNAVAILABLE.to_owned(),
+                );
+            } else if passes.is_empty() {
+                unavailable.insert(
+                    "elapsed_gpu".to_owned(),
+                    "no per-pass GPU time was recorded for this run".to_owned(),
+                );
+            }
+            if !pipeline_statistics_supported {
+                unavailable.insert(
+                    "pipeline_statistics".to_owned(),
+                    PIPELINE_STATISTICS_UNAVAILABLE.to_owned(),
+                );
+            }
         }
         GpuPassReport {
             timestamp_queries_supported,
@@ -300,8 +365,10 @@ impl ProfilingState {
     pub fn scene_report(
         &self,
         entity_count: Option<u64>,
-        pipeline_statistics_supported: bool,
+        renderer: Option<&RendererFingerprint>,
     ) -> SceneReport {
+        let pipeline_statistics_supported =
+            renderer.is_some_and(|value| value.pipeline_statistics_supported);
         let mut unavailable = BTreeMap::new();
         if entity_count.is_none() {
             unavailable.insert(
@@ -336,7 +403,9 @@ impl ProfilingState {
         };
         let vertex_shader_invocations = counters("/vertex_shader_invocations");
         let clipper_primitives_out = counters("/clipper_primitives_out");
-        if !pipeline_statistics_supported {
+        if renderer.is_none() {
+            unavailable.insert("pipeline_statistics".to_owned(), NO_RENDERER.to_owned());
+        } else if !pipeline_statistics_supported {
             unavailable.insert(
                 "pipeline_statistics".to_owned(),
                 PIPELINE_STATISTICS_UNAVAILABLE.to_owned(),
@@ -402,14 +471,25 @@ impl ProfilingState {
         }
     }
 
-    /// The last sampled value of the GPU-memory diagnostics (see [`GpuMemoryReport`]).
-    pub fn gpu_memory(&self) -> GpuMemoryReport {
+    /// The last value of the GPU-memory diagnostics in the measured window (see
+    /// [`GpuMemoryReport`]).
+    ///
+    /// `renderer` is the run's renderer fingerprint, or `None` for a run with no renderer; a
+    /// counter that was not measured is `null` and the reason says which of the two it was.
+    pub fn gpu_memory(&self, renderer: Option<&RendererFingerprint>) -> GpuMemoryReport {
         let mut unavailable = BTreeMap::new();
+        let reason = |specific: &str| {
+            if renderer.is_none() {
+                NO_RENDERER.to_owned()
+            } else {
+                specific.to_owned()
+            }
+        };
         let mut mesh_allocator = |path: &DiagnosticPath, field: &str| match self.memory_sample(path)
         {
             Some(value) => Some(value.max(0.0) as u64),
             None => {
-                unavailable.insert(field.to_owned(), MESH_ALLOCATOR_UNAVAILABLE.to_owned());
+                unavailable.insert(field.to_owned(), reason(MESH_ALLOCATOR_UNAVAILABLE));
                 None
             }
         };
@@ -434,7 +514,7 @@ impl ProfilingState {
                 None => {
                     unavailable.insert(
                         format!("gpu_asset_counts/{label}"),
-                        RENDER_ASSET_UNAVAILABLE.to_owned(),
+                        reason(RENDER_ASSET_UNAVAILABLE),
                     );
                 }
             }
@@ -444,7 +524,7 @@ impl ProfilingState {
             mesh_allocator_slabs,
             mesh_allocator_allocations,
             render_asset_counts,
-            measured_frames: self.measured_frames,
+            measured_frames: self.gpu_memory_frames,
             unavailable,
         }
     }
@@ -572,7 +652,10 @@ fn take_render_measurements(
             }
         }
         if keep {
-            push_bounded(metrics.entry(path.to_owned()).or_default(), measurement.value);
+            push_bounded(
+                metrics.entry(path.to_owned()).or_default(),
+                measurement.value,
+            );
         }
         next = Some(match next {
             Some(next) if next.time == measurement.time => RenderCursor {
@@ -706,9 +789,12 @@ pub struct MemoryReport {
 
 /// The CPU-side bytes of the mesh and image assets, read once at the end of the run.
 ///
-/// A mesh Bevy has extracted to the render world without keeping a main-world copy — the glTF
-/// loader's default, and so every streamed model — has no attribute or index data left to measure;
-/// those meshes are counted in `meshes_without_cpu_data` and contribute no bytes to `mesh_bytes`.
+/// A mesh Bevy has extracted to the render world without keeping a main-world copy (a
+/// `RenderAssetUsages::RENDER_WORLD` mesh, whose GPU data was taken) has no attribute or index data
+/// left to measure; those meshes are counted in `meshes_without_cpu_data` and contribute no bytes
+/// to `mesh_bytes`. Bevy 0.19's glTF loader keeps both worlds by default
+/// (`GltfLoaderSettings::load_meshes` is `RenderAssetUsages::default()`) and the engine does not
+/// override it, so streamed models keep their main-world mesh data and are measured here.
 #[derive(Debug, Clone, Serialize)]
 pub struct CpuAssetBytes {
     pub meshes: usize,
@@ -722,8 +808,9 @@ pub struct CpuAssetBytes {
 ///
 /// Every field is a counter, not a VRAM total: wgpu reports how many resources are live, and the
 /// engine can read no vendor memory counter. `mesh_allocator_slab_bytes` is the byte size of the
-/// allocator's own slabs, the one real byte figure available. A counter that was not sampled is
-/// `null` with the reason in `unavailable`, never zero.
+/// allocator's own slabs, the one real byte figure available. A counter is `null` with the reason
+/// in `unavailable` until the render world has measured it, never the zero Bevy publishes before
+/// its first extraction.
 #[derive(Debug, Clone, Serialize)]
 pub struct GpuMemoryReport {
     pub mesh_allocator_slab_bytes: Option<u64>,
@@ -731,8 +818,8 @@ pub struct GpuMemoryReport {
     pub mesh_allocator_allocations: Option<u64>,
     /// Live render-asset counts, by asset type: a count of assets, never a byte size.
     pub render_asset_counts: BTreeMap<String, u64>,
-    /// The frames of the measured window these values were sampled over, the frame count they rest
-    /// on.
+    /// The measured frames in which the render world's counters were sampled: the number of frames
+    /// these values rest on, `0` when the render world never measured them.
     pub measured_frames: u64,
     pub unavailable: BTreeMap<String, String>,
 }
@@ -1100,6 +1187,23 @@ mod tests {
             .add_measurement(DiagnosticMeasurement { time, value });
     }
 
+    /// A renderer fingerprint carrying the two GPU-diagnostic features, for the report sections
+    /// that read the device's capabilities rather than a bare pair of flags.
+    fn renderer(
+        timestamp_queries_supported: bool,
+        pipeline_statistics_supported: bool,
+    ) -> RendererFingerprint {
+        RendererFingerprint {
+            backend: "Vulkan".into(),
+            adapter: "Test Adapter".into(),
+            driver: "test-driver".into(),
+            driver_info: "1.2.3".into(),
+            device_type: "DiscreteGpu".into(),
+            timestamp_queries_supported,
+            pipeline_statistics_supported,
+        }
+    }
+
     /// Per-pass GPU time is summarised over every measured frame, and the pipeline-statistics
     /// counters that share the `render/` tree stay out of the per-pass table.
     #[test]
@@ -1122,9 +1226,9 @@ mod tests {
                 "render/main_opaque_pass_3d/vertex_shader_invocations",
                 100.0,
             );
-            profiler.sample_frame(&diagnostics, None, true);
+            profiler.sample_frame(&diagnostics, None, true, true);
         }
-        let report = profiler.gpu_passes(true, true);
+        let report = profiler.gpu_passes(Some(&renderer(true, true)));
         assert!(report.timestamp_queries_supported);
         assert!(report.pipeline_statistics_supported);
         assert!(report.unavailable.is_empty());
@@ -1155,8 +1259,8 @@ mod tests {
         let batch = Instant::now();
         feed_at(&mut diagnostics, path, 4.0, batch);
         feed_at(&mut diagnostics, path, 6.0, batch);
-        profiler.sample_frame(&diagnostics, None, true);
-        let report = profiler.gpu_passes(true, true);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let report = profiler.gpu_passes(Some(&renderer(true, true)));
         assert_eq!(
             report.passes[path].count, 2,
             "both cameras' observations of the pass are kept"
@@ -1164,8 +1268,8 @@ mod tests {
         assert_eq!(report.passes[path].total, 10.0);
 
         // The readback has not arrived: the store is unchanged and nothing may be resampled.
-        profiler.sample_frame(&diagnostics, None, true);
-        let report = profiler.gpu_passes(true, true);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let report = profiler.gpu_passes(Some(&renderer(true, true)));
         assert_eq!(
             report.passes[path].count, 2,
             "an unchanged store adds no sample"
@@ -1177,16 +1281,20 @@ mod tests {
 
         // A later frame: another pass keeps producing, this one has stopped running.
         let later = batch + Duration::from_millis(16);
-        feed_at(&mut diagnostics, "render/tonemapping/elapsed_gpu", 3.0, later);
-        profiler.sample_frame(&diagnostics, None, true);
-        let report = profiler.gpu_passes(true, true);
+        feed_at(
+            &mut diagnostics,
+            "render/tonemapping/elapsed_gpu",
+            3.0,
+            later,
+        );
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let report = profiler.gpu_passes(Some(&renderer(true, true)));
         assert_eq!(
             report.passes[path].count, 2,
             "a pass that stopped running adds no further sample"
         );
         assert_eq!(
-            report.passes["render/tonemapping/elapsed_gpu"].count,
-            1,
+            report.passes["render/tonemapping/elapsed_gpu"].count, 1,
             "a pass that is still running does"
         );
     }
@@ -1202,23 +1310,25 @@ mod tests {
         for value in [10.0, 20.0] {
             feed(&mut diagnostics, path, value);
             feed(&mut diagnostics, "mesh_allocator_slabs", value);
-            profiler.sample_frame(&diagnostics, None, false);
+            profiler.sample_frame(&diagnostics, None, false, true);
         }
-        let warm = profiler.gpu_passes(true, true);
+        let warm = profiler.gpu_passes(Some(&renderer(true, true)));
         assert!(
             warm.passes.is_empty(),
             "a warm-up pass sample is not measured"
         );
         assert_eq!(warm.measured_frames, 0);
         assert_eq!(
-            profiler.gpu_memory().mesh_allocator_slabs,
+            profiler
+                .gpu_memory(Some(&renderer(true, true)))
+                .mesh_allocator_slabs,
             None,
             "a warm-up counter is not a measured one"
         );
 
         // The first measured frame finds no new measurement and must not report the warm-up ones.
-        profiler.sample_frame(&diagnostics, None, true);
-        let measured = profiler.gpu_passes(true, true);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let measured = profiler.gpu_passes(Some(&renderer(true, true)));
         assert!(
             measured.passes.is_empty(),
             "the warm-up history is not a measured window"
@@ -1228,12 +1338,12 @@ mod tests {
         // A measurement that arrives inside the window is the only one reported.
         feed(&mut diagnostics, path, 5.0);
         feed(&mut diagnostics, "mesh_allocator_slabs", 3.0);
-        profiler.sample_frame(&diagnostics, None, true);
-        let measured = profiler.gpu_passes(true, true);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let measured = profiler.gpu_passes(Some(&renderer(true, true)));
         assert_eq!(measured.passes[path].count, 1);
         assert_eq!(measured.passes[path].mean, 5.0);
         assert_eq!(measured.measured_frames, 2);
-        let memory = profiler.gpu_memory();
+        let memory = profiler.gpu_memory(Some(&renderer(true, true)));
         assert_eq!(memory.mesh_allocator_slabs, Some(3));
         assert_eq!(memory.measured_frames, 2);
     }
@@ -1249,9 +1359,9 @@ mod tests {
             "render/main_opaque_pass_3d/elapsed_gpu",
             3.0,
         );
-        profiler.sample_frame(&diagnostics, None, true);
+        profiler.sample_frame(&diagnostics, None, true, true);
 
-        let unsupported = profiler.gpu_passes(false, false);
+        let unsupported = profiler.gpu_passes(Some(&renderer(false, false)));
         assert!(unsupported.passes.is_empty());
         assert!(!unsupported.timestamp_queries_supported);
         assert!(!unsupported.pipeline_statistics_supported);
@@ -1265,7 +1375,7 @@ mod tests {
         );
 
         // A device that can time GPU work, but a run in which no pass was recorded.
-        let empty = ProfilingState::default().gpu_passes(true, true);
+        let empty = ProfilingState::default().gpu_passes(Some(&renderer(true, true)));
         assert!(empty.passes.is_empty());
         assert!(
             empty.unavailable["elapsed_gpu"].contains("no per-pass GPU time"),
@@ -1274,6 +1384,75 @@ mod tests {
         );
     }
 
+    /// A run with no renderer says so, rather than blaming the backend for a device it never had.
+    #[test]
+    fn a_run_with_no_renderer_says_so_instead_of_blaming_the_backend() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        feed(
+            &mut diagnostics,
+            "render/main_opaque_pass_3d/elapsed_gpu",
+            3.0,
+        );
+        profiler.sample_frame(&diagnostics, None, true, true);
+
+        let passes = profiler.gpu_passes(None);
+        assert!(passes.passes.is_empty());
+        assert!(!passes.timestamp_queries_supported);
+        assert!(!passes.pipeline_statistics_supported);
+        assert_eq!(passes.unavailable["elapsed_gpu"], NO_RENDERER);
+        assert_eq!(passes.unavailable["pipeline_statistics"], NO_RENDERER);
+
+        let scene = profiler.scene_report(None, None);
+        assert_eq!(scene.unavailable["pipeline_statistics"], NO_RENDERER);
+
+        let memory = profiler.gpu_memory(None);
+        assert_eq!(memory.mesh_allocator_slabs, None);
+        assert_eq!(memory.unavailable["mesh_allocator_slabs"], NO_RENDERER);
+        assert_eq!(memory.unavailable["gpu_asset_counts/mesh"], NO_RENDERER);
+    }
+
+    /// The probe reports measured only once the render world's extraction has marked it.
+    #[test]
+    fn the_render_measurement_probe_reports_only_what_extraction_marked() {
+        let probe = RenderMeasurementProbe::default();
+        assert!(!probe.measured());
+        probe.mark_measured();
+        assert!(probe.measured());
+    }
+
+    /// A zero Bevy published before its first extraction is not a measurement: until the render
+    /// world has produced a value, the counters are `null` with a reason.
+    #[test]
+    fn gpu_memory_stays_null_until_the_render_world_measures_it() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        feed(&mut diagnostics, "mesh_allocator_slabs", 0.0);
+        feed(
+            &mut diagnostics,
+            RenderAssetDiagnosticPlugin::<RenderMesh>::render_asset_diagnostic_path().as_str(),
+            0.0,
+        );
+        // Bevy's plugins publish these atomics in the main world from the first frame, and they are
+        // zero until the render world's extraction fills them: a `Some(0.0)` from the store proves
+        // nothing, which is exactly what the flag says.
+        profiler.sample_frame(&diagnostics, None, true, false);
+        let gpu = profiler.gpu_memory(Some(&renderer(true, true)));
+        assert_eq!(gpu.mesh_allocator_slabs, None);
+        assert!(gpu.render_asset_counts.is_empty());
+        assert_eq!(gpu.measured_frames, 0);
+        assert_eq!(
+            gpu.unavailable["mesh_allocator_slabs"],
+            MESH_ALLOCATOR_UNAVAILABLE
+        );
+
+        // Once the render world has measured, its value is the one reported.
+        feed(&mut diagnostics, "mesh_allocator_slabs", 2.0);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let gpu = profiler.gpu_memory(Some(&renderer(true, true)));
+        assert_eq!(gpu.mesh_allocator_slabs, Some(2));
+        assert_eq!(gpu.measured_frames, 1);
+    }
 
     /// The memory section reports the last sample of each counter, counts assets as counts, and
     /// names a reason for every counter the run did not sample.
@@ -1289,11 +1468,11 @@ mod tests {
             RenderAssetDiagnosticPlugin::<RenderMesh>::render_asset_diagnostic_path().as_str(),
             7.0,
         );
-        profiler.sample_frame(&diagnostics, None, true);
+        profiler.sample_frame(&diagnostics, None, true, true);
         feed(&mut diagnostics, "mesh_allocator_allocations", 45.0);
-        profiler.sample_frame(&diagnostics, None, true);
+        profiler.sample_frame(&diagnostics, None, true, true);
 
-        let gpu = profiler.gpu_memory();
+        let gpu = profiler.gpu_memory(Some(&renderer(true, true)));
         assert_eq!(gpu.mesh_allocator_slab_bytes, Some(8_388_608));
         assert_eq!(gpu.mesh_allocator_slabs, Some(2));
         assert_eq!(
@@ -1310,7 +1489,7 @@ mod tests {
         assert!(gpu.unavailable.contains_key("gpu_asset_counts/image"));
         assert!(gpu.unavailable.contains_key("gpu_asset_counts/material"));
 
-        let unsampled = ProfilingState::default().gpu_memory();
+        let unsampled = ProfilingState::default().gpu_memory(Some(&renderer(true, true)));
         assert_eq!(unsampled.mesh_allocator_slab_bytes, None);
         assert!(unsampled.render_asset_counts.is_empty());
         assert_eq!(unsampled.measured_frames, 0);
@@ -1323,7 +1502,6 @@ mod tests {
             RENDER_ASSET_UNAVAILABLE
         );
     }
-
 
     /// The CPU-side bytes count each mesh's attributes and indices and each image's pixels; a mesh
     /// Bevy extracted without a main-world copy is counted but contributes no bytes.
@@ -1436,9 +1614,9 @@ mod tests {
                 "render/main_opaque_pass_3d/clipper_primitives_out",
                 value / 2.0,
             );
-            profiler.sample_frame(&diagnostics, None, true);
+            profiler.sample_frame(&diagnostics, None, true, true);
         }
-        let scene = profiler.scene_report(Some(42), true);
+        let scene = profiler.scene_report(Some(42), Some(&renderer(true, true)));
         assert_eq!(scene.entity_count, Some(42));
         assert_eq!(scene.mesh_entities, Some(4));
         assert_eq!(scene.terrain_patches, Some(9));
@@ -1477,8 +1655,8 @@ mod tests {
             "render/main_opaque_pass_3d/vertex_shader_invocations",
             7.0,
         );
-        profiler.sample_frame(&diagnostics, None, true);
-        let scene = profiler.scene_report(None, false);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let scene = profiler.scene_report(None, Some(&renderer(false, false)));
         assert!(!scene.pipeline_statistics_supported);
         assert!(scene.vertex_shader_invocations.is_empty());
         assert!(scene.clipper_primitives_out.is_empty());
@@ -1494,7 +1672,7 @@ mod tests {
 
         // A supported backend that recorded no counter says that instead of blaming the backend.
         let unsampled =
-            ProfilingState::default().scene_report(Some(1), true);
+            ProfilingState::default().scene_report(Some(1), Some(&renderer(true, true)));
         assert!(unsampled.vertex_shader_invocations.is_empty());
         assert_eq!(
             unsampled.unavailable["pipeline_statistics"],
