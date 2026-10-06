@@ -1,7 +1,11 @@
 use crate::{
     config::EngineConfig,
+    fingerprint::{RunFingerprint, records_measurements},
     pacing::{PacingReport, PacingTracker},
-    profiling::{MetricSummary, ProfilingState, SystemMetadata, summarize},
+    profiling::{
+        GpuPassReport, MemoryReport, MetricSummary, ProfilingState, SystemMetadata,
+        cpu_asset_bytes, summarize,
+    },
     render::RendererMetrics,
     render_timing::{PipelineActivity, RenderTimingPlugin, RenderTimings},
     streaming::StreamingMetrics,
@@ -12,6 +16,14 @@ use bevy::{
         SystemInformationDiagnosticsPlugin,
     },
     prelude::*,
+    render::{
+        diagnostic::{
+            ErasedRenderAssetDiagnosticPlugin, MeshAllocatorDiagnosticPlugin,
+            RenderAssetDiagnosticPlugin,
+        },
+        mesh::RenderMesh,
+        texture::GpuImage,
+    },
 };
 use serde::Serialize;
 use std::{
@@ -39,7 +51,31 @@ impl Plugin for AcceptanceMetricsPlugin {
             .get_resource::<EngineConfig>()
             .map(EngineConfig::measures_pacing);
         install_schedule_timing(app, measures_pacing);
+        let records_measurements = app
+            .world()
+            .get_resource::<EngineConfig>()
+            .map(records_measurements);
+        install_gpu_memory_diagnostics(app, records_measurements);
     }
+}
+
+/// Adds Bevy's GPU-memory diagnostics — the mesh allocator's counters and the live GPU-asset
+/// counts — only when the run records measurements.
+///
+/// Each of these runs a system every frame, in the main world and in the render world, so an
+/// ordinary play session installs none of them. Materials are counted through the erased
+/// render-asset diagnostic: every material type prepares into the same `PreparedMaterial` map, so
+/// the one count covers all of them (see `profiling::gpu_asset_diagnostics`).
+fn install_gpu_memory_diagnostics(app: &mut App, records_measurements: Option<bool>) {
+    if records_measurements != Some(true) {
+        return;
+    }
+    app.add_plugins((
+        MeshAllocatorDiagnosticPlugin,
+        RenderAssetDiagnosticPlugin::<RenderMesh>::new(" meshes"),
+        RenderAssetDiagnosticPlugin::<GpuImage>::new(" images"),
+        ErasedRenderAssetDiagnosticPlugin::<MeshMaterial3d<StandardMaterial>>::new(" materials"),
+    ));
 }
 
 /// Adds the schedule-timing plugin (which also counts asset arrivals) only when the run measures
@@ -96,6 +132,14 @@ struct BenchmarkReport {
     /// sit at the top level of the report and are absent for a run with no streaming.
     #[serde(flatten)]
     pacing: Option<PacingReport>,
+    /// What the run ran on: machine, renderer, world data, and the settings it rendered with (see
+    /// `fingerprint`). `null` only for a run that recorded measurements without installing the
+    /// fingerprint.
+    fingerprint: Option<RunFingerprint>,
+    /// Per-pass GPU time over the measured frames (see [`GpuPassReport`]).
+    gpu_passes: GpuPassReport,
+    /// Where the run's memory was: Bevy's CPU-side asset data and the GPU-side counters.
+    memory: MemoryReport,
     thresholds: Thresholds,
     passed: bool,
 }
@@ -131,6 +175,9 @@ fn collect_and_finish(
     renderer: Res<RendererMetrics>,
     render_timings: Res<RenderTimings>,
     pacing: Option<Res<PacingTracker>>,
+    fingerprint: Option<Res<RunFingerprint>>,
+    meshes: Res<Assets<Mesh>>,
+    images: Res<Assets<Image>>,
     mut samples: ResMut<BenchmarkSamples>,
     mut profiler: ResMut<ProfilingState>,
     mut exit: MessageWriter<AppExit>,
@@ -249,6 +296,17 @@ fn collect_and_finish(
         && streaming_lifecycle_validated
         && renderer_path_active
         && screenshot_captured;
+    // Whether the device can time GPU work is the device's own answer, recorded in the fingerprint
+    // at startup; a run with no renderer at all cannot, so the passes stay absent with a reason.
+    let renderer_capabilities = fingerprint.as_deref().and_then(|value| value.renderer.as_ref());
+    let gpu_passes = profiler.gpu_passes(
+        renderer_capabilities.is_some_and(|value| value.timestamp_queries_supported),
+        renderer_capabilities.is_some_and(|value| value.pipeline_statistics_supported),
+    );
+    let memory = MemoryReport {
+        cpu: cpu_asset_bytes(&meshes, &images),
+        gpu: profiler.gpu_memory(),
+    };
     let system_snapshot = system.map(|value| SystemSnapshot {
         os: value.os.clone(),
         kernel: value.kernel.clone(),
@@ -257,7 +315,7 @@ fn collect_and_finish(
         memory: value.memory.clone(),
     });
     let report = BenchmarkReport {
-        format_version: 8,
+        format_version: 9,
         generated_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
@@ -305,6 +363,9 @@ fn collect_and_finish(
         render_world,
         render_pipelines,
         pacing: pacing_report,
+        fingerprint: fingerprint.as_deref().cloned(),
+        gpu_passes,
+        memory,
         thresholds: Thresholds {
             minimum_average_fps: config.accept_min_fps,
             maximum_p95_frame_ms: config.accept_p95_ms,
@@ -350,6 +411,7 @@ fn collect_and_finish(
         streaming.as_deref(),
         &renderer,
         bundle_system,
+        fingerprint.as_deref(),
     ) {
         error!(%error, "failed to write profiling bundle");
         exit.write(AppExit::error());

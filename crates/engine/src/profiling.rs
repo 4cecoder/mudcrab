@@ -1,5 +1,19 @@
-use crate::{config::EngineConfig, render::RendererMetrics, streaming::StreamingMetrics};
-use bevy::{diagnostic::DiagnosticsStore, prelude::*};
+use crate::{
+    config::EngineConfig, fingerprint::RunFingerprint, render::RendererMetrics,
+    streaming::StreamingMetrics,
+};
+use bevy::{
+    diagnostic::{DiagnosticPath, DiagnosticsStore},
+    prelude::*,
+    render::{
+        diagnostic::{
+            ErasedRenderAssetDiagnosticPlugin, MeshAllocatorDiagnosticPlugin,
+            RenderAssetDiagnosticPlugin,
+        },
+        mesh::RenderMesh,
+        texture::GpuImage,
+    },
+};
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -10,6 +24,25 @@ use std::{
 
 const MAX_SAMPLES_PER_METRIC: usize = 200_000;
 const MAX_TIMELINE_EVENTS: usize = 100_000;
+
+/// Why the report has no per-pass GPU times: Bevy's render diagnostics can time GPU work only on a
+/// backend with timestamp queries (Vulkan and DX12), and record nothing on the others.
+const TIMESTAMP_QUERIES_UNAVAILABLE: &str = "the graphics backend does not support timestamp queries, so Bevy records no per-pass GPU time";
+
+/// Why the report has no per-pass shader-invocation counters: DX12 does not offer pipeline
+/// statistics.
+const PIPELINE_STATISTICS_UNAVAILABLE: &str =
+    "the graphics backend does not support pipeline statistics queries";
+
+/// Why a mesh-allocator counter is `null`: the diagnostic is installed only for measured runs, and
+/// only a rendered frame samples it.
+const MESH_ALLOCATOR_UNAVAILABLE: &str =
+    "Bevy's mesh-allocator diagnostic was not sampled in this run";
+
+/// Why a render-asset count is missing: the diagnostic is installed only for measured runs, and
+/// only a rendered frame samples it.
+const RENDER_ASSET_UNAVAILABLE: &str =
+    "Bevy's render-asset diagnostic for this type was not sampled in this run";
 
 pub struct ProfilingPlugin;
 
@@ -26,6 +59,10 @@ pub struct ProfilingState {
     frame: u64,
     cpu_spans_ms: BTreeMap<String, Vec<f64>>,
     render_metrics: BTreeMap<String, Vec<f64>>,
+    /// The last value sampled for each GPU-memory diagnostic (the mesh allocator's counters and the
+    /// live render-asset counts). These are gauges, not distributions: only the value at the end of
+    /// the run is reported.
+    memory_metrics: BTreeMap<String, f64>,
     counters: BTreeMap<String, u64>,
     gauges: BTreeMap<String, f64>,
     timeline: Vec<TimelineEvent>,
@@ -39,6 +76,7 @@ impl Default for ProfilingState {
             frame: 0,
             cpu_spans_ms: BTreeMap::new(),
             render_metrics: BTreeMap::new(),
+            memory_metrics: BTreeMap::new(),
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
             timeline: Vec::new(),
@@ -107,13 +145,19 @@ impl ProfilingState {
         self.frame = self.frame.saturating_add(1);
         for diagnostic in diagnostics.iter() {
             let path = diagnostic.path().as_str();
-            if path.starts_with("render/")
-                && let Some(value) = diagnostic.value()
-            {
-                push_bounded(
-                    self.render_metrics.entry(path.to_owned()).or_default(),
-                    value,
-                );
+            if let Some(value) = diagnostic.value() {
+                if path.starts_with("render/") {
+                    push_bounded(
+                        self.render_metrics.entry(path.to_owned()).or_default(),
+                        value,
+                    );
+                }
+                // The GPU-memory diagnostics do not sit under `render/`, so they are matched by
+                // their own names, deliberately: the mesh allocator's counters and the live
+                // render-asset counts, the only paths the report's memory section reads.
+                else if is_gpu_memory_path(path) {
+                    self.memory_metrics.insert(path.to_owned(), value);
+                }
             }
         }
         if self.frame.is_multiple_of(60)
@@ -126,6 +170,94 @@ impl ProfilingState {
         }
     }
 
+    /// The per-pass GPU times, summarised over every sample taken this run (see [`GpuPassReport`]).
+    pub fn gpu_passes(
+        &self,
+        timestamp_queries_supported: bool,
+        pipeline_statistics_supported: bool,
+    ) -> GpuPassReport {
+        let passes: BTreeMap<String, MetricSummary> = self
+            .render_metrics
+            .iter()
+            .filter(|(path, _)| path.ends_with("/elapsed_gpu"))
+            .map(|(path, samples)| (path.clone(), summarize(samples)))
+            .collect();
+        let mut unavailable = BTreeMap::new();
+        if !timestamp_queries_supported {
+            unavailable.insert(
+                "elapsed_gpu".to_owned(),
+                TIMESTAMP_QUERIES_UNAVAILABLE.to_owned(),
+            );
+        } else if passes.is_empty() {
+            unavailable.insert(
+                "elapsed_gpu".to_owned(),
+                "no per-pass GPU time was recorded for this run".to_owned(),
+            );
+        }
+        if !pipeline_statistics_supported {
+            unavailable.insert(
+                "pipeline_statistics".to_owned(),
+                PIPELINE_STATISTICS_UNAVAILABLE.to_owned(),
+            );
+        }
+        GpuPassReport {
+            timestamp_queries_supported,
+            pipeline_statistics_supported,
+            passes,
+            unavailable,
+        }
+    }
+
+    /// The last sampled value of the GPU-memory diagnostics (see [`GpuMemoryReport`]).
+    pub fn gpu_memory(&self) -> GpuMemoryReport {
+        let mut unavailable = BTreeMap::new();
+        let mut mesh_allocator = |path: &DiagnosticPath, field: &str| match self.memory_sample(path) {
+            Some(value) => Some(value.max(0.0) as u64),
+            None => {
+                unavailable.insert(field.to_owned(), MESH_ALLOCATOR_UNAVAILABLE.to_owned());
+                None
+            }
+        };
+        let mesh_allocator_slab_bytes = mesh_allocator(
+            MeshAllocatorDiagnosticPlugin::slabs_size_diagnostic_path(),
+            "mesh_allocator_slab_bytes",
+        );
+        let mesh_allocator_slabs = mesh_allocator(
+            MeshAllocatorDiagnosticPlugin::slabs_diagnostic_path(),
+            "mesh_allocator_slabs",
+        );
+        let mesh_allocator_allocations = mesh_allocator(
+            MeshAllocatorDiagnosticPlugin::allocations_diagnostic_path(),
+            "mesh_allocator_allocations",
+        );
+        let mut render_asset_counts = BTreeMap::new();
+        for (label, path) in gpu_asset_diagnostics() {
+            match self.memory_sample(&path) {
+                Some(value) => {
+                    render_asset_counts.insert(label.to_owned(), value.max(0.0) as u64);
+                }
+                None => {
+                    unavailable.insert(
+                        format!("gpu_asset_counts/{label}"),
+                        RENDER_ASSET_UNAVAILABLE.to_owned(),
+                    );
+                }
+            }
+        }
+        GpuMemoryReport {
+            mesh_allocator_slab_bytes,
+            mesh_allocator_slabs,
+            mesh_allocator_allocations,
+            render_asset_counts,
+            unavailable,
+        }
+    }
+
+    /// The last value sampled for a diagnostic path, if it was sampled at all.
+    fn memory_sample(&self, path: &DiagnosticPath) -> Option<f64> {
+        self.memory_metrics.get(path.as_str()).copied()
+    }
+
     pub fn write_bundle(
         &self,
         config: &EngineConfig,
@@ -133,6 +265,7 @@ impl ProfilingState {
         streaming: Option<&StreamingMetrics>,
         renderer: &RendererMetrics,
         system: Option<SystemMetadata>,
+        fingerprint: Option<&RunFingerprint>,
     ) -> std::io::Result<()> {
         let Some(root) = &config.profile_output_dir else {
             return Ok(());
@@ -156,26 +289,16 @@ impl ProfilingState {
         write_json(
             &root.join("metadata.json"),
             &Metadata {
-                format_version: 1,
-                engine_version: env!("CARGO_PKG_VERSION"),
-                bevy_version: "0.19",
+                format_version: 2,
                 generated_unix_ms: unix_ms(),
                 scenario: config.profile_scenario.clone(),
                 run_id: config.profile_run_id.clone(),
-                commit: config.profile_commit.clone(),
-                dirty_worktree: config.profile_dirty_worktree,
                 hardware_label: config.profile_hardware.clone(),
-                build_profile: if cfg!(debug_assertions) {
-                    "debug"
-                } else {
-                    "release"
-                },
-                resolution: [1600, 900],
                 worldspace_id: config.worldspace_id,
                 start_grid: config.start_grid,
-                stream_radius: config.stream_radius,
                 synthetic_instances: config.synthetic_instances,
                 system,
+                fingerprint: fingerprint.cloned(),
             },
         )?;
         write_json(&root.join("frame-metrics.json"), frame_metrics)?;
@@ -257,24 +380,23 @@ pub struct SystemMetadata {
     pub memory: String,
 }
 
+/// The profile bundle's metadata: what this run was, and where the bundle came from.
+///
+/// Everything the run fingerprint already records (commit, dirty state, build profile, window
+/// resolution, engine and Bevy versions, stream radius) lives in `fingerprint` alone, so the two
+/// cannot disagree.
 #[derive(Debug, Clone, Serialize)]
-struct Metadata<'a> {
+struct Metadata {
     format_version: u32,
-    engine_version: &'a str,
-    bevy_version: &'a str,
     generated_unix_ms: u128,
     scenario: String,
     run_id: String,
-    commit: String,
-    dirty_worktree: bool,
     hardware_label: String,
-    build_profile: &'a str,
-    resolution: [u32; 2],
     worldspace_id: u32,
     start_grid: (i32, i32),
-    stream_radius: i32,
     synthetic_instances: usize,
     system: Option<SystemMetadata>,
+    fingerprint: Option<RunFingerprint>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -301,6 +423,60 @@ pub struct MetricSummary {
     pub p95: f64,
     pub p99: f64,
     pub worst: f64,
+}
+
+/// The report's per-pass GPU times: one summary per Bevy render-diagnostic path, plus what the
+/// device could not measure.
+///
+/// The paths are Bevy's own: `render/<pass>/elapsed_gpu`, where `<pass>` is the label the render
+/// pass was created with (`main_opaque_pass_3d`, `tonemapping`, `shadow_directional_light_0_cascade_1`,
+/// …). Several cameras that run the same pass write the same path, so a summary covers every camera
+/// that ran it. When the device cannot time GPU work the passes are left empty and `unavailable`
+/// says why, rather than reporting zeros.
+#[derive(Debug, Clone, Serialize)]
+pub struct GpuPassReport {
+    pub timestamp_queries_supported: bool,
+    pub pipeline_statistics_supported: bool,
+    pub passes: BTreeMap<String, MetricSummary>,
+    pub unavailable: BTreeMap<String, String>,
+}
+
+/// The run's memory, split by where it is: Bevy's CPU-side asset data, and the GPU-side counters
+/// the render diagnostics expose.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryReport {
+    pub cpu: CpuAssetBytes,
+    pub gpu: GpuMemoryReport,
+}
+
+/// The CPU-side bytes of the mesh and image assets, read once at the end of the run.
+///
+/// A mesh Bevy has extracted to the render world without keeping a main-world copy — the glTF
+/// loader's default, and so every streamed model — has no attribute or index data left to measure;
+/// those meshes are counted in `meshes_without_cpu_data` and contribute no bytes to `mesh_bytes`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CpuAssetBytes {
+    pub meshes: usize,
+    pub mesh_bytes: u64,
+    pub meshes_without_cpu_data: usize,
+    pub images: usize,
+    pub image_bytes: u64,
+}
+
+/// The GPU-side memory counters, from Bevy's mesh-allocator and render-asset diagnostics.
+///
+/// Every field is a counter, not a VRAM total: wgpu reports how many resources are live, and the
+/// engine can read no vendor memory counter. `mesh_allocator_slab_bytes` is the byte size of the
+/// allocator's own slabs, the one real byte figure available. A counter that was not sampled is
+/// `null` with the reason in `unavailable`, never zero.
+#[derive(Debug, Clone, Serialize)]
+pub struct GpuMemoryReport {
+    pub mesh_allocator_slab_bytes: Option<u64>,
+    pub mesh_allocator_slabs: Option<u64>,
+    pub mesh_allocator_allocations: Option<u64>,
+    /// Live render-asset counts, by asset type: a count of assets, never a byte size.
+    pub render_asset_counts: BTreeMap<String, u64>,
+    pub unavailable: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -358,6 +534,85 @@ fn memory_slope(samples: &[MemorySample]) -> Option<f64> {
     let last = samples.last()?;
     let minutes = (last.elapsed_seconds - first.elapsed_seconds) / 60.0;
     (minutes > 0.0).then_some((last.process_gib - first.process_gib) / minutes)
+}
+
+/// Whether a diagnostic path is one of the GPU-memory counters.
+///
+/// These sit outside the `render/` tree — the mesh allocator's counters are top-level paths and the
+/// render-asset counts are under `render_asset/` — so [`ProfilingState::sample_frame`] matches them
+/// by name instead of by prefix, keeping only the paths the report's memory section reads.
+fn is_gpu_memory_path(path: &str) -> bool {
+    path.starts_with("mesh_allocator_")
+        || path.starts_with("render_asset/")
+        || path.starts_with("erased_render_asset/")
+}
+
+/// The live GPU-asset counts the report records, each with the label it is reported under.
+///
+/// Bevy's plugins build each path out of the Rust type name of the *prepared* asset (Bevy 0.19
+/// prepares a source asset into a GPU-side one), so each path is taken from the plugin itself
+/// rather than spelled out here; the labels are the report's own, stable across versions.
+///
+/// Materials are one shared count, not one per material type: every `MeshMaterial3d<M>` prepares
+/// into the same erased `PreparedMaterial` map, so Bevy reports the same number for each material
+/// type it is asked about (see `ErasedRenderAssetDiagnosticPlugin`).
+fn gpu_asset_diagnostics() -> [(&'static str, DiagnosticPath); 3] {
+    [
+        (
+            "mesh",
+            RenderAssetDiagnosticPlugin::<RenderMesh>::render_asset_diagnostic_path(),
+        ),
+        (
+            "image",
+            RenderAssetDiagnosticPlugin::<GpuImage>::render_asset_diagnostic_path(),
+        ),
+        (
+            "material",
+            ErasedRenderAssetDiagnosticPlugin::<MeshMaterial3d<StandardMaterial>>::
+                render_asset_diagnostic_path(),
+        ),
+    ]
+}
+
+/// The CPU-side bytes of the run's mesh and image assets (see [`CpuAssetBytes`]).
+///
+/// A mesh's bytes are its vertex attributes (each attribute's element size times its vertex count)
+/// plus its indices; an image's are the bytes of its pixel data. Both are read once, at the end of
+/// the run, rather than per frame: the figures move only when assets load or unload.
+pub fn cpu_asset_bytes(meshes: &Assets<Mesh>, images: &Assets<Image>) -> CpuAssetBytes {
+    let mut mesh_bytes = 0;
+    let mut meshes_without_cpu_data = 0;
+    for (_, mesh) in meshes.iter() {
+        let Ok(attributes) = mesh.try_attributes() else {
+            meshes_without_cpu_data += 1;
+            continue;
+        };
+        mesh_bytes += attributes
+            .map(|(attribute, values)| values.len() as u64 * attribute.format.size())
+            .sum::<u64>();
+        if let Ok(indices) = mesh.try_indices() {
+            mesh_bytes += indices.len() as u64 * index_size(indices);
+        }
+    }
+    let image_bytes = images
+        .iter()
+        .map(|(_, image)| image.data.as_ref().map_or(0, Vec::len) as u64)
+        .sum();
+    CpuAssetBytes {
+        meshes: meshes.len(),
+        mesh_bytes,
+        meshes_without_cpu_data,
+        images: images.len(),
+        image_bytes,
+    }
+}
+
+/// The size in bytes of one index of a mesh's index buffer.
+fn index_size(indices: &bevy::mesh::Indices) -> u64 {
+    match indices {
+        bevy::mesh::Indices::U16(_) => 2,
+        bevy::mesh::Indices::U32(_) => 4,
+    }
 }
 
 fn unavailable_render_metrics(
@@ -582,6 +837,7 @@ mod tests {
             "frame_ms_p95": 14.0,
             "passed": true
         });
+        let fingerprint = RunFingerprint::collect(&config, None, None, None, false);
         profiler
             .write_bundle(
                 &config,
@@ -589,6 +845,7 @@ mod tests {
                 Some(&StreamingMetrics::default()),
                 &RendererMetrics::default(),
                 None,
+                Some(&fingerprint),
             )
             .unwrap();
         for name in [
@@ -607,6 +864,18 @@ mod tests {
         assert!(
             summary.contains("Terrain seam points welded: 0"),
             "the summary must report the welded terrain seam points"
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.path().join("metadata.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata["format_version"], serde_json::json!(2));
+        assert!(
+            metadata["fingerprint"]["commit"].is_string(),
+            "the bundle metadata must carry the run fingerprint"
+        );
+        assert!(
+            metadata.get("commit").is_none(),
+            "the fields the fingerprint duplicates must not be written twice"
         );
     }
 }
