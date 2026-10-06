@@ -26,7 +26,94 @@ Each run writes a self-contained directory containing `metadata.json`, `frame-me
   the first and last samples after a steady-state settling window equal to 10% of the scenario
   duration, capped at 60 seconds. Peak memory still covers the entire run. This excludes one-time
   asset and pipeline warm-up without hiding sustained growth in the long acceptance scenarios.
-- Metadata records scenario, run, commit, dirty-worktree state, build profile and machine details.
+- Metadata records scenario, run, hardware label, worldspace and grid, and the run's fingerprint
+  (`fingerprint`, format version 2). The fingerprint is written once, in both the bundle and the
+  benchmark report, and the fields it carries (commit, dirty-worktree state, build profile, window
+  resolution, engine and Bevy versions, stream radius) are no longer repeated beside it.
+
+## Run fingerprint, per-pass GPU time and memory
+
+A report is only comparable to another run that ran the same thing. These three sections, and the
+`fingerprint` object in `metadata.json`, say what a run actually was; all of them are installed only
+when the run records measurements (`--benchmark-frames` or `--benchmark-duration`, or
+`--profile-output`). An ordinary play session adds no startup system, no diagnostic plugin and no
+per-frame sampling for any of them.
+
+### Fingerprint
+
+`fingerprint` appears in the benchmark report (report `format_version` 9) and in the bundle's
+`metadata.json` (format version 2):
+
+- `commit`, `dirty_worktree` — the `--profile-commit` / `--profile-dirty-worktree` values.
+- `engine_version`, `bevy_version`, `build_profile` — `release` or `debug`, from the build itself.
+- `renderer` — the adapter Bevy selected: `backend` (`Vulkan`, `Dx12`, `Metal`, …), `adapter`,
+  `driver`, `driver_info`, `device_type` (`DiscreteGpu`, …), and the device features the GPU
+  diagnostics depend on (`timestamp_queries_supported`, `pipeline_statistics_supported`). `null`
+  for a run with no renderer.
+- `resolution` — the primary window's physical pixels as the run actually opened it, `null` for a
+  headless run. Compare runs at the same resolution: it changes every pixel-count-bound number.
+- `world_database_schema` — what this engine build expects (`shared::WORLD_DATABASE_SCHEMA_VERSION`),
+  and `opened_world_database_schema` — what the database the run opened actually says in its
+  `schema_info` table (`null` when the run opened none, e.g. the synthetic benchmark).
+  `cell_cache_version` is the layout `cell_cache.rkyv` must match; a cache of any other version
+  fails to open.
+- `graphics` — the effective settings, after `--ini` files and the command line have both been
+  applied: `stream_radius`, `unload_radius`, the three terrain LOD block distances and
+  `split_distance_mult`, `max_upload_mib_per_frame`, `lights`, `headless`, and the window's
+  `present_mode`. This engine keeps no separate graphics-settings type; `EngineConfig` is where a
+  run's render-affecting settings live.
+
+### `gpu_passes`
+
+Per-pass GPU time over the measured frames, from Bevy's render diagnostics: `mean`, `p95`, `worst`
+and `total_ms` (with `count`, `p50`, `p99`) for each pass path, plus
+`timestamp_queries_supported` and `pipeline_statistics_supported` from the device.
+
+A path is Bevy's own: `render/<pass>/elapsed_gpu`, where `<pass>` is the label the render pass was
+created with — `main_opaque_pass_3d`, `tonemapping`, `upscaling`, `ssao`, `clustering`, and so on.
+Two things to know when reading one:
+
+- Several cameras that run the same pass write the same path, so a row covers every camera that ran
+  it, not one camera. Compare cameras by rendering them in separate runs.
+- Shadow views are labelled per light and cascade
+  (`shadow_directional_light_<light>_cascade_<cascade>`, `shadow_point_light_<light>_<face>`,
+  `shadow_spot_light_<light>`), but Bevy's standard shadow node does not open a diagnostic span for
+  them (only its meshlet path does), so those passes are normally absent from the report rather than
+  zero. A missing row means "not measured here".
+
+When the device cannot time GPU work — any backend but Vulkan and DX12 — `passes` is empty and
+`unavailable.elapsed_gpu` carries the reason. An empty `passes` on a device that *can* time GPU work
+says no pass was recorded, which is also a reason rather than a zero. Pipeline statistics (the
+per-pass shader-invocation counters the bundle keeps in `gpu-passes.json`) are a separate device
+feature and are described under `unavailable.pipeline_statistics` when absent. Never diff numbers
+across backends.
+
+### `memory`
+
+Split by where the memory is:
+
+- `cpu.mesh_bytes` and `cpu.image_bytes` — the CPU-side bytes of the mesh and image assets, summed
+  once at the end of the run (not per frame): each mesh's vertex attributes (element size times
+  vertex count) plus its indices, and each image's pixel data. `meshes` and `images` say how many
+  assets were counted, and `meshes_without_cpu_data` how many meshes Bevy extracted to the render
+  world without keeping a main-world copy — the glTF loader's default, and so every streamed model.
+  Those meshes contribute no bytes to `mesh_bytes`, which is why `mesh_bytes` is not a total of all
+  loaded geometry.
+- `gpu.mesh_allocator_slab_bytes`, `gpu.mesh_allocator_slabs`, `gpu.mesh_allocator_allocations` —
+  Bevy's mesh allocator: the byte size of its slabs (the one true byte figure here) and how many
+  slabs and mesh allocations are live.
+- `gpu.render_asset_counts` — how many GPU-side assets are live, by type: `mesh`, `image`,
+  `material`. These are **counts, not bytes**: wgpu reports the number of live resources and the
+  engine can read no vendor VRAM counter. `material` is one shared count, not one per material
+  type: every `MeshMaterial3d<M>` prepares into the same `PreparedMaterial` map, so Bevy reports
+  the same number for any material type it is asked about.
+- `gpu.unavailable` — a reason for every counter that was not sampled (a run that rendered no
+  frame, for instance). Counters are never zero-filled.
+
+`gpu.mesh_allocator_*` and `gpu.render_asset_counts` come from Bevy's mesh-allocator and
+render-asset diagnostic plugins, which are installed only for measured runs; sampling keeps their
+last value of the run. The process-level memory figures stay where they were
+(`peak_process_memory_gib`, `process_memory_growth_gib` and the bundle's `memory.json`).
 
 ## Reproducible campaign
 
@@ -66,7 +153,7 @@ retains the complete bundles as CI artifacts.
 
 These measurements show where world-loading time goes; they change nothing about what the engine
 loads or in what order. They are fields of the benchmark report (`--benchmark-output`, report
-`format_version` 8) and spans and events in the profiling bundle. They are installed only when the
+`format_version` 9) and spans and events in the profiling bundle. They are installed only when the
 run measures pacing (`EngineConfig::measures_pacing`: a benchmark run, or a jump target with no
 frame limit); an ordinary play session adds none of the marker schedules, asset-arrival counts or
 window scans.
@@ -160,7 +247,10 @@ cargo run --release -p engine -- --assets D:\SkyrimConverted --grid-x 0 --grid-y
 
 ## Interpretation
 
-Compare identical scenario, resolution, release profile and hardware. Start with frame P95/P99,
-then inspect the top CPU spans, GPU passes and streaming timeline in the same run. A missing GPU
+Compare the run fingerprints first: two runs whose `fingerprint` objects differ (different adapter,
+resolution, graphics settings, world-database schema or commit) are not comparable, and the
+fingerprint is written precisely so that difference is visible. Then, with scenario, resolution,
+build profile and hardware the same, start with frame P95/P99 and inspect the top CPU spans, GPU
+passes and streaming timeline in the same run. A missing GPU
 counter means unsupported instrumentation, not a zero value. Real-asset and target-hardware sign-off
 remains an execution result, not something the repository can pre-certify.
