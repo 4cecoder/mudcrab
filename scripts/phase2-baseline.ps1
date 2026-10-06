@@ -95,12 +95,17 @@ function Get-Values($Reports, [scriptblock]$Selector) {
 }
 
 # The spread, across the repeats, of the `mean` of each entry of a `name -> MetricSummary` map
-# (the report's GPU passes, CPU schedules and CPU spans).
+# (the report's GPU passes, CPU schedules and CPU spans). The names are the union of every repeat's
+# keys, so a pass or span only a later repeat measured is still reported, with the sample count
+# telling the reader how many repeats measured it.
 function Get-SummaryMap($Reports, [scriptblock]$Selector) {
-    $first = & $Selector $Reports[0]
-    if ($null -eq $first) { return [ordered]@{} }
+    $names = [ordered]@{}
+    foreach ($report in $Reports) {
+        $map = & $Selector $report
+        if ($map) { foreach ($key in @($map.Keys)) { $names[$key] = $true } }
+    }
     $summary = [ordered]@{}
-    foreach ($name in @($first.Keys)) {
+    foreach ($name in @($names.Keys)) {
         $values = foreach ($report in $Reports) {
             $map = & $Selector $report
             if ($map -and $map.ContainsKey($name)) { $map[$name].mean } else { $null }
@@ -108,6 +113,97 @@ function Get-SummaryMap($Reports, [scriptblock]$Selector) {
         $summary[$name] = Get-Spread $values
     }
     return $summary
+}
+
+# The reasons a section could not measure something, unioned across the repeats: a key any repeat
+# reports as unavailable is unavailable for the window, and every distinct reason is kept rather
+# than only the first repeat's.
+function Get-UnavailableMap($Reports, [scriptblock]$Selector) {
+    $perKey = [ordered]@{}
+    foreach ($report in $Reports) {
+        $map = & $Selector $report
+        if (-not $map) { continue }
+        foreach ($key in @($map.Keys)) {
+            $reason = [string]$map[$key]
+            if (-not $perKey.Contains($key)) { $perKey[$key] = @() }
+            if ($perKey[$key] -notcontains $reason) { $perKey[$key] += $reason }
+        }
+    }
+    $merged = [ordered]@{}
+    foreach ($key in @($perKey.Keys)) { $merged[$key] = ($perKey[$key] -join "; ") }
+    return $merged
+}
+
+# The fields of a fingerprint every window of one campaign must share: the machine, the build and
+# the world-data schemas the numbers were measured on. Everything that legitimately differs between
+# windows — the effective graphics settings (a stream-radius override), which database a scenario
+# opened, the commit being benchmarked — is kept per window instead.
+function Get-FingerprintInvariant($Fingerprint) {
+    if ($null -eq $Fingerprint) { return $null }
+    $renderer = $Fingerprint.renderer
+    return [ordered]@{
+        engine_version = $Fingerprint.engine_version
+        bevy_version = $Fingerprint.bevy_version
+        build_profile = $Fingerprint.build_profile
+        resolution = $Fingerprint.resolution
+        world_database_schema = $Fingerprint.world_database_schema
+        cell_cache_version = $Fingerprint.cell_cache_version
+        renderer = if ($null -eq $renderer) { $null } else { [ordered]@{
+                backend = $renderer.backend
+                adapter = $renderer.adapter
+                driver = $renderer.driver
+                driver_info = $renderer.driver_info
+                device_type = $renderer.device_type
+                timestamp_queries_supported = $renderer.timestamp_queries_supported
+                pipeline_statistics_supported = $renderer.pipeline_statistics_supported
+            } }
+    }
+}
+
+# The differences between two maps of scalars (nested maps are compared one level deep), as
+# human-readable `field : old -> new` lines. An empty list means the two describe the same thing.
+function Get-FieldDifferences($Old, $New, [string]$Prefix = "") {
+    $names = [ordered]@{}
+    foreach ($name in @($Old.Keys)) { $names[$name] = $true }
+    foreach ($name in @($New.Keys)) { $names[$name] = $true }
+    $differences = @()
+    foreach ($name in @($names.Keys)) {
+        $oldValue = $Old[$name]
+        $newValue = $New[$name]
+        $path = if ($Prefix) { "$Prefix.$name" } else { "$name" }
+        if ($oldValue -is [System.Collections.IDictionary] -or $newValue -is [System.Collections.IDictionary]) {
+            if ($null -eq $oldValue -or $null -eq $newValue) {
+                if ($null -ne $oldValue -or $null -ne $newValue) { $differences += "$path : $(Format-FieldValue $oldValue) -> $(Format-FieldValue $newValue)" }
+                continue
+            }
+            $differences += Get-FieldDifferences $oldValue $newValue $path
+            continue
+        }
+        if ((Format-FieldValue $oldValue) -ne (Format-FieldValue $newValue)) {
+            $differences += "$path : $(Format-FieldValue $oldValue) -> $(Format-FieldValue $newValue)"
+        }
+    }
+    return $differences
+}
+
+function Format-FieldValue($Value) {
+    if ($null -eq $Value) { return "null" }
+    return "$Value"
+}
+
+# The inputs a window's scenario was started with, taken from the engine arguments that produced it
+# and the report itself, so two windows' numbers can be shown to describe the same workload.
+function Get-ScenarioInputs($Arguments, $Report, [int]$DurationSeconds) {
+    $worldspace = Get-ArgumentValue $Arguments "--worldspace"
+    $gridX = Get-ArgumentValue $Arguments "--grid-x"
+    $gridY = Get-ArgumentValue $Arguments "--grid-y"
+    return [ordered]@{
+        worldspace = $worldspace
+        grid = if ($null -eq $gridX -and $null -eq $gridY) { $null } else { [ordered]@{ x = [int]$gridX; y = [int]$gridY } }
+        stream_radius = $Report.fingerprint.graphics.stream_radius
+        duration_seconds = $DurationSeconds
+        warmup_frames = $Report.warmup_frames
+    }
 }
 
 # One frame-time metric of one report, by the report's own field name.
@@ -124,28 +220,40 @@ function Get-FrameMetric($Report, [string]$Metric) {
     return $null
 }
 
-# One window of one scenario: what every repeat measured, reduced to medians and spreads. The maps
-# are per pass, per schedule and per span; everything the report left `null` stays `null` here.
-function Get-WindowReport($Reports, [string]$Kind, [int]$DurationSeconds) {
+# One window of one scenario: what every repeat measured, reduced to medians and spreads, plus the
+# provenance that says what the window actually was — the run's fingerprint and the scenario inputs
+# it was started with — so it can be set against another run's window. The maps are per pass, per
+# schedule and per span; everything the report left `null` stays `null` here, and every section
+# carries the report's `unavailable` reasons.
+function Get-WindowReport($Reports, [string]$Kind, $Inputs) {
     $first = $Reports[0]
     $window = [ordered]@{
         window = $Kind
         runs = $Reports.Count
-        duration_seconds = $DurationSeconds
+        scenario_inputs = $Inputs
+        fingerprint = $first.fingerprint
     }
     foreach ($metric in @("count", "mean_ms", "p50_ms", "p95_ms", "p99_ms", "worst_ms", "average_fps")) {
         $window[$metric] = Get-Spread (Get-Values $Reports { param($report) Get-FrameMetric $report $metric })
     }
-    $window.gpu_passes = Get-SummaryMap $Reports { param($report) $report.gpu_passes.passes }
+    $window.gpu_passes = [ordered]@{
+        passes = Get-SummaryMap $Reports { param($report) $report.gpu_passes.passes }
+        unavailable = Get-UnavailableMap $Reports { param($report) $report.gpu_passes.unavailable }
+    }
     $window.memory = [ordered]@{
         process_peak_gib = Get-Spread (Get-Values $Reports { param($report) $report.peak_process_memory_gib })
         process_growth_gib = Get-Spread (Get-Values $Reports { param($report) $report.process_memory_growth_gib })
-        cpu_mesh_bytes = Get-Spread (Get-Values $Reports { param($report) $report.memory.cpu.mesh_bytes })
-        cpu_image_bytes = Get-Spread (Get-Values $Reports { param($report) $report.memory.cpu.image_bytes })
-        mesh_allocator_slab_bytes = Get-Spread (Get-Values $Reports { param($report) $report.memory.gpu.mesh_allocator_slab_bytes })
-        mesh_allocator_slabs = Get-Spread (Get-Values $Reports { param($report) $report.memory.gpu.mesh_allocator_slabs })
-        mesh_allocator_allocations = Get-Spread (Get-Values $Reports { param($report) $report.memory.gpu.mesh_allocator_allocations })
-        gpu_assets = Get-SpreadPerName $Reports { param($report) $report.memory.gpu.render_asset_counts }
+        cpu = [ordered]@{
+            mesh_bytes = Get-Spread (Get-Values $Reports { param($report) $report.memory.cpu.mesh_bytes })
+            image_bytes = Get-Spread (Get-Values $Reports { param($report) $report.memory.cpu.image_bytes })
+        }
+        gpu = [ordered]@{
+            mesh_allocator_slab_bytes = Get-Spread (Get-Values $Reports { param($report) $report.memory.gpu.mesh_allocator_slab_bytes })
+            mesh_allocator_slabs = Get-Spread (Get-Values $Reports { param($report) $report.memory.gpu.mesh_allocator_slabs })
+            mesh_allocator_allocations = Get-Spread (Get-Values $Reports { param($report) $report.memory.gpu.mesh_allocator_allocations })
+            render_asset_counts = Get-SpreadPerName $Reports { param($report) $report.memory.gpu.render_asset_counts }
+            unavailable = Get-UnavailableMap $Reports { param($report) $report.memory.gpu.unavailable }
+        }
     }
     $window.scene = [ordered]@{
         entity_count = Get-Spread (Get-Values $Reports { param($report) $report.scene.entity_count })
@@ -155,28 +263,32 @@ function Get-WindowReport($Reports, [string]$Kind, [int]$DurationSeconds) {
         pipeline_statistics_supported = $first.scene.pipeline_statistics_supported
         vertex_shader_invocations = Get-SummaryMap $Reports { param($report) $report.scene.vertex_shader_invocations }
         clipper_primitives_out = Get-SummaryMap $Reports { param($report) $report.scene.clipper_primitives_out }
-        draw_calls = $null
-        unavailable = $first.scene.unavailable
+        draw_calls = Get-Spread (Get-Values $Reports { param($report) $report.scene.draw_calls })
+        unavailable = Get-UnavailableMap $Reports { param($report) $report.scene.unavailable }
     }
     $window.cpu = [ordered]@{
         schedules = Get-SummaryMap $Reports { param($report) $report.cpu.schedules }
         spans = Get-SummaryMap $Reports { param($report) $report.cpu.spans }
-        render_world_prep = $null
-        unavailable = $first.cpu.unavailable
+        render_world_prep = Get-Spread (Get-Values $Reports { param($report) $report.cpu.render_world_prep })
+        unavailable = Get-UnavailableMap $Reports { param($report) $report.cpu.unavailable }
     }
     return $window
 }
 
-# The same spread for a `name -> number` map (the GPU-asset counts).
+# The same spread for a `name -> number` map (the GPU-asset counts), over the union of the repeats'
+# names.
 function Get-SpreadPerName($Reports, [scriptblock]$Selector) {
     # The inner scriptblock below must call the *caller's* selector. Inside it, `$Selector` would
     # resolve to the scriptblock itself (a scriptblock closes over the scope that made it), so the
     # selector is copied to a name the closure cannot confuse with itself.
     $select = $Selector
-    $first = & $select $Reports[0]
-    if ($null -eq $first) { return [ordered]@{} }
+    $names = [ordered]@{}
+    foreach ($report in $Reports) {
+        $map = & $select $report
+        if ($map) { foreach ($key in @($map.Keys)) { $names[$key] = $true } }
+    }
     $spread = [ordered]@{}
-    foreach ($name in @($first.Keys)) {
+    foreach ($name in @($names.Keys)) {
         $spread[$name] = Get-Spread (Get-Values $Reports { param($report) (& $select $report)[$name] })
     }
     return $spread
@@ -229,11 +341,11 @@ function Get-MarkdownTable($Name, $Window, [string]$Kind) {
         }
     }
     $lines += "| CPU spans recorded | $($Window.cpu.spans.Count) (schedules: $($Window.cpu.schedules.Count)) |"
-    $topPasses = @($Window.gpu_passes.Keys | Sort-Object { -($Window.gpu_passes[$_].median) } | Select-Object -First 5)
+    $topPasses = @($Window.gpu_passes.passes.Keys | Sort-Object { -($Window.gpu_passes.passes[$_].median) } | Select-Object -First 5)
     if ($topPasses.Count -eq 0) {
         $lines += "| Slowest GPU passes | n/a: $($Window.cpu.unavailable.render_world_prep) |"
     } else {
-        $lines += "| Slowest GPU passes (mean ms) | $(($topPasses | ForEach-Object { "$_ $(Format-Spread $Window.gpu_passes[$_])" }) -join '; ') |"
+        $lines += "| Slowest GPU passes (mean ms) | $(($topPasses | ForEach-Object { "$_ $(Format-Spread $Window.gpu_passes.passes[$_])" }) -join '; ') |"
     }
     $topSpans = @($Window.cpu.spans.Keys | Sort-Object { -($Window.cpu.spans[$_].median) } | Select-Object -First 5)
     if ($topSpans.Count -gt 0) {
@@ -351,17 +463,22 @@ $previous = if (Test-Path -LiteralPath $comparePath -PathType Leaf) {
 # Named `$scenarioReports`, not `$scenarios`: PowerShell variable names are case-insensitive, so a
 # local `$scenarios` would be this script's own `-Scenarios` parameter, validation and all.
 $scenarioReports = [ordered]@{}
-$fingerprint = $null
+# The machine/build invariants of the campaign, taken from the first window, and the label of the
+# window they came from so a later window that disagrees can name both.
+$campaignFingerprint = $null
+$campaignFingerprintLabel = $null
 foreach ($name in $requested) {
     $moves = $windowsPerScenario[$name] -eq 2
     $kinds = if ($moves) { @("standing_still", "streaming") } else { @("standing_still") }
     $reports = @{}
     foreach ($kind in $kinds) {
         $windowReports = @()
+        $windowArguments = $null
         for ($run = 1; $run -le $Repeats; $run++) {
             # A moving scenario gets two windows: the scene left standing still (the steady frames),
             # then the scenario's own flight (the streaming frames). Everything else is one window.
             $label = if ($kind -eq "streaming") { "baseline $name streaming $run/$Repeats" } else { "baseline $name $run/$Repeats" }
+            $reportLabel = "baseline $name/$kind/run-$run"
             $runDirectory = Join-Path $campaignRoot "$name\$($kind -replace '_', '-')\run-$run"
             $arguments = Get-ScenarioArguments -Name $name -RunDirectory $runDirectory -Commit $identity.commit `
                 -Hardware $hardware -RunId "run-$run" -RunLabel $label -DirtyWorktree:$identity.dirty `
@@ -370,18 +487,31 @@ foreach ($name in $requested) {
                 -ResolvedAssets $resolvedAssets -Worldspace $Worldspace `
                 -RuralGridX $RuralGridX -RuralGridY $RuralGridY -DenseGridX $DenseGridX -DenseGridY $DenseGridY `
                 -WaterGridX $WaterGridX -WaterGridY $WaterGridY
+            if ($null -eq $windowArguments) { $windowArguments = $arguments }
             $report = Invoke-EngineWindow -Engine $engine -Arguments $arguments -RunDirectory $runDirectory `
                 -Label "Baseline run $name/$kind/run-$run" -AsHashtable
-            if ($null -eq $fingerprint) {
-                $fingerprint = $report.fingerprint
+            if ($null -eq $report.fingerprint) {
+                throw "$reportLabel recorded no run fingerprint in $runDirectory, so the window cannot be shown to be comparable with the others"
+            }
+            if ($null -eq $campaignFingerprint) {
+                $campaignFingerprint = Get-FingerprintInvariant $report.fingerprint
+                $campaignFingerprintLabel = $reportLabel
                 # Comparing is only meaningful between the same backend and adapter, so a mismatch is
                 # refused before the rest of the campaign spends hours producing numbers nobody can
                 # set against the older baseline.
                 if ($previous) { Assert-Comparable -Old $previous -New $report -Path $comparePath }
+            } else {
+                # Every window after the first must agree with it on the machine, the build and the
+                # schemas, or the campaign is not one comparable set of numbers.
+                $differences = @(Get-FieldDifferences $campaignFingerprint (Get-FingerprintInvariant $report.fingerprint))
+                if ($differences.Count -gt 0) {
+                    throw "The windows of this campaign were not measured on the same machine and build: $reportLabel differs from ${campaignFingerprintLabel} in $($differences -join '; '). A baseline mixes only windows measured on one machine, backend and build"
+                }
             }
             $windowReports += $report
         }
-        $reports[$kind] = Get-WindowReport $windowReports $kind (Get-WindowDuration $name)
+        $inputs = Get-ScenarioInputs -Arguments $windowArguments -Report $windowReports[0] -DurationSeconds (Get-WindowDuration $name)
+        $reports[$kind] = Get-WindowReport $windowReports $kind $inputs
     }
     $entry = [ordered]@{ moves = $moves; windows = [ordered]@{} }
     foreach ($kind in @("standing_still", "streaming")) {
@@ -396,7 +526,7 @@ foreach ($name in $requested) {
 # Named `$baselineReport`, not `$baseline`: the dot-sourced profile script declares a `$Baseline`
 # parameter, and PowerShell would treat the two as the same variable.
 $baselineReport = [ordered]@{
-    format_version = 1
+    format_version = 2
     generated_at = (Get-Date).ToString("o")
     commit = $identity.commit
     dirty = $identity.dirty
@@ -404,7 +534,10 @@ $baselineReport = [ordered]@{
     repeats = $Repeats
     duration_seconds = $DurationSeconds
     stability_seconds = $StabilitySeconds
-    fingerprint = $fingerprint
+    # Where this campaign's own report bundles are, so a window's raw evidence can be found again
+    # after a later campaign has written to the same -Out.
+    run_directory = $campaignRoot
+    fingerprint = $campaignFingerprint
     scenarios = $scenarioReports
 }
 if ($previous) {
@@ -412,10 +545,10 @@ if ($previous) {
 }
 $baselineReport | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Out "baseline.json")
 
-$rendererLine = if ($null -eq $fingerprint) {
-    "not recorded: the run installed no fingerprint"
+$rendererLine = if ($null -eq $campaignFingerprint.renderer) {
+    "not recorded: the run installed no renderer fingerprint"
 } else {
-    "$($fingerprint.renderer.backend) / $($fingerprint.renderer.adapter) ($($fingerprint.renderer.device_type)), driver $($fingerprint.renderer.driver); GPU timestamps: $($fingerprint.renderer.timestamp_queries_supported); pipeline statistics: $($fingerprint.renderer.pipeline_statistics_supported)"
+    "$($campaignFingerprint.renderer.backend) / $($campaignFingerprint.renderer.adapter) ($($campaignFingerprint.renderer.device_type)), driver $($campaignFingerprint.renderer.driver); GPU timestamps: $($campaignFingerprint.renderer.timestamp_queries_supported); pipeline statistics: $($campaignFingerprint.renderer.pipeline_statistics_supported)"
 }
 $markdown = @(
     "# Phase 2 engine baseline",
