@@ -47,8 +47,12 @@ foreach ($name in $sharedNames) { $requestedValues[$name] = Get-Variable -Name $
 foreach ($name in $sharedNames) { Set-Variable -Name $name -Value $requestedValues[$name] }
 
 $defaultScenarios = @("synthetic", "rural", "dense", "water", "stress")
-$requested = if ($Scenarios.Count -eq 0) { $defaultScenarios } elseif ($Scenarios -contains "all") {
-    @("synthetic", "rural", "dense", "water", "stress", "stability")
+$requested = if ($Scenarios.Count -eq 0) {
+    # Like the profiling campaign, the default without -Assets is the one scene that needs no
+    # converted data instead of a request that immediately fails.
+    if ($Assets) { $defaultScenarios } else { @("synthetic") }
+} elseif ($Scenarios -contains "all") {
+    if ($Assets) { @("synthetic", "rural", "dense", "water", "stress", "stability") } else { @("synthetic") }
 } else { $Scenarios }
 if ($Repeats -lt 1) { throw "Repeats must be at least 1" }
 if ($requested.Where({ $_ -ne "synthetic" }).Count -gt 0 -and -not $Assets) {
@@ -325,11 +329,20 @@ if (-not $NoBuild -or -not (Test-Path -LiteralPath $engine -PathType Leaf)) {
 }
 $identity = Get-BenchmarkRunIdentity
 $hardware = Get-BenchmarkHardware
+# Every campaign's report bundles go to their own timestamped directory, so a `run-N` this campaign
+# reads back can never be a file an earlier campaign left behind.
+$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$campaignRoot = Join-Path $Out "runs\$stamp-$hardware"
 
 $comparePath = if ($CompareTo) {
     if ([IO.Path]::IsPathRooted($CompareTo)) { $CompareTo } else { Join-Path $repository $CompareTo }
 } else {
     Join-Path $Out "baseline.json"
+}
+# An explicitly requested comparison against a file that is not there is a mistyped path, not a run
+# without a previous baseline, so it is refused rather than silently treated as no comparison.
+if ($CompareTo -and -not (Test-Path -LiteralPath $comparePath -PathType Leaf)) {
+    throw "Cannot compare: -CompareTo $comparePath does not exist"
 }
 $previous = if (Test-Path -LiteralPath $comparePath -PathType Leaf) {
     Get-Content -LiteralPath $comparePath -Raw | ConvertFrom-Json -AsHashtable
@@ -349,7 +362,7 @@ foreach ($name in $requested) {
             # A moving scenario gets two windows: the scene left standing still (the steady frames),
             # then the scenario's own flight (the streaming frames). Everything else is one window.
             $label = if ($kind -eq "streaming") { "baseline $name streaming $run/$Repeats" } else { "baseline $name $run/$Repeats" }
-            $runDirectory = Join-Path $Out "runs\$name\$($kind -replace '_', '-')\run-$run"
+            $runDirectory = Join-Path $campaignRoot "$name\$($kind -replace '_', '-')\run-$run"
             $arguments = Get-ScenarioArguments -Name $name -RunDirectory $runDirectory -Commit $identity.commit `
                 -Hardware $hardware -RunId "run-$run" -RunLabel $label -DirtyWorktree:$identity.dirty `
                 -StandingStill:($kind -eq "standing_still") `

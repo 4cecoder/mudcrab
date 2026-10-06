@@ -29,6 +29,9 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     throw "Phase 2 campaign scripts need PowerShell 7 (pwsh): run again as 'pwsh -File scripts/$(Split-Path -Leaf $PSCommandPath) ...'"
 }
 $script:repository = Split-Path -Parent $PSScriptRoot
+# The report format this script reads back. The engine writes it into every benchmark report; a
+# `frame-metrics.json` left by another build is not accepted as this invocation's report.
+$script:benchmarkReportFormatVersion = 10
 
 function Get-ProfilingRepository {
     return $script:repository
@@ -181,6 +184,15 @@ function Get-ScenarioArguments {
     return $arguments
 }
 
+# The value of `--<Name>` in an engine argument list, or `$null` when the switch is not there.
+function Get-ArgumentValue {
+    param([string[]]$Arguments, [string]$Name)
+    for ($index = 0; $index -lt ($Arguments.Count - 1); $index++) {
+        if ($Arguments[$index] -eq $Name) { return $Arguments[$index + 1] }
+    }
+    return $null
+}
+
 function Get-Median {
     param([double[]]$Values)
     $ordered = @($Values | Sort-Object)
@@ -216,7 +228,9 @@ function Get-RegressionComparison {
 }
 
 # Runs one window of one scenario and returns its report (`frame-metrics.json`, the JSON the engine
-# also writes as `acceptance.json`). Throws when the engine exits non-zero.
+# also writes as `acceptance.json`). Throws when the engine exits non-zero, and when the report it
+# reads back cannot be shown to have been written by this invocation: a successful exit with a stale
+# or absent report would otherwise count an old run (or nothing) as a fresh repeat.
 function Invoke-EngineWindow {
     param(
         [Parameter(Mandatory)][string]$Engine,
@@ -226,20 +240,54 @@ function Invoke-EngineWindow {
         [switch]$AsHashtable
     )
     New-Item -ItemType Directory -Force -Path $RunDirectory | Out-Null
+    $reportPath = Join-Path $RunDirectory "frame-metrics.json"
+    $metadataPath = Join-Path $RunDirectory "metadata.json"
+    # What this invocation asked the engine to run, so the bundle read back can be identified as this
+    # run's rather than an earlier one's.
+    $expectedRunId = Get-ArgumentValue $Arguments "--profile-run-id"
+    $expectedScenario = Get-ArgumentValue $Arguments "--profile-scenario"
+    $startedUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     # The engine logs to stderr; under `$ErrorActionPreference = "Stop"` PowerShell 5.1 would treat
-    # the first log line as an error, so the preference is relaxed for the run.
+    # the first log line as an error, so the preference is relaxed for the run. The engine runs from
+    # the repository root: its default assets directory, ini files and screenshot paths are resolved
+    # relative to the working directory, so a direct campaign must not depend on where it was started.
     $previous = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
+    Push-Location $script:repository
     try {
         & $Engine @Arguments
         $exitCode = $LASTEXITCODE
     } finally {
+        Pop-Location
         $ErrorActionPreference = $previous
     }
     if ($exitCode -ne 0) { throw "$Label failed with exit code $exitCode" }
-    $raw = Get-Content -LiteralPath (Join-Path $RunDirectory "frame-metrics.json") -Raw
-    if ($AsHashtable) { return ($raw | ConvertFrom-Json -AsHashtable) }
-    return ($raw | ConvertFrom-Json)
+    if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
+        throw "$Label exited 0 but wrote no report in $RunDirectory`: the repeat measured nothing"
+    }
+    $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json -AsHashtable
+    if ($report.format_version -ne $script:benchmarkReportFormatVersion) {
+        throw "$Label wrote report format $($report.format_version) in $RunDirectory, but this script reads format $($script:benchmarkReportFormatVersion)"
+    }
+    if ([long]$report.generated_unix_ms -lt $startedUnixMs) {
+        throw "$Label read a stale report from $RunDirectory (written at $($report.generated_unix_ms) ms, this run started at $startedUnixMs ms)"
+    }
+    if ([long]$report.frames -le 0 -or [double]$report.elapsed_seconds -le 0) {
+        throw "$Label reported no measured frames in $RunDirectory (frames $($report.frames), elapsed $($report.elapsed_seconds) s), so the repeat did not complete"
+    }
+    if (Test-Path -LiteralPath $metadataPath -PathType Leaf) {
+        $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json -AsHashtable
+        if ($expectedRunId -and $metadata.run_id -ne $expectedRunId) {
+            throw "$Label read a bundle in $RunDirectory belonging to run '$($metadata.run_id)', not '$expectedRunId'"
+        }
+        if ($expectedScenario -and $metadata.scenario -ne $expectedScenario) {
+            throw "$Label read a bundle in $RunDirectory belonging to scenario '$($metadata.scenario)', not '$expectedScenario'"
+        }
+    } elseif ($expectedRunId) {
+        throw "$Label exited 0 but wrote no profiling bundle in $RunDirectory (no metadata.json), so the repeat cannot be identified"
+    }
+    if ($AsHashtable) { return $report }
+    return (Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json)
 }
 
 if ($AsLibrary) { return }
