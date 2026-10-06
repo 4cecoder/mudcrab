@@ -245,6 +245,79 @@ cargo run --release -p engine -- --assets D:\SkyrimConverted --grid-x 0 --grid-y
   --benchmark-output target/pacing-fly.json --run-label pacing-fly
 ```
 
+## Scene counts and CPU time in the report (format version 10)
+
+The benchmark report (`acceptance.json`, and the same value as the bundle's `frame-metrics.json`)
+carries two more sections, and every field in them is `null` plus a reason rather than a zero when
+the run could not measure it.
+
+- **`scene`** — what the frame drew. `entity_count` is Bevy's own entity-count diagnostic;
+  `mesh_entities`, `terrain_patches` and `water_surfaces` are the engine's scene inventory, sampled
+  every 60th frame (a scene inventory that was never sampled is `null`, so a synthetic run's real
+  zero terrain patches and a missing sample are told apart). `pipeline_statistics_supported` is the
+  device's answer, and on a device that has pipeline statistics (Vulkan; DX12 offers none) the
+  section lists per pass `vertex_shader_invocations` and `clipper_primitives_out`, each a
+  distribution over the measured frames. `draw_calls` is always `null`:
+  `unavailable["draw_calls"]` says "Bevy 0.19 exposes no draw-call count", because no Bevy, wgpu or
+  engine API counts them.
+- **`cpu`** — where the frame's CPU time went, in milliseconds. `schedules` is one summary per Bevy
+  main schedule (`main_schedule/<name>`, the eight `schedule_timing` times), `spans` is one per
+  span the engine records by hand, the `streaming/*` spans among them (the schedule summaries are
+  not repeated in `spans`, and the `assets_added/*` counts are in neither: they are counts, not
+  milliseconds, and stay in the bundle's `cpu-spans.json`). Each summary carries count, total,
+  mean, p50, p95, p99 and worst. `render_world_prep` is always `null`: Bevy 0.19 has no diagnostic
+  that times the render app's schedules (`bevy_diagnostic` ships no schedule timer and
+  `RenderDiagnosticsPlugin` records only per-pass spans), so the report says so instead of
+  inventing one. What does exist for render-world work is the report's own `render_world` section
+  and the `render_world/*` spans in `cpu.spans` (main world, extract, the wait for the render
+  thread, the render thread's phases), and per pass `render/<pass>/elapsed_cpu` in the bundle's
+  `gpu-passes.json`.
+
+## The baseline command
+
+`scripts/phase2-baseline.ps1` runs the fixed scenes on whatever branch is checked out and writes a
+small `baseline.json` and `baseline.md` for it:
+
+```powershell
+pwsh -File scripts/phase2-baseline.ps1 -Assets D:\SkyrimConverted            # 3 repeats of the five baseline scenes
+pwsh -File scripts/phase2-baseline.ps1 -Assets D:\SkyrimConverted -Scenarios stress -Repeats 5 -DurationSeconds 180
+pwsh -File scripts/phase2-baseline.ps1                                       # synthetic only: no -Assets needed
+```
+
+Both scripts need PowerShell 7 (`pwsh`): they read reports with `ConvertFrom-Json -AsHashtable`.
+The command builds the engine once (`cargo build --release --bin engine`, skipped with `-NoBuild`,
+and the binary is looked for under `CARGO_TARGET_DIR` when that is set), prints the number of
+windows and the expected duration before starting, and reuses `phase2-profile.ps1`'s scenario
+definitions and engine invocation (that file is dot-sourced with `-AsLibrary`, so the two commands
+cannot drift apart).
+
+- **Windows.** Every scenario gets a standing-still window. A scenario that moves — `stress` and
+  `stability`, which fly the camera — gets a second, streaming window: the same scene once with the
+  camera left in place and once as the scenario defines it. That is how steady frames and streaming
+  frames are reported separately; nothing in the engine's CLI measures both in one run. Every
+  engine run is labelled `--run-label "baseline <scenario> <n>/<repeats>"`, and the streaming
+  window adds `streaming`.
+- **Scenarios.** The default set is `synthetic`, `rural`, `dense`, `water`, `stress`. `stability`
+  is left out because it is a 30-minute soak, not a baseline; `-Scenarios all` includes it, and
+  `-Scenarios` takes any of the names `phase2-profile.ps1` knows.
+- **`baseline.json`.** One `fingerprint` for the campaign (backend, adapter, driver, resolution,
+  settings, schemas), then per scenario and window: `frames` (count, mean, p50, p95, p99, worst,
+  average FPS) as median/min/max over the repeats, `gpu_passes` (per pass, the mean over the
+  repeats), `memory`, `scene` (the counts and the per-pass pipeline-statistics counters) and `cpu`
+  (per schedule and per span). A window a scenario does not have is `null` with the reason in the
+  scenario's `streaming_unavailable`. Nothing is zero-filled here either.
+- **`baseline.md`.** One short table per scenario window, plus the two facts a table cannot hold:
+  which counters were unavailable and why, and the slowest GPU passes and CPU spans.
+- **Comparing baselines.** With `-CompareTo <baseline.json>` (or, without it, an existing
+  `baseline.json` in `-Out`), the new numbers are set against the old ones using the profiling
+  campaign's noise floors. The comparison is refused, before the remaining windows are run, when
+  the two runs' renderer backend or adapter differ: engine results compare only on the same machine
+  and the same backend. `-Out` defaults to `target/phase2-baseline`, so a rerun compares with the
+  previous baseline by default; each window's report bundle stays under `-Out/runs/`.
+- **CI.** Nothing here runs in CI: the `performance` job is converter-side and has no GPU, and only
+  the manual self-hosted runner can run even the synthetic scene. A baseline is a local,
+  same-machine measurement.
+
 ## Interpretation
 
 Compare the run fingerprints first: two runs whose `fingerprint` objects differ (different adapter,
