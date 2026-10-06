@@ -52,7 +52,13 @@ $requested = if ($Scenarios.Count -eq 0) {
     # converted data instead of a request that immediately fails.
     if ($Assets) { $defaultScenarios } else { @("synthetic") }
 } elseif ($Scenarios -contains "all") {
-    if ($Assets) { @("synthetic", "rural", "dense", "water", "stress", "stability") } else { @("synthetic") }
+    # `all` is an explicit request for every scenario, the world ones included, so unlike the bare
+    # default it is not narrowed to the scene that needs no converted data: without an asset set it
+    # is refused here, naming the missing input, before a campaign is planned.
+    if (-not $Assets) {
+        throw "-Scenarios all needs -Assets with a converted legal Skyrim asset set: all six scenarios include the four world scenes. The bare default without -Assets runs 'synthetic' only"
+    }
+    @("synthetic", "rural", "dense", "water", "stress", "stability")
 } else { $Scenarios }
 if ($Repeats -lt 1) { throw "Repeats must be at least 1" }
 if ($requested.Where({ $_ -ne "synthetic" }).Count -gt 0 -and -not $Assets) {
@@ -192,14 +198,23 @@ function Format-FieldValue($Value) {
 }
 
 # The inputs a window's scenario was started with, taken from the engine arguments that produced it
-# and the report itself, so two windows' numbers can be shown to describe the same workload.
+# and the report itself, so two windows' numbers can be shown to describe the same workload: where
+# the camera was, how the scenario flew it (`--auto-fly-speed`, absent when the camera was left
+# standing still), the synthetic scene's instance count, and the resolved asset set the run loaded.
+# The asset set is recorded as its full path, so the same set named by a different relative path is
+# the same identity and a different set is a difference.
 function Get-ScenarioInputs($Arguments, $Report, [int]$DurationSeconds) {
     $worldspace = Get-ArgumentValue $Arguments "--worldspace"
     $gridX = Get-ArgumentValue $Arguments "--grid-x"
     $gridY = Get-ArgumentValue $Arguments "--grid-y"
+    $flySpeed = Get-ArgumentValue $Arguments "--auto-fly-speed"
+    $syntheticInstances = Get-ArgumentValue $Arguments "--synthetic-instances"
     return [ordered]@{
         worldspace = $worldspace
         grid = if ($null -eq $gridX -and $null -eq $gridY) { $null } else { [ordered]@{ x = [int]$gridX; y = [int]$gridY } }
+        fly_speed = if ($null -eq $flySpeed) { $null } else { [int]$flySpeed }
+        synthetic_instances = if ($null -eq $syntheticInstances) { $null } else { [int]$syntheticInstances }
+        assets = Get-ArgumentValue $Arguments "--assets"
         stream_radius = $Report.fingerprint.graphics.stream_radius
         duration_seconds = $DurationSeconds
         warmup_frames = $Report.warmup_frames
@@ -414,19 +429,34 @@ function Get-SummaryLine($Summary) {
 }
 
 # The campaign format this script writes and reads. Per-window fingerprints and scenario inputs
-# arrived in format 2; an older file cannot be checked against this run, so a comparison with it is
-# refused rather than made on fields it does not carry.
-$script:baselineFormatVersion = 2
+# arrived in format 2, and the workload fields the comparison checks in scenario_inputs — the flight
+# speed, the synthetic instance count and the resolved asset set — in format 3. An older file does
+# not carry those fields, so it cannot be checked against this run: a comparison with it is refused
+# rather than made on fields it does not carry.
+$script:baselineFormatVersion = 3
+
+# Why a file can never be compared with this run, as a readable reason, or `$null` when its format
+# and provenance are the ones a comparison needs. It is checked before the first timed window, so a
+# stale file in the default -Out costs nothing and an explicit -CompareTo is refused before the
+# measured windows are spent on a comparison that cannot be made.
+function Get-BaselineProblem($Baseline) {
+    if ($null -eq $Baseline -or $Baseline -isnot [System.Collections.IDictionary]) { return "it is not a JSON object" }
+    $version = if ($Baseline.Contains("format_version")) { $Baseline.format_version } else { $null }
+    if ($version -ne $script:baselineFormatVersion) {
+        return "it is baseline format $(Format-FieldValue $version), and this script reads format $($script:baselineFormatVersion) (scenario inputs that name the flight speed, synthetic instance count and asset set); rerun the older baseline with this script to compare against it"
+    }
+    if ($null -eq $Baseline.fingerprint) { return "it recorded no run fingerprint, so the machine and build it ran on cannot be checked" }
+    if ($null -eq $Baseline.scenarios) { return "it carries no scenarios map, so it holds no window to compare with" }
+    return $null
+}
 
 # Refuses a comparison the fields say cannot be made: two runs on a different machine, build,
 # resolution, driver, renderer or world-data schema. A different commit is expected — comparing
 # across commits is what the baseline is for — but everything else that changes the numbers must be
 # the same on both sides.
 function Assert-Comparable($Old, $NewFingerprint, [string]$Path) {
-    $oldVersion = if ($Old.Contains("format_version")) { $Old.format_version } else { $null }
-    if ($oldVersion -ne $script:baselineFormatVersion) {
-        throw "Cannot compare with ${Path}: it is baseline format $(Format-FieldValue $oldVersion), and this script reads format $($script:baselineFormatVersion) (per-window fingerprints and scenario inputs). Rerun the older baseline with this script"
-    }
+    $problem = Get-BaselineProblem $Old
+    if ($problem) { throw "Cannot compare with ${Path}: $problem" }
     $oldInvariant = Get-FingerprintInvariant $Old.fingerprint
     $newInvariant = Get-FingerprintInvariant $NewFingerprint
     if ($null -eq $oldInvariant -or $null -eq $newInvariant) {
@@ -439,8 +469,8 @@ function Assert-Comparable($Old, $NewFingerprint, [string]$Path) {
 }
 
 # Refuses a comparison between two windows that are not the same workload: the scenario inputs
-# (worldspace, grid, stream radius, duration, warm-up), the effective graphics settings and the
-# world database opened must match.
+# (worldspace, grid, flight speed, synthetic instance count, asset set, stream radius, duration,
+# warm-up), the effective graphics settings and the world database opened must match.
 function Assert-WindowComparable($OldWindow, $NewWindow, [string]$Path, [string]$Scope) {
     $differences = @(Get-FieldDifferences $OldWindow.scenario_inputs $NewWindow.scenario_inputs)
     $differences += Get-FieldDifferences $OldWindow.fingerprint.graphics $NewWindow.fingerprint.graphics "graphics"
@@ -452,6 +482,18 @@ function Assert-WindowComparable($OldWindow, $NewWindow, [string]$Path, [string]
     if ($differences.Count -gt 0) {
         throw "Cannot compare $Scope with ${Path}: the two windows are not the same workload ($($differences -join '; ')). A comparison needs the same scenario inputs, graphics settings and schemas; only the commit may differ"
     }
+}
+
+# The refusal message of a comparison check, or `$null` when the check passed. A comparison the user
+# asked for with -CompareTo is refused by throwing; a baseline picked up from -Out by default was
+# never asked for, so its refusal is returned for the caller to warn about and drop instead of
+# aborting a campaign that does not depend on the comparison.
+function Get-ComparisonRefusal([scriptblock]$Check) {
+    $refusal = $null
+    try { & $Check } catch { $refusal = $_.Exception.Message }
+    if (-not $refusal) { return $null }
+    if ($explicitCompare) { throw $refusal }
+    return $refusal
 }
 
 # Per-metric comparison against an older baseline of the same machine and backend, reusing the
@@ -540,9 +582,30 @@ $comparePath = if ($CompareTo) {
 if ($CompareTo -and -not (Test-Path -LiteralPath $comparePath -PathType Leaf)) {
     throw "Cannot compare: -CompareTo $comparePath does not exist"
 }
-$previous = if (Test-Path -LiteralPath $comparePath -PathType Leaf) {
-    Get-Content -LiteralPath $comparePath -Raw | ConvertFrom-Json -AsHashtable
-} else { $null }
+# `-CompareTo` names a comparison the user asked for, so a file that cannot be used is refused. A
+# `baseline.json` that merely happens to sit in -Out is picked up by default, and that file may be
+# from an older format, half-written, or measured on another machine: it is checked here, before the
+# first timed window, and dropped with one warning rather than aborting a campaign that never asked
+# to compare.
+$explicitCompare = [bool]$CompareTo
+$previous = $null
+if (Test-Path -LiteralPath $comparePath -PathType Leaf) {
+    $candidate = $null
+    $problem = $null
+    try {
+        $candidate = Get-Content -LiteralPath $comparePath -Raw | ConvertFrom-Json -AsHashtable
+        $problem = Get-BaselineProblem $candidate
+    } catch {
+        $candidate = $null
+        $problem = "it is not readable JSON ($($_.Exception.Message))"
+    }
+    if ($problem) {
+        if ($explicitCompare) { throw "Cannot compare with ${comparePath}: $problem" }
+        Write-Warning "Not comparing with ${comparePath}: $problem. The campaign runs without a comparison; pass -CompareTo to have a baseline like this refused instead"
+    } else {
+        $previous = $candidate
+    }
+}
 
 # Named `$scenarioReports`, not `$scenarios`: PowerShell variable names are case-insensitive, so a
 # local `$scenarios` would be this script's own `-Scenarios` parameter, validation and all.
@@ -582,8 +645,15 @@ foreach ($name in $requested) {
                 $campaignFingerprintLabel = $reportLabel
                 # Comparing is only meaningful between the same machine, build and schemas, so a
                 # mismatch is refused before the rest of the campaign spends hours producing numbers
-                # nobody can set against the older baseline.
-                if ($previous) { Assert-Comparable -Old $previous -NewFingerprint $campaignFingerprint -Path $comparePath }
+                # nobody can set against the older baseline — unless the baseline was picked up from
+                # -Out, in which case it is dropped with one warning and the campaign goes on.
+                if ($previous) {
+                    $refusal = Get-ComparisonRefusal { Assert-Comparable -Old $previous -NewFingerprint $campaignFingerprint -Path $comparePath }
+                    if ($refusal) {
+                        Write-Warning "$refusal The campaign continues without a comparison"
+                        $previous = $null
+                    }
+                }
             } else {
                 # Every window after the first must agree with it on the machine, the build and the
                 # schemas, or the campaign is not one comparable set of numbers.
@@ -597,10 +667,17 @@ foreach ($name in $requested) {
         $inputs = Get-ScenarioInputs -Arguments $windowArguments -Report $windowReports[0] -DurationSeconds (Get-WindowDuration $name)
         $reports[$kind] = Get-WindowReport $windowReports $kind $inputs
         # The workload itself must match the older baseline's window before any number in it is
-        # compared, so a rerun with different coordinates or settings is refused, not scored.
+        # compared, so a rerun with different coordinates, flight speed, asset set or settings is
+        # refused, not scored — refused outright only when the baseline was asked for by -CompareTo.
         if ($previous -and $previous.scenarios.ContainsKey($name)) {
             $oldWindow = $previous.scenarios[$name].windows[$kind]
-            if ($oldWindow) { Assert-WindowComparable -OldWindow $oldWindow -NewWindow $reports[$kind] -Path $comparePath -Scope "baseline $name/$kind" }
+            if ($oldWindow) {
+                $refusal = Get-ComparisonRefusal { Assert-WindowComparable -OldWindow $oldWindow -NewWindow $reports[$kind] -Path $comparePath -Scope "baseline $name/$kind" }
+                if ($refusal) {
+                    Write-Warning "$refusal The campaign continues without a comparison"
+                    $previous = $null
+                }
+            }
         }
     }
     $entry = [ordered]@{ moves = $moves; windows = [ordered]@{} }
