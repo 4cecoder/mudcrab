@@ -176,12 +176,17 @@ impl ProfilingState {
         timestamp_queries_supported: bool,
         pipeline_statistics_supported: bool,
     ) -> GpuPassReport {
-        let passes: BTreeMap<String, MetricSummary> = self
-            .render_metrics
-            .iter()
-            .filter(|(path, _)| path.ends_with("/elapsed_gpu"))
-            .map(|(path, samples)| (path.clone(), summarize(samples)))
-            .collect();
+        // Without timestamp queries no such sample can be real, so a stray one (a diagnostic left
+        // over from another device, say) is dropped rather than reported as a pass time.
+        let passes: BTreeMap<String, MetricSummary> = if timestamp_queries_supported {
+            self.render_metrics
+                .iter()
+                .filter(|(path, _)| path.ends_with("/elapsed_gpu"))
+                .map(|(path, samples)| (path.clone(), summarize(samples)))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         let mut unavailable = BTreeMap::new();
         if !timestamp_queries_supported {
             unavailable.insert(
@@ -771,6 +776,185 @@ fn push_bounded(values: &mut Vec<f64>, value: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::diagnostic::{Diagnostic, DiagnosticMeasurement};
+
+    /// Feeds a diagnostic store with one measurement of a path, the way a diagnostic plugin's own
+    /// system does, so the tests drive the real sampling rather than a shortcut.
+    fn feed(diagnostics: &mut DiagnosticsStore, path: &str, value: f64) {
+        let path = DiagnosticPath::new(path.to_owned());
+        if diagnostics.get(&path).is_none() {
+            diagnostics.add(Diagnostic::new(path.clone()));
+        }
+        diagnostics
+            .get_mut(&path)
+            .expect("the diagnostic was just added")
+            .add_measurement(DiagnosticMeasurement {
+                time: Instant::now(),
+                value,
+            });
+    }
+
+    /// Per-pass GPU time is summarised over every measured frame, and the pipeline-statistics
+    /// counters that share the `render/` tree stay out of the per-pass table.
+    #[test]
+    fn summarises_per_pass_gpu_time_from_sampled_diagnostics() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        for value in [1.0, 2.0, 3.0, 4.0] {
+            feed(
+                &mut diagnostics,
+                "render/main_opaque_pass_3d/elapsed_gpu",
+                value,
+            );
+            feed(&mut diagnostics, "render/tonemapping/elapsed_gpu", value * 2.0);
+            feed(
+                &mut diagnostics,
+                "render/main_opaque_pass_3d/vertex_shader_invocations",
+                100.0,
+            );
+            profiler.sample_frame(&diagnostics, None);
+        }
+        let report = profiler.gpu_passes(true, true);
+        assert!(report.timestamp_queries_supported);
+        assert!(report.pipeline_statistics_supported);
+        assert!(report.unavailable.is_empty());
+        let pass = &report.passes["render/main_opaque_pass_3d/elapsed_gpu"];
+        assert_eq!(pass.count, 4);
+        assert_eq!(pass.mean, 2.5);
+        assert_eq!(pass.total, 10.0);
+        assert_eq!(pass.p95, 4.0);
+        assert_eq!(pass.worst, 4.0);
+        assert_eq!(report.passes["render/tonemapping/elapsed_gpu"].mean, 5.0);
+        assert!(
+            !report
+                .passes
+                .contains_key("render/main_opaque_pass_3d/vertex_shader_invocations"),
+            "a pipeline-statistics counter is not a pass time"
+        );
+    }
+
+    /// A backend without timestamp queries reports the reason and no pass times — never zeros, and
+    /// never a stray sample from somewhere else.
+    #[test]
+    fn gpu_passes_say_why_they_are_empty_instead_of_reporting_zeros() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        feed(
+            &mut diagnostics,
+            "render/main_opaque_pass_3d/elapsed_gpu",
+            3.0,
+        );
+        profiler.sample_frame(&diagnostics, None);
+
+        let unsupported = profiler.gpu_passes(false, false);
+        assert!(unsupported.passes.is_empty());
+        assert!(!unsupported.timestamp_queries_supported);
+        assert!(!unsupported.pipeline_statistics_supported);
+        assert!(unsupported.unavailable.contains_key("elapsed_gpu"));
+        assert!(unsupported.unavailable.contains_key("pipeline_statistics"));
+
+        // A device that can time GPU work, but a run in which no pass was recorded.
+        let empty = ProfilingState::default().gpu_passes(true, true);
+        assert!(empty.passes.is_empty());
+        assert!(
+            empty.unavailable["elapsed_gpu"].contains("no per-pass GPU time"),
+            "an empty run must say so: {:?}",
+            empty.unavailable
+        );
+    }
+
+    /// The memory section reports the last sample of each counter, counts assets as counts, and
+    /// names a reason for every counter the run did not sample.
+    #[test]
+    fn reports_the_gpu_memory_counters_that_were_sampled() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        feed(&mut diagnostics, "mesh_allocator_slabs", 2.0);
+        feed(&mut diagnostics, "mesh_allocator_slabs_size", 8_388_608.0);
+        feed(&mut diagnostics, "mesh_allocator_allocations", 42.0);
+        feed(
+            &mut diagnostics,
+            RenderAssetDiagnosticPlugin::<RenderMesh>::render_asset_diagnostic_path().as_str(),
+            7.0,
+        );
+        profiler.sample_frame(&diagnostics, None);
+        feed(&mut diagnostics, "mesh_allocator_allocations", 45.0);
+        profiler.sample_frame(&diagnostics, None);
+
+        let gpu = profiler.gpu_memory();
+        assert_eq!(gpu.mesh_allocator_slab_bytes, Some(8_388_608));
+        assert_eq!(gpu.mesh_allocator_slabs, Some(2));
+        assert_eq!(
+            gpu.mesh_allocator_allocations,
+            Some(45),
+            "the reported value is the run's last sample"
+        );
+        assert_eq!(gpu.render_asset_counts["mesh"], 7);
+        assert!(
+            !gpu.unavailable.contains_key("gpu_asset_counts/mesh"),
+            "a sampled counter is not unavailable"
+        );
+        assert!(gpu.unavailable.contains_key("gpu_asset_counts/image"));
+        assert!(gpu.unavailable.contains_key("gpu_asset_counts/material"));
+
+        let unsampled = ProfilingState::default().gpu_memory();
+        assert_eq!(unsampled.mesh_allocator_slab_bytes, None);
+        assert!(unsampled.render_asset_counts.is_empty());
+        assert!(unsampled.unavailable.contains_key("mesh_allocator_slab_bytes"));
+        assert!(unsampled.unavailable.contains_key("gpu_asset_counts/mesh"));
+    }
+
+    /// The CPU-side bytes count each mesh's attributes and indices and each image's pixels; a mesh
+    /// Bevy extracted without a main-world copy is counted but contributes no bytes.
+    #[test]
+    fn sums_the_cpu_bytes_of_meshes_and_images() {
+        use bevy::{
+            asset::RenderAssetUsages,
+            render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension, TextureFormat},
+        };
+
+        let mut meshes = Assets::<Mesh>::default();
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        );
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        );
+        mesh.insert_indices(bevy::mesh::Indices::U32(vec![0, 1, 2]));
+        meshes.add(mesh);
+        let mut extracted = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
+        extracted.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0, 0.0, 0.0]]);
+        extracted
+            .take_gpu_data()
+            .expect("the render-world-only mesh's data must be extractable");
+        meshes.add(extracted);
+
+        let mut images = Assets::<Image>::default();
+        images.add(Image::new_fill(
+            Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 0],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        ));
+
+        let bytes = cpu_asset_bytes(&meshes, &images);
+        assert_eq!(bytes.meshes, 2);
+        assert_eq!(
+            bytes.mesh_bytes,
+            3 * 12 + 3 * 4,
+            "three positions and three u32 indices, and no bytes from the extracted mesh"
+        );
+        assert_eq!(bytes.meshes_without_cpu_data, 1);
+        assert_eq!(bytes.images, 1);
+        assert_eq!(bytes.image_bytes, 16);
+    }
 
     #[test]
     fn summarizes_percentiles_and_worst_value() {

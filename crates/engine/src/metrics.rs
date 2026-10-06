@@ -606,6 +606,45 @@ mod tests {
         assert!(!installed(None), "no config means no measured run");
     }
 
+    /// The GPU-memory diagnostics are measurement data: an ordinary play session installs none of
+    /// them, and a benchmark or profile run installs all of them.
+    #[test]
+    fn gpu_memory_diagnostics_are_installed_only_for_measured_runs() {
+        let installed = |config: EngineConfig| {
+            let mut app = App::new();
+            app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+            app.insert_resource(config);
+            app.add_plugins(AcceptanceMetricsPlugin);
+            (
+                app.is_plugin_added::<MeshAllocatorDiagnosticPlugin>(),
+                app.is_plugin_added::<RenderAssetDiagnosticPlugin<RenderMesh>>(),
+                app.is_plugin_added::<RenderAssetDiagnosticPlugin<GpuImage>>(),
+                app.is_plugin_added::<ErasedRenderAssetDiagnosticPlugin<
+                    MeshMaterial3d<StandardMaterial>,
+                >>(),
+            )
+        };
+        assert_eq!(
+            installed(EngineConfig::default()),
+            (false, false, false, false),
+            "a play session must install none of the GPU-memory diagnostics"
+        );
+        assert_eq!(
+            installed(EngineConfig {
+                benchmark_frames: Some(60),
+                ..EngineConfig::default()
+            }),
+            (true, true, true, true)
+        );
+        assert_eq!(
+            installed(EngineConfig {
+                profile_output_dir: Some("profiles/run-1".into()),
+                ..EngineConfig::default()
+            }),
+            (true, true, true, true)
+        );
+    }
+
     #[test]
     fn frame_times_are_written_in_measured_order() {
         assert_eq!(
