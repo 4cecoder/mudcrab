@@ -68,10 +68,14 @@ per-frame sampling for any of them.
 Per-pass GPU time over the measured frames (after the warm-up), from Bevy's render diagnostics:
 `mean`, `p95`, `worst` and `total` (with `count`, `p50`, `p99`) for each pass path,
 `measured_frames` (the frames of the measured window the numbers rest on), plus
-`timestamp_queries_supported` and `pipeline_statistics_supported` from the device. Every
-observation Bevy records is taken exactly once, not resampled from its latest value, so a pass's
-`count` is its real sample count: larger than `measured_frames` when several cameras ran the pass,
-smaller when the GPU readback lagged.
+`timestamp_queries_supported` and `pipeline_statistics_supported` from the device. The GPU
+readback lags a frame or two behind the frame that ran the pass, so the first measured samples
+can describe passes of the last warm-up frames (a measurement already in flight when the window
+opens is kept; the warm-up's own samples are consumed and dropped). Every observation Bevy
+records is taken exactly once, not resampled from its latest value, so a pass's `count` is its
+real sample count: larger than `measured_frames` when several cameras ran the pass, smaller when
+the GPU readback lagged or the pass did not run every frame; `phase2-baseline.ps1` marks a pass
+whose count is below its window's `measured_frames` for exactly that reason.
 
 A path is Bevy's own: `render/<pass>/elapsed_gpu`, where `<pass>` is the label the render pass was
 created with — `main_opaque_pass_3d`, `tonemapping`, `upscaling`, `ssao`, `clustering`, and so on.
@@ -314,9 +318,11 @@ cannot drift apart).
   window adds `streaming`.
 - **Scenarios.** The default set is `synthetic`, `rural`, `dense`, `water`, `stress`. `stability`
   is left out because it is a 30-minute soak, not a baseline; `-Scenarios all` includes it, and
-  `-Scenarios` takes any of the names `phase2-profile.ps1` knows. Without `-Assets` the command
-  runs `synthetic` only, the one scene that needs no converted data; naming a world scenario
-  without `-Assets` still fails.
+  `-Scenarios` takes any of the names `phase2-profile.ps1` knows. Without `-Assets` the bare
+  default runs `synthetic` only, the one scene that needs no converted data, because the default is
+  a convenience rather than a request. An explicit request is not narrowed that way: naming a world
+  scenario without `-Assets` fails, and `-Scenarios all` without `-Assets` fails with that reason
+  instead of quietly running the synthetic scene alone.
 - **Fresh reports.** Every campaign writes its bundles to its own timestamped directory,
   `-Out/runs/<timestamp>-<hardware>/`, so a `run-N` is never a file an earlier campaign left
   behind. A repeat counts only when the engine wrote a report this invocation can identify as its
@@ -324,34 +330,52 @@ cannot drift apart).
   frames, and the run id and scenario in the bundle's `metadata.json` — and the engine runs from
   the repository root, as the profiling campaign always has. Anything else throws with the
   scenario, repeat and directory rather than being aggregated.
-- **`baseline.json`** (`format_version` 2). The campaign level carries what every window shares —
+- **`baseline.json`** (`format_version` 3). The campaign level carries what every window shares —
   `commit`, the machine, the repeats, the window lengths, the run directory, and a `fingerprint`
   holding only the fields that must be the same in every window (engine and Bevy versions, build
   profile, resolution, renderer, world-database and cell-cache schemas). The script throws when two
-  windows disagree on any of those. Each scenario window then carries its own full `fingerprint` and
-  its
-  `scenario_inputs` (worldspace, grid, effective stream radius, duration, warm-up frames), and the
-  measurements: frame metrics (count, mean, p50, p95, p99, worst, average FPS) as median/min/max
-  over the repeats, `gpu_passes.passes` (per pass, the median over the repeats) with
-  `gpu_passes.unavailable`, `memory` (the process figures, `cpu` asset bytes, the `gpu` counters)
-  with `memory.gpu.unavailable`, `scene` (the counts and the per-pass pipeline-statistics counters)
-  with `scene.unavailable`, and `cpu` (per schedule and per span) with `cpu.unavailable`. Every
+  windows disagree on any of those. Each scenario window then carries its own full `fingerprint`
+  and its `scenario_inputs` — worldspace, grid, effective stream radius, duration, warm-up frames, and the
+  workload itself: the `fly_speed` the scenario flew at (`null` when the camera was left standing
+  still), the `synthetic_instances` it rendered, and the resolved full path of the `assets` set it
+  loaded. The window comparison checks every one of them, so a rerun at another flight speed,
+  another instance count or against another asset set is refused rather than scored against a
+  different workload. Format 3 added those fields and the `measured_frames` below; a format-2 file
+  does not carry them and cannot be compared with a run of this script.
+  The measurements follow: frame metrics (count, mean, p50, p95, p99, worst, average FPS) as
+  median/min/max over the repeats, `gpu_passes.passes` (per pass, the median over the repeats)
+  with `gpu_passes.measured_frames` (the frames the pass samples rest on, median/min/max over the
+  repeats), `gpu_passes.pass_samples` (each pass's own sample count, so a count below
+  `measured_frames` — GPU readback lag, or a pass that did not run every frame — is visible in the
+  file) and `gpu_passes.unavailable`, `memory` (the process figures, `cpu` asset bytes, and the
+  `gpu` counters with their own `measured_frames`) with `memory.gpu.unavailable`, `scene` (the
+  counts, `measured_frames`, and the per-pass pipeline-statistics counters) with
+  `scene.unavailable`, and `cpu` (per schedule and per span) with `cpu.unavailable`. Every
   map takes the union of its keys across the repeats and each entry keeps `samples`, the number of
   repeats that measured it, so a pass or span only one repeat recorded is still visible. A window a
   scenario does not have is `null` with the reason in the scenario's `streaming_unavailable`.
-  Nothing is zero-filled here either.
+  Nothing is zero-filled here either: a counter the report left `null` stays `null`.
 - **`baseline.md`.** One short table per scenario window, whose "median (min-max over N runs)"
   cells are exactly what `baseline.json` holds; a short memory table (CPU asset bytes in MiB, the
   GPU counters as counts with their unit); the slowest GPU passes and CPU spans; and every
   counter a window could not measure with the reason the report gave for it. When GPU pass times
-  are missing the row prints the GPU reason, not the CPU-schedule one.
+  are missing the row prints the GPU reason, not the CPU-schedule one. The measured frame counts
+  are printed beside those tables — "Measured frames" for the GPU passes, the pipeline statistics
+  and the GPU counters — and every pass whose sample count is below its window's measured frames is
+  listed under the table as "fewer samples than frames (GPU readback lag or a pass that did not run
+  every frame)".
 - **Comparing baselines.** With `-CompareTo <baseline.json>` (or, without it, an existing
   `baseline.json` in `-Out`; a `-CompareTo` path that does not exist is refused rather than
   ignored), the new numbers are set against the old ones using the profiling campaign's noise
-  floors. The comparison is refused before the remaining windows are run when the two runs differ
-  in any field that changes the numbers: renderer backend, adapter or driver, resolution, build
+  floors. The baseline picked up from `-Out` was not asked for, so it is checked before the first
+  window and, when it is unreadable, of an older format or otherwise unusable, it is skipped with
+  one warning line and the campaign runs without a comparison; `-CompareTo` names a comparison the
+  user asked for, so a file like that is refused there instead. A requested comparison is refused
+  before the remaining windows are run when the two runs differ in any field that changes the
+  numbers: renderer backend, adapter or driver, resolution, build
   profile, graphics settings, world-database and cell-cache schemas, or any window's scenario
-  inputs. A different **commit** is expected and allowed — comparing a branch against the baseline
+  inputs (flight speed, synthetic instance count and asset set included). A different **commit** is
+  expected and allowed — comparing a branch against the baseline
   it was measured from is the point of the command. `-Out` defaults to `target/phase2-baseline`, so
   a rerun compares with the previous baseline by default; each window's report bundle stays under
   `-Out/runs/`, and `baseline.json`'s `run_directory` says which campaign's bundles belong to it.
