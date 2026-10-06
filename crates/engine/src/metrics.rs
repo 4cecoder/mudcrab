@@ -3,8 +3,8 @@ use crate::{
     fingerprint::{RunFingerprint, records_measurements},
     pacing::{PacingReport, PacingTracker},
     profiling::{
-        GpuPassReport, MemoryReport, MetricSummary, ProfilingState, SystemMetadata,
-        cpu_asset_bytes, summarize,
+        CpuReport, GpuPassReport, MemoryReport, MetricSummary, ProfilingState, SceneReport,
+        SystemMetadata, cpu_asset_bytes, summarize,
     },
     render::RendererMetrics,
     render_timing::{PipelineActivity, RenderTimingPlugin, RenderTimings},
@@ -138,6 +138,12 @@ struct BenchmarkReport {
     fingerprint: Option<RunFingerprint>,
     /// Per-pass GPU time over the measured frames (see [`GpuPassReport`]).
     gpu_passes: GpuPassReport,
+    /// What the run's scene contained: entity and mesh counts, and the per-pass
+    /// pipeline-statistics counters the backend can report (see [`SceneReport`]).
+    scene: SceneReport,
+    /// Where the run's CPU time went: Bevy's main schedules and the engine's own spans (see
+    /// [`CpuReport`]).
+    cpu: CpuReport,
     /// Where the run's memory was: Bevy's CPU-side asset data and the GPU-side counters.
     memory: MemoryReport,
     thresholds: Thresholds,
@@ -301,14 +307,22 @@ fn collect_and_finish(
     let renderer_capabilities = fingerprint
         .as_deref()
         .and_then(|value| value.renderer.as_ref());
+    let pipeline_statistics_supported =
+        renderer_capabilities.is_some_and(|value| value.pipeline_statistics_supported);
     let gpu_passes = profiler.gpu_passes(
         renderer_capabilities.is_some_and(|value| value.timestamp_queries_supported),
-        renderer_capabilities.is_some_and(|value| value.pipeline_statistics_supported),
+        pipeline_statistics_supported,
     );
     let memory = MemoryReport {
         cpu: cpu_asset_bytes(&meshes, &images),
         gpu: profiler.gpu_memory(),
     };
+    // Both sections report what the run measured, so a count that was never sampled stays `null`
+    // with a reason rather than becoming a zero (see `profiling::SceneReport`).
+    let entity_count = diagnostic_value(&diagnostics, &EntityCountDiagnosticsPlugin::ENTITY_COUNT)
+        .map(|value| value as u64);
+    let scene = profiler.scene_report(entity_count, pipeline_statistics_supported);
+    let cpu = profiler.cpu_report();
     let system_snapshot = system.map(|value| SystemSnapshot {
         os: value.os.clone(),
         kernel: value.kernel.clone(),
@@ -317,7 +331,7 @@ fn collect_and_finish(
         memory: value.memory.clone(),
     });
     let report = BenchmarkReport {
-        format_version: 9,
+        format_version: 10,
         generated_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
@@ -357,8 +371,7 @@ fn collect_and_finish(
         peak_process_memory_gib: (samples.peak_process_memory_gib > 0.0)
             .then_some(samples.peak_process_memory_gib),
         process_memory_growth_gib: memory_growth_gib,
-        entity_count: diagnostic_value(&diagnostics, &EntityCountDiagnosticsPlugin::ENTITY_COUNT)
-            .map(|value| value as u64),
+        entity_count,
         system: system_snapshot.clone(),
         streaming: streaming.as_ref().map(|value| (*value).clone()),
         renderer: renderer.clone(),
@@ -367,6 +380,8 @@ fn collect_and_finish(
         pacing: pacing_report,
         fingerprint: fingerprint.as_deref().cloned(),
         gpu_passes,
+        scene,
+        cpu,
         memory,
         thresholds: Thresholds {
             minimum_average_fps: config.accept_min_fps,

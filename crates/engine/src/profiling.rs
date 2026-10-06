@@ -45,6 +45,37 @@ const MESH_ALLOCATOR_UNAVAILABLE: &str =
 const RENDER_ASSET_UNAVAILABLE: &str =
     "Bevy's render-asset diagnostic for this type was not sampled in this run";
 
+/// Why a scene count is `null`: the inventory is sampled every 60th frame, so a run that rendered
+/// no sampled frame has none.
+const SCENE_INVENTORY_UNAVAILABLE: &str = "the scene inventory was not sampled in this run";
+
+/// Why a pipeline-statistics counter is `null` on a device that supports them: none was recorded,
+/// which is what a run with no rendered frame looks like.
+const NO_PIPELINE_STATISTICS: &str =
+    "no pipeline-statistics counter was recorded for this run, which renders nothing";
+
+/// Why the entity count is `null`: Bevy's entity-count diagnostic was not sampled.
+const ENTITY_COUNT_UNAVAILABLE: &str = "Bevy's entity-count diagnostic was not sampled in this run";
+
+/// Why `scene.draw_calls` is always `null`: Bevy has no counter to read.
+const DRAW_CALLS_UNAVAILABLE: &str = "Bevy 0.19 exposes no draw-call count";
+
+/// Why `cpu.schedules` is empty: the schedule markers are installed only for a run that measures
+/// pacing (see `schedule_timing`).
+const SCHEDULE_TIMING_UNAVAILABLE: &str =
+    "the run did not measure pacing, so Bevy's main schedules were not timed";
+
+/// Why `cpu.render_world_prep` is always `null`: Bevy 0.19 times no render-app schedule.
+///
+/// What the engine does record of render-world work is in this report: the `render_world/*` spans
+/// in `cpu.spans` (the main world, extract, the wait for the render thread, and the render thread's
+/// own phases, from `render_timing`), and per pass `render/<pass>/elapsed_cpu` in the profile
+/// bundle's `gpu-passes.json`. Neither is a Bevy schedule timer, so none is reported as one.
+const RENDER_WORLD_PREP_UNAVAILABLE: &str = "Bevy 0.19 records no per-schedule time for the render app; the engine's render-world phases are the render_world/* spans here, and per-pass CPU time is render/<pass>/elapsed_cpu in the profile bundle";
+
+/// Why `cpu.spans` is empty: nothing was recorded, which only an aborted run does.
+const NO_CPU_SPANS: &str = "the run recorded no CPU spans";
+
 pub struct ProfilingPlugin;
 
 impl Plugin for ProfilingPlugin {
@@ -210,6 +241,118 @@ impl ProfilingState {
             timestamp_queries_supported,
             pipeline_statistics_supported,
             passes,
+            unavailable,
+        }
+    }
+
+    /// What the rendered scene contained: the entity counts and the per-pass counters the graphics
+    /// backend can report (see [`SceneReport`]).
+    ///
+    /// The counts come from the inventory `sample_scene_inventory` takes every 60th frame (the mesh
+    /// entities, terrain patches and water surfaces of the world), and the entity count from Bevy's
+    /// own diagnostic, which `entity_count` carries. A count that was never sampled is `null` with
+    /// the reason in `unavailable`, never a zero: zero mesh entities in a synthetic scene is a
+    /// count, a missing sample is not.
+    pub fn scene_report(
+        &self,
+        entity_count: Option<u64>,
+        pipeline_statistics_supported: bool,
+    ) -> SceneReport {
+        let mut unavailable = BTreeMap::new();
+        if entity_count.is_none() {
+            unavailable.insert(
+                "entity_count".to_owned(),
+                ENTITY_COUNT_UNAVAILABLE.to_owned(),
+            );
+        }
+        let count = |name: &str| self.gauges.get(name).map(|value| value.max(0.0) as u64);
+        let mesh_entities = count("scene/mesh_entities");
+        let terrain_patches = count("scene/terrain_patches");
+        let water_surfaces = count("scene/water_surfaces");
+        for (field, sampled) in [
+            ("mesh_entities", mesh_entities),
+            ("terrain_patches", terrain_patches),
+            ("water_surfaces", water_surfaces),
+        ] {
+            if sampled.is_none() {
+                unavailable.insert(field.to_owned(), SCENE_INVENTORY_UNAVAILABLE.to_owned());
+            }
+        }
+        // Without pipeline statistics no such counter can be real, so a stray sample (a diagnostic
+        // left over from another device, say) is dropped rather than reported as a count.
+        let counters = |suffix: &str| -> BTreeMap<String, MetricSummary> {
+            if !pipeline_statistics_supported {
+                return BTreeMap::new();
+            }
+            self.render_metrics
+                .iter()
+                .filter(|(path, _)| path.ends_with(suffix))
+                .map(|(path, samples)| (path.clone(), summarize(samples)))
+                .collect()
+        };
+        let vertex_shader_invocations = counters("/vertex_shader_invocations");
+        let clipper_primitives_out = counters("/clipper_primitives_out");
+        if !pipeline_statistics_supported {
+            unavailable.insert(
+                "pipeline_statistics".to_owned(),
+                PIPELINE_STATISTICS_UNAVAILABLE.to_owned(),
+            );
+        } else if vertex_shader_invocations.is_empty() && clipper_primitives_out.is_empty() {
+            unavailable.insert(
+                "pipeline_statistics".to_owned(),
+                NO_PIPELINE_STATISTICS.to_owned(),
+            );
+        }
+        unavailable.insert("draw_calls".to_owned(), DRAW_CALLS_UNAVAILABLE.to_owned());
+        SceneReport {
+            entity_count,
+            mesh_entities,
+            terrain_patches,
+            water_surfaces,
+            pipeline_statistics_supported,
+            vertex_shader_invocations,
+            clipper_primitives_out,
+            draw_calls: None,
+            unavailable,
+        }
+    }
+
+    /// Where the run's CPU time went: the main schedules Bevy ran and the engine's own spans (see
+    /// [`CpuReport`]).
+    pub fn cpu_report(&self) -> CpuReport {
+        let mut schedules = BTreeMap::new();
+        let mut spans = BTreeMap::new();
+        for (name, samples) in &self.cpu_spans_ms {
+            // `assets_added/*` hold counts, not milliseconds (see `schedule_timing`), so they are
+            // left out of a table of CPU time; they stay in the profile bundle's `cpu-spans.json`.
+            if name.starts_with("assets_added/") {
+                continue;
+            }
+            let summary = summarize(samples);
+            if name.starts_with("main_schedule/") {
+                schedules.insert(name.clone(), summary);
+            } else {
+                spans.insert(name.clone(), summary);
+            }
+        }
+        let mut unavailable = BTreeMap::new();
+        if schedules.is_empty() {
+            unavailable.insert(
+                "schedules".to_owned(),
+                SCHEDULE_TIMING_UNAVAILABLE.to_owned(),
+            );
+        }
+        if spans.is_empty() {
+            unavailable.insert("spans".to_owned(), NO_CPU_SPANS.to_owned());
+        }
+        unavailable.insert(
+            "render_world_prep".to_owned(),
+            RENDER_WORLD_PREP_UNAVAILABLE.to_owned(),
+        );
+        CpuReport {
+            schedules,
+            spans,
+            render_world_prep: None,
             unavailable,
         }
     }
@@ -483,6 +626,51 @@ pub struct GpuMemoryReport {
     pub mesh_allocator_allocations: Option<u64>,
     /// Live render-asset counts, by asset type: a count of assets, never a byte size.
     pub render_asset_counts: BTreeMap<String, u64>,
+    pub unavailable: BTreeMap<String, String>,
+}
+
+/// What the run's scene contained: the entity counts, and the per-pass pipeline-statistics
+/// counters the graphics backend can report.
+///
+/// The counters are Bevy's own render diagnostics, `render/<pass>/vertex_shader_invocations` and
+/// `render/<pass>/clipper_primitives_out`. Only Vulkan offers pipeline statistics, so on DX12 (and
+/// on every backend without them) both maps are empty and `unavailable` says why; the counts are
+/// per pass, and several cameras that run the same pass write the same path.
+///
+/// `draw_calls` is always `null`: Bevy 0.19 exposes no draw-call count. It is spelled out rather
+/// than left off so a reader of the report does not have to conclude it is missing.
+#[derive(Debug, Clone, Serialize)]
+pub struct SceneReport {
+    pub entity_count: Option<u64>,
+    pub mesh_entities: Option<u64>,
+    pub terrain_patches: Option<u64>,
+    pub water_surfaces: Option<u64>,
+    pub pipeline_statistics_supported: bool,
+    /// Per pass: shader invocations, over the measured frames, as `mean`/`p95`/`worst` and friends.
+    pub vertex_shader_invocations: BTreeMap<String, MetricSummary>,
+    /// Per pass: primitives that survived clipping, over the measured frames.
+    pub clipper_primitives_out: BTreeMap<String, MetricSummary>,
+    /// Always `null`; see `unavailable["draw_calls"]` for why.
+    pub draw_calls: Option<u64>,
+    pub unavailable: BTreeMap<String, String>,
+}
+
+/// Where the run's CPU time went, in milliseconds.
+///
+/// `schedules` are the eight Bevy main schedules `schedule_timing` times (`main_schedule/<name>`);
+/// `spans` is every other span the engine recorded by hand, the `streaming/*` spans among them.
+/// The two are kept apart so a reader can see Bevy's own frame structure without sorting it out of
+/// the engine's spans. Asset-arrival counts (`assets_added/*`) are counts, not milliseconds, so they
+/// appear in neither map; the profile bundle's `cpu-spans.json` keeps them.
+///
+/// `render_world_prep` is always `null` on Bevy 0.19 and says so; see
+/// `unavailable["render_world_prep"]`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CpuReport {
+    pub schedules: BTreeMap<String, MetricSummary>,
+    pub spans: BTreeMap<String, MetricSummary>,
+    /// Always `null`; see `unavailable["render_world_prep"]` for why and for what does exist.
+    pub render_world_prep: Option<BTreeMap<String, MetricSummary>>,
     pub unavailable: BTreeMap<String, String>,
 }
 
@@ -1002,6 +1190,138 @@ mod tests {
             !summary.contains("assets_added/mesh"),
             "a count span must not be shown as milliseconds"
         );
+    }
+
+    /// The scene section reports the sampled counts, the per-pass counters on a backend that has
+    /// them, and `null` for the draw-call count Bevy cannot give — with no zero standing in for a
+    /// sample that never happened.
+    #[test]
+    fn reports_the_scene_counts_and_pipeline_statistics() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        profiler.set_gauge("scene/mesh_entities", 4.0);
+        profiler.set_gauge("scene/terrain_patches", 9.0);
+        profiler.set_gauge("scene/water_surfaces", 2.0);
+        for value in [100.0, 200.0] {
+            feed(
+                &mut diagnostics,
+                "render/main_opaque_pass_3d/vertex_shader_invocations",
+                value,
+            );
+            feed(
+                &mut diagnostics,
+                "render/main_opaque_pass_3d/clipper_primitives_out",
+                value / 2.0,
+            );
+            profiler.sample_frame(&diagnostics, None);
+        }
+        let scene = profiler.scene_report(Some(42), true);
+        assert_eq!(scene.entity_count, Some(42));
+        assert_eq!(scene.mesh_entities, Some(4));
+        assert_eq!(scene.terrain_patches, Some(9));
+        assert_eq!(scene.water_surfaces, Some(2));
+        assert!(scene.pipeline_statistics_supported);
+        assert_eq!(
+            scene.vertex_shader_invocations["render/main_opaque_pass_3d/vertex_shader_invocations"]
+                .mean,
+            150.0
+        );
+        assert_eq!(
+            scene.clipper_primitives_out["render/main_opaque_pass_3d/clipper_primitives_out"].mean,
+            75.0
+        );
+        assert_eq!(scene.draw_calls, None, "Bevy exposes no draw-call count");
+        assert_eq!(
+            scene.unavailable["draw_calls"],
+            "Bevy 0.19 exposes no draw-call count"
+        );
+        assert!(
+            !scene.unavailable.contains_key("mesh_entities"),
+            "a sampled count is not unavailable"
+        );
+    }
+
+    /// A backend without pipeline statistics reports neither counter, and says why — even when a
+    /// stray diagnostic holds samples. A scene the inventory never sampled is `null` with a reason,
+    /// not a zero.
+    #[test]
+    fn the_scene_section_says_why_a_counter_is_missing() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        feed(
+            &mut diagnostics,
+            "render/main_opaque_pass_3d/vertex_shader_invocations",
+            7.0,
+        );
+        profiler.sample_frame(&diagnostics, None);
+        let scene = profiler.scene_report(None, false);
+        assert!(!scene.pipeline_statistics_supported);
+        assert!(scene.vertex_shader_invocations.is_empty());
+        assert!(scene.clipper_primitives_out.is_empty());
+        assert!(scene.unavailable.contains_key("pipeline_statistics"));
+        assert_eq!(scene.entity_count, None);
+        assert!(scene.unavailable.contains_key("entity_count"));
+        for field in ["mesh_entities", "terrain_patches", "water_surfaces"] {
+            assert_eq!(scene.unavailable[field], SCENE_INVENTORY_UNAVAILABLE);
+        }
+
+        // A supported backend that recorded no counter says that instead of blaming the backend.
+        let unsampled = ProfilingState::default().scene_report(Some(1), true);
+        assert!(unsampled.vertex_shader_invocations.is_empty());
+        assert_eq!(
+            unsampled.unavailable["pipeline_statistics"],
+            NO_PIPELINE_STATISTICS
+        );
+    }
+
+    /// The CPU section splits Bevy's main schedules from the engine's own spans, keeps the
+    /// asset-arrival counts out of both (they are counts, not milliseconds), and says that Bevy
+    /// offers no render-world schedule timing.
+    #[test]
+    fn the_cpu_section_splits_schedules_from_spans() {
+        let mut profiler = ProfilingState::default();
+        profiler.record_ms("main_schedule/Update", 4.0);
+        profiler.record_ms("main_schedule/Update", 6.0);
+        profiler.record_ms("streaming/plan_cells", 1.0);
+        profiler.record_ms("streaming/plan_cells", 3.0);
+        profiler.record_ms("render_world/render_thread", 2.0);
+        profiler.record_ms("assets_added/mesh", 12.0);
+        let cpu = profiler.cpu_report();
+        assert_eq!(cpu.schedules.len(), 1);
+        assert_eq!(cpu.schedules["main_schedule/Update"].mean, 5.0);
+        assert_eq!(cpu.schedules["main_schedule/Update"].worst, 6.0);
+        assert!(
+            !cpu.spans.contains_key("main_schedule/Update"),
+            "a schedule is not one of the engine's own spans"
+        );
+        assert_eq!(cpu.spans["streaming/plan_cells"].total, 4.0);
+        assert_eq!(cpu.spans["streaming/plan_cells"].p95, 3.0);
+        assert!(
+            cpu.spans.contains_key("render_world/render_thread"),
+            "the render-world phases the engine records are spans"
+        );
+        assert!(
+            !cpu.spans.contains_key("assets_added/mesh"),
+            "an asset-arrival count is not CPU time"
+        );
+        assert!(
+            cpu.render_world_prep.is_none(),
+            "Bevy 0.19 has no render-app schedule timing to report"
+        );
+        assert!(cpu.unavailable.contains_key("render_world_prep"));
+        assert!(!cpu.unavailable.contains_key("schedules"));
+        assert!(!cpu.unavailable.contains_key("spans"));
+    }
+
+    /// A run that recorded nothing CPU-side says so rather than serialising two empty tables as if
+    /// the frame had cost nothing.
+    #[test]
+    fn the_cpu_section_says_why_it_is_empty() {
+        let cpu = ProfilingState::default().cpu_report();
+        assert!(cpu.schedules.is_empty());
+        assert!(cpu.spans.is_empty());
+        assert!(cpu.unavailable.contains_key("schedules"));
+        assert!(cpu.unavailable.contains_key("spans"));
     }
 
     #[test]
