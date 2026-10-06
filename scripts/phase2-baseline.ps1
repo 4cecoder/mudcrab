@@ -121,6 +121,31 @@ function Get-SummaryMap($Reports, [scriptblock]$Selector) {
     return $summary
 }
 
+# The engine's own sample count behind each entry of a `name -> MetricSummary` map, as a spread over
+# the repeats. This is the count the window's `measured_frames` is set against: smaller means the
+# pass or counter was not sampled on every measured frame (GPU readback lag, or a pass that did not
+# run every frame), larger that several cameras ran the same pass.
+function Get-CountMap($Reports, [scriptblock]$Selector) {
+    # The inner scriptblock must call the *caller's* selector, not itself; see Get-SpreadPerName.
+    $select = $Selector
+    $names = [ordered]@{}
+    foreach ($report in $Reports) {
+        $map = & $select $report
+        if ($map) { foreach ($key in @($map.Keys)) { $names[$key] = $true } }
+    }
+    $counts = [ordered]@{}
+    foreach ($name in @($names.Keys)) {
+        $values = foreach ($report in $Reports) {
+            $map = & $select $report
+            # Indexed with `["count"]` rather than read as `.count`: a hashtable without a `count`
+            # key answers a property of that name with its key count, which is not a sample count.
+            if ($map -and $map.ContainsKey($name)) { $map[$name]["count"] } else { $null }
+        }
+        $counts[$name] = Get-Spread $values
+    }
+    return $counts
+}
+
 # The reasons a section could not measure something, unioned across the repeats: a key any repeat
 # reports as unavailable is unavailable for the window, and every distinct reason is kept rather
 # than only the first repeat's.
@@ -252,7 +277,12 @@ function Get-WindowReport($Reports, [string]$Kind, $Inputs) {
         $window[$metric] = Get-Spread (Get-Values $Reports { param($report) Get-FrameMetric $report $metric })
     }
     $window.gpu_passes = [ordered]@{
+        # The frames the window's per-pass numbers rest on, kept beside them so a reader can tell a
+        # pass that ran every frame from one that was measured on a few: `pass_samples` below is
+        # each pass's own count.
+        measured_frames = Get-Spread (Get-Values $Reports { param($report) $report.gpu_passes.measured_frames })
         passes = Get-SummaryMap $Reports { param($report) $report.gpu_passes.passes }
+        pass_samples = Get-CountMap $Reports { param($report) $report.gpu_passes.passes }
         unavailable = Get-UnavailableMap $Reports { param($report) $report.gpu_passes.unavailable }
     }
     $window.memory = [ordered]@{
@@ -263,6 +293,9 @@ function Get-WindowReport($Reports, [string]$Kind, $Inputs) {
             image_bytes = Get-Spread (Get-Values $Reports { param($report) $report.memory.cpu.image_bytes })
         }
         gpu = [ordered]@{
+            # These counters are gauges sampled by the render world, so `measured_frames` says how
+            # many frames they rest on; it is 0 when the render world never measured them.
+            measured_frames = Get-Spread (Get-Values $Reports { param($report) $report.memory.gpu.measured_frames })
             mesh_allocator_slab_bytes = Get-Spread (Get-Values $Reports { param($report) $report.memory.gpu.mesh_allocator_slab_bytes })
             mesh_allocator_slabs = Get-Spread (Get-Values $Reports { param($report) $report.memory.gpu.mesh_allocator_slabs })
             mesh_allocator_allocations = Get-Spread (Get-Values $Reports { param($report) $report.memory.gpu.mesh_allocator_allocations })
@@ -271,6 +304,7 @@ function Get-WindowReport($Reports, [string]$Kind, $Inputs) {
         }
     }
     $window.scene = [ordered]@{
+        measured_frames = Get-Spread (Get-Values $Reports { param($report) $report.scene.measured_frames })
         entity_count = Get-Spread (Get-Values $Reports { param($report) $report.scene.entity_count })
         mesh_entities = Get-Spread (Get-Values $Reports { param($report) $report.scene.mesh_entities })
         terrain_patches = Get-Spread (Get-Values $Reports { param($report) $report.scene.terrain_patches })
@@ -343,6 +377,28 @@ function Get-UnavailableItems($Window) {
     return $items
 }
 
+# The passes whose own sample count is below the window's measured frames, as `pass (samples)` items
+# with the frame count they were set against, or `$null` when every pass was sampled as often as the
+# window had frames (or there is nothing to compare). The engine's `count` is the pass's real sample
+# count, so a smaller one means the GPU readback lagged or the pass did not run every frame.
+function Get-LaggingPasses($Window) {
+    $measured = if ($null -ne $Window.gpu_passes.measured_frames) { $Window.gpu_passes.measured_frames.median } else { $null }
+    if ($null -eq $measured -or $measured -le 0) { return $null }
+    $passes = @($Window.gpu_passes.passes.Keys | Where-Object {
+            $samples = $Window.gpu_passes.pass_samples[$_]
+            # `$null -lt $measured` is true in PowerShell, so the entry and its median are both
+            # checked before the comparison.
+            $null -ne $samples -and $null -ne $samples.median -and $samples.median -lt $measured
+        } | Sort-Object)
+    if ($passes.Count -eq 0) { return $null }
+    return [ordered]@{
+        frames = [string]::Format('{0:N0}', $measured)
+        passes = @($passes | ForEach-Object {
+                "$_ ($([string]::Format('{0:N0}', $Window.gpu_passes.pass_samples[$_].median)))"
+            })
+    }
+}
+
 # One short table per scenario window, the window's memory, and the facts a table cannot hold: which
 # counters were unavailable and why, and which passes and spans cost the most.
 function Get-MarkdownTable($Name, $Window, [string]$Kind) {
@@ -371,6 +427,7 @@ function Get-MarkdownTable($Name, $Window, [string]$Kind) {
     if ($Window.scene.pipeline_statistics_supported) {
         $lines += "| Vertex shader invocations | $(Get-SummaryLine $Window.scene.vertex_shader_invocations) |"
         $lines += "| Clipper primitives out | $(Get-SummaryLine $Window.scene.clipper_primitives_out) |"
+        $lines += "| Measured frames (pipeline statistics) | $(Format-Spread $Window.scene.measured_frames '{0:N0}') |"
     } else {
         $lines += "| Pipeline-statistics counters | null: $($Window.scene.unavailable.pipeline_statistics) |"
     }
@@ -385,6 +442,7 @@ function Get-MarkdownTable($Name, $Window, [string]$Kind) {
         }
     }
     $lines += "| CPU spans recorded | $($Window.cpu.spans.Count) (schedules: $($Window.cpu.schedules.Count)) |"
+    $lines += "| Measured frames (GPU passes) | $(Format-Spread $Window.gpu_passes.measured_frames '{0:N0}') |"
     $topPasses = @($Window.gpu_passes.passes.Keys | Sort-Object { -($Window.gpu_passes.passes[$_].median) } | Select-Object -First 5)
     if ($topPasses.Count -eq 0) {
         # The reason GPU pass times are missing is the GPU one; the CPU reason belongs to the CPU
@@ -397,6 +455,16 @@ function Get-MarkdownTable($Name, $Window, [string]$Kind) {
     if ($topSpans.Count -gt 0) {
         $lines += "| Slowest CPU spans (median ms) | $(($topSpans | ForEach-Object { "$_ $(Format-Spread $Window.cpu.spans[$_])" }) -join '; ') |"
     }
+    # A pass whose own sample count is below the window's measured frames was not sampled on every
+    # frame: its GPU readback lagged, or it did not run every frame. Every pass is listed, not just
+    # the slowest, so a counter dropping out of the window is visible.
+    $lagging = Get-LaggingPasses $Window
+    if ($lagging) {
+        $lines += @(
+            "",
+            "Passes with fewer samples than the $($lagging.frames) frames the window measured: $($lagging.passes -join ', ') - fewer samples than frames (GPU readback lag or a pass that did not run every frame)"
+        )
+    }
     # A short resource table: byte figures in MiB, GPU counters as counts with their unit in the row
     # label, so a quick scan cannot mistake one for the other.
     $lines += @(
@@ -407,6 +475,7 @@ function Get-MarkdownTable($Name, $Window, [string]$Kind) {
         "|---|---:|",
         "| CPU mesh data (MiB) | $(Format-MiB $Window.memory.cpu.mesh_bytes) |",
         "| CPU image data (MiB) | $(Format-MiB $Window.memory.cpu.image_bytes) |",
+        "| Measured frames (GPU counters) | $(Format-Spread $Window.memory.gpu.measured_frames '{0:N0}') |",
         "| GPU mesh slab bytes (MiB) | $(Format-MiB $Window.memory.gpu.mesh_allocator_slab_bytes) |",
         "| GPU mesh allocator slabs (count) | $(Format-Spread $Window.memory.gpu.mesh_allocator_slabs '{0:N0}') |",
         "| GPU mesh allocations (count) | $(Format-Spread $Window.memory.gpu.mesh_allocator_allocations '{0:N0}') |"
@@ -430,9 +499,9 @@ function Get-SummaryLine($Summary) {
 
 # The campaign format this script writes and reads. Per-window fingerprints and scenario inputs
 # arrived in format 2, and the workload fields the comparison checks in scenario_inputs — the flight
-# speed, the synthetic instance count and the resolved asset set — in format 3. An older file does
-# not carry those fields, so it cannot be checked against this run: a comparison with it is refused
-# rather than made on fields it does not carry.
+# speed, the synthetic instance count and the resolved asset set — in format 3. An older file neither
+# carries those fields nor the `measured_frames` a window now keeps, so it cannot be checked against
+# this run: a comparison with it is refused rather than made on fields it does not carry.
 $script:baselineFormatVersion = 3
 
 # Why a file can never be compared with this run, as a readable reason, or `$null` when its format
@@ -443,7 +512,7 @@ function Get-BaselineProblem($Baseline) {
     if ($null -eq $Baseline -or $Baseline -isnot [System.Collections.IDictionary]) { return "it is not a JSON object" }
     $version = if ($Baseline.Contains("format_version")) { $Baseline.format_version } else { $null }
     if ($version -ne $script:baselineFormatVersion) {
-        return "it is baseline format $(Format-FieldValue $version), and this script reads format $($script:baselineFormatVersion) (scenario inputs that name the flight speed, synthetic instance count and asset set); rerun the older baseline with this script to compare against it"
+        return "it is baseline format $(Format-FieldValue $version), and this script reads format $($script:baselineFormatVersion) (scenario inputs that name the flight speed, synthetic instance count and asset set, and per-window measured_frames); rerun the older baseline with this script to compare against it"
     }
     if ($null -eq $Baseline.fingerprint) { return "it recorded no run fingerprint, so the machine and build it ran on cannot be checked" }
     if ($null -eq $Baseline.scenarios) { return "it carries no scenarios map, so it holds no window to compare with" }
