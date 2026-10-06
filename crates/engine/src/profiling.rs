@@ -109,9 +109,12 @@ pub struct ProfilingState {
     /// exactly once however many cameras wrote it and however the GPU readback lags.
     render_cursors: BTreeMap<String, RenderCursor>,
     /// The last value sampled for each GPU-memory diagnostic (the mesh allocator's counters and the
-    /// live render-asset counts). These are gauges, not distributions: only the value at the end of
-    /// the run is reported.
+    /// live render-asset counts). These are gauges, not distributions: only the last value in the
+    /// measured window is reported.
     memory_metrics: BTreeMap<String, f64>,
+    /// The frames of the measured window this state sampled: the frames every GPU and
+    /// pipeline-statistics number in the report rests on.
+    measured_frames: u64,
     counters: BTreeMap<String, u64>,
     gauges: BTreeMap<String, f64>,
     timeline: Vec<TimelineEvent>,
@@ -127,6 +130,7 @@ impl Default for ProfilingState {
             render_metrics: BTreeMap::new(),
             render_cursors: BTreeMap::new(),
             memory_metrics: BTreeMap::new(),
+            measured_frames: 0,
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
             timeline: Vec::new(),
@@ -187,18 +191,30 @@ impl ProfilingState {
         });
     }
 
-    /// Samples a frame: the process memory every frame, and the GPU diagnostics from Bevy's stores.
+    /// Samples a frame: the process memory every frame, and the GPU diagnostics when `measured`.
+    ///
+    /// `measured` is whether this frame is inside the measured window — after the warm-up frames a
+    /// benchmark leaves out. The caller knows the warm-up gate; this state cannot see it.
     ///
     /// Every render-diagnostic measurement is taken exactly once, however many cameras wrote it and
     /// however long the GPU readback takes: [`take_render_measurements`] advances a cursor per path
-    /// rather than resampling Bevy's latest value. The process-memory timeline stays whole-run: it
+    /// rather than resampling Bevy's latest value. Only measurements arriving inside the measured
+    /// window are kept — the ones that arrive during the warm-up are consumed and dropped, so they
+    /// cannot leak into a later frame's samples. Because the readback lags, a measurement taken in
+    /// the first measured frames can describe a pass recorded a frame or two earlier, in the
+    /// warm-up; there is no per-camera record to split that, and dropping a fixed number of frames
+    /// instead would be a guess about the latency. The process-memory timeline stays whole-run: it
     /// is a growth curve, not one of the frame statistics.
     pub fn sample_frame(
         &mut self,
         diagnostics: &DiagnosticsStore,
         process_memory_gib: Option<f64>,
+        measured: bool,
     ) {
         self.frame = self.frame.saturating_add(1);
+        if measured {
+            self.measured_frames = self.measured_frames.saturating_add(1);
+        }
         for diagnostic in diagnostics.iter() {
             let path = diagnostic.path().as_str();
             if path.starts_with("render/") {
@@ -206,13 +222,14 @@ impl ProfilingState {
                     diagnostic,
                     &mut self.render_metrics,
                     &mut self.render_cursors,
+                    measured,
                 );
             }
             // The GPU-memory diagnostics do not sit under `render/`, so they are matched by their
             // own names, deliberately: the mesh allocator's counters and the live render-asset
             // counts, the only paths the report's memory section reads. They are gauges, so the
-            // last value of the run is what is kept.
-            else if is_gpu_memory_path(path) {
+            // last value of the measured window is what is kept.
+            else if measured && is_gpu_memory_path(path) {
                 if let Some(value) = diagnostic.value() {
                     self.memory_metrics.insert(path.to_owned(), value);
                 }
@@ -228,7 +245,7 @@ impl ProfilingState {
         }
     }
 
-    /// The per-pass GPU times, summarised over every sample taken this run (see [`GpuPassReport`]).
+    /// The per-pass GPU times, summarised over the measured window (see [`GpuPassReport`]).
     pub fn gpu_passes(
         &self,
         timestamp_queries_supported: bool,
@@ -266,6 +283,7 @@ impl ProfilingState {
         GpuPassReport {
             timestamp_queries_supported,
             pipeline_statistics_supported,
+            measured_frames: self.measured_frames,
             passes,
             unavailable,
         }
@@ -336,6 +354,7 @@ impl ProfilingState {
             terrain_patches,
             water_surfaces,
             pipeline_statistics_supported,
+            measured_frames: self.measured_frames,
             vertex_shader_invocations,
             clipper_primitives_out,
             draw_calls: None,
@@ -425,6 +444,7 @@ impl ProfilingState {
             mesh_allocator_slabs,
             mesh_allocator_allocations,
             render_asset_counts,
+            measured_frames: self.measured_frames,
             unavailable,
         }
     }
@@ -533,6 +553,7 @@ fn take_render_measurements(
     diagnostic: &Diagnostic,
     metrics: &mut BTreeMap<String, Vec<f64>>,
     cursors: &mut BTreeMap<String, RenderCursor>,
+    keep: bool,
 ) {
     let path = diagnostic.path().as_str();
     let cursor = cursors.get(path).copied();
@@ -550,7 +571,9 @@ fn take_render_measurements(
                 }
             }
         }
-        push_bounded(metrics.entry(path.to_owned()).or_default(), measurement.value);
+        if keep {
+            push_bounded(metrics.entry(path.to_owned()).or_default(), measurement.value);
+        }
         next = Some(match next {
             Some(next) if next.time == measurement.time => RenderCursor {
                 taken_at_time: next.taken_at_time.saturating_add(1),
@@ -665,6 +688,10 @@ pub struct MetricSummary {
 pub struct GpuPassReport {
     pub timestamp_queries_supported: bool,
     pub pipeline_statistics_supported: bool,
+    /// The frames of the measured window the passes were sampled over: the frame count behind these
+    /// numbers. A pass's own `count` can be smaller — its GPU readback lags — and larger — several
+    /// cameras ran it.
+    pub measured_frames: u64,
     pub passes: BTreeMap<String, MetricSummary>,
     pub unavailable: BTreeMap<String, String>,
 }
@@ -704,6 +731,9 @@ pub struct GpuMemoryReport {
     pub mesh_allocator_allocations: Option<u64>,
     /// Live render-asset counts, by asset type: a count of assets, never a byte size.
     pub render_asset_counts: BTreeMap<String, u64>,
+    /// The frames of the measured window these values were sampled over, the frame count they rest
+    /// on.
+    pub measured_frames: u64,
     pub unavailable: BTreeMap<String, String>,
 }
 
@@ -724,6 +754,9 @@ pub struct SceneReport {
     pub terrain_patches: Option<u64>,
     pub water_surfaces: Option<u64>,
     pub pipeline_statistics_supported: bool,
+    /// The frames of the measured window the counters were sampled over: the frame count behind
+    /// their per-pass `count`s.
+    pub measured_frames: u64,
     /// Per pass: shader invocations, over the measured frames, as `mean`/`p95`/`worst` and friends.
     pub vertex_shader_invocations: BTreeMap<String, MetricSummary>,
     /// Per pass: primitives that survived clipping, over the measured frames.
@@ -1089,12 +1122,13 @@ mod tests {
                 "render/main_opaque_pass_3d/vertex_shader_invocations",
                 100.0,
             );
-            profiler.sample_frame(&diagnostics, None);
+            profiler.sample_frame(&diagnostics, None, true);
         }
         let report = profiler.gpu_passes(true, true);
         assert!(report.timestamp_queries_supported);
         assert!(report.pipeline_statistics_supported);
         assert!(report.unavailable.is_empty());
+        assert_eq!(report.measured_frames, 4);
         let pass = &report.passes["render/main_opaque_pass_3d/elapsed_gpu"];
         assert_eq!(pass.count, 4);
         assert_eq!(pass.mean, 2.5);
@@ -1121,7 +1155,7 @@ mod tests {
         let batch = Instant::now();
         feed_at(&mut diagnostics, path, 4.0, batch);
         feed_at(&mut diagnostics, path, 6.0, batch);
-        profiler.sample_frame(&diagnostics, None);
+        profiler.sample_frame(&diagnostics, None, true);
         let report = profiler.gpu_passes(true, true);
         assert_eq!(
             report.passes[path].count, 2,
@@ -1130,17 +1164,21 @@ mod tests {
         assert_eq!(report.passes[path].total, 10.0);
 
         // The readback has not arrived: the store is unchanged and nothing may be resampled.
-        profiler.sample_frame(&diagnostics, None);
+        profiler.sample_frame(&diagnostics, None, true);
         let report = profiler.gpu_passes(true, true);
         assert_eq!(
             report.passes[path].count, 2,
             "an unchanged store adds no sample"
         );
+        assert_eq!(
+            report.measured_frames, 2,
+            "the window counts frames, not samples"
+        );
 
         // A later frame: another pass keeps producing, this one has stopped running.
         let later = batch + Duration::from_millis(16);
         feed_at(&mut diagnostics, "render/tonemapping/elapsed_gpu", 3.0, later);
-        profiler.sample_frame(&diagnostics, None);
+        profiler.sample_frame(&diagnostics, None, true);
         let report = profiler.gpu_passes(true, true);
         assert_eq!(
             report.passes[path].count, 2,
@@ -1151,6 +1189,53 @@ mod tests {
             1,
             "a pass that is still running does"
         );
+    }
+
+    /// The GPU sections cover the measured window alone: samples taken while a benchmark is warming
+    /// up are consumed and dropped rather than dug up later, and the report says how many measured
+    /// frames its numbers rest on.
+    #[test]
+    fn the_measured_window_excludes_the_warm_up() {
+        let mut diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+        let path = "render/main_opaque_pass_3d/elapsed_gpu";
+        for value in [10.0, 20.0] {
+            feed(&mut diagnostics, path, value);
+            feed(&mut diagnostics, "mesh_allocator_slabs", value);
+            profiler.sample_frame(&diagnostics, None, false);
+        }
+        let warm = profiler.gpu_passes(true, true);
+        assert!(
+            warm.passes.is_empty(),
+            "a warm-up pass sample is not measured"
+        );
+        assert_eq!(warm.measured_frames, 0);
+        assert_eq!(
+            profiler.gpu_memory().mesh_allocator_slabs,
+            None,
+            "a warm-up counter is not a measured one"
+        );
+
+        // The first measured frame finds no new measurement and must not report the warm-up ones.
+        profiler.sample_frame(&diagnostics, None, true);
+        let measured = profiler.gpu_passes(true, true);
+        assert!(
+            measured.passes.is_empty(),
+            "the warm-up history is not a measured window"
+        );
+        assert_eq!(measured.measured_frames, 1);
+
+        // A measurement that arrives inside the window is the only one reported.
+        feed(&mut diagnostics, path, 5.0);
+        feed(&mut diagnostics, "mesh_allocator_slabs", 3.0);
+        profiler.sample_frame(&diagnostics, None, true);
+        let measured = profiler.gpu_passes(true, true);
+        assert_eq!(measured.passes[path].count, 1);
+        assert_eq!(measured.passes[path].mean, 5.0);
+        assert_eq!(measured.measured_frames, 2);
+        let memory = profiler.gpu_memory();
+        assert_eq!(memory.mesh_allocator_slabs, Some(3));
+        assert_eq!(memory.measured_frames, 2);
     }
 
     /// A backend without timestamp queries reports the reason and no pass times — never zeros, and
@@ -1164,7 +1249,7 @@ mod tests {
             "render/main_opaque_pass_3d/elapsed_gpu",
             3.0,
         );
-        profiler.sample_frame(&diagnostics, None);
+        profiler.sample_frame(&diagnostics, None, true);
 
         let unsupported = profiler.gpu_passes(false, false);
         assert!(unsupported.passes.is_empty());
@@ -1204,9 +1289,9 @@ mod tests {
             RenderAssetDiagnosticPlugin::<RenderMesh>::render_asset_diagnostic_path().as_str(),
             7.0,
         );
-        profiler.sample_frame(&diagnostics, None);
+        profiler.sample_frame(&diagnostics, None, true);
         feed(&mut diagnostics, "mesh_allocator_allocations", 45.0);
-        profiler.sample_frame(&diagnostics, None);
+        profiler.sample_frame(&diagnostics, None, true);
 
         let gpu = profiler.gpu_memory();
         assert_eq!(gpu.mesh_allocator_slab_bytes, Some(8_388_608));
@@ -1216,6 +1301,7 @@ mod tests {
             Some(45),
             "the reported value is the run's last sample"
         );
+        assert_eq!(gpu.measured_frames, 2);
         assert_eq!(gpu.render_asset_counts["mesh"], 7);
         assert!(
             !gpu.unavailable.contains_key("gpu_asset_counts/mesh"),
@@ -1227,6 +1313,7 @@ mod tests {
         let unsampled = ProfilingState::default().gpu_memory();
         assert_eq!(unsampled.mesh_allocator_slab_bytes, None);
         assert!(unsampled.render_asset_counts.is_empty());
+        assert_eq!(unsampled.measured_frames, 0);
         assert_eq!(
             unsampled.unavailable["mesh_allocator_slab_bytes"],
             MESH_ALLOCATOR_UNAVAILABLE
@@ -1349,7 +1436,7 @@ mod tests {
                 "render/main_opaque_pass_3d/clipper_primitives_out",
                 value / 2.0,
             );
-            profiler.sample_frame(&diagnostics, None);
+            profiler.sample_frame(&diagnostics, None, true);
         }
         let scene = profiler.scene_report(Some(42), true);
         assert_eq!(scene.entity_count, Some(42));
@@ -1357,6 +1444,7 @@ mod tests {
         assert_eq!(scene.terrain_patches, Some(9));
         assert_eq!(scene.water_surfaces, Some(2));
         assert!(scene.pipeline_statistics_supported);
+        assert_eq!(scene.measured_frames, 2);
         assert_eq!(
             scene.vertex_shader_invocations["render/main_opaque_pass_3d/vertex_shader_invocations"]
                 .mean,
@@ -1389,7 +1477,7 @@ mod tests {
             "render/main_opaque_pass_3d/vertex_shader_invocations",
             7.0,
         );
-        profiler.sample_frame(&diagnostics, None);
+        profiler.sample_frame(&diagnostics, None, true);
         let scene = profiler.scene_report(None, false);
         assert!(!scene.pipeline_statistics_supported);
         assert!(scene.vertex_shader_invocations.is_empty());

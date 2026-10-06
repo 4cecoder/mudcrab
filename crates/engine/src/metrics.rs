@@ -197,8 +197,12 @@ fn collect_and_finish(
             &diagnostics,
             &SystemInformationDiagnosticsPlugin::PROCESS_MEM_USAGE,
         );
-        profiler.sample_frame(&diagnostics, process_memory);
-        if samples.frames_seen > config.benchmark_warmup_frames {
+        // The profiler samples every frame — its process-memory timeline is whole-run — but only
+        // keeps the GPU diagnostics of the measured frames, after the warm-up a benchmark leaves
+        // out (see `ProfilingState::sample_frame`).
+        let measured = samples.frames_seen > config.benchmark_warmup_frames;
+        profiler.sample_frame(&diagnostics, process_memory, measured);
+        if measured {
             render_timings.set_recording(true);
             let milliseconds = time.delta_secs_f64() * 1000.0;
             if milliseconds.is_finite() && milliseconds > 0.0 {
