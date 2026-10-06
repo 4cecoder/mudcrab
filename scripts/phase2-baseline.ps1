@@ -299,8 +299,37 @@ function Format-Spread($Spread, [string]$Format = "{0:N3}") {
     return "$([string]::Format($Format, $Spread.median)) ($([string]::Format($Format, $Spread.min))-$([string]::Format($Format, $Spread.max)))"
 }
 
-# One short table per scenario window, plus the two facts a table cannot hold: why a counter is
-# missing, and which passes and spans cost the most.
+# A byte spread in MiB, or `n/a` when the repeats did not measure it.
+function Format-MiB($Spread) {
+    if ($null -eq $Spread) { return "n/a" }
+    $mib = @{ median = $Spread.median / 1MB; min = $Spread.min / 1MB; max = $Spread.max / 1MB }
+    return (Format-Spread $mib '{0:N2}')
+}
+
+# The reason a section could not measure something, preferring the key the caller is printing, with
+# the other keys of the same section listed after it so nothing is dropped.
+function Get-UnavailableReason($Map, [string[]]$Keys) {
+    if ($null -eq $Map -or $Map.Count -eq 0) { return "no reason recorded" }
+    $preferred = foreach ($key in $Keys) { if ($Map.Contains($key) -and $Map[$key]) { "$key`: $($Map[$key])" } }
+    if ($preferred) { return ($preferred -join "; ") }
+    return (@($Map.Keys | ForEach-Object { "$_`: $($Map[$_])" }) -join "; ")
+}
+
+# Every counter a window could not measure, as `section.key = reason` items, so the report explains
+# its own gaps instead of leaving a bare `n/a`.
+function Get-UnavailableItems($Window) {
+    $items = @()
+    foreach ($section in @("gpu_passes", "scene", "cpu")) {
+        $map = $Window[$section].unavailable
+        foreach ($key in @($map.Keys)) { $items += "$section.$key = $($map[$key])" }
+    }
+    $map = $Window.memory.gpu.unavailable
+    foreach ($key in @($map.Keys)) { $items += "memory.gpu.$key = $($map[$key])" }
+    return $items
+}
+
+# One short table per scenario window, the window's memory, and the facts a table cannot hold: which
+# counters were unavailable and why, and which passes and spans cost the most.
 function Get-MarkdownTable($Name, $Window, [string]$Kind) {
     $label = if ($Kind -eq "streaming") { "$Name (streaming)" } else { "$Name (standing still)" }
     $lines = @(
@@ -343,13 +372,36 @@ function Get-MarkdownTable($Name, $Window, [string]$Kind) {
     $lines += "| CPU spans recorded | $($Window.cpu.spans.Count) (schedules: $($Window.cpu.schedules.Count)) |"
     $topPasses = @($Window.gpu_passes.passes.Keys | Sort-Object { -($Window.gpu_passes.passes[$_].median) } | Select-Object -First 5)
     if ($topPasses.Count -eq 0) {
-        $lines += "| Slowest GPU passes | n/a: $($Window.cpu.unavailable.render_world_prep) |"
+        # The reason GPU pass times are missing is the GPU one; the CPU reason belongs to the CPU
+        # schedules and would explain the wrong section.
+        $lines += "| Slowest GPU passes | n/a: $(Get-UnavailableReason $Window.gpu_passes.unavailable @('elapsed_gpu', 'passes')) |"
     } else {
-        $lines += "| Slowest GPU passes (mean ms) | $(($topPasses | ForEach-Object { "$_ $(Format-Spread $Window.gpu_passes.passes[$_])" }) -join '; ') |"
+        $lines += "| Slowest GPU passes (median ms) | $(($topPasses | ForEach-Object { "$_ $(Format-Spread $Window.gpu_passes.passes[$_])" }) -join '; ') |"
     }
     $topSpans = @($Window.cpu.spans.Keys | Sort-Object { -($Window.cpu.spans[$_].median) } | Select-Object -First 5)
     if ($topSpans.Count -gt 0) {
-        $lines += "| Slowest CPU spans (mean ms) | $(($topSpans | ForEach-Object { "$_ $(Format-Spread $Window.cpu.spans[$_])" }) -join '; ') |"
+        $lines += "| Slowest CPU spans (median ms) | $(($topSpans | ForEach-Object { "$_ $(Format-Spread $Window.cpu.spans[$_])" }) -join '; ') |"
+    }
+    # A short resource table: byte figures in MiB, GPU counters as counts with their unit in the row
+    # label, so a quick scan cannot mistake one for the other.
+    $lines += @(
+        "",
+        "### Memory",
+        "",
+        "| Counter | Median (min-max over $($Window.runs) runs) |",
+        "|---|---:|",
+        "| CPU mesh data (MiB) | $(Format-MiB $Window.memory.cpu.mesh_bytes) |",
+        "| CPU image data (MiB) | $(Format-MiB $Window.memory.cpu.image_bytes) |",
+        "| GPU mesh slab bytes (MiB) | $(Format-MiB $Window.memory.gpu.mesh_allocator_slab_bytes) |",
+        "| GPU mesh allocator slabs (count) | $(Format-Spread $Window.memory.gpu.mesh_allocator_slabs '{0:N0}') |",
+        "| GPU mesh allocations (count) | $(Format-Spread $Window.memory.gpu.mesh_allocator_allocations '{0:N0}') |"
+    )
+    foreach ($asset in @($Window.memory.gpu.render_asset_counts.Keys)) {
+        $lines += "| GPU live $asset assets (count) | $(Format-Spread $Window.memory.gpu.render_asset_counts[$asset] '{0:N0}') |"
+    }
+    $unavailable = @(Get-UnavailableItems $Window)
+    if ($unavailable.Count -gt 0) {
+        $lines += @("", "Unavailable: $($unavailable -join '; ')")
     }
     return $lines
 }
@@ -361,15 +413,44 @@ function Get-SummaryLine($Summary) {
     return ($top | ForEach-Object { "$_ $(Format-Spread $Summary[$_])" }) -join '; '
 }
 
-# Refuses a comparison the issue says cannot be made: two runs on a different backend or adapter.
-function Assert-Comparable($Old, $New, [string]$Path) {
-    $oldRenderer = $Old.fingerprint.renderer
-    $newRenderer = $New.fingerprint.renderer
-    if ($null -eq $oldRenderer -or $null -eq $newRenderer) {
-        throw "Cannot compare with ${Path}: one of the two baselines recorded no renderer, so their backends cannot be checked"
+# The campaign format this script writes and reads. Per-window fingerprints and scenario inputs
+# arrived in format 2; an older file cannot be checked against this run, so a comparison with it is
+# refused rather than made on fields it does not carry.
+$script:baselineFormatVersion = 2
+
+# Refuses a comparison the fields say cannot be made: two runs on a different machine, build,
+# resolution, driver, renderer or world-data schema. A different commit is expected — comparing
+# across commits is what the baseline is for — but everything else that changes the numbers must be
+# the same on both sides.
+function Assert-Comparable($Old, $NewFingerprint, [string]$Path) {
+    $oldVersion = if ($Old.Contains("format_version")) { $Old.format_version } else { $null }
+    if ($oldVersion -ne $script:baselineFormatVersion) {
+        throw "Cannot compare with ${Path}: it is baseline format $(Format-FieldValue $oldVersion), and this script reads format $($script:baselineFormatVersion) (per-window fingerprints and scenario inputs). Rerun the older baseline with this script"
     }
-    if ($oldRenderer.backend -ne $newRenderer.backend -or $oldRenderer.adapter -ne $newRenderer.adapter) {
-        throw "Cannot compare with ${Path}: it ran on $($oldRenderer.backend)/$($oldRenderer.adapter) but this run is on $($newRenderer.backend)/$($newRenderer.adapter). Engine results compare only on the same machine and backend"
+    $oldInvariant = Get-FingerprintInvariant $Old.fingerprint
+    $newInvariant = Get-FingerprintInvariant $NewFingerprint
+    if ($null -eq $oldInvariant -or $null -eq $newInvariant) {
+        throw "Cannot compare with ${Path}: one of the two baselines recorded no run fingerprint, so the machine and build they ran on cannot be checked"
+    }
+    $differences = @(Get-FieldDifferences $oldInvariant $newInvariant)
+    if ($differences.Count -gt 0) {
+        throw "Cannot compare with ${Path}: the machine, build, resolution, driver or schema fields differ ($($differences -join '; ')). Engine results compare only on the same resolution, build profile, driver, backend, adapter and schemas; only the commit is expected to differ"
+    }
+}
+
+# Refuses a comparison between two windows that are not the same workload: the scenario inputs
+# (worldspace, grid, stream radius, duration, warm-up), the effective graphics settings and the
+# world database opened must match.
+function Assert-WindowComparable($OldWindow, $NewWindow, [string]$Path, [string]$Scope) {
+    $differences = @(Get-FieldDifferences $OldWindow.scenario_inputs $NewWindow.scenario_inputs)
+    $differences += Get-FieldDifferences $OldWindow.fingerprint.graphics $NewWindow.fingerprint.graphics "graphics"
+    $oldSchema = $OldWindow.fingerprint.opened_world_database_schema
+    $newSchema = $NewWindow.fingerprint.opened_world_database_schema
+    if ((Format-FieldValue $oldSchema) -ne (Format-FieldValue $newSchema)) {
+        $differences += "opened_world_database_schema : $(Format-FieldValue $oldSchema) -> $(Format-FieldValue $newSchema)"
+    }
+    if ($differences.Count -gt 0) {
+        throw "Cannot compare $Scope with ${Path}: the two windows are not the same workload ($($differences -join '; ')). A comparison needs the same scenario inputs, graphics settings and schemas; only the commit may differ"
     }
 }
 
@@ -392,11 +473,14 @@ function Get-Comparison($Old, $New) {
             }
             $current = @{}
             foreach ($metric in @($metrics.Keys)) {
-                $new = $metrics[$metric][0]; $old = $metrics[$metric][1]
-                if ($null -eq $new -or $null -eq $old -or $old.median -le 0) { continue }
-                $regression = Get-RegressionComparison -Metric $metric -Old $old.median -New $new.median
+                # Named `$newSpread`/`$oldSpread`, not `$new`/`$old`: variable names are
+                # case-insensitive, so `$new = ...` would overwrite the `$New` parameter and the next
+                # window would be read out of a metric spread.
+                $newSpread = $metrics[$metric][0]; $oldSpread = $metrics[$metric][1]
+                if ($null -eq $newSpread -or $null -eq $oldSpread -or $oldSpread.median -le 0) { continue }
+                $regression = Get-RegressionComparison -Metric $metric -Old $oldSpread.median -New $newSpread.median
                 $current["$name/$kind/$metric"] = [ordered]@{
-                    baseline = $old.median; current = $new.median
+                    baseline = $oldSpread.median; current = $newSpread.median
                     regression_percent = $regression.regression_percent
                     regression_absolute = $regression.regression_absolute
                     noise_floor = $regression.noise_floor
@@ -496,10 +580,10 @@ foreach ($name in $requested) {
             if ($null -eq $campaignFingerprint) {
                 $campaignFingerprint = Get-FingerprintInvariant $report.fingerprint
                 $campaignFingerprintLabel = $reportLabel
-                # Comparing is only meaningful between the same backend and adapter, so a mismatch is
-                # refused before the rest of the campaign spends hours producing numbers nobody can
-                # set against the older baseline.
-                if ($previous) { Assert-Comparable -Old $previous -New $report -Path $comparePath }
+                # Comparing is only meaningful between the same machine, build and schemas, so a
+                # mismatch is refused before the rest of the campaign spends hours producing numbers
+                # nobody can set against the older baseline.
+                if ($previous) { Assert-Comparable -Old $previous -NewFingerprint $campaignFingerprint -Path $comparePath }
             } else {
                 # Every window after the first must agree with it on the machine, the build and the
                 # schemas, or the campaign is not one comparable set of numbers.
@@ -512,6 +596,12 @@ foreach ($name in $requested) {
         }
         $inputs = Get-ScenarioInputs -Arguments $windowArguments -Report $windowReports[0] -DurationSeconds (Get-WindowDuration $name)
         $reports[$kind] = Get-WindowReport $windowReports $kind $inputs
+        # The workload itself must match the older baseline's window before any number in it is
+        # compared, so a rerun with different coordinates or settings is refused, not scored.
+        if ($previous -and $previous.scenarios.ContainsKey($name)) {
+            $oldWindow = $previous.scenarios[$name].windows[$kind]
+            if ($oldWindow) { Assert-WindowComparable -OldWindow $oldWindow -NewWindow $reports[$kind] -Path $comparePath -Scope "baseline $name/$kind" }
+        }
     }
     $entry = [ordered]@{ moves = $moves; windows = [ordered]@{} }
     foreach ($kind in @("standing_still", "streaming")) {
@@ -526,7 +616,7 @@ foreach ($name in $requested) {
 # Named `$baselineReport`, not `$baseline`: the dot-sourced profile script declares a `$Baseline`
 # parameter, and PowerShell would treat the two as the same variable.
 $baselineReport = [ordered]@{
-    format_version = 2
+    format_version = $script:baselineFormatVersion
     generated_at = (Get-Date).ToString("o")
     commit = $identity.commit
     dirty = $identity.dirty
@@ -541,7 +631,12 @@ $baselineReport = [ordered]@{
     scenarios = $scenarioReports
 }
 if ($previous) {
-    $baselineReport.comparison = [ordered]@{ against = $comparePath; metrics = Get-Comparison -Old $previous -New $baselineReport }
+    $baselineReport.comparison = [ordered]@{
+        against = $comparePath
+        against_commit = $previous.commit
+        against_generated_at = $previous.generated_at
+        metrics = Get-Comparison -Old $previous -New $baselineReport
+    }
 }
 $baselineReport | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Out "baseline.json")
 
@@ -558,6 +653,7 @@ $markdown = @(
     "- Renderer: $rendererLine",
     "- Repeats: $Repeats; window: $DurationSeconds s ($StabilitySeconds s for stability)",
     "- Generated: $($baselineReport.generated_at)",
+    "- Report bundles: $campaignRoot",
     ""
 )
 foreach ($name in $requested) {
@@ -571,7 +667,16 @@ foreach ($name in $requested) {
     }
 }
 if ($previous) {
-    $markdown += @("", "## Comparison against $comparePath", "", "| Metric | Baseline | Current | Change % | Status |", "|---|---:|---:|---:|---|")
+    $markdown += @(
+        "",
+        "## Comparison against $comparePath",
+        "",
+        "- Compared with commit $($previous.commit), generated $($previous.generated_at); this run is commit $($identity.commit).",
+        "- The two runs were checked to share resolution, build profile, driver, backend, adapter, schemas, graphics settings and scenario inputs; the commit is the field allowed to differ.",
+        "",
+        "| Metric | Baseline | Current | Change % | Status |",
+        "|---|---:|---:|---:|---|"
+    )
     foreach ($scope in @($baselineReport.comparison.metrics.Keys)) {
         foreach ($metric in @($baselineReport.comparison.metrics[$scope].Keys)) {
             $value = $baselineReport.comparison.metrics[$scope][$metric]
