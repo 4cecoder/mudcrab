@@ -65,9 +65,13 @@ per-frame sampling for any of them.
 
 ### `gpu_passes`
 
-Per-pass GPU time over the measured frames, from Bevy's render diagnostics: `mean`, `p95`, `worst`
-and `total` (with `count`, `p50`, `p99`) for each pass path, plus
-`timestamp_queries_supported` and `pipeline_statistics_supported` from the device.
+Per-pass GPU time over the measured frames (after the warm-up), from Bevy's render diagnostics:
+`mean`, `p95`, `worst` and `total` (with `count`, `p50`, `p99`) for each pass path,
+`measured_frames` (the frames of the measured window the numbers rest on), plus
+`timestamp_queries_supported` and `pipeline_statistics_supported` from the device. Every
+observation Bevy records is taken exactly once, not resampled from its latest value, so a pass's
+`count` is its real sample count: larger than `measured_frames` when several cameras ran the pass,
+smaller when the GPU readback lagged.
 
 A path is Bevy's own: `render/<pass>/elapsed_gpu`, where `<pass>` is the label the render pass was
 created with — `main_opaque_pass_3d`, `tonemapping`, `upscaling`, `ssao`, `clustering`, and so on.
@@ -82,9 +86,11 @@ Two things to know when reading one:
   zero. A missing row means "not measured here".
 
 When the device cannot time GPU work — any backend but Vulkan and DX12 — `passes` is empty and
-`unavailable.elapsed_gpu` carries the reason. An empty `passes` on a device that *can* time GPU work
-says no pass was recorded, which is also a reason rather than a zero. Pipeline statistics (the
-per-pass shader-invocation counters the bundle keeps in `gpu-passes.json`) are a separate device
+`unavailable.elapsed_gpu` carries the reason; a run with no renderer at all gets "no renderer in
+this run" for both `elapsed_gpu` and `pipeline_statistics` instead of a backend complaint. An empty
+`passes` on a device that *can* time GPU work says no pass was recorded, which is also a reason
+rather than a zero. Pipeline statistics (the per-pass shader-invocation counters the bundle keeps in
+`gpu-passes.json`) are a separate device
 feature and are described under `unavailable.pipeline_statistics` when absent. Never diff numbers
 across backends.
 
@@ -96,9 +102,11 @@ Split by where the memory is:
   once at the end of the run (not per frame): each mesh's vertex attributes (element size times
   vertex count) plus its indices, and each image's pixel data. `meshes` and `images` say how many
   assets were counted, and `meshes_without_cpu_data` how many meshes Bevy extracted to the render
-  world without keeping a main-world copy — the glTF loader's default, and so every streamed model.
-  Those meshes contribute no bytes to `mesh_bytes`, which is why `mesh_bytes` is not a total of all
-  loaded geometry.
+  world without keeping a main-world copy (a `RenderAssetUsages::RENDER_WORLD` mesh whose GPU data
+  was taken). Bevy 0.19's glTF loader keeps meshes in both worlds by default
+  (`GltfLoaderSettings::load_meshes` is `RenderAssetUsages::default()`) and the engine does not
+  override it, so streamed models do keep main-world mesh data; only those render-world-only meshes
+  contribute no bytes to `mesh_bytes`.
 - `gpu.mesh_allocator_slab_bytes`, `gpu.mesh_allocator_slabs`, `gpu.mesh_allocator_allocations` —
   Bevy's mesh allocator: the byte size of its slabs (the one true byte figure here) and how many
   slabs and mesh allocations are live.
@@ -107,8 +115,12 @@ Split by where the memory is:
   engine can read no vendor VRAM counter. `material` is one shared count, not one per material
   type: every `MeshMaterial3d<M>` prepares into the same `PreparedMaterial` map, so Bevy reports
   the same number for any material type it is asked about.
-- `gpu.unavailable` — a reason for every counter that was not sampled (a run that rendered no
-  frame, for instance). Counters are never zero-filled.
+- `gpu.unavailable` — a reason for every counter that was not sampled; the mesh allocator and
+  render-asset counters stay `null` until the render world has actually measured them (Bevy publishes
+  their atomics in main-world `PreUpdate` from the first frame, at zero), `gpu.measured_frames` says
+  on how many measured frames they were sampled, and a run with no renderer says "no renderer in
+  this run" rather than claiming the diagnostic was not sampled (a run that rendered no frame, for
+  instance). Counters are never zero-filled.
 
 `gpu.mesh_allocator_*` and `gpu.render_asset_counts` come from Bevy's mesh-allocator and
 render-asset diagnostic plugins, which are installed only for measured runs; sampling keeps their
@@ -257,7 +269,9 @@ the run could not measure it.
   zero terrain patches and a missing sample are told apart). `pipeline_statistics_supported` is the
   device's answer, and on a device that has pipeline statistics (Vulkan; DX12 offers none) the
   section lists per pass `vertex_shader_invocations` and `clipper_primitives_out`, each a
-  distribution over the measured frames. `draw_calls` is always `null`:
+  distribution over the measured frames, with `measured_frames` giving the frames those numbers rest
+  on; a run with no renderer gets "no renderer in this run" as the `pipeline_statistics` reason.
+  `draw_calls` is always `null`:
   `unavailable["draw_calls"]` says "Bevy 0.19 exposes no draw-call count", because no Bevy, wgpu or
   engine API counts them.
 - **`cpu`** — where the frame's CPU time went, in milliseconds. `schedules` is one summary per Bevy
