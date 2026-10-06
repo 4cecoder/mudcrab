@@ -160,9 +160,8 @@ impl RunFingerprint {
             device_type: format!("{:?}", info.device_type),
             timestamp_queries_supported: features
                 .is_some_and(|features| features.contains(WgpuFeatures::TIMESTAMP_QUERY)),
-            pipeline_statistics_supported: features.is_some_and(|features| {
-                features.contains(WgpuFeatures::PIPELINE_STATISTICS_QUERY)
-            }),
+            pipeline_statistics_supported: features
+                .is_some_and(|features| features.contains(WgpuFeatures::PIPELINE_STATISTICS_QUERY)),
         });
         Self {
             commit: config.profile_commit.clone(),
@@ -267,7 +266,10 @@ mod tests {
             value["world_database_schema"],
             serde_json::json!(shared::WORLD_DATABASE_SCHEMA_VERSION)
         );
-        assert_eq!(value["opened_world_database_schema"], serde_json::Value::Null);
+        assert_eq!(
+            value["opened_world_database_schema"],
+            serde_json::Value::Null
+        );
         assert_eq!(
             value["cell_cache_version"],
             serde_json::json!(shared::CELL_CACHE_VERSION)
@@ -277,7 +279,10 @@ mod tests {
         assert_eq!(graphics["unload_radius"], serde_json::json!(4));
         assert_eq!(graphics["block_level0_distance"], serde_json::json!(1000.0));
         assert_eq!(graphics["block_level1_distance"], serde_json::json!(2000.0));
-        assert_eq!(graphics["block_maximum_distance"], serde_json::json!(3000.0));
+        assert_eq!(
+            graphics["block_maximum_distance"],
+            serde_json::json!(3000.0)
+        );
         assert_eq!(graphics["split_distance_mult"], serde_json::json!(1.25));
         assert_eq!(graphics["lights"], serde_json::json!(true));
         assert_eq!(graphics["present_mode"], serde_json::Value::Null);

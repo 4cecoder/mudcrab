@@ -298,7 +298,9 @@ fn collect_and_finish(
         && screenshot_captured;
     // Whether the device can time GPU work is the device's own answer, recorded in the fingerprint
     // at startup; a run with no renderer at all cannot, so the passes stay absent with a reason.
-    let renderer_capabilities = fingerprint.as_deref().and_then(|value| value.renderer.as_ref());
+    let renderer_capabilities = fingerprint
+        .as_deref()
+        .and_then(|value| value.renderer.as_ref());
     let gpu_passes = profiler.gpu_passes(
         renderer_capabilities.is_some_and(|value| value.timestamp_queries_supported),
         renderer_capabilities.is_some_and(|value| value.pipeline_statistics_supported),

@@ -27,7 +27,8 @@ const MAX_TIMELINE_EVENTS: usize = 100_000;
 
 /// Why the report has no per-pass GPU times: Bevy's render diagnostics can time GPU work only on a
 /// backend with timestamp queries (Vulkan and DX12), and record nothing on the others.
-const TIMESTAMP_QUERIES_UNAVAILABLE: &str = "the graphics backend does not support timestamp queries, so Bevy records no per-pass GPU time";
+const TIMESTAMP_QUERIES_UNAVAILABLE: &str =
+    "the graphics backend does not support timestamp queries, so Bevy records no per-pass GPU time";
 
 /// Why the report has no per-pass shader-invocation counters: DX12 does not offer pipeline
 /// statistics.
@@ -216,7 +217,8 @@ impl ProfilingState {
     /// The last sampled value of the GPU-memory diagnostics (see [`GpuMemoryReport`]).
     pub fn gpu_memory(&self) -> GpuMemoryReport {
         let mut unavailable = BTreeMap::new();
-        let mut mesh_allocator = |path: &DiagnosticPath, field: &str| match self.memory_sample(path) {
+        let mut mesh_allocator = |path: &DiagnosticPath, field: &str| match self.memory_sample(path)
+        {
             Some(value) => Some(value.max(0.0) as u64),
             None => {
                 unavailable.insert(field.to_owned(), MESH_ALLOCATOR_UNAVAILABLE.to_owned());
@@ -806,7 +808,11 @@ mod tests {
                 "render/main_opaque_pass_3d/elapsed_gpu",
                 value,
             );
-            feed(&mut diagnostics, "render/tonemapping/elapsed_gpu", value * 2.0);
+            feed(
+                &mut diagnostics,
+                "render/tonemapping/elapsed_gpu",
+                value * 2.0,
+            );
             feed(
                 &mut diagnostics,
                 "render/main_opaque_pass_3d/vertex_shader_invocations",
@@ -900,7 +906,11 @@ mod tests {
         let unsampled = ProfilingState::default().gpu_memory();
         assert_eq!(unsampled.mesh_allocator_slab_bytes, None);
         assert!(unsampled.render_asset_counts.is_empty());
-        assert!(unsampled.unavailable.contains_key("mesh_allocator_slab_bytes"));
+        assert!(
+            unsampled
+                .unavailable
+                .contains_key("mesh_allocator_slab_bytes")
+        );
         assert!(unsampled.unavailable.contains_key("gpu_asset_counts/mesh"));
     }
 
@@ -910,7 +920,9 @@ mod tests {
     fn sums_the_cpu_bytes_of_meshes_and_images() {
         use bevy::{
             asset::RenderAssetUsages,
-            render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension, TextureFormat},
+            render::render_resource::{
+                Extent3d, PrimitiveTopology, TextureDimension, TextureFormat,
+            },
         };
 
         let mut meshes = Assets::<Mesh>::default();
@@ -924,7 +936,10 @@ mod tests {
         );
         mesh.insert_indices(bevy::mesh::Indices::U32(vec![0, 1, 2]));
         meshes.add(mesh);
-        let mut extracted = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
+        let mut extracted = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::RENDER_WORLD,
+        );
         extracted.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0, 0.0, 0.0]]);
         extracted
             .take_gpu_data()
