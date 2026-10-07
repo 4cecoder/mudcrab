@@ -1,13 +1,17 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("all", "synthetic", "rural", "dense", "water", "stress", "stability")]
+    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability")]
     [string]$Scenario = "all",
     [string]$Assets,
     [string]$Worldspace = "0x3c",
     [int]$RuralGridX = 0,
     [int]$RuralGridY = 0,
-    [int]$DenseGridX = 0,
-    [int]$DenseGridY = 0,
+    # Dense is Riverwood (about 2,900 references within two cells). `dense-legacy` is the place
+    # `dense` used to be (18,-5, about 1,530), kept for one release to compare older baselines.
+    [int]$DenseGridX = 3,
+    [int]$DenseGridY = -12,
+    [int]$DenseLegacyGridX = 18,
+    [int]$DenseLegacyGridY = -5,
     [int]$WaterGridX = 0,
     [int]$WaterGridY = 0,
     [int]$Repetitions = 3,
@@ -143,8 +147,10 @@ function Get-ScenarioArguments {
         [string]$Worldspace = "0x3c",
         [int]$RuralGridX = 0,
         [int]$RuralGridY = 0,
-        [int]$DenseGridX = 0,
-        [int]$DenseGridY = 0,
+        [int]$DenseGridX = 3,
+        [int]$DenseGridY = -12,
+        [int]$DenseLegacyGridX = 18,
+        [int]$DenseLegacyGridY = -5,
         [int]$WaterGridX = 0,
         [int]$WaterGridY = 0
     )
@@ -168,6 +174,9 @@ function Get-ScenarioArguments {
         $arguments += @("--assets", $ResolvedAssets, "--worldspace", $Worldspace)
         if ($Name -eq "water") {
             $arguments += @("--grid-x", "$WaterGridX", "--grid-y", "$WaterGridY")
+        } elseif ($Name -eq "dense-legacy") {
+            # The old dense place (18,-5), kept for one release so older baselines can be compared.
+            $arguments += @("--grid-x", "$DenseLegacyGridX", "--grid-y", "$DenseLegacyGridY")
         } elseif ($Name -in @("dense", "stability")) {
             $arguments += @("--grid-x", "$DenseGridX", "--grid-y", "$DenseGridY")
         } else {
@@ -345,6 +354,7 @@ foreach ($name in $requested) {
             -RunId "run-$run" -DirtyWorktree:$dirty -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds `
             -ResolvedAssets $resolvedAssets -Worldspace $Worldspace `
             -RuralGridX $RuralGridX -RuralGridY $RuralGridY -DenseGridX $DenseGridX -DenseGridY $DenseGridY `
+            -DenseLegacyGridX $DenseLegacyGridX -DenseLegacyGridY $DenseLegacyGridY `
             -WaterGridX $WaterGridX -WaterGridY $WaterGridY
         $runs += Invoke-EngineWindow -Engine $engine -Arguments $arguments -RunDirectory $runDirectory -Label "Profiling run $name/run-$run"
     }

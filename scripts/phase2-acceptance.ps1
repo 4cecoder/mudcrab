@@ -3,7 +3,10 @@ param(
     [string]$Assets,
     [string]$Worldspace = "0x3c",
     [int]$RuralGridX = 0, [int]$RuralGridY = 0,
-    [int]$DenseGridX = 0, [int]$DenseGridY = 0,
+    # Dense is Riverwood (3,-12, about 2,900 references within two cells). `dense-legacy` is the old
+    # dense place (18,-5, about 1,530), kept for one release; it runs only with -IncludeDenseLegacy.
+    [int]$DenseGridX = 3, [int]$DenseGridY = -12,
+    [int]$DenseLegacyGridX = 18, [int]$DenseLegacyGridY = -5,
     [int]$WaterGridX = 0, [int]$WaterGridY = 0,
     [int]$SyntheticSeconds = 120,
     [int]$WorldSeconds = 300,
@@ -18,6 +21,7 @@ param(
     [string]$OutputRoot,
     [switch]$UpdateBaseline,
     [switch]$RequireVisualSignoff,
+    [switch]$IncludeDenseLegacy,
     [switch]$Quick,
     [switch]$SkipQualityGates,
     [switch]$SkipRobustness,
@@ -283,6 +287,9 @@ else {
                 $worldBase = @("--assets", $resolvedAssets, "--worldspace", $Worldspace)
                 $scenarios += [ordered]@{ name = "rural"; seconds = $WorldSeconds; arguments = $worldBase + @("--grid-x", "$RuralGridX", "--grid-y", "$RuralGridY") }
                 $scenarios += [ordered]@{ name = "dense"; seconds = $WorldSeconds; arguments = $worldBase + @("--grid-x", "$DenseGridX", "--grid-y", "$DenseGridY") }
+                if ($IncludeDenseLegacy) {
+                    $scenarios += [ordered]@{ name = "dense-legacy"; seconds = $WorldSeconds; arguments = $worldBase + @("--grid-x", "$DenseLegacyGridX", "--grid-y", "$DenseLegacyGridY") }
+                }
                 $scenarios += [ordered]@{ name = "water"; seconds = $WorldSeconds; arguments = $worldBase + @("--grid-x", "$WaterGridX", "--grid-y", "$WaterGridY") }
                 $scenarios += [ordered]@{ name = "stress"; seconds = $StressSeconds; arguments = $worldBase + @("--grid-x", "$RuralGridX", "--grid-y", "$RuralGridY", "--stream-radius", "3", "--auto-fly-speed", "5000") }
                 $scenarios += [ordered]@{ name = "stability"; seconds = $StabilitySeconds; arguments = $worldBase + @("--grid-x", "$DenseGridX", "--grid-y", "$DenseGridY", "--auto-fly-speed", "900") }
@@ -369,6 +376,7 @@ Write-JsonFile $functional (Join-Path $campaign "functional-results.json")
 Write-JsonFile $performance (Join-Path $directories.performance "medians.json")
 $expectedScenarios = @("materials", "terrain-water", "transform-bounds", "renderer", "streaming", "synthetic")
 if ($resolvedAssets) { $expectedScenarios += @("rural", "dense", "water", "stress", "stability") }
+if ($resolvedAssets -and $IncludeDenseLegacy) { $expectedScenarios += "dense-legacy" }
 foreach ($scenario in $expectedScenarios) {
     if (-not $performance.Contains($scenario)) {
         [void]$failures.Add("required scenario was omitted: $scenario")

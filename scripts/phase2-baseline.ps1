@@ -2,9 +2,9 @@
 param(
     # Which scenes to measure. The default is the five the baseline compares: the synthetic scene
     # is the one a machine with no converted data can run, the four world scenes are the walk, the
-    # dense grid, the water and the streaming stress. `stability` is left out because it is a soak
+    # dense place (Riverwood), the water and the streaming stress. `stability` is left out because it is a soak
     # window (30 minutes by default), not a baseline; `all` selects it too.
-    [ValidateSet("all", "synthetic", "rural", "dense", "water", "stress", "stability")]
+    [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability")]
     [string[]]$Scenarios = @(),
     # The converted legal Skyrim asset set every world scenario loads. Not needed for `synthetic`.
     [string]$Assets,
@@ -18,12 +18,18 @@ param(
     # is used. The comparison is refused when the two runs' renderer backend or adapter differ.
     [string]$CompareTo,
     [string]$Worldspace = "0x3c",
+    # The standard places of docs/roadmap/02-acceptance.md, so the three world scenes measure three
+    # different places by default: the phase2-profile.ps1 defaults are 0,0 for rural and water.
+    # Dense is Riverwood (about 2,900 references within two cells); `dense-legacy` is the old dense
+    # place 18,-5 (about 1,530), kept for one release and not in the default set.
     [int]$RuralGridX = 0,
     [int]$RuralGridY = 0,
-    [int]$DenseGridX = 0,
-    [int]$DenseGridY = 0,
-    [int]$WaterGridX = 0,
-    [int]$WaterGridY = 0
+    [int]$DenseGridX = 3,
+    [int]$DenseGridY = -12,
+    [int]$DenseLegacyGridX = 18,
+    [int]$DenseLegacyGridY = -5,
+    [int]$WaterGridX = 7,
+    [int]$WaterGridY = -2
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,7 +45,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 # called with are put back afterwards, or a caller's -Assets and -DurationSeconds would be lost.
 $sharedNames = @(
     "Assets", "DurationSeconds", "StabilitySeconds", "Worldspace",
-    "RuralGridX", "RuralGridY", "DenseGridX", "DenseGridY", "WaterGridX", "WaterGridY"
+    "RuralGridX", "RuralGridY", "DenseGridX", "DenseGridY", "DenseLegacyGridX", "DenseLegacyGridY", "WaterGridX", "WaterGridY"
 )
 $requestedValues = @{}
 foreach ($name in $sharedNames) { $requestedValues[$name] = Get-Variable -Name $name -ValueOnly }
@@ -702,6 +708,7 @@ foreach ($name in $requested) {
                 -DurationSeconds $DurationSeconds -StabilitySeconds $StabilitySeconds `
                 -ResolvedAssets $resolvedAssets -Worldspace $Worldspace `
                 -RuralGridX $RuralGridX -RuralGridY $RuralGridY -DenseGridX $DenseGridX -DenseGridY $DenseGridY `
+                -DenseLegacyGridX $DenseLegacyGridX -DenseLegacyGridY $DenseLegacyGridY `
                 -WaterGridX $WaterGridX -WaterGridY $WaterGridY
             if ($null -eq $windowArguments) { $windowArguments = $arguments }
             $report = Invoke-EngineWindow -Engine $engine -Arguments $arguments -RunDirectory $runDirectory `

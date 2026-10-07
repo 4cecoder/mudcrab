@@ -32,12 +32,28 @@ Run the complete target-hardware campaign:
   -Assets D:\SkyrimConverted `
   -Worldspace 0x3c `
   -RuralGridX 0 -RuralGridY 0 `
-  -DenseGridX 18 -DenseGridY -5 `
+  -DenseGridX 3 -DenseGridY -12 `
   -WaterGridX 7 -WaterGridY -2 `
   -Repetitions 3 `
   -RequireVisualSignoff `
   -VisualReview D:\Evidence\visual-review.json
 ```
+
+The standard places (Tamriel, `0x3c`), with the references within two cells of each (measured from
+the converted world database):
+
+| Scene | Grid | References | Notes |
+| --- | --- | --- | --- |
+| `rural` | 0,0 | about 1,050 | the walk, and the centre of the `stress` flight |
+| `dense` | 3,-12 | about 2,900 | Riverwood, the densest cell neighbourhood in Tamriel |
+| `water` | 7,-2 | about 1,580 | |
+| `dense-legacy` | 18,-5 | about 1,530 | the old `dense` place; kept for one release, then removed |
+
+`dense-legacy` is accepted by the scripts but is not in the default scene sets. Baselines and
+`profiling-baseline.json` results made before this change are not comparable for `dense`, which is
+now a different, about twice as dense place: compare old results with `dense-legacy`.
+
+Pass `-IncludeDenseLegacy` to also run `dense-legacy`.
 
 Defaults are 2 minutes synthetic, 5 minutes per representative world area, 10 minutes streaming
 stress and 30 minutes stability. Each scenario is run three times and evaluated by its median.
