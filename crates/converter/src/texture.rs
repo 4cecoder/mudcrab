@@ -511,8 +511,9 @@ fn assemble_native_ktx2(
 }
 
 /// Writes a native KTX2 container around finished level bytes (faces or slices
-/// already concatenated per level). Each level is Zstandard compressed whole
-/// when `zstd_level > 0`.
+/// already concatenated per level), with the level data stored smallest-first
+/// as KTX 2.0 requires. Each level is Zstandard compressed whole when
+/// `zstd_level > 0`.
 fn write_native_ktx2(
     format: ktx2::Format,
     width: u32,
@@ -553,24 +554,15 @@ fn write_native_ktx2(
     output.extend_from_slice(&(dfd_bytes.len() as u32 + 4).to_le_bytes());
     output.extend_from_slice(&dfd_bytes);
 
-    let mut indexes = Vec::with_capacity(mip_count);
+    let mut stored = Vec::with_capacity(mip_count);
     for level_data in levels {
-        let uncompressed = level_data.len() as u64;
         // Supercompression applies to the complete assembled level (all of
         // its faces/slices), never to faces independently: independently
         // compressed faces would differ in length and break level assembly.
-        let stored = compress_level(level_data, zstd_level)?;
-        while !output.len().is_multiple_of(16) {
-            output.push(0);
-        }
-        let offset = output.len() as u64;
-        output.extend_from_slice(&stored);
-        indexes.push(ktx2::LevelIndex {
-            byte_offset: offset,
-            byte_length: stored.len() as u64,
-            uncompressed_byte_length: uncompressed,
-        });
+        let compressed = compress_level(level_data, zstd_level)?;
+        stored.push((compressed, level_data.len() as u64));
     }
+    let indexes = append_ktx2_levels_spec_order(&mut output, &stored);
 
     let mut header = header;
     if zstd_level > 0 {
@@ -595,12 +587,46 @@ fn compress_level(level: &[u8], zstd_level: i32) -> Result<Vec<u8>> {
     zstd::stream::encode_all(level, zstd_level).wrap_err("Zstandard supercompression failed")
 }
 
+/// Lays out finished level payloads in the order the KTX 2.0 spec requires
+/// for mip level data: the smallest level first, the base level last
+/// (section 3.7). `stored` holds each level's stored bytes and uncompressed
+/// byte length in index order (base level first, section 3.9.7); the
+/// returned index entries stay in index order, with offsets pointing at
+/// the payloads where they now sit. The 16-byte padding between levels
+/// keeps every offset a multiple of 16, which satisfies the alignment rule
+/// of sections 3.9.7 and 3.10 — lcm(texel block size, 4) for uncompressed
+/// data, no alignment for supercompressed data — for every format we write
+/// (texel blocks of 1, 4, 8 and 16 bytes).
+fn append_ktx2_levels_spec_order(
+    output: &mut Vec<u8>,
+    stored: &[(Vec<u8>, u64)],
+) -> Vec<ktx2::LevelIndex> {
+    let mut indexes = Vec::with_capacity(stored.len());
+    // Reversed: the smallest level, the last index entry, is written first.
+    for (bytes, uncompressed) in stored.iter().rev() {
+        while !output.len().is_multiple_of(16) {
+            output.push(0);
+        }
+        let byte_offset = output.len() as u64;
+        output.extend_from_slice(bytes);
+        indexes.push(ktx2::LevelIndex {
+            byte_offset,
+            byte_length: bytes.len() as u64,
+            uncompressed_byte_length: *uncompressed,
+        });
+    }
+    // Back to index order: the base level is entry 0.
+    indexes.reverse();
+    indexes
+}
+
 /// Rewrites a finished uncompressed KTX2 so each mip level is Zstandard
 /// compressed: header scheme set, level index rewritten with compressed
-/// and uncompressed lengths. Used by the UASTC fallback path, whose levels
-/// assemble uncompressed; the native path compresses during assembly.
-/// Levels that do not shrink are still stored compressed: the scheme is
-/// per-file, and a conformant reader handles any per-level ratio.
+/// and uncompressed lengths, level data re-laid-out smallest-first.
+/// Used by the UASTC fallback path, whose levels assemble uncompressed;
+/// the native path compresses during assembly. Levels that do not shrink
+/// are still stored compressed: the scheme is per-file, and a conformant
+/// reader handles any per-level ratio.
 pub(crate) fn supercompress_ktx2_levels(ktx2: &[u8], zstd_level: i32) -> Result<Vec<u8>> {
     if zstd_level <= 0 {
         return Ok(ktx2.to_vec());
@@ -618,20 +644,12 @@ pub(crate) fn supercompress_ktx2_levels(ktx2: &[u8], zstd_level: i32) -> Result<
         .min()
         .unwrap_or(ktx2.len());
     let mut output = ktx2[..first_data_offset].to_vec();
-    let mut indexes = Vec::with_capacity(reader.levels().len());
+    let mut stored = Vec::with_capacity(reader.levels().len());
     for level in reader.levels() {
-        let stored = compress_level(level.data, zstd_level)?;
-        while !output.len().is_multiple_of(16) {
-            output.push(0);
-        }
-        let offset = output.len() as u64;
-        output.extend_from_slice(&stored);
-        indexes.push(ktx2::LevelIndex {
-            byte_offset: offset,
-            byte_length: stored.len() as u64,
-            uncompressed_byte_length: level.data.len() as u64,
-        });
+        let compressed = compress_level(level.data, zstd_level)?;
+        stored.push((compressed, level.data.len() as u64));
     }
+    let indexes = append_ktx2_levels_spec_order(&mut output, &stored);
     header.supercompression_scheme = Some(ktx2::SupercompressionScheme::Zstandard);
     output[..ktx2::Header::LENGTH].copy_from_slice(&header.as_bytes());
     for (level, index) in indexes.iter().enumerate() {
@@ -801,7 +819,7 @@ fn combine_ktx2_mip_levels(template: &[u8], levels: &[Vec<u8>]) -> Result<Vec<u8
     let mut output = template[..first_data_offset].to_vec();
     reference.level_count = u32::try_from(level_count).wrap_err("too many DDS mip levels")?;
     output[..ktx2::Header::LENGTH].copy_from_slice(&reference.as_bytes());
-    let mut indexes = Vec::with_capacity(level_count);
+    let mut stored = Vec::with_capacity(level_count);
     for (mip, level) in levels.iter().enumerate() {
         let reader = ktx2::Reader::new(level)
             .map_err(|error| color_eyre::eyre::eyre!("invalid encoded DDS mip {mip}: {error:?}"))?;
@@ -817,21 +835,13 @@ fn combine_ktx2_mip_levels(template: &[u8], levels: &[Vec<u8>]) -> Result<Vec<u8
                 && header.supercompression_scheme == reference.supercompression_scheme,
             "encoded DDS mip {mip} has an incompatible layout"
         );
-        while !output.len().is_multiple_of(16) {
-            output.push(0);
-        }
-        let offset = output.len() as u64;
         let encoded = reader
             .levels()
             .next()
             .ok_or_else(|| color_eyre::eyre::eyre!("encoded DDS mip {mip} has no data"))?;
-        output.extend_from_slice(encoded.data);
-        indexes.push(ktx2::LevelIndex {
-            byte_offset: offset,
-            byte_length: encoded.data.len() as u64,
-            uncompressed_byte_length: encoded.uncompressed_byte_length,
-        });
+        stored.push((encoded.data.to_vec(), encoded.uncompressed_byte_length));
     }
+    let indexes = append_ktx2_levels_spec_order(&mut output, &stored);
     for (level, index) in indexes.iter().enumerate() {
         let start = ktx2::Header::LENGTH + level * ktx2::LevelIndex::LENGTH;
         output[start..start + ktx2::LevelIndex::LENGTH].copy_from_slice(&index.as_bytes());
@@ -1119,7 +1129,7 @@ fn combine_ktx2_volume(
     output[28..32].copy_from_slice(&depth.to_le_bytes());
     output[32..36].copy_from_slice(&0u32.to_le_bytes());
     output[36..40].copy_from_slice(&1u32.to_le_bytes());
-    let mut indexes = Vec::with_capacity(level_count);
+    let mut stored = Vec::with_capacity(level_count);
     for (mip, slices) in levels.iter().enumerate() {
         let expected_depth = (depth >> mip).max(1) as usize;
         ensure!(
@@ -1127,10 +1137,7 @@ fn combine_ktx2_volume(
             "KTX2 volume mip {mip} has {} slices, expected {expected_depth}",
             slices.len()
         );
-        while !output.len().is_multiple_of(16) {
-            output.push(0);
-        }
-        let offset = output.len() as u64;
+        let mut payload = Vec::new();
         let mut uncompressed_length = 0u64;
         for slice in slices {
             let reader = ktx2::Reader::new(slice)
@@ -1149,17 +1156,14 @@ fn combine_ktx2_volume(
                 .levels()
                 .next()
                 .ok_or_else(|| color_eyre::eyre::eyre!("KTX2 volume slice has no level"))?;
-            output.extend_from_slice(level.data);
+            payload.extend_from_slice(level.data);
             uncompressed_length = uncompressed_length
                 .checked_add(level.uncompressed_byte_length)
                 .ok_or_else(|| color_eyre::eyre::eyre!("KTX2 volume size overflow"))?;
         }
-        indexes.push(ktx2::LevelIndex {
-            byte_offset: offset,
-            byte_length: output.len() as u64 - offset,
-            uncompressed_byte_length: uncompressed_length,
-        });
+        stored.push((payload, uncompressed_length));
     }
+    let indexes = append_ktx2_levels_spec_order(&mut output, &stored);
     for (level, index) in indexes.iter().enumerate() {
         let start = ktx2::Header::LENGTH + level * ktx2::LevelIndex::LENGTH;
         output[start..start + ktx2::LevelIndex::LENGTH].copy_from_slice(&index.as_bytes());
@@ -1228,12 +1232,8 @@ fn combine_ktx2_cubemap_faces(faces: &[Vec<u8>]) -> Result<Vec<u8>> {
         .collect();
     let mut output = faces[0][..first_data_offset].to_vec();
     output[36..40].copy_from_slice(&6u32.to_le_bytes());
-    let mut indexes = Vec::with_capacity(level_count);
+    let mut stored = Vec::with_capacity(level_count);
     for level in 0..level_count {
-        while !output.len().is_multiple_of(16) {
-            output.push(0);
-        }
-        let offset = output.len() as u64;
         let face_length = face_levels[0][level].data.len();
         let face_uncompressed = face_levels[0][level].uncompressed_byte_length;
         for levels in &face_levels {
@@ -1242,14 +1242,14 @@ fn combine_ktx2_cubemap_faces(faces: &[Vec<u8>]) -> Result<Vec<u8>> {
                     && levels[level].uncompressed_byte_length == face_uncompressed,
                 "KTX2 cubemap face levels have incompatible sizes"
             );
-            output.extend_from_slice(levels[level].data);
         }
-        indexes.push(ktx2::LevelIndex {
-            byte_offset: offset,
-            byte_length: (face_length * 6) as u64,
-            uncompressed_byte_length: face_uncompressed.saturating_mul(6),
-        });
+        let payload = face_levels
+            .iter()
+            .flat_map(|levels| levels[level].data.iter().copied())
+            .collect::<Vec<u8>>();
+        stored.push((payload, face_uncompressed.saturating_mul(6)));
     }
+    let indexes = append_ktx2_levels_spec_order(&mut output, &stored);
     for (level, index) in indexes.iter().enumerate() {
         let start = ktx2::Header::LENGTH + level * ktx2::LevelIndex::LENGTH;
         output[start..start + ktx2::LevelIndex::LENGTH].copy_from_slice(&index.as_bytes());
@@ -2271,6 +2271,200 @@ mod tests {
         let metadata = inspect_ktx2(&ktx, TextureEncoding::ColorSrgb).unwrap();
         assert_eq!(metadata.faces, 6);
         assert_eq!(metadata.levels, 2);
+    }
+
+    /// The native path supercompresses an authored BC mip chain, and every
+    /// level still round-trips byte-for-byte through the level index after
+    /// Zstandard decompression.
+    #[test]
+    fn native_bc_mips_round_trip_through_the_index_smallest_first() {
+        let mut dds = Dds::new_dxgi(NewDxgiParams {
+            height: 8,
+            width: 8,
+            depth: None,
+            format: DxgiFormat::BC1_UNorm,
+            mipmap_levels: Some(3),
+            array_layers: None,
+            caps2: None,
+            is_cubemap: false,
+            resource_dimension: D3D10ResourceDimension::Texture2D,
+            alpha_mode: AlphaMode::Straight,
+        })
+        .unwrap();
+        for (index, byte) in dds.data.iter_mut().enumerate() {
+            *byte = (index * 11 + 5) as u8;
+        }
+        let mut bytes = Vec::new();
+        dds.write(&mut bytes).unwrap();
+
+        let ktx = TextureConverter::convert(&bytes, TextureEncoding::DataLinear).unwrap();
+        let reader = ktx2::Reader::new(&ktx).unwrap();
+        assert_eq!(reader.levels().len(), 3);
+        assert_ktx2_spec_level_order(&ktx);
+
+        let mut offset = 0;
+        for mip in 0..reader.levels().len() {
+            let decoded = decode_zstd_level(&ktx, mip);
+            assert_eq!(
+                decoded,
+                &dds.data[offset..offset + decoded.len()],
+                "mip {mip}"
+            );
+            offset += decoded.len();
+        }
+        assert_eq!(offset, dds.data.len(), "trailing DDS bytes");
+    }
+
+    /// Without supercompression the native writer must still store the
+    /// levels smallest-first, with every offset a multiple of
+    /// lcm(texel block size, 4): 16 for BC3 blocks.
+    #[test]
+    fn uncompressed_native_mips_store_level_data_smallest_first() {
+        let mut dds = Dds::new_dxgi(NewDxgiParams {
+            height: 8,
+            width: 8,
+            depth: None,
+            format: DxgiFormat::BC3_UNorm,
+            mipmap_levels: Some(3),
+            array_layers: None,
+            caps2: None,
+            is_cubemap: false,
+            resource_dimension: D3D10ResourceDimension::Texture2D,
+            alpha_mode: AlphaMode::Straight,
+        })
+        .unwrap();
+        for (index, byte) in dds.data.iter_mut().enumerate() {
+            *byte = (index * 13 + 7) as u8;
+        }
+        let mut bytes = Vec::new();
+        dds.write(&mut bytes).unwrap();
+
+        let ktx =
+            TextureConverter::convert_uncompressed(&bytes, TextureEncoding::DataLinear).unwrap();
+        let reader = ktx2::Reader::new(&ktx).unwrap();
+        assert_eq!(reader.header().supercompression_scheme, None);
+        assert_eq!(reader.levels().len(), 3);
+        assert_ktx2_spec_level_order(&ktx);
+
+        // Round trip through the index without decompression: the stored
+        // bytes are the level bytes.
+        let mut offset = 0;
+        for level in reader.levels() {
+            assert_eq!(level.data, &dds.data[offset..offset + level.data.len()]);
+            offset += level.data.len();
+        }
+        assert_eq!(offset, dds.data.len(), "trailing DDS bytes");
+    }
+
+    /// BC5 has no sRGB VkFormat, so a colour slot still takes the UASTC
+    /// path: per-mip encodings combined into one KTX2, then each level
+    /// Zstandard-supercompressed. Both the combined and the supercompressed
+    /// layouts must be smallest-first.
+    #[test]
+    fn uastc_combined_mips_store_level_data_smallest_first() {
+        let mut dds = Dds::new_dxgi(NewDxgiParams {
+            height: 8,
+            width: 8,
+            depth: None,
+            format: DxgiFormat::BC5_UNorm,
+            mipmap_levels: Some(3),
+            array_layers: None,
+            caps2: None,
+            is_cubemap: false,
+            resource_dimension: D3D10ResourceDimension::Texture2D,
+            alpha_mode: AlphaMode::Straight,
+        })
+        .unwrap();
+        for (index, byte) in dds.data.iter_mut().enumerate() {
+            *byte = (index * 17 + 11) as u8;
+        }
+        let mut bytes = Vec::new();
+        dds.write(&mut bytes).unwrap();
+
+        let ktx = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb).unwrap();
+        let reader = ktx2::Reader::new(&ktx).unwrap();
+        assert_eq!(reader.header().format, None, "BC5 in an sRGB slot is UASTC");
+        assert_eq!(
+            reader.header().supercompression_scheme,
+            Some(ktx2::SupercompressionScheme::Zstandard)
+        );
+        assert_eq!(reader.levels().len(), 3);
+        assert_ktx2_spec_level_order(&ktx);
+
+        // Supercompression off: the combined layout is the published file,
+        // uncompressed, so the offsets must meet the block-size alignment.
+        let ktx =
+            TextureConverter::convert_uncompressed(&bytes, TextureEncoding::ColorSrgb).unwrap();
+        let reader = ktx2::Reader::new(&ktx).unwrap();
+        assert_eq!(reader.header().supercompression_scheme, None);
+        assert_eq!(reader.levels().len(), 3);
+        assert_ktx2_spec_level_order(&ktx);
+    }
+
+    /// Volume slices assemble into one KTX2 whose level data is
+    /// smallest-first.
+    #[test]
+    fn volume_level_data_is_stored_smallest_first() {
+        let template = encode_basis_ktx2(
+            4,
+            4,
+            &[64, 64, 64, 255].repeat(16),
+            TextureEncoding::DataLinear,
+            true,
+            192,
+            2,
+        )
+        .unwrap();
+        let levels: Vec<Vec<Vec<u8>>> = [(4, 4, 4), (2, 2, 2), (1, 1, 1)]
+            .into_iter()
+            .map(|(width, height, depth)| {
+                (0..depth)
+                    .map(|slice| {
+                        encode_basis_ktx2(
+                            width,
+                            height,
+                            &[slice as u8 * 20, 80, 120, 255].repeat((width * height) as usize),
+                            TextureEncoding::DataLinear,
+                            false,
+                            192,
+                            2,
+                        )
+                        .unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let volume = combine_ktx2_volume(&template, &levels, 4, 4, 4).unwrap();
+        let reader = ktx2::Reader::new(&volume).unwrap();
+        assert_eq!(reader.header().level_count, 3);
+        assert_ktx2_spec_level_order(&volume);
+    }
+
+    /// Cubemap faces assemble into one KTX2 whose level data is
+    /// smallest-first, and stay that way through Zstandard
+    /// supercompression.
+    #[test]
+    fn cubemap_level_data_is_stored_smallest_first() {
+        let faces: Vec<_> = (0..6)
+            .map(|face| {
+                let pixels = [face * 20, 64, 128, 255].repeat(16);
+                encode_basis_ktx2(4, 4, &pixels, TextureEncoding::ColorSrgb, true, 192, 2).unwrap()
+            })
+            .collect();
+
+        let cubemap = combine_ktx2_cubemap_faces(&faces).unwrap();
+        let reader = ktx2::Reader::new(&cubemap).unwrap();
+        assert_eq!(reader.header().level_count, 3);
+        assert_ktx2_spec_level_order(&cubemap);
+
+        let supercompressed = supercompress_ktx2_levels(&cubemap, 6).unwrap();
+        let reader = ktx2::Reader::new(&supercompressed).unwrap();
+        assert_eq!(
+            reader.header().supercompression_scheme,
+            Some(ktx2::SupercompressionScheme::Zstandard)
+        );
+        assert_ktx2_spec_level_order(&supercompressed);
     }
 
     #[test]
@@ -3565,6 +3759,86 @@ mod tests {
         assert_eq!(metadata.height, dds.get_height());
         assert_eq!(metadata.levels, dds.get_num_mipmap_levels());
         assert_eq!(metadata.faces, 1);
+    }
+
+    /// Least common multiple, for the KTX 2.0 level-offset alignment rule
+    /// (section 3.9.7 / 3.10: lcm(texel block size, 4) for uncompressed
+    /// data).
+    fn lcm(a: u64, b: u64) -> u64 {
+        let (mut x, mut y) = (a, b);
+        while y != 0 {
+            let remainder = x % y;
+            x = y;
+            y = remainder;
+        }
+        a / x * b
+    }
+
+    /// Asserts the mip level layout every KTX2 writer must produce: level
+    /// data smallest-first as KTX 2.0 section 3.7 requires, with the level
+    /// index largest-first (section 3.9.7), so level 0 has the largest
+    /// offset and offsets strictly decrease as the level number rises;
+    /// levels never overlap; every offset meets the section 3.10 alignment
+    /// rule (lcm(texel block size, 4) for uncompressed data, no constraint
+    /// for supercompressed); and the last level ends inside the file.
+    fn assert_ktx2_spec_level_order(bytes: &[u8]) {
+        let reader = ktx2::Reader::new(bytes).expect("readable KTX2");
+        let header = reader.header();
+        let level_count = header.level_count.max(1) as usize;
+        let entries: Vec<_> = (0..level_count)
+            .map(|level| {
+                let start = ktx2::Header::LENGTH + level * ktx2::LevelIndex::LENGTH;
+                let entry: [u8; ktx2::LevelIndex::LENGTH] = bytes
+                    [start..start + ktx2::LevelIndex::LENGTH]
+                    .try_into()
+                    .expect("fixed-size KTX2 level index");
+                ktx2::LevelIndex::from_bytes(&entry)
+            })
+            .collect();
+        assert_eq!(
+            entries.len(),
+            reader.levels().count(),
+            "level index does not match the reader"
+        );
+
+        let alignment = if header.supercompression_scheme.is_some() {
+            1
+        } else {
+            // bytesPlane[0] of the basic DFD block is the texel block size.
+            let texel_block = reader
+                .basic_dfd()
+                .map_or(1u64, |dfd| dfd.bytes_planes[0].into());
+            lcm(texel_block, 4)
+        };
+        for (level, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry.byte_offset % alignment,
+                0,
+                "level {level} offset {} is not {alignment}-aligned",
+                entry.byte_offset
+            );
+            assert!(
+                entry.byte_offset + entry.byte_length <= bytes.len() as u64,
+                "level {level} ends outside the file"
+            );
+            if level + 1 < entries.len() {
+                let smaller = &entries[level + 1];
+                // The smaller level sits earlier in the file: strictly before
+                // this level's payload starts. Ties are only possible for a
+                // zero-length level.
+                assert!(
+                    smaller.byte_offset < entry.byte_offset
+                        || (smaller.byte_offset == entry.byte_offset && smaller.byte_length == 0),
+                    "level {} must sit before level {level} in the file",
+                    level + 1
+                );
+                assert!(
+                    smaller.byte_offset + smaller.byte_length <= entry.byte_offset,
+                    "level {} overlaps level {level}",
+                    level + 1
+                );
+            }
+        }
     }
 
     fn decode_zstd_level(bytes: &[u8], mip: usize) -> Vec<u8> {

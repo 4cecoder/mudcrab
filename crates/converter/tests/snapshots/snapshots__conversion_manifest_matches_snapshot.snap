@@ -85,7 +85,7 @@ expression: manifest
     "textures/generated_color.dds": {
       "output": "textures/generated_color.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 3169,
+      "output_size": 3177,
       "source_hash": "[source_hash]"
     },
     "textures/generated_color_x8.dds": {
@@ -109,7 +109,7 @@ expression: manifest
     "textures/generated_volume.dds": {
       "output": "textures/generated_volume.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 2689,
+      "output_size": 2697,
       "source_hash": "[source_hash]"
     }
   },
