@@ -82,7 +82,9 @@ pub fn write_uastc(
     put_u32(&mut out, 56, kvd_offset);
     put_u32(&mut out, 60, kvd.len() as u32);
     out.extend_from_slice(&kvd);
-    for (level, data) in levels.iter().enumerate() {
+    // KTX 2.0 section 3.7: level data is stored smallest-first, while the level index
+    // (section 3.9.7) keeps the base level at entry 0.
+    for (level, data) in levels.iter().enumerate().rev() {
         while !out.len().is_multiple_of(16) {
             out.push(0);
         }
@@ -152,6 +154,19 @@ mod tests {
         let reader = ::ktx2::Reader::new(&raw[..]).unwrap();
         for (level, expected) in reader.levels().zip(&levels) {
             assert_eq!(level.data, &expected[..]);
+        }
+        // Both files store the level data smallest-first (KTX 2.0 section 3.7).
+        for bytes in [&raw, &packed] {
+            let offsets: Vec<u64> = (0..levels.len())
+                .map(|level| {
+                    let start = HEADER_LEN + level * LEVEL_INDEX_LEN;
+                    u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap())
+                })
+                .collect();
+            assert!(
+                offsets.windows(2).all(|pair| pair[0] > pair[1]),
+                "level data must be stored smallest-first: {offsets:?}"
+            );
         }
     }
 }
