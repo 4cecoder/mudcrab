@@ -137,6 +137,11 @@ table independently of these derived caches.
   aborts the transactional publication when any required texture fails.
 - Asset paths use one lowercase canonical key. Archive overlays follow plugin load order, loose
   files have highest priority, and normalized collisions inside one source layer are fatal.
+  An archive's full filename attaches to the last selected plugin whose stem is followed by
+  ` - ` or `.`. Archives with the same owner use lowercase filename order; unattached archives
+  follow attached ones. This deterministic tie policy has not been established as equivalent
+  to every mod manager's archive insertion order. BSA header file-type categories are advisory;
+  unknown category bits do not relax layout, count, offset or compression validation.
 - Supports runtime transcoding into WebGPU/Vulkan native compressed formats (BC1/BC7 for Desktop, ASTC/ETC2 for Mobile/Web).
 
 ### C. World & Scene Database (`.esm` ➔ `SQLite3` + `rkyv` Zero-Copy Cache)
