@@ -16,6 +16,7 @@ pub mod inhouse_ai;
 pub mod inhouse_audio_extras;
 pub mod inhouse_conditions;
 pub mod inhouse_dialogue;
+pub mod inhouse_history;
 pub mod inhouse_items;
 pub mod inhouse_magic;
 pub mod inhouse_perks;

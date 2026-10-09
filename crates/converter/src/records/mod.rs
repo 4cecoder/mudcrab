@@ -1,6 +1,7 @@
 //! Authored schema-driven Skyrim records, independent of the legacy field decoder.
 pub mod deciders;
 mod decoder;
+pub mod history;
 mod scanner;
 pub mod schema_format;
 pub mod vmad;
@@ -137,6 +138,8 @@ pub struct ReadResult {
     pub headers: Vec<DecodedRecord>,
     pub diagnostics: BTreeMap<String, PluginDiagnostics>,
     pub overrides: HashMap<u32, Vec<RecordSource>>,
+    /// Physical header provenance includes accepted, deleted and rejected versions.
+    pub history: Vec<history::HistoryEntry>,
 }
 
 /// Lazily parse the schema already validated by the build script.
@@ -190,16 +193,37 @@ pub(crate) fn read_plugins_with_validation_and_observer(
         let name = &order.names[index];
         let mut diagnostics = PluginDiagnostics::default();
         let mut seen = HashMap::new();
-        scanner::scan_plugin(path, &mut diagnostics, |scanned, diagnostics| {
+        let history = std::cell::RefCell::new(Vec::<history::HistoryEntry>::new());
+        let observe = |header| {
+            history
+                .borrow_mut()
+                .push(history::header_entry(header, order, index));
+        };
+        scanner::scan_plugin(path, &mut diagnostics, observe, |scanned, diagnostics| {
+            let offset = scanned.source_record_offset;
             let context = decoder::Context {
                 order,
                 plugin_index: index,
                 localized: order.metadata[index].flags & 0x80 != 0,
                 winning_types: None,
             };
-            let mut record = match decoder::decode(scanned, schema, &context, diagnostics) {
+            let mut identity = |name: &str| {
+                if let Some(entry) = history.borrow_mut().last_mut() {
+                    entry.editor_id = Some(name.to_ascii_lowercase());
+                }
+            };
+            let mut record = match decoder::decode_with_identity(
+                scanned,
+                schema,
+                &context,
+                diagnostics,
+                &mut identity,
+            ) {
                 Ok(record) => record,
                 Err(error) => {
+                    if let Some(entry) = history.borrow_mut().last_mut() {
+                        entry.reason = Some(error.clone());
+                    }
                     diagnostics.note("record", || error);
                     return;
                 }
@@ -208,9 +232,28 @@ pub(crate) fn read_plugins_with_validation_and_observer(
                 result.headers.push(record);
                 return;
             }
+            if let Some(entry) = history.borrow_mut().last_mut() {
+                entry.form_id = Some(record.form_id);
+                entry.editor_id = (record.record_type == *b"GMST")
+                    .then(|| {
+                        record.fields.iter().find_map(|field| {
+                            if field.signature == *b"EDID"
+                                && let Value::String(name) = &field.value
+                            {
+                                Some(name.to_ascii_lowercase())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .flatten();
+            }
             if record.flags & 0x20 == 0
                 && let Err(error) = validate(&record)
             {
+                if let Some(entry) = history.borrow_mut().last_mut() {
+                    entry.reason = Some(format!("unusable runtime candidate: {error}"));
+                }
                 diagnostics.note("record", || {
                     format!(
                         "{} {:08X}: unusable runtime candidate: {error}",
@@ -283,6 +326,12 @@ pub(crate) fn read_plugins_with_validation_and_observer(
                 source_form_id: source_id,
                 deleted: record.flags & 0x20 != 0,
             };
+            if let Some(entry) = history.borrow_mut().last_mut() {
+                debug_assert_eq!(entry.source_record_offset, offset);
+                entry.form_id = Some(record.form_id);
+                entry.accepted = true;
+                entry.reason = None;
+            }
             if let Some(previous) = result.records.get(&record.form_id) {
                 result
                     .overrides
@@ -306,8 +355,10 @@ pub(crate) fn read_plugins_with_validation_and_observer(
                 result.records.insert(record.form_id, record);
             }
         })?;
+        result.history.extend(history.into_inner());
         result.diagnostics.insert(name.clone(), diagnostics);
     }
+    history::reconcile_gmst(&mut result.history, &gmst_ids);
     decoder::resolve_deferred(&mut result, schema, order);
     observe(&result);
     decoder::validate_targets(&mut result, schema, order);

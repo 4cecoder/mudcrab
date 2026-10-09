@@ -278,6 +278,17 @@ pub(crate) fn decode(
     context: &Context<'_>,
     diagnostics: &mut PluginDiagnostics,
 ) -> Result<DecodedRecord, String> {
+    decode_with_identity(scanned, schema, context, diagnostics, &mut |_| {})
+}
+
+/// Observe only a successfully decoded GMST EDID, even if a later field rejects the record.
+pub(crate) fn decode_with_identity(
+    scanned: ScannedRecord,
+    schema: &Schema,
+    context: &Context<'_>,
+    diagnostics: &mut PluginDiagnostics,
+    identity: &mut impl FnMut(&str),
+) -> Result<DecodedRecord, String> {
     let id = remap(scanned.source_form_id, context, false, diagnostics)?;
     if id == 0 && !matches!(&scanned.record_type, b"GMST" | b"TES4") {
         return Err("non-GMST record has null FormID".into());
@@ -436,6 +447,9 @@ pub(crate) fn decode(
                     && let Value::String(name) = &value
                 {
                     editor_id.clone_from(name);
+                    if scanned.record_type == *b"GMST" {
+                        identity(name);
+                    }
                 }
                 fields.push(DecodedField {
                     signature,
