@@ -108,6 +108,62 @@ CREATE INDEX IF NOT EXISTS idx_records_type ON records(record_type);
 
 ---
 
+### Draft: optional in-house override history (`record_overrides`)
+
+The prototype in-house producer adds a tooling table containing each physically
+framed source record, including singletons, deleted versions and rejected
+candidates. Runtime readers continue to query the existing winning-record
+tables. No losing payload or decoded field set is retained for history during
+conversion. Singletons are explicit: this makes complete physical-header audits
+and lazy version lookup uniform without a second implicit representation.
+
+`record_overrides` has a physical primary key `(plugin_id, source_record_offset)`
+and a `(form_id, chain_position)` lookup index. Columns are canonical `form_id`,
+zero-based `chain_position`, `plugin_id` referencing `plugins.id`, native
+`source_form_id`, `deleted`, `record_type`, `flags`, `source_record_offset`,
+`source_record_size`, `status`, `reason`, native enclosing cell/world/topic IDs
+and topic-group offset. `source_record_offset` points at the 24-byte native
+header; size is the declared on-disk payload length, including the compressed
+size word when present and excluding the header. Unmappable identities are NULL
+and remain identifiable by plugin, offset and native FormID. Positions follow
+load order, then physical source offset; duplicate physical IDs stay distinct.
+
+`accepted` versions participate in the existing winner/deletion policy;
+`skipped` versions retain a reason and do not displace usable predecessors.
+The last accepted version is the source winner unless it deletes the record.
+GMST history uses the reader's canonical EditorID aliases, including an already
+decoded EditorID when a later mandatory field rejects that version. Broken
+EditorID framing retains the raw numeric alias; history does not guess an ID.
+Each TES4 row uses a NULL canonical identity
+and status `header`, and stores original master-list JSON, source path and the
+authored schema hash. These small metadata rows allow replay to reconstruct
+original full/light mapping without reading another missing or changed plugin.
+They are excluded from ordinary record-chain counts. Their deterministic positions
+in the NULL-identity group are header ordering, not a semantic record chain.
+
+`inhouse-records history <pack> <hex FormID> [--data DIR] [--json]` opens the
+database read-only and verifies each source against `plugins.checksum` before
+decoding the requested offset with the producing schema. Changed, missing,
+oversized or undecodable versions remain local diagnostics; other versions
+continue. The text view aligns authored field names and occurrences and marks
+differences. This is decoded source provenance, not a merge or patch format;
+partial decoding and unsupported semantic roles retain their existing limits.
+
+This optional additive tooling table does not change the runtime database
+contract, accepted version range or asset encodings. World and converter asset
+schema constants therefore remain unchanged. In-house adapter identity advances
+from 4 to 5, invalidating older in-house provenance output through the existing
+reader/configuration identity. This distinguishes a tooling-only addition from
+SPEC V29/V73/V112 changes to runtime or reusable asset output contracts. No
+older texture or mesh bytes are relabeled. The existing global in-house
+configuration hash includes the adapter identity for asset cache entries too:
+normal conversion rejects adapter-4 cache reuse despite unchanged encodings.
+Metadata-only rebuilds retain verified assets under their existing reuse rules.
+Header rows bind the exact authored
+schema; a different schema is reported as undecodable rather than silently
+interpreting an old pack with new definitions. Deterministic sorted insertion
+and an explicit physical primary key make ordered history contents reproducible.
+
 ### 3. Worldspace Registry (`worldspaces`)
 
 Stores worldspace hierarchy and parent world relations (e.g. Tamriel `0x0000003C`, Solstheim).

@@ -837,6 +837,25 @@ async fn inhouse_bad_overrides_preserve_prior_movement_and_authored_heights() {
             0
         )
     );
+    // History lists both versions; the torn one is skipped with its reason.
+    let mut chain = db
+        .prepare("SELECT status, reason FROM record_overrides WHERE form_id = 3072 ORDER BY chain_position")
+        .unwrap();
+    let chain: Vec<(String, Option<String>)> = chain
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        chain,
+        vec![
+            ("accepted".to_owned(), None),
+            (
+                "skipped".to_owned(),
+                Some("incomplete override keeps the earlier complete version".to_owned())
+            ),
+        ]
+    );
 }
 
 /// Repeated metadata rebuilds retain the original asset reader identity and verified bytes.

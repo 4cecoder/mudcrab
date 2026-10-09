@@ -22,7 +22,7 @@ use std::{
 };
 
 /// Decoder/adapter behavior version for output changes outside the authored schema.
-pub const ADAPTER_VERSION: u32 = 4;
+pub const ADAPTER_VERSION: u32 = 5;
 
 /// Identity binds decoder behavior and schema bytes so stale output cannot prove reuse.
 pub fn reader_identity(reader: RecordReader) -> serde_json::Value {
@@ -441,6 +441,7 @@ fn convert_plugins_with_dump(
             params![id, record.source_form_id, record.load_order, String::from_utf8_lossy(&record.record_type), record.flags, record.raw_payload],
         )?;
     }
+    records::history::write_tables(&tx, &decoded.history, &order, plugin_paths)?;
     tx.commit()?;
     if let Some(staging) = db_path.parent() {
         let path = staging.join("inhouse-reader-diagnostics.json");

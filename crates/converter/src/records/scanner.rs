@@ -24,6 +24,20 @@ pub(crate) struct ScannedRecord {
     pub payload: Vec<u8>,
 }
 
+/// Header-only observation also covers safely identified records whose payload cannot be read.
+pub(crate) struct ObservedHeader {
+    pub record_type: [u8; 4],
+    pub source_form_id: u32,
+    pub flags: u32,
+    pub source_record_offset: u64,
+    pub source_record_size: u32,
+    pub cell_form_id: Option<u32>,
+    pub worldspace_form_id: Option<u32>,
+    pub source_topic_form_id: Option<u32>,
+    pub topic_group_offset: Option<u64>,
+    pub failure: Option<String>,
+}
+
 /// Read a checked four-byte integer from framing bytes.
 fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("checked frame"))
@@ -33,6 +47,7 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
 pub(crate) fn scan_plugin(
     path: &Path,
     diagnostics: &mut PluginDiagnostics,
+    mut observe: impl FnMut(ObservedHeader),
     mut receive: impl FnMut(ScannedRecord, &mut PluginDiagnostics),
 ) -> Result<()> {
     let file = File::open(path).wrap_err_with(|| format!("open {}", path.display()))?;
@@ -46,15 +61,26 @@ pub(crate) fn scan_plugin(
         diagnostics.note("record", || "input has no complete TES4 header".into());
         return Ok(());
     }
-    scan_bytes(&map, diagnostics, &mut receive);
+    scan_bytes_observed(&map, diagnostics, &mut receive, &mut observe);
     Ok(())
 }
 
 /// Traverse groups iteratively, retaining siblings when an inner boundary is corrupt.
+#[cfg(test)]
 fn scan_bytes(
     bytes: &[u8],
     diagnostics: &mut PluginDiagnostics,
     receive: &mut impl FnMut(ScannedRecord, &mut PluginDiagnostics),
+) {
+    scan_bytes_observed(bytes, diagnostics, receive, &mut |_| {});
+}
+
+/// Keep history observation separate from payload allocation and existing recovery policy.
+fn scan_bytes_observed(
+    bytes: &[u8],
+    diagnostics: &mut PluginDiagnostics,
+    receive: &mut impl FnMut(ScannedRecord, &mut PluginDiagnostics),
+    observe: &mut impl FnMut(ObservedHeader),
 ) {
     let mut position = 0;
     let mut end = bytes.len();
@@ -108,7 +134,28 @@ fn scan_bytes(
             position += 24;
             continue;
         }
+        let mut observed = ObservedHeader {
+            record_type: signature,
+            source_form_id: u32_at(header, 12),
+            flags: u32_at(header, 8),
+            source_record_offset: position as u64,
+            source_record_size: size as u32,
+            cell_form_id: cell,
+            worldspace_form_id: world,
+            source_topic_form_id: (signature == *b"INFO")
+                .then_some(topic)
+                .flatten()
+                .map(|(id, _)| id),
+            topic_group_offset: (signature == *b"INFO")
+                .then_some(topic)
+                .flatten()
+                .map(|(_, offset)| offset),
+            failure: None,
+        };
         if size > end - position - 24 {
+            observed.failure =
+                Some("truncated record payload; containing group remainder skipped".into());
+            observe(observed);
             diagnostics.note("record", || {
                 format!(
                     "truncated {} {:08X} at byte {position}; skipping containing group remainder",
@@ -128,6 +175,8 @@ fn scan_bytes(
             match inflate(payload) {
                 Ok(bytes) => bytes,
                 Err(error) => {
+                    observed.failure = Some(error.clone());
+                    observe(observed);
                     diagnostics.note("record", || {
                         format!(
                             "{} {source_form_id:08X}: {error}",
@@ -140,6 +189,7 @@ fn scan_bytes(
         } else {
             payload.to_vec()
         };
+        observe(observed);
         receive(
             ScannedRecord {
                 record_type: signature,
@@ -171,7 +221,7 @@ fn scan_bytes(
 }
 
 /// Require exactly one complete zlib stream, with a 64 MiB per-record ceiling.
-fn inflate(payload: &[u8]) -> std::result::Result<Vec<u8>, String> {
+pub(crate) fn inflate(payload: &[u8]) -> std::result::Result<Vec<u8>, String> {
     if payload.len() < 4 {
         return Err("compressed record lacks size".into());
     }
