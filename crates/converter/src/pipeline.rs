@@ -12,7 +12,7 @@ use crate::{
         cell_cache::write_cell_cache,
         exporter::validate_database,
         lodsettings::{LodSettings, sidecar_path},
-        read_plugins_txt,
+        plugins_txt::read_with_notices,
     },
     integration::{IntegrationReport, finalize_world_database_with_sources},
     lod::{
@@ -447,6 +447,7 @@ impl AssetPipeline {
             .wrap_err("MO2 resolver worker panicked")?;
             interrupt(cancellation)?;
             let resolved = resolved?;
+            report.notices.extend(resolved.notices);
             // Rebuild archive-derived inputs on resume; loose assets are read directly from
             // their winning source paths. Remove legacy copied inputs from older runs too.
             for root in [staging.join(".mo2-input")] {
@@ -475,6 +476,19 @@ impl AssetPipeline {
             .collect();
         let plugins = match mo2_plugins {
             Some(plugins) => {
+                let profile = &config.mo2.as_ref().unwrap().profile;
+                let mut recovery_notices = Vec::new();
+                let plugins =
+                    crate::esm::plugins_txt::recover_with_notices(plugins, &mut recovery_notices);
+                report.notices.extend(
+                    recovery_notices
+                        .into_iter()
+                        .map(|notice| format!("MO2 profile {profile}: {notice}")),
+                );
+                ensure!(
+                    !plugins.is_empty(),
+                    "MO2 profile {profile}: no usable active plugins remain"
+                );
                 crate::esm::load_order::LoadOrder::read(&plugins).wrap_err_with(|| {
                     format!(
                         "MO2 profile {}: invalid plugin/master order",
@@ -493,7 +507,14 @@ impl AssetPipeline {
                 progress_tx,
                 ProgressStage::Discovering,
                 None,
-                &format!("note: {notice}"),
+                &format!(
+                    "{}: {notice}",
+                    if config.plugins_file.is_some() || config.mo2.is_some() {
+                        "warning"
+                    } else {
+                        "note"
+                    }
+                ),
             )
             .await;
         }
@@ -2211,7 +2232,13 @@ pub(crate) fn plugin_paths(
     notices: &mut Vec<String>,
 ) -> Result<Vec<PathBuf>> {
     if let Some(path) = &config.plugins_file {
-        return read_plugins_txt(path, &config.data_dir);
+        return read_with_notices(
+            path,
+            &config.data_dir,
+            config.skyrim_ccc_file.as_deref(),
+            config.skyrim_ini_file.as_deref(),
+            notices,
+        );
     }
     let discovered: Vec<_> = files
         .iter()
@@ -2246,14 +2273,10 @@ pub(crate) fn plugin_paths(
             .unwrap_or_default()
             .to_string_lossy()
             .to_ascii_lowercase();
-        let rank = match name.as_str() {
-            "skyrim.esm" => 0,
-            "update.esm" => 1,
-            "dawnguard.esm" => 2,
-            "hearthfires.esm" => 3,
-            "dragonborn.esm" => 4,
-            _ => 10,
-        };
+        let rank = crate::esm::OFFICIAL_MASTERS
+            .iter()
+            .position(|official| official.eq_ignore_ascii_case(&name))
+            .unwrap_or(10);
         (rank, name)
     });
     crate::esm::load_order::order_discovered_plugins(plugins)

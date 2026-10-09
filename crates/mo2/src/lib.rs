@@ -5,8 +5,12 @@ use color_eyre::{
     eyre::{WrapErr, bail, ensure},
 };
 use serde::{Deserialize, Serialize};
+use shared::plugin_selection::{
+    Warnings, decode_windows_1252, parse_plugin_entries, parse_plugin_order, read_skyrim_ccc,
+    select_plugin_names,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -36,22 +40,9 @@ pub struct Instance {
 pub struct Resolved {
     pub files: BTreeMap<String, PathBuf>,
     pub plugins: Vec<String>,
+    /// Recoverable profile selection problems for converter progress and reports.
+    pub notices: Vec<String>,
 }
-
-pub const OFFICIAL_MASTERS: &[&str] = &[
-    "skyrim.esm",
-    "update.esm",
-    "dawnguard.esm",
-    "hearthfires.esm",
-    "dragonborn.esm",
-    // Bundled creations and the resource pack are implicitly enabled by Skyrim SE,
-    // so MO2 can omit them from plugins.txt while retaining them in loadorder.txt.
-    "ccbgssse001-fish.esm",
-    "ccqdrsse001-survivalmode.esl",
-    "ccbgssse037-curios.esl",
-    "ccbgssse025-advdsgs.esm",
-    "_resourcepack.esl",
-];
 
 impl Instance {
     /// Opens an MO2 instance, resolves configured directories, and discovers sorted profile names.
@@ -196,6 +187,9 @@ impl Instance {
     /// Resolves winning files and plugin order for a profile without cancellation.
     ///
     /// Enabled mods overlay the base Data directory in priority order; overwrite files take precedence.
+    /// Official masters and game-folder CCC plugins stay implicitly active. Profile lists use
+    /// Windows-1252 and loadorder.txt; omitted active entries append in plugins.txt order.
+    /// Recoverable list problems are returned in `Resolved::notices`.
     pub fn resolve(&self, data: &Path, profile: &str) -> Result<Resolved> {
         self.resolve_with_cancel(data, profile, &|| false)
     }
@@ -240,58 +234,68 @@ impl Instance {
             overlay(root, &mut files, cancelled)?;
         }
         overlay(&self.overwrite_dir, &mut files, cancelled)?;
-        let active_text = fs::read_to_string(child(&profile_dir, "plugins.txt")?)?;
-        let mut active = BTreeSet::new();
-        let mut active_order = Vec::new();
-        for line in lines(&active_text) {
-            let enabled = self.classic_skyrim || line.starts_with('*');
-            let name = line.strip_prefix('*').unwrap_or(line).trim();
-            plugin_name(name)?;
-            if enabled {
-                let name = name.to_ascii_lowercase();
-                ensure!(
-                    active.insert(name.clone()),
-                    "MO2 profile {profile}: duplicate active plugin {name}"
-                );
-                active_order.push(name);
-            }
-        }
-        let mut plugins = Vec::new();
-        for &master in OFFICIAL_MASTERS {
-            if files.contains_key(master) {
-                plugins.push(master.to_owned());
-            }
-        }
-        let order_path = optional_child(&profile_dir, "loadorder.txt")?;
-        let order = match order_path {
-            Some(path) => fs::read_to_string(path)?,
-            None => active_order.join("\n"),
+        let active_path = child(&profile_dir, "plugins.txt")
+            .wrap_err_with(|| format!("MO2 profile {profile}: locating required plugins.txt"))?;
+        let active_bytes = fs::read(active_path)
+            .wrap_err_with(|| format!("MO2 profile {profile}: reading plugins.txt"))?;
+        let mut warnings = Warnings::default();
+        let entries = parse_plugin_entries(
+            &decode_windows_1252(&active_bytes),
+            self.classic_skyrim,
+            &mut warnings,
+        );
+        let order = match optional_child(&profile_dir, "loadorder.txt")? {
+            Some(path) => match fs::read(&path) {
+                Ok(bytes) => Some(parse_plugin_order(
+                    &decode_windows_1252(&bytes),
+                    &mut warnings,
+                )),
+                Err(error) => {
+                    warnings.add(format!("could not read optional loadorder.txt {}: {error}; using plugins.txt order", path.display()));
+                    None
+                }
+            },
+            None => None,
         };
-        let mut ordered = BTreeSet::new();
-        for name in lines(&order) {
-            plugin_name(name)?;
-            let name = name.to_ascii_lowercase();
-            ensure!(
-                ordered.insert(name.clone()),
-                "MO2 profile {profile}: duplicate loadorder plugin {name}"
-            );
-            if active.contains(&name) && !plugins.contains(&name) {
-                plugins.push(name);
+        let game_folder = data.parent().unwrap_or(data);
+        let creations = match optional_child(game_folder, "Skyrim.ccc") {
+            Ok(Some(path)) => read_skyrim_ccc(&path),
+            Ok(None) => Err(color_eyre::eyre::eyre!("file is missing")),
+            Err(error) => Err(error),
+        };
+        let creations = match creations {
+            Ok(names) => names,
+            Err(error) => {
+                warnings.add(format!(
+                    "could not read optional Skyrim.ccc {}: {error:?}",
+                    game_folder.join("Skyrim.ccc").display()
+                ));
+                Vec::new()
             }
+        };
+        let installed: HashSet<_> = files.keys().cloned().collect();
+        let plugins = select_plugin_names(
+            &entries,
+            &installed,
+            &creations,
+            &[],
+            order.as_deref(),
+            &mut warnings,
+        );
+        let mut notices = Vec::new();
+        warnings.finish(&mut notices);
+        for notice in &mut notices {
+            *notice = format!("MO2 profile {profile}: {notice}");
         }
-        for name in active_order {
-            ensure!(
-                plugins.contains(&name),
-                "MO2 profile {profile}: active plugin absent from loadorder.txt: {name}"
-            );
-        }
-        for name in &plugins {
-            ensure!(
-                files.contains_key(name),
-                "MO2 profile {profile}: active plugin missing from merged Data: {name}"
-            );
-        }
-        Ok(Resolved { files, plugins })
+        ensure!(
+            !plugins.is_empty(),
+            "MO2 profile {profile}: no usable active plugins remain after profile selection"
+        );
+        Ok(Resolved {
+            files,
+            plugins,
+            notices,
+        })
     }
 }
 
@@ -372,21 +376,6 @@ fn safe_name(name: &str) -> Result<()> {
     ensure!(
         !["con", "prn", "aux", "nul"].contains(&stem.as_str()) && !numbered_device,
         "unsafe Windows device path component: {name:?}"
-    );
-    Ok(())
-}
-
-/// Validates a safe plugin filename with an ESM, ESP, or ESL extension.
-fn plugin_name(name: &str) -> Result<()> {
-    safe_name(name)?;
-    ensure!(
-        Path::new(name)
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| ["esm", "esp", "esl"]
-                .iter()
-                .any(|v| e.eq_ignore_ascii_case(v))),
-        "invalid MO2 plugin name: {name}"
     );
     Ok(())
 }

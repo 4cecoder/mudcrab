@@ -2,6 +2,10 @@
 
 This document outlines the conversion pipeline to ingest legacy Skyrim formats (`.bsa`, `.dds`, `.nif`, `.hkx`, `.esm`) and output modern asset standards suitable for modern web & native runtimes (Bevy Engine, glTF 2.0, KTX2, WebGPU).
 
+Explicit player selection is available through `--plugins-file FILE`. Optional `--skyrim-ccc-file FILE` overrides the game-folder Creation list, and `--skyrim-ini-file FILE` supplies General test-file settings without reading ambient profiles. These options also exist as `PipelineConfig.plugins_file`, `skyrim_ccc_file` and `skyrim_ini_file`. Selection rules and recoverable missing-master behavior are documented in [the database specification](db-schema.md). Automatic discovery remains the default.
+
+MO2 profiles use the same official/Creation activation, Windows-1252 decoding, last-duplicate selection and missing-master recovery. `--mo2-instance` and `--mo2-profile` retain the profile's file overlay and `loadorder.txt` order after implicitly active plugins. An active plugin omitted from `loadorder.txt` appends after ordered plugins, in `plugins.txt` order, with a warning. Missing Data entries and missing/disabled-master closures warn and skip while usable neighbors publish. `Skyrim.ccc` comes from the game folder beside physical Data; unreadable or missing CCC warns and continues. MO2 selection and `--plugins-file` are mutually exclusive.
+
 ---
 
 ## 1. Pipeline Overview Diagram

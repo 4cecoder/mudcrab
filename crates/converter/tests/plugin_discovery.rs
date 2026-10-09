@@ -377,9 +377,8 @@ async fn explicit_regular_override_beats_a_master_listed_after_it() {
 
 /// Dependency hoisting must terminate on cycles and preserve validation failures.
 #[test]
-fn explicit_order_rejects_missing_masters_inversions_and_cycles() {
+fn explicit_order_rejects_inversions_and_cycles() {
     let cases: &[&[(&str, &[&str])]] = &[
-        &[("MissingDependent.esm", &["Absent.esm"])],
         &[("Dependent.esm", &["Base.esm"]), ("Base.esm", &[])],
         &[
             ("A.esp", &["B.esp"]),
