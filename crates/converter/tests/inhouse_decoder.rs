@@ -388,9 +388,10 @@ fn typed_targets_clear_wrong_kinds_inside_unions_and_alternate_textures() {
     );
     let (_, result) = fixture.read();
     let object = &result.records[&0x0200_1800];
-    let Value::Array(textures) = &field(object, b"MODS").value else {
-        panic!("alternate textures not decoded");
-    };
+    let textures = field(object, b"MODS")
+        .value
+        .materialized_array()
+        .expect("alternate textures not decoded");
     assert_eq!(
         member(&textures[0], "texture_set"),
         &Value::FormId(0x0100_1401)
@@ -621,9 +622,9 @@ fn land_layers_repeat_and_height_delta_array_excludes_padding() {
     let (_, result) = fixture.read();
     let land = &result.records[&0x0100_1800];
     let height_field = field(land, b"VHGT");
-    let Value::Array(deltas) = member(&height_field.value, "deltas") else {
-        panic!("missing height deltas");
-    };
+    let deltas = member(&height_field.value, "deltas")
+        .materialized_array()
+        .expect("missing height deltas");
     assert_eq!(deltas.len(), 1089);
     assert_eq!(deltas[126], Value::Signed(126));
     assert_eq!(height_field.canonical_bytes, height);

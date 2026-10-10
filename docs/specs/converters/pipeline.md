@@ -74,6 +74,20 @@ This option does not produce a runnable pack or claim whole runtime SQL
 equivalence. The default diagnostic export and normal converter still build all
 runtime views. No diagnostic mode converts meshes, textures, scripts or LOD.
 
+Fixed link-free scalar arrays use compact decoded storage with a shared element
+layout. Serialization still emits the existing tagged `Array`, `Struct` and
+`Bytes` values in source order, with unchanged numeric values and canonical field
+bytes. Layouts containing links, strings, selectors or deferred fields keep the
+ordinary representation. Rust consumers can use `Value::array_element` or
+`Value::materialized_array` for either representation; exhaustive enum matches
+must handle `Value::CompactArray`. The streaming typed writer avoids materializing
+the array. Serialized data and runtime archive layouts do not gain a new variant.
+
+Export buffers are released after their last consumers. Accepted raw records,
+physical source history and unresolved localized bytes remain available through
+their publication steps. Runtime projections clone only the retained subrecords,
+avoiding a redundant full-record clone before omitted fields are filtered.
+
 Set `MUDCRAB_RECORDS_PROFILE=1` before starting the process to emit stage timing
 observations on stderr. Each observation names the stage, elapsed wall seconds
 and record count; these timings need a quiet machine for meaningful comparisons.

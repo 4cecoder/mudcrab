@@ -85,6 +85,7 @@ impl Serialize for FieldView<'_> {
 struct ValueView<'a>(&'a Value);
 
 impl Serialize for ValueView<'_> {
+    /// Stream legacy tags and widened float values from ordinary or compact storage.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self.0 {
             Value::Unsigned(value) => {
@@ -116,6 +117,9 @@ impl Serialize for ValueView<'_> {
             }
             Value::Array(value) => {
                 serializer.serialize_newtype_variant("Value", 9, "Array", &ValuesView(value))
+            }
+            Value::CompactArray(value) => {
+                serializer.serialize_newtype_variant("Value", 9, "Array", &value.elements(true))
             }
         }
     }
@@ -149,6 +153,115 @@ impl Serialize for ValuesView<'_> {
 mod tests {
     use super::*;
     use std::io;
+
+    /// Full-envelope equivalence compares an independently built legacy value to the
+    /// compact source bytes, including float tokens, canonical padding and raw metadata.
+    #[test]
+    fn compact_complete_record_matches_legacy_array_and_widened_float_wire() {
+        use super::super::{
+            compact_array::try_decode,
+            schema_format::{FieldSchema, Schema},
+        };
+        let schema = Schema::parse(br#"{"version":1,"records":[]}"#).unwrap();
+        let layout = FieldSchema {
+            kind: "struct".into(),
+            size: Some(8),
+            members: vec![
+                FieldSchema {
+                    kind: "f32".into(),
+                    offset: 4,
+                    name: "same".into(),
+                    ..Default::default()
+                },
+                FieldSchema {
+                    kind: "i16".into(),
+                    name: "same".into(),
+                    ..Default::default()
+                },
+                FieldSchema {
+                    kind: "bytes".into(),
+                    offset: 2,
+                    size: Some(2),
+                    name: "padding".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        let mut values = Vec::new();
+        for bits in [0_u32, 0x8000_0000, 1, 0x8000_0001, 0x3dcccccd, 0x7f7f_ffff] {
+            bytes.extend([0, 128, 127, 255]);
+            bytes.extend(bits.to_le_bytes());
+            values.push(Value::Struct(vec![
+                ("same".into(), Value::Float(f32::from_bits(bits))),
+                ("same".into(), Value::Signed(-32768)),
+                ("padding".into(), Value::Bytes(vec![127, 255])),
+            ]));
+        }
+        let compact = Value::CompactArray(
+            try_decode(&layout, &bytes, values.len(), 8, &schema, 0)
+                .unwrap()
+                .unwrap(),
+        );
+        let ordinary = Value::Array(values);
+        assert_eq!(
+            serde_json::to_vec(&compact).unwrap(),
+            serde_json::to_vec(&ordinary).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&ValueView(&compact)).unwrap(),
+            serde_json::to_vec(&ValueView(&ordinary)).unwrap()
+        );
+        let mut compact_record = record(vec![field(compact)]);
+        compact_record.fields[0].canonical_bytes = bytes.clone();
+        let mut ordinary_record = record(vec![field(ordinary)]);
+        ordinary_record.fields[0].canonical_bytes = bytes;
+        let localization = BTreeMap::from([(0, serde_json::json!({"status":"absent","id":null}))]);
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        write_record(&mut left, &compact_record, &localization).unwrap();
+        write_record(&mut right, &ordinary_record, &localization).unwrap();
+        assert_eq!(left, right);
+        assert_eq!(
+            written(&compact_record, &localization),
+            written(&ordinary_record, &localization)
+        );
+        struct BrokenBody {
+            remaining: usize,
+        }
+        impl io::Write for BrokenBody {
+            /// Accept a bounded prefix, then fail while the compact body is being streamed.
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "compact body failure",
+                    ));
+                }
+                let count = bytes.len().min(self.remaining);
+                self.remaining -= count;
+                Ok(count)
+            }
+            /// Keep flushing independent of the injected body-write failure.
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let prefix = left
+            .windows(b"\"Array\":[".len())
+            .position(|part| part == b"\"Array\":[")
+            .unwrap();
+        let error = write_record(
+            &mut BrokenBody {
+                remaining: prefix + 30,
+            },
+            &compact_record,
+            &localization,
+        )
+        .unwrap_err();
+        assert!(error.is_io());
+    }
 
     /// Construct independent header and physical-source metadata for writer controls.
     fn record(fields: Vec<DecodedField>) -> DecodedRecord {

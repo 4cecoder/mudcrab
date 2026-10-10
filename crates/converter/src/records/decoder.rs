@@ -853,6 +853,18 @@ fn array(
             ..Default::default()
         }
     };
+    if field.decider.is_none()
+        && let Some(compact) = super::compact_array::try_decode(
+            &element,
+            &bytes[offset..],
+            count,
+            stride,
+            schema,
+            depth,
+        )?
+    {
+        return Ok((Value::CompactArray(compact), bytes.to_vec()));
+    }
     let mut canonical = bytes.to_vec();
     let mut values = Vec::with_capacity(count);
     for index in 0..count {
@@ -1258,7 +1270,8 @@ fn validate_value(
         | Value::String(_)
         | Value::LocalizedString(_)
         | Value::Bytes(_)
-        | Value::Deferred(_) => return,
+        | Value::Deferred(_)
+        | Value::CompactArray(_) => return,
         _ => {}
     }
     let Ok(field) = validation_schema(schema, field) else {
@@ -1424,6 +1437,243 @@ mod target_validation_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Count prefixes and mixed structs retain every canonical byte; an optional policy
+    /// marker forces the unchanged materialized path for an asymmetric decoder oracle.
+    #[test]
+    fn compact_arrays_match_materialized_counts_padding_and_field_local_errors() {
+        let schema = Schema::parse(br#"{"version":1,"records":[]}"#).unwrap();
+        let order = LoadOrder::read(&[]).unwrap();
+        let context = Context {
+            order: &order,
+            plugin_index: 0,
+            localized: false,
+            winning_types: None,
+        };
+        let selection = super::super::deciders::Context {
+            record_type: *b"TEST",
+            form_version: 44,
+            editor_id: "",
+            preceding_subrecords: &[],
+            parent_payload: None,
+            link_record_type: None,
+        };
+        let mut diagnostics = PluginDiagnostics::default();
+        let mut field = FieldSchema {
+            kind: "array".into(),
+            count: Some(serde_json::json!({"kind":"prefix_u32","stride":8})),
+            members: vec![
+                FieldSchema {
+                    name: "weight".into(),
+                    kind: "f32".into(),
+                    offset: 4,
+                    ..Default::default()
+                },
+                FieldSchema {
+                    name: "index".into(),
+                    kind: "u16".into(),
+                    ..Default::default()
+                },
+                FieldSchema {
+                    name: "padding".into(),
+                    kind: "bytes".into(),
+                    offset: 2,
+                    size: Some(2),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut bytes = 2_u32.to_le_bytes().to_vec();
+        bytes.extend([1, 128, 99, 255]);
+        bytes.extend((-0.0_f32).to_le_bytes());
+        bytes.extend([7, 0, 66, 77]);
+        bytes.extend(f32::from_bits(1).to_le_bytes());
+        let (compact, canonical) = array(
+            &field,
+            &bytes,
+            &schema,
+            &context,
+            &mut diagnostics,
+            &selection,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(&compact, Value::CompactArray(_)));
+        assert_eq!(canonical, bytes);
+        field.decider = Some("size".into());
+        let (old, old_canonical) = array(
+            &field,
+            &bytes,
+            &schema,
+            &context,
+            &mut diagnostics,
+            &selection,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(&old, Value::Array(_)));
+        assert_eq!(compact, old);
+        assert_eq!(canonical, old_canonical);
+        assert_eq!(
+            serde_json::to_vec(&compact).unwrap(),
+            serde_json::to_vec(&old).unwrap()
+        );
+        field.decider = None;
+        // An invalid second element must reject the field, never publish a prefix array.
+        let mut bad = bytes.clone();
+        bad[16..20].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert_eq!(
+            array(
+                &field,
+                &bad,
+                &schema,
+                &context,
+                &mut diagnostics,
+                &selection,
+                1
+            )
+            .unwrap_err(),
+            "non-finite float"
+        );
+        assert!(
+            array(
+                &field,
+                &bytes,
+                &schema,
+                &context,
+                &mut diagnostics,
+                &selection,
+                1
+            )
+            .is_ok()
+        );
+        // Framing/extent failures still use the preexisting path and diagnostic boundary.
+        assert_eq!(
+            array(
+                &field,
+                &bytes[..19],
+                &schema,
+                &context,
+                &mut diagnostics,
+                &selection,
+                1
+            )
+            .unwrap_err(),
+            "array extent/count mismatch"
+        );
+        assert_eq!(diagnostics.invalid_links, 0);
+        assert!(!contains_target_link(&compact));
+        let mut after = canonical.clone();
+        let mut compact = compact;
+        validate_value(
+            &mut compact,
+            &mut after,
+            &field,
+            &schema,
+            &HashMap::new(),
+            &mut diagnostics,
+            &selection,
+        );
+        assert_eq!(after, canonical);
+    }
+
+    /// Preserve fixed, remaining-byte and empty-array counts across both storage paths.
+    #[test]
+    fn compact_fixed_remaining_and_empty_arrays_preserve_count_authority() {
+        let schema = Schema::parse(br#"{"version":1,"records":[]}"#).unwrap();
+        let order = LoadOrder::read(&[]).unwrap();
+        let context = Context {
+            order: &order,
+            plugin_index: 0,
+            localized: false,
+            winning_types: None,
+        };
+        let selection = super::super::deciders::Context {
+            record_type: *b"TEST",
+            form_version: 44,
+            editor_id: "",
+            preceding_subrecords: &[],
+            parent_payload: None,
+            link_record_type: None,
+        };
+        let mut diagnostics = PluginDiagnostics::default();
+        let mut field = FieldSchema {
+            kind: "array".into(),
+            size: Some(1),
+            members: vec![FieldSchema {
+                kind: "i8".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for rule in [
+            serde_json::json!({"kind":"remaining"}),
+            serde_json::json!({"kind":"fixed","value":3}),
+        ] {
+            field.count = Some(rule);
+            let (actual, bytes) = array(
+                &field,
+                &[128, 0, 127],
+                &schema,
+                &context,
+                &mut diagnostics,
+                &selection,
+                1,
+            )
+            .unwrap();
+            assert_eq!(
+                actual,
+                Value::Array(vec![
+                    Value::Signed(-128),
+                    Value::Signed(0),
+                    Value::Signed(127)
+                ])
+            );
+            assert_eq!(bytes, [128, 0, 127]);
+        }
+        field.count = Some(serde_json::json!({"kind":"fixed","value":0}));
+        let (empty, _) = array(
+            &field,
+            &[],
+            &schema,
+            &context,
+            &mut diagnostics,
+            &selection,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(empty, Value::Array(values) if values.is_empty()));
+        field.count = Some(serde_json::json!({"kind":"fixed","value":1_000_001}));
+        assert_eq!(
+            array(
+                &field,
+                &[],
+                &schema,
+                &context,
+                &mut diagnostics,
+                &selection,
+                1
+            )
+            .unwrap_err(),
+            "array exceeds one million elements"
+        );
+        field.count = None;
+        field.size = Some(0);
+        assert_eq!(
+            array(
+                &field,
+                &[],
+                &schema,
+                &context,
+                &mut diagnostics,
+                &selection,
+                1
+            )
+            .unwrap_err(),
+            "zero array stride"
+        );
+    }
 
     /// Unknown and out-of-order fields cannot rewind a nonrepeating schema cursor.
     #[test]

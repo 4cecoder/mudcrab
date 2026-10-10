@@ -166,6 +166,7 @@ pub fn export_record_bundle_typed_with_options(
         }
     }
     strings_stage.finish(plugins.len());
+    drop(paths);
     let records = convert_plugins_with_dump(
         &plugins,
         &database_path,
@@ -173,6 +174,7 @@ pub fn export_record_bundle_typed_with_options(
         (!signatures.is_empty()).then_some((output, signatures)),
         mode,
     )?;
+    drop(plugins);
     let terrain_stage = records::profile::ProfileStage::start("terrain_cache_pair");
     let count = write_terrain_caches(&records, &database_path, output)?;
     terrain_stage.finish(records.len());
@@ -470,6 +472,9 @@ fn convert_plugins_with_dump(
             }
         },
     )?;
+    // Winner validation and the observer have finished; physical history and
+    // winning source payloads stay alive for the established provenance SQL pass.
+    release_reader_metadata(&mut decoded);
     let mut localized_fields = Vec::new();
     let mut unresolved_fields = HashMap::new();
     let mut tables: HashMap<(usize, String), HashMap<u32, String>> = HashMap::new();
@@ -588,6 +593,10 @@ fn convert_plugins_with_dump(
         writer.flush()?;
     }
     projection_stage.finish(master.len());
+    // Runtime replacements and localized provenance now own their text. The
+    // completed typed writer and string-table cache have no remaining consumers.
+    drop(tables);
+    drop(typed_output);
     let setup_stage = records::profile::ProfileStage::start("database_setup_plugin_hashes");
     let conn = Connection::open(db_path)?;
     // Keep a modest page-cache target for this conversion's private connection.
@@ -625,6 +634,7 @@ fn convert_plugins_with_dump(
         export_inhouse_record_archive_to_db(&conn, &master, &order)?;
     }
     runtime_stage.finish(master.len());
+    drop(unresolved_fields);
     // Keep the established rkyv records.data contract for runtime tools.
     // Auxiliary provenance holds verbatim source framing and file-relative IDs.
     let provenance_stage = records::profile::ProfileStage::start("source_database_export");
@@ -692,6 +702,13 @@ fn convert_plugins_with_dump(
     release_stage.finish(master.len());
     warnings.report();
     Ok(master)
+}
+
+/// Free reader-only header/override lookups after winners and observation are finalized.
+/// Physical history, raw winning payloads and diagnostics remain for their SQL pass.
+fn release_reader_metadata(decoded: &mut records::ReadResult) {
+    drop(std::mem::take(&mut decoded.headers));
+    drop(std::mem::take(&mut decoded.overrides));
 }
 
 /// Validate required runtime semantics before merge so a bad override leaves its predecessor.
@@ -912,6 +929,76 @@ mod runtime_move_tests {
             raw_payload: b"source".to_vec(),
             supported: false,
         }
+    }
+
+    /// Releasing lookup capacity retains raw winners, physical rejection history and diagnostics.
+    #[test]
+    fn reader_metadata_release_preserves_raw_history_and_diagnostics() {
+        let winner = record();
+        let id = winner.form_id;
+        let history = records::history::HistoryEntry {
+            form_id: Some(id),
+            plugin_index: 7,
+            source_form_id: 0x0200_5678,
+            record_type: *b"INFO",
+            flags: 0x4000,
+            source_record_offset: 257,
+            source_record_size: 6,
+            source_group_end: 1025,
+            frame_complete: true,
+            accepted: false,
+            reason: Some("authored rejected predecessor".into()),
+            source_cell_form_id: Some(91),
+            source_worldspace_form_id: Some(92),
+            source_topic_form_id: Some(0x0200_0001),
+            topic_group_offset: Some(129),
+            editor_id: Some("authored identity".into()),
+        };
+        let mut decoded = records::ReadResult {
+            records: HashMap::from([(id, winner.clone())]),
+            headers: vec![winner],
+            overrides: HashMap::from([(
+                id,
+                vec![records::RecordSource {
+                    plugin_index: 3,
+                    source_form_id: 0x0100_1234,
+                    deleted: true,
+                }],
+            )]),
+            history: vec![history],
+            diagnostics: BTreeMap::from([(
+                "authored plugin".into(),
+                records::PluginDiagnostics {
+                    skipped_records: 13,
+                    skipped_fields: 17,
+                    compatibility_headers: 19,
+                    first_example: Some("authored diagnostic".into()),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let raw_pointer = decoded.records[&id].raw_payload.as_ptr();
+        let history_pointer = decoded.history.as_ptr();
+        let record_before = serde_json::to_vec(&decoded.records[&id]).unwrap();
+        let history_before = format!("{:?}", decoded.history);
+        let diagnostics_before = serde_json::to_vec(&decoded.diagnostics).unwrap();
+        assert!(decoded.headers.capacity() > 0 && decoded.overrides.capacity() > 0);
+        release_reader_metadata(&mut decoded);
+        assert_eq!(decoded.headers.capacity(), 0);
+        assert_eq!(decoded.overrides.capacity(), 0);
+        assert!(decoded.headers.is_empty() && decoded.overrides.is_empty());
+        assert_eq!(decoded.records[&id].raw_payload.as_ptr(), raw_pointer);
+        assert_eq!(decoded.records[&id].raw_payload, b"source");
+        assert_eq!(
+            serde_json::to_vec(&decoded.records[&id]).unwrap(),
+            record_before
+        );
+        assert_eq!(decoded.history.as_ptr(), history_pointer);
+        assert_eq!(format!("{:?}", decoded.history), history_before);
+        assert_eq!(
+            serde_json::to_vec(&decoded.diagnostics).unwrap(),
+            diagnostics_before
+        );
     }
 
     #[test]

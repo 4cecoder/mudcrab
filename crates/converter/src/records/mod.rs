@@ -1,4 +1,5 @@
 //! Authored schema-driven Skyrim records, independent of the legacy field decoder.
+pub mod compact_array;
 pub mod deciders;
 mod decoder;
 pub mod history;
@@ -13,7 +14,7 @@ pub mod vmad;
 use crate::esm::{load_order::LoadOrder, records::RawRecord};
 use color_eyre::Result;
 use schema_format::Schema;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -24,7 +25,9 @@ use std::{
 pub const SCHEMA_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/records-schema.json"));
 
 /// Numeric values keep their binary widths in the schema; floats retain raw f32 precision.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+/// Arrays may use ordinary or compact storage. Tooling should use `array_element` or
+/// `materialized_array` to inspect either representation; serialized tags remain unchanged.
+#[derive(Clone, Debug)]
 pub enum Value {
     Unsigned(u64),
     Signed(i64),
@@ -37,6 +40,90 @@ pub enum Value {
     Deferred(Vec<u8>),
     Struct(Vec<(String, Value)>),
     Array(Vec<Value>),
+    /// Internal immutable fixed layout; serialization remains the legacy Array variant.
+    CompactArray(compact_array::CompactArray),
+}
+
+impl Value {
+    /// Inspect one array element without materializing the entire compact array.
+    /// Ordinary arrays clone only the selected element; compact arrays decode it on demand.
+    pub fn array_element(&self, index: usize) -> Option<Value> {
+        match self {
+            Self::Array(values) => values.get(index).cloned(),
+            Self::CompactArray(values) => values.get(index),
+            _ => None,
+        }
+    }
+
+    /// Obtain owned array elements for explicit inspection.
+    /// This allocates in proportion to the element count; streaming export does not use it.
+    pub fn materialized_array(&self) -> Option<Vec<Value>> {
+        match self {
+            Self::Array(values) => Some(values.clone()),
+            Self::CompactArray(values) => Some(values.materialize()),
+            _ => None,
+        }
+    }
+}
+
+impl PartialEq for Value {
+    /// Compare the legacy logical value independent of compact storage and padding.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unsigned(a), Self::Unsigned(b)) => a == b,
+            (Self::Signed(a), Self::Signed(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::LocalizedString(a), Self::LocalizedString(b)) => a == b,
+            (Self::FormId(a), Self::FormId(b)) => a == b,
+            (Self::Bytes(a), Self::Bytes(b)) | (Self::Deferred(a), Self::Deferred(b)) => a == b,
+            (Self::Struct(a), Self::Struct(b)) => a == b,
+            (Self::Array(a), Self::Array(b)) => a == b,
+            (Self::CompactArray(a), Self::CompactArray(b)) => a == b,
+            (Self::CompactArray(a), Self::Array(b)) | (Self::Array(b), Self::CompactArray(a)) => {
+                a.len() == b.len()
+                    && b.iter()
+                        .enumerate()
+                        .all(|(index, value)| a.get(index).as_ref() == Some(value))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Serialize for Value {
+    /// Keep the derived enum's external tags, indices and ordinary f32 policy unchanged.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Unsigned(value) => {
+                serializer.serialize_newtype_variant("Value", 0, "Unsigned", value)
+            }
+            Self::Signed(value) => {
+                serializer.serialize_newtype_variant("Value", 1, "Signed", value)
+            }
+            Self::Float(value) => serializer.serialize_newtype_variant("Value", 2, "Float", value),
+            Self::String(value) => {
+                serializer.serialize_newtype_variant("Value", 3, "String", value)
+            }
+            Self::LocalizedString(value) => {
+                serializer.serialize_newtype_variant("Value", 4, "LocalizedString", value)
+            }
+            Self::FormId(value) => {
+                serializer.serialize_newtype_variant("Value", 5, "FormId", value)
+            }
+            Self::Bytes(value) => serializer.serialize_newtype_variant("Value", 6, "Bytes", value),
+            Self::Deferred(value) => {
+                serializer.serialize_newtype_variant("Value", 7, "Deferred", value)
+            }
+            Self::Struct(value) => {
+                serializer.serialize_newtype_variant("Value", 8, "Struct", value)
+            }
+            Self::Array(value) => serializer.serialize_newtype_variant("Value", 9, "Array", value),
+            Self::CompactArray(value) => {
+                serializer.serialize_newtype_variant("Value", 9, "Array", &value.elements(false))
+            }
+        }
+    }
 }
 
 /// One matched subrecord and the validated bytes used by runtime projections.

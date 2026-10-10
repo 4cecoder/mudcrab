@@ -327,15 +327,21 @@ fn runtime_projection(
     unresolved_fields: Option<&HashMap<u32, BTreeSet<usize>>>,
 ) -> Option<RawRecord> {
     let unresolved = unresolved_fields?.get(&record.form_id)?;
-    let mut projected = record.clone();
-    projected.subrecords = record
-        .subrecords
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !unresolved.contains(index))
-        .map(|(_, field)| field.clone())
-        .collect();
-    Some(projected)
+    Some(RawRecord {
+        form_id: record.form_id,
+        record_type: record.record_type,
+        flags: record.flags,
+        subrecords: record
+            .subrecords
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !unresolved.contains(index))
+            .map(|(_, field)| field.clone())
+            .collect(),
+        cell_form_id: record.cell_form_id,
+        worldspace_form_id: record.worldspace_form_id,
+        load_order: record.load_order,
+    })
 }
 
 /// Reject unusable movement records before the tolerant frontend exports them.

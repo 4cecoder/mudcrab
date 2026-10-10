@@ -400,24 +400,26 @@ fn location_arrays_keep_y_x_order_and_repeat_each_world_entry() {
     let result = fixture.read();
     let location = &result.records[&0x0100_3700];
     assert!(location.rejected_fields.is_empty());
-    let Value::Array(persistent) = &named(location, "added_persistent").value else {
-        panic!("persistent array")
-    };
+    let persistent = named(location, "added_persistent")
+        .value
+        .materialized_array()
+        .expect("persistent array");
     assert_eq!(member(&persistent[0], "grid_y"), &Value::Signed(-13));
     assert_eq!(member(&persistent[0], "grid_x"), &Value::Signed(37));
     let worlds = values(location, "added_world_cells");
     assert_eq!(worlds.len(), 2);
     for (world, y) in worlds.into_iter().zip([-17i64, 43]) {
-        let Value::Array(cells) = member(world, "cells") else {
-            panic!("cells array")
-        };
+        let cells = member(world, "cells")
+            .materialized_array()
+            .expect("cells array");
         assert_eq!(cells.len(), 2);
         assert_eq!(member(&cells[0], "grid_y"), &Value::Signed(y));
         assert_eq!(member(&cells[1], "grid_x"), &Value::Signed(-71));
     }
-    let Value::Array(enable) = &named(location, "added_enable_points").value else {
-        panic!("enable array")
-    };
+    let enable = named(location, "added_enable_points")
+        .value
+        .materialized_array()
+        .expect("enable array");
     assert_eq!(member(&enable[0], "flags"), &Value::Unsigned(3));
     assert_eq!(
         member(&enable[0], "unused"),

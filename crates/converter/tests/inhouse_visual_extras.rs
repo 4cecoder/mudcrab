@@ -97,9 +97,9 @@ fn every_visual_type_preserves_native_values_and_context() {
     };
     assert!(!colors.iter().any(|(n, _)| n == "water_multiplier"));
     let animation = &result.records[&(visual::FIRST_ID + 3)];
-    let Value::Array(keys) = named(animation, "eye_adaptation_speed_multiply") else {
-        panic!("curve lost")
-    };
+    let keys = named(animation, "eye_adaptation_speed_multiply")
+        .materialized_array()
+        .expect("curve lost");
     assert_eq!(keys.len(), 2);
     assert_eq!(member(&keys[0], "time"), &Value::Float(-1.875));
     assert_eq!(member(&keys[0], "value"), &Value::Float(-1.5));
