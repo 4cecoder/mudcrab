@@ -42,13 +42,12 @@ fn plugin(root: &Path, name: &str, masters: &[&str], flags: u32, records: &[u8])
     path
 }
 
-/// Keep root-run fixture artifacts for failure review.
-fn retained_root() -> PathBuf {
-    let retained = tempfile::tempdir().unwrap().keep();
-    let data = retained.join("Data");
+/// Keep original files and exported replay context alive for the complete test scope.
+fn test_root() -> (tempfile::TempDir, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("Data");
     fs::create_dir(&data).unwrap();
-    eprintln!("retained source-history fixture: {}", retained.display());
-    data
+    (root, data)
 }
 
 /// Exercise the completed public records-only export API, including real SQLite publication.
@@ -67,7 +66,7 @@ fn export(root: &Path, names: &[&str], signatures: &[[u8; 4]]) -> PathBuf {
 #[test]
 /// Unknown signatures remain explicit unsupported typed payloads and exact stored raw material.
 fn unknown_new_signature_and_header_bits_export_without_typed_invention() {
-    let root = retained_root();
+    let (_fixture, root) = test_root();
     let payload = sub(b"NEWX", &[0, 0xff, 0x12, 0x99]);
     let original = frame(b"ZZZZ", 0x1800, 0x8000_0000, &payload);
     plugin(&root, "Base.esm", &[], 0, &original);
@@ -121,7 +120,7 @@ fn unknown_new_signature_and_header_bits_export_without_typed_invention() {
 #[test]
 /// A nullable runtime ID retains guarded converter-readable bytes and original source identity.
 fn wide_light_body_is_raw_queryable_without_aliasing_adjacent_owner() {
-    let root = retained_root();
+    let (_fixture, root) = test_root();
     plugin(&root, "Base.esm", &[], 0, &[]);
     let wide_payload = sub(b"EDID", b"wide_original\0");
     let neighbor_payload = sub(b"EDID", b"different_neighbor\0");
@@ -211,7 +210,7 @@ fn wide_light_body_is_raw_queryable_without_aliasing_adjacent_owner() {
 #[test]
 /// A malformed compressed record does not hide a valid later unknown-signature neighbor.
 fn malformed_compressed_neighbor_preserves_header_and_later_complete_unknown_record() {
-    let root = retained_root();
+    let (_fixture, root) = test_root();
     let compressed_bad = frame(b"STAT", 0x1800, 0x40000, &[5, 0, 0, 0, 0x78, 0x9c, 0]);
     let later_payload = sub(b"NEWX", &[9, 8, 7]);
     let mut records = compressed_bad;
@@ -260,7 +259,7 @@ fn malformed_compressed_neighbor_preserves_header_and_later_complete_unknown_rec
 #[test]
 /// A malformed later TES4 retains its scanner reason without hiding a usable neighbor.
 fn malformed_later_header_preserves_failure_and_usable_neighbor() {
-    let root = retained_root();
+    let (_fixture, root) = test_root();
     let bad = frame(b"TES4", 0, 0x40000, &[5, 0, 0, 0, 0x78, 0x9c, 0]);
     let payload = sub(b"NEWX", &[0x91, 0x42, 0xde]);
     let mut records = bad.clone();
@@ -304,7 +303,7 @@ fn malformed_later_header_preserves_failure_and_usable_neighbor() {
 /// A complete main header inside a truncated group must never consume an outer sibling body.
 #[test]
 fn containing_group_limit_returns_header_only_and_keeps_outer_neighbor() {
-    let root = retained_root();
+    let (_fixture, root) = test_root();
     let mut bad_header = frame(b"STAT", 0x1800, 0, &[]);
     bad_header[4..8].copy_from_slice(&1000u32.to_le_bytes());
     let mut group = vec![0; 24];
@@ -351,7 +350,7 @@ fn containing_group_limit_returns_header_only_and_keeps_outer_neighbor() {
 /// Runtime supplier compatibility does not invent original ownership; a self neighbor stays exact.
 #[test]
 fn generic_master_compatibility_keeps_original_owner_unresolved_and_valid_neighbor() {
-    let root = retained_root();
+    let (_fixture, root) = test_root();
     plugin(&root, "Base.esm", &[], 0, &[]);
     let bad_payload = sub(b"EDID", b"unproven_owner\0");
     let good_payload = sub(b"EDID", b"valid_owner\0");
@@ -409,7 +408,7 @@ fn generic_master_compatibility_keeps_original_owner_unresolved_and_valid_neighb
 /// Raw latest, reader-admitted latest, surviving fallback and accepted deletion stay distinct.
 #[test]
 fn source_candidate_admission_fallback_and_deletion_are_independent() {
-    let root = retained_root();
+    let (_fixture, root) = test_root();
     let a = sub(b"EDID", b"older_usable\0");
     let b = sub(b"EDID", b"later_deleted\0");
     let mut base = frame(b"STAT", 0x1800, 0, &a);

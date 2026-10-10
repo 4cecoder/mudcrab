@@ -1056,9 +1056,9 @@ mod history_reuse_private_controls {
     /// The old live history FK fails at the second conversion's plugin replacements.
     #[test]
     fn reused_inhouse_database_reorders_plugins_and_refreshes_source_history() {
-        let root = tempfile::tempdir().unwrap().keep();
-        let data = root.join("Data");
-        let output = root.join("output");
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("Data");
+        let output = root.path().join("output");
         fs::create_dir(&data).unwrap();
         fs::create_dir(&output).unwrap();
         let (a, a_payload, a_header) = independent_plugin(&data, "A.esm", 0x1800, b"different_a\0");

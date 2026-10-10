@@ -1,11 +1,9 @@
 //! Authored schema-driven Skyrim records, independent of the legacy field decoder.
-pub(crate) mod canonical_bind_profile_v1;
 pub mod deciders;
 mod decoder;
 pub mod history;
 pub mod history_source;
 pub(crate) mod profile;
-pub(crate) mod runtime_sql_profile_v3;
 mod scanner;
 pub mod schema_format;
 pub mod source_identity;

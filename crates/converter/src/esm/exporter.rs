@@ -3,19 +3,57 @@ use crate::esm::{
     load_order::LoadOrder,
     records::RawRecord,
 };
-use crate::records::canonical_bind_profile_v1::{BindSite, CanonicalBindProfile};
-use crate::records::runtime_sql_profile_v3::{RuntimeSqlProfile, Site};
 use crate::{
     asset_path::{AssetKind, canonical_asset_path},
     esm::records::record_type::vmad::parse_vmad,
 };
-use rusqlite::{Connection, Result, Transaction, params};
+use rusqlite::{Connection, Result, Statement, ToSql, Transaction, params};
 use std::{
     collections::{BTreeSet, HashMap},
     str::from_utf8,
 };
 
 const CELL_SIZE: f32 = 4096.0;
+const RECORDS_INSERT_SQL: &str = "INSERT OR REPLACE INTO records(form_id, record_type, cell_id, worldspace_id, load_order, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
+/// Validate the fixed row shape once before any raw-bound record is executed.
+fn check_record_insert(statement: &Statement<'_>) -> Result<()> {
+    let expected = statement.parameter_count();
+    if expected != 6 {
+        // Match the old positional-slice cardinality diagnostic. This
+        // constant SQL always has six; never step a drifted statement.
+        let observed = 6.min(expected.saturating_add(1));
+        return Err(rusqlite::Error::InvalidParameterCount(observed, expected));
+    }
+    Ok(())
+}
+
+/// Write one canonical row with unchanged positional values and clear successful bindings.
+/// A failed bind or execute returns before clearing; dropping the cached statement resets it.
+#[inline]
+fn insert_canonical_record(
+    statement: &mut Statement<'_>,
+    form_id: u32,
+    record_type: impl ToSql,
+    cell_form_id: Option<u32>,
+    worldspace_form_id: Option<u32>,
+    load_order: u32,
+    data: &[u8],
+) -> Result<usize> {
+    statement.raw_bind_parameter(1, form_id)?;
+    statement.raw_bind_parameter(2, record_type)?;
+    statement.raw_bind_parameter(3, cell_form_id)?;
+    statement.raw_bind_parameter(4, worldspace_form_id)?;
+    statement.raw_bind_parameter(5, load_order)?;
+    statement.raw_bind_parameter(6, data)?;
+    let changed = statement.raw_execute()?;
+    statement.clear_bindings();
+    Ok(changed)
+}
+
+#[cfg(test)]
+#[path = "canonical_bind_tests.rs"]
+mod canonical_bind_tests;
 
 fn invalid_movement_field(form_id: u32, field: &str) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
@@ -337,9 +375,6 @@ fn export_records(
     runtime_views: bool,
 ) -> Result<()> {
     conn.set_prepared_statement_cache_capacity(64);
-    let mut detail = RuntimeSqlProfile::new();
-    let mut canonical_detail = CanonicalBindProfile::new();
-    let setup_started = detail.begin();
     let tx = conn.unchecked_transaction()?;
     if runtime_views {
         tx.prepare_cached("DELETE FROM movement_types")?
@@ -365,8 +400,6 @@ fn export_records(
     }
     let mut cells: HashMap<u32, CellMetadata> = HashMap::new();
     let unordered_offsets = HashMap::new();
-    detail.record(Site::Setup, setup_started, 0, 0);
-    let terrain_started = detail.begin();
     let terrain_winners = if runtime_views {
         crate::esm::cell_cache::land_winners_by_cell(
             master,
@@ -375,19 +408,12 @@ fn export_records(
     } else {
         HashMap::new()
     };
-    detail.record(
-        Site::TerrainWinners,
-        terrain_started,
-        terrain_winners.len(),
-        0,
-    );
 
     if runtime_views {
         for (&form_id, record) in master
             .iter()
             .filter(|(_, record)| &record.record_type == b"CELL")
         {
-            let cell_started = detail.begin();
             let projection = runtime_projection(record, unresolved_fields);
             let projected = projection.as_ref().unwrap_or(record);
             let (grid_x, grid_y, interior_name) = extract_cell_info(&projected.subrecords);
@@ -405,73 +431,35 @@ fn export_records(
                 },
             )?;
             cells.insert(form_id, (grid_x, grid_y, record.worldspace_form_id));
-            detail.record(Site::Cells, cell_started, 1, data.len());
         }
     }
 
-    let ordering_started = detail.begin();
     let mut ordered: Vec<_> = master.iter().collect();
     ordered.sort_unstable_by_key(|(form_id, _)| **form_id);
-    detail.record(Site::Ordering, ordering_started, ordered.len(), 0);
     // Keep the hot statement checked out. Repeated cache checkout/return recreates
     // its owned SQL key and cache entry for every record. Prepare lazily for an
     // empty legacy subset, and clear each row's bindings as before.
     let mut records_insert = if ordered.is_empty() {
         None
     } else {
-        let statement = tx.prepare_cached(
-            "INSERT OR REPLACE INTO records(form_id, record_type, cell_id, worldspace_id, load_order, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?;
-        let expected = statement.parameter_count();
-        if expected != 6 {
-            // Match the old positional-slice cardinality diagnostic. This
-            // constant SQL always has six; never step a drifted statement.
-            let observed = 6.min(expected.saturating_add(1));
-            return Err(rusqlite::Error::InvalidParameterCount(observed, expected));
-        }
+        let statement = tx.prepare_cached(RECORDS_INSERT_SQL)?;
+        check_record_insert(&statement)?;
         Some(statement)
     };
     for (&form_id, record) in ordered {
         let type_str = from_utf8(&record.record_type).unwrap_or("UNKN");
-        let serialization_started = detail.begin();
         let blob = serialize_subrecords(&record.subrecords);
-        detail.record(
-            Site::RecordSerialization,
-            serialization_started,
-            1,
-            blob.len(),
-        );
-        let records_sql_started = detail.begin();
         let insert = records_insert.as_mut().expect("nonempty record loop");
-        canonical_detail.attempt_row(blob.len());
-        let bind_started = canonical_detail.begin();
-        let bound = (|| -> Result<()> {
-            insert.raw_bind_parameter(1, form_id)?;
-            insert.raw_bind_parameter(2, type_str)?;
-            insert.raw_bind_parameter(3, record.cell_form_id)?;
-            insert.raw_bind_parameter(4, record.worldspace_form_id)?;
-            insert.raw_bind_parameter(5, record.load_order)?;
-            insert.raw_bind_parameter(6, &blob)?;
-            Ok(())
-        })();
-        canonical_detail.record(BindSite::Bind, bind_started, bound.is_ok(), blob.len());
-        bound?;
-        let execute_started = canonical_detail.begin();
-        let executed = insert.raw_execute();
-        canonical_detail.record(
-            BindSite::ExecuteReset,
-            execute_started,
-            executed.is_ok(),
-            blob.len(),
-        );
-        canonical_detail.sql_changes(executed?);
-        let clear_started = canonical_detail.begin();
-        insert.clear_bindings();
-        canonical_detail.record(BindSite::Clear, clear_started, true, blob.len());
-        detail.record(Site::RecordsSql, records_sql_started, 1, blob.len());
-        canonical_detail.completed_row();
+        insert_canonical_record(
+            insert,
+            form_id,
+            type_str,
+            record.cell_form_id,
+            record.worldspace_form_id,
+            record.load_order,
+            &blob,
+        )?;
         if let Some(order) = order {
-            let identity_started = detail.begin();
             let identity = order.identity(form_id).map_err(|error| {
                 rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -482,62 +470,33 @@ fn export_records(
                 "INSERT OR REPLACE INTO formid_map(form_id, plugin_name, internal_id, record_type) VALUES (?1, ?2, ?3, ?4)")?.execute(
                 params![form_id, identity.plugin, identity.local_id, type_str],
             )?;
-            detail.record(Site::FormIdMap, identity_started, 1, 0);
         }
 
         if !runtime_views {
-            detail.completed_record(form_id, &record.record_type);
             // Canonical records/formid_map are complete; only materialized runtime views defer.
             continue;
         }
         let canonical_record = record;
-        let projection_started = detail.begin();
         let projection = runtime_projection(record, unresolved_fields);
         let record = projection.as_ref().unwrap_or(record);
-        detail.record(Site::RuntimeProjection, projection_started, 1, 0);
-        let view_started = detail.begin();
         let view = SubrecordView::new(&record.subrecords);
         let vmad_bytes = view.find(b"VMAD");
-        detail.record(Site::SubrecordView, view_started, 1, 0);
         if let Some(vmad_bytes) = vmad_bytes {
-            let parsing_started = detail.begin();
             let parsed = parse_vmad(vmad_bytes, &record.record_type);
-            detail.record(Site::VmadParsing, parsing_started, 1, vmad_bytes.len());
             if let Ok((_, vmad)) = parsed {
                 for script in vmad.scripts {
-                    let script_serialization_started = detail.begin();
                     let properties =
                         serde_json::to_string(&script.properties).map_err(|error| {
                             rusqlite::Error::ToSqlConversionFailure(Box::new(error))
                         })?;
-                    detail.record(
-                        Site::ScriptSerialization,
-                        script_serialization_started,
-                        1,
-                        properties.len(),
-                    );
-                    let script_sql_started = detail.begin();
                     tx.prepare_cached(
                     "INSERT OR REPLACE INTO scripts(form_id, script_name, vmad, properties_json) VALUES (?1, ?2, ?3, ?4)")?.execute(
                     params![form_id, script.name, vmad_bytes, properties],
                 )?;
-                    detail.record(
-                        Site::ScriptSql,
-                        script_sql_started,
-                        1,
-                        vmad_bytes.len() + properties.len(),
-                    );
                 }
             }
         }
 
-        // Reference sites are independently observed inside the owning helper.
-        let reference_dispatch = matches!(type_str, "REFR" | "ACHR" | "ACRE" | "PGRE" | "PMIS");
-        let remaining_started = if reference_dispatch {
-            None
-        } else {
-            detail.begin()
-        };
         match type_str {
             "GRAS" => {
                 insert_grass(&tx, form_id, &view, record.load_order)?;
@@ -554,21 +513,18 @@ fn export_records(
             }
             "REFR" | "ACHR" | "ACRE" | "PGRE" | "PMIS" => {
                 let cell_id = record.cell_form_id.unwrap_or(0);
-                insert_reference_profiled(
+                insert_reference(
                     &tx,
                     form_id,
                     cell_id,
                     cells.get(&cell_id).copied(),
                     record.flags,
                     &canonical_record.subrecords,
-                    &mut detail,
                 )?;
             }
             "LAND" => {
                 let cell_id = record.cell_form_id.unwrap_or(form_id);
                 if terrain_winners.get(&cell_id) != Some(&form_id) {
-                    detail.record(Site::RemainingProjections, remaining_started, 1, 0);
-                    detail.completed_record(form_id, &record.record_type);
                     continue;
                 }
                 let (heightmap, vtex, vclr, normals) = extract_land_data(&record.subrecords);
@@ -720,18 +676,9 @@ fn export_records(
             }
             _ => {}
         }
-        detail.record(Site::RemainingProjections, remaining_started, 1, 0);
-        detail.completed_record(form_id, &record.record_type);
     }
     drop(records_insert);
-    let commit_started = detail.begin();
-    let committed = tx.commit();
-    if committed.is_ok() {
-        detail.record(Site::Commit, commit_started, 1, 0);
-        detail.finish(master.len());
-    }
-    canonical_detail.finish(committed.is_ok());
-    committed
+    tx.commit()
 }
 
 /// Projects xEdit's TES5 GRAS/DATA layout without inventing missing fields.
@@ -883,29 +830,6 @@ pub fn insert_reference(
     header_flags: u32,
     subs: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<()> {
-    insert_reference_profiled(
-        tx,
-        form_id,
-        cell_id,
-        cell,
-        header_flags,
-        subs,
-        &mut RuntimeSqlProfile::disabled(),
-    )
-}
-
-/// Preserve the reference path while accumulating its disjoint serial sites.
-#[allow(clippy::too_many_arguments)]
-fn insert_reference_profiled(
-    tx: &Transaction<'_>,
-    form_id: u32,
-    cell_id: u32,
-    cell: Option<CellMetadata>,
-    header_flags: u32,
-    subs: &[(Vec<u8>, Vec<u8>)],
-    detail: &mut RuntimeSqlProfile,
-) -> Result<()> {
-    let derived_started = detail.begin();
     let view = SubrecordView::new(subs);
     let transform = view.get_f32_slice(b"DATA").unwrap_or_default();
     let pos = [
@@ -932,16 +856,7 @@ fn insert_reference_profiled(
     // streaming is spatial rather than tied to the owning CELL record.
     let local_x = is_exterior.then(|| pos[0] - (pos[0] / CELL_SIZE).floor() * CELL_SIZE);
     let local_y = is_exterior.then(|| pos[1] - (pos[1] / CELL_SIZE).floor() * CELL_SIZE);
-    detail.record(Site::ReferenceDerivedFields, derived_started, 1, 0);
-    let serialization_started = detail.begin();
     let blob = serialize_subrecords(subs);
-    detail.record(
-        Site::ReferenceSerialization,
-        serialization_started,
-        1,
-        blob.len(),
-    );
-    let derived_started = detail.begin();
     // `XRDS` is the reference's own radius, in the same Creation units as a
     // light's `DATA` radius and usually different from it: 10,810 of the
     // 12,148 `LIGH` references in Skyrim.esm carry one. It rides on glow and beam
@@ -965,18 +880,13 @@ fn insert_reference_profiled(
         })
         .unzip();
 
-    detail.record(Site::ReferenceDerivedFields, derived_started, 0, 0);
-    let sql_started = detail.begin();
     tx.prepare_cached(
         "INSERT OR REPLACE INTO \"references\"(id, cell_id, worldspace_id, base_form_id, is_exterior, pos_x, pos_y, pos_z, local_x, local_y, rot_x, rot_y, rot_z, scale, radius_override, header_flags, enable_parent_id, enable_parent_flags, data)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)")?.execute(
         params![form_id, cell_id, worldspace_id, base_form_id, is_exterior, pos[0], pos[1], pos[2], local_x, local_y, rot[0], rot[1], rot[2], scale, radius_override, header_flags, enable_parent_id, enable_parent_flags, blob],
     )?;
-    detail.record(Site::ReferenceSql, sql_started, 1, blob.len());
     if is_exterior {
-        let rtree_started = detail.begin();
         tx.prepare_cached("INSERT OR REPLACE INTO exterior_spatial(id, minX, maxX, minY, maxY, minZ, maxZ, cell_id, worldspace_id) VALUES (?1, ?2, ?2, ?3, ?3, ?4, ?4, ?5, ?6)")?.execute( params![form_id, pos[0], pos[1], pos[2], cell_id, worldspace_id])?;
-        detail.record(Site::ReferenceRtree, rtree_started, 1, 0);
     }
     Ok(())
 }

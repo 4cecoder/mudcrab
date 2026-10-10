@@ -42,15 +42,12 @@ fn plugin(data: &Path, name: &str, masters: &[&str], flags: u32, body: &[u8]) {
     fs::write(data.join(name), bytes).unwrap();
 }
 
-fn retained_data() -> PathBuf {
-    let root = tempfile::tempdir().unwrap().keep();
-    let data = root.join("Data");
+/// Keep synthetic source files and exports alive until their owning test scope ends.
+fn test_data() -> (tempfile::TempDir, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("Data");
     fs::create_dir(&data).unwrap();
-    eprintln!(
-        "retained master-index compatibility fixture: {}",
-        root.display()
-    );
-    data
+    (root, data)
 }
 
 fn export(data: &Path, names: &[&str], label: &str, signatures: &[[u8; 4]]) -> PathBuf {
@@ -147,7 +144,7 @@ fn unknown_source(
 
 #[test]
 fn full_supplier_projection_preserves_source_and_optional_link_policy() {
-    let data = retained_data();
+    let (_fixture, data) = test_data();
     plugin(&data, "Base.esm", &[], 0, &[]);
     let mut first = sub(b"EDID", b"compatibility_one\0");
     let raw_link = 0x0200_0712u32;
@@ -211,7 +208,7 @@ fn full_supplier_projection_preserves_source_and_optional_link_policy() {
 
 #[test]
 fn normal_full24_and_unknown_signature_preserve_generic_archive_without_typed_claim() {
-    let data = retained_data();
+    let (_fixture, data) = test_data();
     plugin(&data, "Base.esm", &[], 0, &[]);
     let wide = sub(b"EDID", b"normal_full24\0");
     let unknown = sub(b"ZZZZ", &[0, 255, 17, 0, 128]);
@@ -263,7 +260,7 @@ fn normal_full24_and_unknown_signature_preserve_generic_archive_without_typed_cl
 
 #[test]
 fn narrow_light_projection_and_wide_failure_never_alias_adjacent_owner() {
-    let data = retained_data();
+    let (_fixture, data) = test_data();
     plugin(&data, "Base.esm", &[], 0, &[]);
     let narrow = sub(b"EDID", b"first_light\0");
     let wide = sub(b"EDID", b"wide_archived_only\0");
@@ -299,7 +296,7 @@ fn narrow_light_projection_and_wide_failure_never_alias_adjacent_owner() {
 #[test]
 fn duplicate_projection_both_orders_keeps_existing_first_admission_policy() {
     for compatibility_first in [false, true] {
-        let data = retained_data();
+        let (_fixture, data) = test_data();
         plugin(&data, "Base.esm", &[], 0, &[]);
         let compat = sub(b"EDID", b"compatibility_candidate\0");
         let valid = sub(b"EDID", b"proven_candidate\0");
@@ -350,7 +347,7 @@ fn duplicate_projection_both_orders_keeps_existing_first_admission_policy() {
 
 #[test]
 fn legal_master_override_deletion_and_restore_share_runtime_not_original_owner_proof() {
-    let data = retained_data();
+    let (_fixture, data) = test_data();
     let initial = sub(b"EDID", b"inferred_runtime\0");
     let replacement = sub(b"EDID", b"legal_override\0");
     let restore = sub(b"EDID", b"legal_restore\0");
@@ -432,7 +429,7 @@ fn legal_master_override_deletion_and_restore_share_runtime_not_original_owner_p
 
 #[test]
 fn malformed_body_and_unusable_candidate_counts_do_not_masquerade_as_winners() {
-    let data = retained_data();
+    let (_fixture, data) = test_data();
     let compressed = [5, 0, 0, 0, 0x78, 0x9c, 0];
     let movt = sub(b"EDID", b"NpcDefault_MissingRequiredSpeeds\0");
     let neighbor = sub(b"EDID", b"usable_neighbor\0");
@@ -460,7 +457,7 @@ fn setting(raw: u32, name: &str, value: f32) -> Vec<u8> {
 
 #[test]
 fn gmst_editor_identity_deletion_and_zero_restore_keep_existing_convention() {
-    let data = retained_data();
+    let (_fixture, data) = test_data();
     plugin(
         &data,
         "Base.esm",
@@ -528,7 +525,7 @@ fn gmst_editor_identity_deletion_and_zero_restore_keep_existing_convention() {
 
 #[test]
 fn actual_runtime_null_checks_do_not_invent_a_local_zero_rejection() {
-    let data = retained_data();
+    let (_fixture, data) = test_data();
     let body = sub(b"EDID", b"local_zero\0");
     let mut base = frame(b"STAT", 0, 0, &body);
     base.extend(frame(b"STAT", 0x0100_0000, 0, &body)); // Full slot0 required projection is runtime zero.

@@ -77,6 +77,9 @@ runtime views. No diagnostic mode converts meshes, textures, scripts or LOD.
 Set `MUDCRAB_RECORDS_PROFILE=1` before starting the process to emit stage timing
 observations on stderr. Each observation names the stage, elapsed wall seconds
 and record count; these timings need a quiet machine for meaningful comparisons.
+This is the single profiling switch. It covers coarse export stages, reads no
+clock when disabled, and ignores observation-write failures. Detailed per-record
+SQL/binding instrumentation is not part of production export.
 
 In-house terrain publication selects the latest accepted LAND by plugin priority
 and physical record order when several identities share a cell. It retains

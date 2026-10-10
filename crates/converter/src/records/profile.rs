@@ -1,8 +1,8 @@
 //! Optional stage timings for complete record exports, independent of native content.
 
-use std::{sync::OnceLock, time::Instant};
+use std::{io::Write, sync::OnceLock, time::Instant};
 
-/// Read the same process-wide profile flag for stage and detailed observations.
+/// Read the single process-wide switch for coarse export stage timings.
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -28,7 +28,8 @@ impl ProfileStage {
     /// Emit one completed-stage observation; errors never imply a completed stage.
     pub(crate) fn finish(self, records: usize) {
         if let Some(started) = self.started {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr().lock(),
                 "records-profile {}",
                 serde_json::json!({
                     "stage": self.name,
