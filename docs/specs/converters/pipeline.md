@@ -16,18 +16,25 @@ retain the existing default-height cache behavior.
 
 `record-reader.json` stamps the selected frontend. In-house identity includes the
 authored schema SHA-256, adapter version and English localization choice, and
-`inhouse-reader-diagnostics.json` records decoder and adapter omissions. Generated
+`inhouse-reader-diagnostics.json` records bounded decoder and adapter issues. Generated
 database, terrain cache and LOD artifacts are rebuilt when resuming staging.
 In-house mode includes this identity in the configuration proof, because the
 corrected TXST slots affect texture roles. The current shared configuration key
 also invalidates mesh reuse conservatively; legacy configuration hashes remain
 compatible with existing packs. Resume commands preserve the reader choice.
 
-Localized FULL names and string GMST DATA in in-house mode use English STRINGS tables from the effective
-archive VFS, with loose files taking precedence. Missing keys produce NULL and
-a counted warning. Unconsumed localized descriptions retain their binary IDs;
-DLSTRINGS/ILSTRINGS resolution and other language selection are not implemented
-in this phase and produce no missing-name diagnostics for these unused fields.
+Localized fields in in-house mode use their declared English STRINGS, DLSTRINGS
+or ILSTRINGS bank from the effective archive VFS, with loose files taking
+precedence. Every validated occurrence remains in canonical records. Null or
+missing IDs yield empty canonical text and retain their original ID, bank,
+winning plugin and status in `inhouse_localized_fields`; nullable runtime name
+columns remain NULL. Missing nonzero keys produce counted warnings. Explicitly
+resolved empty text remains distinguishable from unresolved text. Other language
+selection is not implemented.
+Ordinary plugin text and English string banks use Windows-1252, including bytes
+that happen to form valid UTF-8. VMAD strings use their independent UTF-8 format.
+Runtime text is encoded as UTF-8 after decoding, and original source bytes remain
+available in provenance. The reader identity records both encoding contracts.
 Metadata rebuild uses the selected reader while validating retained assets under
 their original recorded reader configuration (unstamped older packs are legacy).
 Provenance records the retained reader separately, including across repeated
@@ -45,9 +52,38 @@ every retained asset is copied and verified against its output hash. This
 compatibility proof does not alter normal conversion or staging cache identities.
 
 For record-only diagnostics, `inhouse-records <Data> <plugins.txt> <new directory>`
-writes the database, cell cache, reader identity and diagnostic report without
+writes the database, cell caches, reader identity and diagnostic report without
 running asset stages or publishing a runtime pack. The new directory also keeps
 selected English archive STRINGS inputs under `.strings-input` for comparison.
+
+`--typed-signatures TAG1,TAG2` selects the authored typed envelopes to retain;
+`--database-work-dir <new directory>` builds SQLite on a separate local disk and
+copies the closed database and diagnostics into the output, retaining both copies.
+Output and working directories must be fresh and separate from the inputs.
+
+The explicit diagnostic option `--record-archive-only` retains the same typed
+selection, canonical `records` and `formid_map`, original source payloads, physical
+override history, localized keys/text/status, terrain layers/source order and both
+terrain caches. It defers runtime materialized tables, script indexing and the
+exterior spatial index. Script bytes and typed VMAD fields remain in the records.
+`record-bundle-scope.json` begins with `INCOMPLETE` and declares completion only
+after all retained artifacts and any database copy finish. It lists preserved and
+deferred tables and stamps `runtime_ready=false`, as does `record-reader.json`.
+This option does not produce a runnable pack or claim whole runtime SQL
+equivalence. The default diagnostic export and normal converter still build all
+runtime views. No diagnostic mode converts meshes, textures, scripts or LOD.
+
+In-house terrain publication selects the latest accepted LAND by plugin priority
+and physical record order when several identities share a cell. It retains
+normalized original texture IDs, slots and blend weights in
+`inhouse_terrain_layers` and `cell_cache_preserved.rkyv`. The runtime
+`cell_cache.rkyv` keeps those slots and weights with explicit zero-ID placeholders
+for absent, deleted or wrong-kind texture targets. Native null assignments are
+resolved before this replacement, so they do not displace a nonnull assignment
+or revive discarded weights. Runtime material construction accepts placeholders
+in any slot; a nonzero texture with missing converted images still fails its
+existing lookup checks. Original native fields and padding remain in the source
+table independently of these derived caches.
 
 ---
 
@@ -118,6 +154,11 @@ selected English archive STRINGS inputs under `.strings-input` for comparison.
   aborts the transactional publication when any required texture fails.
 - Asset paths use one lowercase canonical key. Archive overlays follow plugin load order, loose
   files have highest priority, and normalized collisions inside one source layer are fatal.
+  An archive's full filename attaches to the last selected plugin whose stem is followed by
+  ` - ` or `.`. Archives with the same owner use lowercase filename order; unattached archives
+  follow attached ones. This deterministic tie policy has not been established as equivalent
+  to every mod manager's archive insertion order. BSA header file-type categories are advisory;
+  unknown category bits do not relax layout, count, offset or compression validation.
 - Supports runtime transcoding into WebGPU/Vulkan native compressed formats (BC1/BC7 for Desktop, ASTC/ETC2 for Mobile/Web).
 
 ### C. World & Scene Database (`.esm` ➔ `SQLite3` + `rkyv` Zero-Copy Cache)

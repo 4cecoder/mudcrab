@@ -132,6 +132,38 @@ FormIDs remain file-relative. Malformed fields are omitted from canonical
 consumer bytes while their source payload remains available as provenance.
 These omissions do not invent a value or damage valid neighbors.
 
+Localized field occurrences are retained even when their key is zero or absent
+from the selected plugin's string bank. Canonical bytes contain an empty
+NUL-terminated text value in those cases. `inhouse_localized_fields` records the
+canonical field index, signature, field name, bank, original string ID, winning
+load order, nullable resolved text and status (`resolved`, `null_id`, `missing`).
+An explicitly resolved empty string remains distinct from a null or missing ID.
+Runtime nullable text projections omit only unresolved occurrences during
+extraction, so a missing NPC name remains NULL. Original ID bytes remain in the
+source payload; no decimal ID or raw four-byte key is presented as text.
+Ordinary inline strings and English localization banks decode as Windows-1252;
+valid UTF-8 byte sequences do not override that native encoding. VMAD names and
+values retain their separately specified UTF-8 decoder. Canonical runtime text
+is UTF-8, with original encoded bytes preserved in the source payload or bank.
+
+Multiple live LAND identities can share one parent cell. Both the database's
+cell-keyed terrain projection and cache select the record with the highest
+winning load order, then the latest physical source-record offset. FormID is
+only a deterministic final tie-breaker for callers without physical order.
+`inhouse_terrain_source_order` retains accepted LAND offsets for the full
+pipeline and diagnostic exporter. All winning LAND identities and their native
+fields remain in the records/source tables, including unselected alternatives.
+
+`inhouse_terrain_layers` retains normalized, globally remapped original texture
+assignments for accepted LAND records, with their cell, load order and unresolved
+texture IDs. Source duplicate slots and authored NULL assignments are resolved
+before optional target clearing. `cell_cache_preserved.rkyv` uses these original
+assignments. The runtime cache replaces unusable texture keys with zero while
+retaining each selected assignment's quadrant, slot and blend weights; these
+placeholders must not be normalized again as native NULL assignments. Both
+caches select the same complete LAND record. Original VTXT padding and authored
+NULL weights remain in the independent native source payload.
+
 Decoded records report `payload_complete` and deduplicated `rejected_fields`.
 An incomplete subrecord boundary preserves the safely framed prefix and marks
 the payload incomplete; it cannot establish whether a required field was absent
@@ -343,6 +375,11 @@ conversions are comparison policies, not replacements for its native bytes.
 DIAL's child-group timestamp and unknown fields likewise belong to the GRUP7
 header and must not be confused with the DIAL record's version-control header.
 
+A malformed INFO response TRDT omits only the members in its matched response
+group with bounded field diagnostics. A new response or unrelated group ends
+that omission. Malformed text beneath a valid TRDT omits only that text, keeping
+the usable response and neighboring records.
+
 INFO records also retain their containing GRUP7 label independently of TPIC.
 The typed reader and JSON diagnostic export expose the resolved DIAL owner,
 the native file-relative label, and the source group/record byte offsets.
@@ -364,11 +401,16 @@ opaque parameter bytes without guessing references.
 Only run-on mode 2 interprets the offset-24 slot as a reference FormID. Other
 modes preserve that slot as an unused u32; the signed offset-28 parameter holds
 the run-on alias/package/event index. CIS1 and CIS2 are independent native
-zero-terminated strings. Safely framed malformed CTDA is omitted with a bounded
-field diagnostic while valid neighbors continue to publication. Invalid
-optional links are cleared through the existing remap/target-validation path.
+zero-terminated strings belonging to the preceding CTDA. A safely framed
+malformed or out-of-order CTDA and its immediately following CIS1/CIS2 are
+omitted with bounded field diagnostics, preserving other conditions and records
+through publication. The reader identity also includes the decoder/adapter
+behavior version so outputs predating this recovery policy cannot prove reuse.
+Invalid optional links are cleared through the existing remap/target-validation path.
 
-Complete VMAD fragment and alias interpretation remains the separate shared
-script component. Loading this section's schemas and conditions does not
+The assembled phase-3 schema activates shared conditions in all family overlays
+and uses the attached-script component for complete VMAD fragments and aliases.
+The components retain their separate schema and parser ownership. Loading
+these schemas and conditions does not
 establish all other phase-3 owners, a complete mod-list audit, or runtime quest
 and dialogue execution.

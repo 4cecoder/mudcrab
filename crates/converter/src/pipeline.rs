@@ -635,12 +635,19 @@ impl AssetPipeline {
                 &staging.join("vfs"),
             )?;
             validate_database(&Connection::open(&db_path)?)?;
-            write_cell_cache(&merged, &staging.join("cell_cache.rkyv"))?;
+            if config.record_reader == crate::config::RecordReader::Inhouse {
+                crate::esm::inhouse::write_terrain_caches(&merged, &db_path, staging)?;
+            } else {
+                write_cell_cache(&merged, &staging.join("cell_cache.rkyv"))?;
+            }
             crate::esm::inhouse::write_reader_identity(staging, config.record_reader)?;
             if config.record_reader == crate::config::RecordReader::Inhouse {
                 report
                     .artifacts
                     .push(PathBuf::from("inhouse-reader-diagnostics.json"));
+                report
+                    .artifacts
+                    .push(PathBuf::from("cell_cache_preserved.rkyv"));
             }
             report.artifacts.extend([
                 PathBuf::from("skyrim_world.db"),
@@ -2021,6 +2028,7 @@ fn plugin_paths(
     crate::esm::load_order::order_discovered_plugins(plugins)
 }
 
+/// Replay archives by attached plugin priority, then deterministic filename order.
 pub(crate) fn sort_archives_by_load_order(archives: &mut [PathBuf], plugins: &[PathBuf]) {
     archives.sort_by_cached_key(|archive| {
         (
@@ -2034,29 +2042,24 @@ pub(crate) fn sort_archives_by_load_order(archives: &mut [PathBuf], plugins: &[P
     });
 }
 
+/// Attach a full archive filename to the final matching active plugin.
 pub(crate) fn archive_load_order_priority(archive: &Path, plugins: &[PathBuf]) -> Option<usize> {
-    let plugin_stems = plugins
-        .iter()
-        .filter_map(|path| path.file_stem())
-        .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    let stem = archive
-        .file_stem()
+    let filename = archive
+        .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_ascii_lowercase();
-    plugin_stems
+    plugins
         .iter()
         .enumerate()
-        .filter(|(_, plugin)| {
-            stem == plugin.as_str()
-                || stem
-                    .strip_prefix(plugin.as_str())
-                    .and_then(|suffix| suffix.chars().next())
-                    .is_some_and(|separator| matches!(separator, ' ' | '-' | '_'))
+        .rev()
+        .find_map(|(index, plugin)| {
+            let stem = plugin.file_stem()?.to_string_lossy().to_ascii_lowercase();
+            filename
+                .strip_prefix(&stem)
+                .is_some_and(|suffix| suffix.starts_with(" - ") || suffix.starts_with('.'))
+                .then_some(index)
         })
-        .map(|(index, _)| index)
-        .next()
 }
 
 fn extension(path: &Path, expected: &[&str]) -> bool {
@@ -2111,6 +2114,7 @@ fn invalidate_staged_generated_outputs(staging: &Path) -> Result<()> {
         "skyrim_world.db-wal",
         "skyrim_world.db-shm",
         "cell_cache.rkyv",
+        "cell_cache_preserved.rkyv",
         "record-reader.json",
         "inhouse-reader-diagnostics.json",
         "integration-report.json",
@@ -4229,6 +4233,51 @@ mod tests {
                 PathBuf::from("Example - Textures.bsa"),
             ]
         );
+    }
+
+    /// The final matching owner wins even when it is the shorter plugin stem.
+    #[test]
+    fn archive_attachment_uses_the_last_matching_plugin() {
+        let archive = Path::new("Parent - Child - Textures.bsa");
+        let child_first = vec![
+            PathBuf::from("Parent - Child.esp"),
+            PathBuf::from("Unrelated.esp"),
+            PathBuf::from("Parent.esp"),
+        ];
+        assert_eq!(archive_load_order_priority(archive, &child_first), Some(2));
+        let parent_first = vec![
+            PathBuf::from("Parent.esp"),
+            PathBuf::from("Unrelated.esp"),
+            PathBuf::from("Parent - Child.esp"),
+        ];
+        assert_eq!(archive_load_order_priority(archive, &parent_first), Some(2));
+    }
+
+    /// Match the complete filename delimiters, without admitting loose prefixes.
+    #[test]
+    fn archive_attachment_requires_native_filename_delimiters() {
+        let plugins = vec![PathBuf::from("Example.esp")];
+        for name in ["EXAMPLE.BSA", "Example - Textures.bsa", "Example.part.bsa"] {
+            assert_eq!(
+                archive_load_order_priority(Path::new(name), &plugins),
+                Some(0),
+                "valid attachment {name}"
+            );
+        }
+        for name in [
+            "Example-Textures.bsa",
+            "Example_Textures.bsa",
+            "Example Other.bsa",
+            "Example -Textures.bsa",
+            "ExampleElse.bsa",
+            "Unrelated.bsa",
+        ] {
+            assert_eq!(
+                archive_load_order_priority(Path::new(name), &plugins),
+                None,
+                "unattached archive {name}"
+            );
+        }
     }
 
     #[tokio::test]

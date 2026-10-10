@@ -5,7 +5,7 @@ use super::{
     schema_format::{FieldSchema, Schema},
 };
 use crate::esm::load_order::LoadOrder;
-use std::{collections::HashMap, sync::OnceLock};
+use std::{borrow::Cow, collections::HashMap, sync::OnceLock};
 
 /// Per-file interpretation supplied by the shared load-order authority.
 pub(crate) struct Context<'a> {
@@ -278,9 +278,37 @@ pub(crate) fn decode(
     context: &Context<'_>,
     diagnostics: &mut PluginDiagnostics,
 ) -> Result<DecodedRecord, String> {
+    decode_with_identity(scanned, schema, context, diagnostics, &mut |_| {})
+}
+
+/// Observe only a successfully decoded GMST EDID, even if a later field rejects the record.
+pub(crate) fn decode_with_identity(
+    scanned: ScannedRecord,
+    schema: &Schema,
+    context: &Context<'_>,
+    diagnostics: &mut PluginDiagnostics,
+    identity: &mut impl FnMut(&str),
+) -> Result<DecodedRecord, String> {
+    // Original ownership stays strict; required headers retain supplier-self runtime compatibility.
+    let source_identity = super::source_identity::resolve(
+        &scanned.record_type,
+        scanned.source_form_id,
+        context.plugin_index,
+        context.order,
+    );
     let id = remap(scanned.source_form_id, context, false, diagnostics)?;
     if id == 0 && !matches!(&scanned.record_type, b"GMST" | b"TES4") {
         return Err("non-GMST record has null FormID".into());
+    }
+    if source_identity.state == super::source_identity::SourceIdentityState::MasterIndexOutOfRange {
+        // Count header projection, not final admission; later body/collision checks remain independent.
+        diagnostics.note("compatibility", || {
+            format!(
+                "{} {:08X}: original owner unresolved; supplier-self runtime projection {id:08X}",
+                String::from_utf8_lossy(&scanned.record_type),
+                scanned.source_form_id
+            )
+        });
     }
     let cell = scanned
         .cell_form_id
@@ -303,12 +331,34 @@ pub(crate) fn decode(
     let mut fields = Vec::new();
     let mut rejected_fields = Vec::new();
     let mut editor_id = String::new();
+    // CIS leaves belong to the preceding CTDA, not the preceding surviving one.
+    let mut rejected_condition_strings = false;
+    // Response members must not move beneath an earlier surviving TRDT.
+    let mut rejected_info_response: Option<(usize, usize)> = None;
     let framed = subrecords(&scanned.payload, diagnostics, scanned.source_form_id);
     let link_kind = |source_id| {
         let id = remap(source_id, context, true, &mut PluginDiagnostics::default()).ok()?;
         context.winning_types?.get(&id).copied()
     };
     for (position, &(signature, bytes)) in framed.fields.iter().enumerate() {
+        let condition_string = matches!(&signature, b"CIS1" | b"CIS2");
+        if condition_string && rejected_condition_strings {
+            if !rejected_fields.contains(&signature) {
+                rejected_fields.push(signature);
+            }
+            diagnostics.note("field", || {
+                format!(
+                    "{} {id:08X} {}: string belongs to rejected CTDA",
+                    String::from_utf8_lossy(&scanned.record_type),
+                    String::from_utf8_lossy(&signature)
+                )
+            });
+            continue;
+        }
+        if !condition_string {
+            // A new source field ends this rejected condition's contiguous string block.
+            rejected_condition_strings = false;
+        }
         let selection = super::deciders::Context {
             record_type: scanned.record_type,
             form_version: scanned.form_version,
@@ -358,6 +408,9 @@ pub(crate) fn decode(
             continue;
         };
         let Some(index) = match_field(record_schema, &signature, cursor, last) else {
+            if signature == *b"CTDA" {
+                rejected_condition_strings = true;
+            }
             if record_schema.entries.iter().any(|entry| {
                 entry
                     .field
@@ -380,6 +433,23 @@ pub(crate) fn decode(
         let field_schema = &record_schema.entries[index].field;
         cursor = index + usize::from(!field_schema.repeat);
         last = Some(index);
+        if let Some((start, end)) = rejected_info_response {
+            if index > start && index < end {
+                if !rejected_fields.contains(&signature) {
+                    rejected_fields.push(signature);
+                }
+                diagnostics.note("field", || {
+                    format!(
+                        "{} {id:08X} {}: member belongs to rejected TRDT",
+                        String::from_utf8_lossy(&scanned.record_type),
+                        String::from_utf8_lossy(&signature)
+                    )
+                });
+                continue;
+            }
+            // A new response anchor or matched field outside this group ends it.
+            rejected_info_response = None;
+        }
         match value(
             field_schema,
             bytes,
@@ -394,6 +464,9 @@ pub(crate) fn decode(
                     && let Value::String(name) = &value
                 {
                     editor_id.clone_from(name);
+                    if scanned.record_type == *b"GMST" {
+                        identity(name);
+                    }
                 }
                 fields.push(DecodedField {
                     signature,
@@ -403,6 +476,16 @@ pub(crate) fn decode(
                 });
             }
             Err(error) => {
+                if signature == *b"CTDA" {
+                    rejected_condition_strings = true;
+                }
+                if scanned.record_type == *b"INFO" && signature == *b"TRDT" {
+                    rejected_info_response = record_schema.entries[index]
+                        .repeat_ranges
+                        .iter()
+                        .find(|range| range.start == index)
+                        .map(|range| (range.start, range.end));
+                }
                 if field_schema.reject_record_on_error && scanned.flags & 0x20 == 0 {
                     return Err(format!(
                         "{} {id:08X} mandatory {}: {error}",
@@ -685,11 +768,8 @@ fn value(
     Ok((decoded, bytes.to_vec()))
 }
 
-/// Decode Windows-1252 plugin text while preserving already valid UTF-8.
+/// Ordinary Skyrim plugin text uses Windows-1252; VMAD owns its separate UTF-8 decoder.
 pub(crate) fn decode_string(bytes: &[u8]) -> String {
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        return text.to_owned();
-    }
     const HIGH: [char; 32] = [
         '€', '\u{0081}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{008d}', 'Ž',
         '\u{008f}', '\u{0090}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ',
@@ -877,6 +957,12 @@ fn merge_new_diagnostics(
                 .invalid_links
                 .saturating_sub(baseline.invalid_links),
         ),
+        (
+            "compatibility",
+            resolved
+                .compatibility_headers
+                .saturating_sub(baseline.compatibility_headers),
+        ),
     ];
     for (category, count) in additions {
         if count == 0 {
@@ -886,6 +972,7 @@ fn merge_new_diagnostics(
             "record" => target.skipped_records += count,
             "field" => target.skipped_fields += count,
             "unexpected" => target.unexpected_subrecords += count,
+            "compatibility" => target.compatibility_headers += count,
             _ => target.invalid_links += count,
         }
         if !target.first_by_category.contains_key(category)
@@ -900,6 +987,10 @@ fn merge_new_diagnostics(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "master_index_compatibility_diagnostic_tests.rs"]
+mod master_index_compatibility_diagnostic_tests;
 
 /// Resolve catalogue-dependent unions without recounting already diagnosed source issues.
 pub(crate) fn resolve_deferred(result: &mut ReadResult, schema: &Schema, order: &LoadOrder) {
@@ -975,6 +1066,28 @@ pub(crate) fn resolve_deferred(result: &mut ReadResult, schema: &Schema, order: 
     }
 }
 
+/// Resolve named definitions with occurrence overrides; plain fields are already complete.
+fn validation_schema<'a>(
+    schema: &Schema,
+    field: &'a FieldSchema,
+) -> Result<Cow<'a, FieldSchema>, String> {
+    if field.definition.is_none() {
+        Ok(Cow::Borrowed(field))
+    } else {
+        schema.resolve(field).map(Cow::Owned)
+    }
+}
+
+/// Only nonzero typed links can require generic target validation and selector snapshots.
+fn contains_target_link(value: &Value) -> bool {
+    match value {
+        Value::FormId(id) => *id != 0,
+        Value::Struct(members) => members.iter().any(|(_, value)| contains_target_link(value)),
+        Value::Array(values) => values.iter().any(contains_target_link),
+        _ => false,
+    }
+}
+
 /// Validate declared target kinds after all winners exist; dangling optional links are nulled.
 pub(crate) fn validate_targets(result: &mut ReadResult, schema: &Schema, order: &LoadOrder) {
     let kinds: HashMap<u32, [u8; 4]> = result
@@ -1001,30 +1114,44 @@ pub(crate) fn validate_targets(result: &mut ReadResult, schema: &Schema, order: 
                 format!("INFO {:08X} GRUP7 has a null owner", record.form_id)
             });
         }
-        let preceding: Vec<_> = record
+        // Keep original selector bytes when any typed link could need them.
+        // VMAD and INFO ownership validation remain independent of this snapshot.
+        let needs_context = record
             .fields
             .iter()
-            .map(|field| (field.signature, field.canonical_bytes.clone()))
-            .collect();
+            .any(|field| contains_target_link(&field.value));
+        let preceding: Vec<_> = if needs_context {
+            record
+                .fields
+                .iter()
+                .map(|field| (field.signature, field.canonical_bytes.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let preceding: Vec<_> = preceding
             .iter()
             .map(|(tag, bytes)| (*tag, bytes.as_slice()))
             .collect();
-        let editor_id = record
-            .fields
-            .iter()
-            .find_map(|field| {
-                if field.signature == *b"EDID" {
-                    if let Value::String(name) = &field.value {
-                        Some(name.clone())
+        let editor_id = if needs_context {
+            record
+                .fields
+                .iter()
+                .find_map(|field| {
+                    if field.signature == *b"EDID" {
+                        if let Value::String(name) = &field.value {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let link_kind = |id| kinds.get(&id).copied();
         for (position, field) in record.fields.iter_mut().enumerate() {
             let field_schema = record_schema
@@ -1053,9 +1180,7 @@ pub(crate) fn validate_targets(result: &mut ReadResult, schema: &Schema, order: 
             let Some(field_schema) = field_schema else {
                 continue;
             };
-            let resolved = schema
-                .resolve(field_schema)
-                .expect("validated common field");
+            let resolved = validation_schema(schema, field_schema).expect("validated common field");
             if resolved.decider.as_deref() == Some("vmad") {
                 // Canonical VMAD links are already global; check all primary and alias objects.
                 let validation =
@@ -1088,7 +1213,11 @@ pub(crate) fn validate_targets(result: &mut ReadResult, schema: &Schema, order: 
                     record_type: record.record_type,
                     form_version: record.form_version,
                     editor_id: &editor_id,
-                    preceding_subrecords: &preceding[..position],
+                    preceding_subrecords: if needs_context {
+                        &preceding[..position]
+                    } else {
+                        &[]
+                    },
                     parent_payload: None,
                     link_record_type: Some(&link_kind),
                 },
@@ -1119,7 +1248,20 @@ fn validate_value(
     diagnostics: &mut PluginDiagnostics,
     selection: &super::deciders::Context<'_>,
 ) {
-    let Ok(field) = schema.resolve(field) else {
+    // Nonlink leaves never mutate bytes or emit target diagnostics. Keep this
+    // inside the generic walker, after the independent outer VMAD dispatch.
+    match decoded {
+        Value::FormId(0)
+        | Value::Unsigned(_)
+        | Value::Signed(_)
+        | Value::Float(_)
+        | Value::String(_)
+        | Value::LocalizedString(_)
+        | Value::Bytes(_)
+        | Value::Deferred(_) => return,
+        _ => {}
+    }
+    let Ok(field) = validation_schema(schema, field) else {
         return;
     };
     if let Ok(Some(layout)) = super::deciders::layout(&field, bytes) {
@@ -1274,6 +1416,10 @@ fn validate_value(
         _ => {}
     }
 }
+
+#[cfg(test)]
+#[path = "target_validation_tests.rs"]
+mod target_validation_tests;
 
 #[cfg(test)]
 mod tests {

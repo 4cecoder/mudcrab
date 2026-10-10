@@ -108,6 +108,123 @@ CREATE INDEX IF NOT EXISTS idx_records_type ON records(record_type);
 
 ---
 
+### Draft: optional in-house override history (`record_overrides`)
+
+The prototype in-house producer adds a tooling table containing each physically
+framed source record, including singletons, deleted versions and rejected
+candidates. Runtime readers continue to query the existing winning-record
+tables. No losing payload or decoded field set is retained for history during
+conversion. Singletons are explicit: this makes complete physical-header audits
+and lazy version lookup uniform without a second implicit representation.
+
+`record_overrides` has a physical primary key `(plugin_id, source_record_offset)`
+and a `(form_id, chain_position)` lookup index. Columns are canonical `form_id`,
+zero-based `chain_position`, `plugin_id` naming `plugins.id`, native
+`source_form_id`, `deleted`, `record_type`, `flags`, `source_record_offset`,
+`source_record_size`, `status`, `reason`, native enclosing cell/world/topic IDs
+and topic-group offset. The preservation extension also stores proven
+`original_owner`, unmasked `full_local`, `source_identity_state`, exclusive
+`source_group_end`, `frame_complete`, and exact four-byte `record_signature`
+BLOB. A source lookup index covers `(original_owner,full_local,plugin_id,
+source_record_offset)`. The record signature does not create a separate source
+identity namespace; changing kinds at one owner/local remains a type conflict.
+`source_record_offset` points at the 24-byte native
+header; size is the declared on-disk payload length, including the compressed
+size word when present and excluding the header. Unmappable identities are NULL
+and remain identifiable by plugin, offset and native FormID. Positions follow
+load order, then physical source offset; duplicate physical IDs stay distinct.
+
+`accepted` versions participate in the existing winner/deletion policy;
+`skipped` versions retain a reason and do not displace usable predecessors.
+The last accepted version is the source winner unless it deletes the record.
+GMST history uses the reader's canonical EditorID aliases, including an already
+decoded EditorID when a later mandatory field rejects that version. Broken
+EditorID framing retains the raw numeric alias; history does not guess an ID.
+Each TES4 row uses a NULL canonical identity
+and status `header`, and stores original master-list JSON, source path and the
+authored schema hash. These small metadata rows allow replay to reconstruct
+original full/light mapping without reading another missing or changed plugin.
+They are excluded from ordinary record-chain counts. Their deterministic positions
+in the NULL-identity group are header ordering, not a semantic record chain.
+
+`inhouse-records history <pack> <hex FormID> [--data DIR] [--json]` opens the
+database read-only and verifies each source against `plugins.checksum` before
+decoding the requested offset with the producing schema. Changed, missing,
+oversized or undecodable versions remain local diagnostics; other versions
+continue. The text view aligns authored field names and occurrences and marks
+differences. This is decoded source provenance, not a merge or patch format;
+partial decoding and unsupported semantic roles retain their existing limits.
+
+This optional additive tooling table does not change the runtime database
+contract, accepted version range or asset encodings. World and converter asset
+schema constants therefore remain unchanged. In-house adapter identity advances
+from 4 to 5, invalidating older in-house provenance output through the existing
+reader/configuration identity. This distinguishes a tooling-only addition from
+SPEC V29/V73/V112 changes to runtime or reusable asset output contracts. No
+older texture or mesh bytes are relabeled. This preservation extension advances
+the proposed adapter identity again to 6, distinguishing it from the committed
+history contribution's adapter 5. The existing global in-house
+configuration hash includes the adapter identity for asset cache entries too:
+normal conversion rejects adapter-4 cache reuse despite unchanged encodings.
+Metadata-only rebuilds retain verified assets under their existing reuse rules.
+Header rows bind the exact authored
+schema; a different schema is reported as undecodable rather than silently
+interpreting an old pack with new definitions. Deterministic sorted insertion
+and an explicit physical primary key make ordered history contents reproducible.
+
+`inhouse-records history-source <pack> <owner basename> <hex full local>
+[--data DIR]` also reaches nullable runtime identities. Proven source ownership
+comes only from the original supplier's MAST list: lower high-byte indices name
+masters, the equal index names self, and a generic greater index remains
+`master_index_out_of_range` with no invented self owner. The existing GMST
+greater-index convention is separately labelled `gmst_editor_id_convention`;
+its physical rows and decoded EDID/runtime aliases do not establish native
+owner proof. Source words of zero remain a separate null state, while nonzero
+self/master words with a local component of zero retain that exact source key.
+Missing-master load-order validation remains a producer limitation: this
+extension does not admit or scan a wholly rejected plugin sequence.
+
+`history-physical <pack> <decimal plugin id> <decimal source offset> [--data DIR]`
+reaches every stored header, including unproven owner words. Source/physical
+access requires the caller to authenticate the complete database against a
+trusted completed-producer receipt/pin and preserve that integrity through
+the call, retaining before/after bundle guards. Read-only SQL is not integrity
+validation. Original-file checksums prove read bytes, not edited stored MAST,
+slot, group-bound or candidate/winner context. These APIs do not independently
+verify arbitrary edited databases; their context authority is the authenticated
+producing bundle. Callers must consume/drop streamed versions to keep one-body
+memory, and must reject partial delivery without a successful complete summary.
+Both new commands
+emit one version JSONL row at a time followed by a summary. The Rust streaming
+callback exposes exact original 24-byte header and on-disk stored payload
+(including compression prefix) with full original-file checksum guards before
+and after reading through the same handle. It does not inflate, normalize,
+repair flags, mask locals, or manufacture typed/runtime decoding. Complete
+stored frames have a 64 MiB body access ceiling. A frame crossing its original
+containing-group end yields header-only material even when later outer siblings
+would satisfy its nominal size. Changed or unavailable originals remain local
+access failures. Source queries have an explicit 4096-version capacity; callback
+errors and exceeded query capacity return partial/error rather than claiming
+complete access. The caller must retain the emitted partial report. Files are
+not embedded or copied during conversion, so immutable originals are required
+for future body access, and each queried version entails whole-original
+checksum passes. The conversion retains header structs plus a sorted-reference
+vector; this is not a disk-bounded all-candidate conversion design.
+
+The report distinguishes the latest physical source candidate, latest
+reader-admitted candidate, current accepted-source winner, runtime presence,
+and surviving earlier runtime fallback. Deletions remain admitted history but
+do not become a live source/runtime winner. Wide light locals remain proven
+owner/full-local source keys with nullable runtime IDs and exact raw access;
+they never spill or mask into an adjacent light slot. Generic required invalid
+master indices reject only that candidate, with its header/reason retained and
+valid neighbors continuing. Full conversion atomically recreates only the owned
+tooling table within the provenance transaction, so its older optional schema
+does not silently survive with missing columns. There are no new sidecar files,
+asset conversions or runtime schema changes. Normal asset-cache identity
+invalidation remains an existing global adapter coupling and must be considered
+separately if this records-only prepared patch is integrated into full conversion.
+
 ### 3. Worldspace Registry (`worldspaces`)
 
 Stores worldspace hierarchy and parent world relations (e.g. Tamriel `0x0000003C`, Solstheim).
@@ -185,19 +302,19 @@ dropped, so both columns are NULL. See the remapped-field table below.
 
 ---
 
-### 6. Hybrid Spatial Indexing (`refs_rtree` & Interior `cell_id` Index)
+### 6. Hybrid Spatial Indexing (`exterior_spatial` & Interior `cell_id` Index)
 
-To prevent `float32` single-precision accuracy loss at large exterior coordinates (e.g. Tamriel bounds $\pm 200,000$) and avoid coordinate collisions between interior local origins $(0,0,0)$ and exterior global space, Mudcrab uses a **Two-Tier Hybrid Spatial Strategy**:
+Exterior references use a spatial index with a worldspace filter; interior references use direct cell lookup:
 
-1. **Exterior Worldspace R-Tree (`refs_rtree`):** Coordinates inside the R-Tree virtual table are stored normalized relative to cell centers (values constrained between $-2048.0$ and $+2048.0$), keeping numbers small to guarantee high single-precision float accuracy.
+1. **Exterior Worldspace R-Tree (`exterior_spatial`):** Bounds are the reference's global X/Y/Z point position, with equal minimum and maximum values. The exporter does not constrain coordinate magnitudes. SQLite stores single-precision bounds; `cell_id` and `worldspace_id` are auxiliary columns, not spatial dimensions. Cell-local X/Y offsets remain separate columns in `references`.
 2. **Interior Cell Direct Lookup (`idx_references_cell_id`):** Interior dungeons and houses do not use R-Trees. All interior references are loaded directly by `cell_id` for instant $O(1)$ lookup upon entering interior doors.
 
 ```sql
 -- R-Tree virtual table for Exterior 3D bounding box spatial queries
-CREATE VIRTUAL TABLE IF NOT EXISTS refs_rtree USING rtree(
+CREATE VIRTUAL TABLE IF NOT EXISTS exterior_spatial USING rtree(
     id,                                 -- Matches internal reference ID
-    minX, maxX,                         -- Local cell X offset (-2048.0 to +2048.0)
-    minY, maxY,                         -- Local cell Y offset (-2048.0 to +2048.0)
+    minX, maxX,                         -- Global reference X position
+    minY, maxY,                         -- Global reference Y position
     minZ, maxZ,                         -- World Z Height units
     +cell_id,                           -- Exterior CELL FormID
     +worldspace_id                      -- Parent WorldSpace FormID (e.g. 0x0000003C for Tamriel)
