@@ -286,6 +286,10 @@ fn copy_completed_record_database(work: &Path, output: &Path) -> Result<()> {
 #[path = "database_work_dir_tests.rs"]
 mod database_work_dir_tests;
 
+#[cfg(test)]
+#[path = "inhouse_review_tests.rs"]
+mod inhouse_review_tests;
+
 /// Stamp generated pack metadata after database/cache regeneration.
 pub(crate) fn write_reader_identity(staging: &Path, reader: RecordReader) -> Result<()> {
     let path = staging.join("record-reader.json");
@@ -443,32 +447,71 @@ fn convert_plugins_with_dump(
     dump: Option<(&Path, &[[u8; 4]])>,
     mode: RecordBundleMode,
 ) -> Result<HashMap<u32, RawRecord>> {
+    convert_plugins_with_dump_impl(
+        plugin_paths,
+        db_path,
+        strings_root,
+        dump,
+        mode,
+        #[cfg(test)]
+        None,
+    )
+}
+
+/// Keep synthetic schema selection private to tests of the real publication path.
+fn convert_plugins_with_dump_impl(
+    plugin_paths: &[PathBuf],
+    db_path: &Path,
+    strings_root: &Path,
+    dump: Option<(&Path, &[[u8; 4]])>,
+    mode: RecordBundleMode,
+    #[cfg(test)] test_schema: Option<&records::schema_format::Schema>,
+) -> Result<HashMap<u32, RawRecord>> {
     let order_stage = records::profile::ProfileStage::start("read_load_order");
     let order = LoadOrder::read(plugin_paths)?;
     order_stage.finish(plugin_paths.len());
     let mut warnings = Warnings::default();
     let mut preserved_layers = HashMap::new();
+    let preserve = |accepted: &records::ReadResult| {
+        for record in accepted
+            .records
+            .values()
+            .filter(|record| record.record_type == *b"LAND")
+        {
+            match crate::esm::cell_cache::preserved_texture_layers(&record.to_raw_record()) {
+                Ok(layers) => {
+                    preserved_layers.insert(record.form_id, layers);
+                }
+                Err(error) => warnings.skipped(
+                    &order.names[record.load_order as usize],
+                    format!("{:08X} terrain layer provenance: {error}", record.form_id),
+                ),
+            }
+        }
+    };
+    #[cfg(test)]
+    let mut decoded = if let Some(schema) = test_schema {
+        records::read_plugins_with_validation_and_observer_with_schema(
+            plugin_paths,
+            &order,
+            schema,
+            validate_candidate,
+            preserve,
+        )?
+    } else {
+        records::read_plugins_with_validation_and_observer(
+            plugin_paths,
+            &order,
+            validate_candidate,
+            preserve,
+        )?
+    };
+    #[cfg(not(test))]
     let mut decoded = records::read_plugins_with_validation_and_observer(
         plugin_paths,
         &order,
         validate_candidate,
-        |accepted| {
-            for record in accepted
-                .records
-                .values()
-                .filter(|record| record.record_type == *b"LAND")
-            {
-                match crate::esm::cell_cache::preserved_texture_layers(&record.to_raw_record()) {
-                    Ok(layers) => {
-                        preserved_layers.insert(record.form_id, layers);
-                    }
-                    Err(error) => warnings.skipped(
-                        &order.names[record.load_order as usize],
-                        format!("{:08X} terrain layer provenance: {error}", record.form_id),
-                    ),
-                }
-            }
-        },
+        preserve,
     )?;
     let mut localized_fields = Vec::new();
     let mut unresolved_fields = HashMap::new();
@@ -484,16 +527,11 @@ fn convert_plugins_with_dump(
     for record in decoded.records.values_mut() {
         let priority = record.load_order as usize;
         let plugin = &order.names[priority];
-        let mut runtime_text_updates = Vec::new();
+        let mut runtime_text_updates = decoded_text_updates(record);
         let mut unresolved = BTreeSet::new();
         let mut localized = Vec::new();
         let mut localization = BTreeMap::new();
         for (index, field) in record.fields.iter().enumerate() {
-            if let Value::String(text) = &field.value
-                && let Some(bytes) = runtime_text(text, &field.canonical_bytes)
-            {
-                runtime_text_updates.push((index, bytes));
-            }
             if let Value::LocalizedString(id) = &field.value {
                 let bank = records::string_table(&record.record_type, &field.name);
                 let table = tables
@@ -699,12 +737,26 @@ fn validate_candidate(record: &records::DecodedRecord) -> std::result::Result<()
     if !matches!(&record.record_type, b"LAND" | b"MOVT" | b"GMST" | b"RACE") {
         return Ok(());
     }
-    if record.record_type == *b"LAND"
-        && (!record.payload_complete || record.rejected_fields.contains(b"VHGT"))
-    {
-        return Err("incomplete terrain payload or rejected authored VHGT".into());
+    if record.record_type == *b"LAND" {
+        if !record.payload_complete {
+            return Err("incomplete terrain payload".into());
+        }
+        if let Some(signature) = record
+            .rejected_fields
+            .iter()
+            .copied()
+            .find(|signature| matches!(signature, b"VHGT" | b"BTXT" | b"ATXT" | b"VTXT"))
+        {
+            return Err(format!(
+                "rejected authored terrain field {}",
+                String::from_utf8_lossy(&signature)
+            ));
+        }
     }
-    let raw = record.to_raw_record();
+    let mut raw = record.to_raw_record();
+    for (index, text) in decoded_text_updates(record) {
+        raw.subrecords[index].1 = text;
+    }
     validate_inhouse_record(&raw).map_err(|error| error.to_string())?;
     if record.record_type == *b"LAND" {
         validate_inhouse_land(&raw).map_err(|error| error.to_string())?;
@@ -728,6 +780,22 @@ fn take_runtime_record(record: &mut records::DecodedRecord) -> RawRecord {
         worldspace_form_id: record.worldspace_form_id,
         load_order: record.load_order,
     }
+}
+
+/// Use the same decoded inline text in candidate validation and final publication.
+/// Field indices follow both raw projections; localized keys are resolved separately.
+fn decoded_text_updates(record: &records::DecodedRecord) -> Vec<(usize, Vec<u8>)> {
+    record
+        .fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| {
+            let Value::String(text) = &field.value else {
+                return None;
+            };
+            runtime_text(text, &field.canonical_bytes).map(|bytes| (index, bytes))
+        })
+        .collect()
 }
 
 /// Encode decoded text for the shared runtime extractor without changing original source bytes.
