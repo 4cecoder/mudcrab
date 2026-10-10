@@ -33,8 +33,9 @@ resolved empty text remains distinguishable from unresolved text. Other language
 selection is not implemented.
 Ordinary plugin text and English string banks use Windows-1252, including bytes
 that happen to form valid UTF-8. VMAD strings use their independent UTF-8 format.
-Runtime text is encoded as UTF-8 after decoding, and original source bytes remain
-available in provenance. The reader identity records both encoding contracts.
+Text requiring normalization is encoded as UTF-8 after decoding; already exact
+ASCII codes retain their original width and termination. Original source bytes
+remain available in provenance. The reader identity records both encoding contracts.
 Metadata rebuild uses the selected reader while validating retained assets under
 their original recorded reader configuration (unstamped older packs are legacy).
 Provenance records the retained reader separately, including across repeated
@@ -55,6 +56,27 @@ For record-only diagnostics, `inhouse-records <Data> <plugins.txt> <new director
 writes the database, cell caches, reader identity and diagnostic report without
 running asset stages or publishing a runtime pack. The new directory also keeps
 selected English archive STRINGS inputs under `.strings-input` for comparison.
+
+`--typed-signatures TAG1,TAG2` selects the authored typed envelopes to retain;
+`--database-work-dir <new directory>` builds SQLite on a separate local disk and
+copies the closed database and diagnostics into the output, retaining both copies.
+Output and working directories must be fresh and separate from the inputs.
+
+The explicit diagnostic option `--record-archive-only` retains the same typed
+selection, canonical `records` and `formid_map`, original source payloads, physical
+override history, localized keys/text/status, terrain layers/source order and both
+terrain caches. It defers runtime materialized tables, script indexing and the
+exterior spatial index. Script bytes and typed VMAD fields remain in the records.
+`record-bundle-scope.json` begins with `INCOMPLETE` and declares completion only
+after all retained artifacts and any database copy finish. It lists preserved and
+deferred tables and stamps `runtime_ready=false`, as does `record-reader.json`.
+This option does not produce a runnable pack or claim whole runtime SQL
+equivalence. The default diagnostic export and normal converter still build all
+runtime views. No diagnostic mode converts meshes, textures, scripts or LOD.
+
+Set `MUDCRAB_RECORDS_PROFILE=1` before starting the process to emit stage timing
+observations on stderr. Each observation names the stage, elapsed wall seconds
+and record count; these timings need a quiet machine for meaningful comparisons.
 
 In-house terrain publication selects the latest accepted LAND by plugin priority
 and physical record order when several identities share a cell. It retains

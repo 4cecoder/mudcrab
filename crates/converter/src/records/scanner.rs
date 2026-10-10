@@ -31,6 +31,10 @@ pub(crate) struct ObservedHeader {
     pub flags: u32,
     pub source_record_offset: u64,
     pub source_record_size: u32,
+    /// Exclusive containing-group end (file end for an ungrouped record).
+    pub source_group_end: u64,
+    /// Declared stored body fits this group; siblings outside it cannot satisfy the frame.
+    pub frame_complete: bool,
     pub cell_form_id: Option<u32>,
     pub worldspace_form_id: Option<u32>,
     pub source_topic_form_id: Option<u32>,
@@ -140,6 +144,8 @@ fn scan_bytes_observed(
             flags: u32_at(header, 8),
             source_record_offset: position as u64,
             source_record_size: size as u32,
+            source_group_end: end as u64,
+            frame_complete: size <= end - position - 24,
             cell_form_id: cell,
             worldspace_form_id: world,
             source_topic_form_id: (signature == *b"INFO")

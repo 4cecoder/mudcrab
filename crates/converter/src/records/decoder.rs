@@ -5,7 +5,7 @@ use super::{
     schema_format::{FieldSchema, Schema},
 };
 use crate::esm::load_order::LoadOrder;
-use std::{collections::HashMap, sync::OnceLock};
+use std::{borrow::Cow, collections::HashMap, sync::OnceLock};
 
 /// Per-file interpretation supplied by the shared load-order authority.
 pub(crate) struct Context<'a> {
@@ -289,9 +289,26 @@ pub(crate) fn decode_with_identity(
     diagnostics: &mut PluginDiagnostics,
     identity: &mut impl FnMut(&str),
 ) -> Result<DecodedRecord, String> {
+    // Original ownership stays strict; required headers retain supplier-self runtime compatibility.
+    let source_identity = super::source_identity::resolve(
+        &scanned.record_type,
+        scanned.source_form_id,
+        context.plugin_index,
+        context.order,
+    );
     let id = remap(scanned.source_form_id, context, false, diagnostics)?;
     if id == 0 && !matches!(&scanned.record_type, b"GMST" | b"TES4") {
         return Err("non-GMST record has null FormID".into());
+    }
+    if source_identity.state == super::source_identity::SourceIdentityState::MasterIndexOutOfRange {
+        // Count header projection, not final admission; later body/collision checks remain independent.
+        diagnostics.note("compatibility", || {
+            format!(
+                "{} {:08X}: original owner unresolved; supplier-self runtime projection {id:08X}",
+                String::from_utf8_lossy(&scanned.record_type),
+                scanned.source_form_id
+            )
+        });
     }
     let cell = scanned
         .cell_form_id
@@ -940,6 +957,12 @@ fn merge_new_diagnostics(
                 .invalid_links
                 .saturating_sub(baseline.invalid_links),
         ),
+        (
+            "compatibility",
+            resolved
+                .compatibility_headers
+                .saturating_sub(baseline.compatibility_headers),
+        ),
     ];
     for (category, count) in additions {
         if count == 0 {
@@ -949,6 +972,7 @@ fn merge_new_diagnostics(
             "record" => target.skipped_records += count,
             "field" => target.skipped_fields += count,
             "unexpected" => target.unexpected_subrecords += count,
+            "compatibility" => target.compatibility_headers += count,
             _ => target.invalid_links += count,
         }
         if !target.first_by_category.contains_key(category)
@@ -963,6 +987,10 @@ fn merge_new_diagnostics(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "master_index_compatibility_diagnostic_tests.rs"]
+mod master_index_compatibility_diagnostic_tests;
 
 /// Resolve catalogue-dependent unions without recounting already diagnosed source issues.
 pub(crate) fn resolve_deferred(result: &mut ReadResult, schema: &Schema, order: &LoadOrder) {
@@ -1038,6 +1066,28 @@ pub(crate) fn resolve_deferred(result: &mut ReadResult, schema: &Schema, order: 
     }
 }
 
+/// Resolve named definitions with occurrence overrides; plain fields are already complete.
+fn validation_schema<'a>(
+    schema: &Schema,
+    field: &'a FieldSchema,
+) -> Result<Cow<'a, FieldSchema>, String> {
+    if field.definition.is_none() {
+        Ok(Cow::Borrowed(field))
+    } else {
+        schema.resolve(field).map(Cow::Owned)
+    }
+}
+
+/// Only nonzero typed links can require generic target validation and selector snapshots.
+fn contains_target_link(value: &Value) -> bool {
+    match value {
+        Value::FormId(id) => *id != 0,
+        Value::Struct(members) => members.iter().any(|(_, value)| contains_target_link(value)),
+        Value::Array(values) => values.iter().any(contains_target_link),
+        _ => false,
+    }
+}
+
 /// Validate declared target kinds after all winners exist; dangling optional links are nulled.
 pub(crate) fn validate_targets(result: &mut ReadResult, schema: &Schema, order: &LoadOrder) {
     let kinds: HashMap<u32, [u8; 4]> = result
@@ -1064,30 +1114,44 @@ pub(crate) fn validate_targets(result: &mut ReadResult, schema: &Schema, order: 
                 format!("INFO {:08X} GRUP7 has a null owner", record.form_id)
             });
         }
-        let preceding: Vec<_> = record
+        // Keep original selector bytes when any typed link could need them.
+        // VMAD and INFO ownership validation remain independent of this snapshot.
+        let needs_context = record
             .fields
             .iter()
-            .map(|field| (field.signature, field.canonical_bytes.clone()))
-            .collect();
+            .any(|field| contains_target_link(&field.value));
+        let preceding: Vec<_> = if needs_context {
+            record
+                .fields
+                .iter()
+                .map(|field| (field.signature, field.canonical_bytes.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let preceding: Vec<_> = preceding
             .iter()
             .map(|(tag, bytes)| (*tag, bytes.as_slice()))
             .collect();
-        let editor_id = record
-            .fields
-            .iter()
-            .find_map(|field| {
-                if field.signature == *b"EDID" {
-                    if let Value::String(name) = &field.value {
-                        Some(name.clone())
+        let editor_id = if needs_context {
+            record
+                .fields
+                .iter()
+                .find_map(|field| {
+                    if field.signature == *b"EDID" {
+                        if let Value::String(name) = &field.value {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let link_kind = |id| kinds.get(&id).copied();
         for (position, field) in record.fields.iter_mut().enumerate() {
             let field_schema = record_schema
@@ -1116,9 +1180,7 @@ pub(crate) fn validate_targets(result: &mut ReadResult, schema: &Schema, order: 
             let Some(field_schema) = field_schema else {
                 continue;
             };
-            let resolved = schema
-                .resolve(field_schema)
-                .expect("validated common field");
+            let resolved = validation_schema(schema, field_schema).expect("validated common field");
             if resolved.decider.as_deref() == Some("vmad") {
                 // Canonical VMAD links are already global; check all primary and alias objects.
                 let validation =
@@ -1151,7 +1213,11 @@ pub(crate) fn validate_targets(result: &mut ReadResult, schema: &Schema, order: 
                     record_type: record.record_type,
                     form_version: record.form_version,
                     editor_id: &editor_id,
-                    preceding_subrecords: &preceding[..position],
+                    preceding_subrecords: if needs_context {
+                        &preceding[..position]
+                    } else {
+                        &[]
+                    },
                     parent_payload: None,
                     link_record_type: Some(&link_kind),
                 },
@@ -1182,7 +1248,20 @@ fn validate_value(
     diagnostics: &mut PluginDiagnostics,
     selection: &super::deciders::Context<'_>,
 ) {
-    let Ok(field) = schema.resolve(field) else {
+    // Nonlink leaves never mutate bytes or emit target diagnostics. Keep this
+    // inside the generic walker, after the independent outer VMAD dispatch.
+    match decoded {
+        Value::FormId(0)
+        | Value::Unsigned(_)
+        | Value::Signed(_)
+        | Value::Float(_)
+        | Value::String(_)
+        | Value::LocalizedString(_)
+        | Value::Bytes(_)
+        | Value::Deferred(_) => return,
+        _ => {}
+    }
+    let Ok(field) = validation_schema(schema, field) else {
         return;
     };
     if let Ok(Some(layout)) = super::deciders::layout(&field, bytes) {
@@ -1337,6 +1416,10 @@ fn validate_value(
         _ => {}
     }
 }
+
+#[cfg(test)]
+#[path = "target_validation_tests.rs"]
+mod target_validation_tests;
 
 #[cfg(test)]
 mod tests {

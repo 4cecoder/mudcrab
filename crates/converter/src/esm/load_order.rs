@@ -179,6 +179,8 @@ impl LoadOrder {
 
     /// Rebuild the same validated slot/master authority from immutable stored header facts.
     /// This does not read source files, select plugins or reorder the supplied sequence.
+    /// The caller supplies source-authenticated metadata; namespace validation does not prove
+    /// that supplied fields match original bytes or authenticate an edited producing database.
     pub fn from_metadata(names: Vec<String>, metadata: Vec<PluginMetadata>) -> Result<Self> {
         ensure!(
             names.len() == metadata.len(),

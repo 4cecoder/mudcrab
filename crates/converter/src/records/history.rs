@@ -13,7 +13,7 @@ use std::{
 };
 
 /// Stored filename, original source path and native SHA-256.
-type PluginSource = (String, PathBuf, Vec<u8>);
+pub(crate) type PluginSource = (String, PathBuf, Vec<u8>);
 
 /// One physical native record header; rejected versions never participate in winner selection.
 #[derive(Clone, Debug)]
@@ -26,6 +26,8 @@ pub struct HistoryEntry {
     pub source_record_offset: u64,
     /// Declared on-disk payload bytes, excluding the 24-byte main-record header.
     pub source_record_size: u32,
+    pub source_group_end: u64,
+    pub frame_complete: bool,
     pub accepted: bool,
     pub reason: Option<String>,
     pub source_cell_form_id: Option<u32>,
@@ -42,26 +44,12 @@ pub(crate) fn header_entry(
     order: &LoadOrder,
     index: usize,
 ) -> HistoryEntry {
-    let form_id = if header.record_type == *b"TES4" {
-        None
-    } else {
-        let source = header.source_form_id;
-        let masters = &order.metadata[index].masters;
-        let owner = masters
-            .get((source >> 24) as usize)
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_else(|| order.names[index].clone());
-        if source == 0 {
-            Some(0)
-        } else if let Some(slot) = order.light.get(&owner) {
-            (source & 0xFFFFFF <= 0xFFF).then_some(0xFE00_0000 | slot << 12 | source & 0xFFF)
-        } else {
-            order
-                .normal
-                .get(&owner)
-                .map(|slot| slot << 24 | source & 0xFFFFFF)
-        }
-    };
+    let form_id = super::source_identity::header_runtime_id(
+        &header.record_type,
+        header.source_form_id,
+        index,
+        order,
+    );
     HistoryEntry {
         form_id,
         plugin_index: index as u32,
@@ -70,14 +58,11 @@ pub(crate) fn header_entry(
         flags: header.flags,
         source_record_offset: header.source_record_offset,
         source_record_size: header.source_record_size,
+        source_group_end: header.source_group_end,
+        frame_complete: header.frame_complete,
         accepted: false,
-        reason: if header.record_type == *b"TES4" {
-            None
-        } else {
-            header.failure.or_else(|| {
-                Some("record rejected by reader identity or candidate validation".into())
-            })
-        },
+        // Decoder/candidate rejection supplies its reason only when it occurs.
+        reason: header.failure,
         source_cell_form_id: header.cell_form_id,
         source_worldspace_form_id: header.worldspace_form_id,
         source_topic_form_id: header.source_topic_form_id,
@@ -111,38 +96,70 @@ pub(crate) fn write_tables(
     order: &LoadOrder,
     paths: &[PathBuf],
 ) -> Result<()> {
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS record_overrides(
+    // Complete conversion replaces this owned tooling snapshot atomically with provenance.
+    // Recreate only this table so a retained older optional-history schema is not reused.
+    conn.execute_batch("DROP TABLE IF EXISTS record_overrides;
+        CREATE TABLE record_overrides(
         form_id INTEGER, chain_position INTEGER NOT NULL,
-        plugin_id INTEGER NOT NULL REFERENCES plugins(id), source_form_id INTEGER NOT NULL,
+        plugin_id INTEGER NOT NULL, source_form_id INTEGER NOT NULL,
         deleted INTEGER NOT NULL CHECK(deleted IN (0,1)), record_type TEXT NOT NULL,
         flags INTEGER NOT NULL, source_record_offset INTEGER NOT NULL, source_record_size INTEGER NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('accepted','skipped','header')), reason TEXT,
         source_cell_form_id INTEGER, source_worldspace_form_id INTEGER,
         source_topic_form_id INTEGER, topic_group_offset INTEGER,
         plugin_masters TEXT, source_path TEXT, schema_sha256 TEXT,
+        original_owner TEXT, full_local INTEGER, source_identity_state TEXT NOT NULL,
+        source_group_end INTEGER NOT NULL, frame_complete INTEGER NOT NULL CHECK(frame_complete IN (0,1)),
+        record_signature BLOB NOT NULL CHECK(length(record_signature)=4),
         PRIMARY KEY(plugin_id,source_record_offset)) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS record_overrides_chain ON record_overrides(form_id,chain_position);
-        DELETE FROM record_overrides;")?;
+        CREATE INDEX record_overrides_chain ON record_overrides(form_id,chain_position);
+        CREATE INDEX record_overrides_source ON record_overrides(original_owner,full_local,plugin_id,source_record_offset);")?;
     let source_paths = paths
         .iter()
         .map(|p| p.canonicalize())
         .collect::<std::io::Result<Vec<_>>>()?;
-    let mut sorted: Vec<_> = entries.iter().collect();
-    sorted.sort_by_key(|e| (e.form_id, e.plugin_index, e.source_record_offset));
+    let mut sorted: Vec<_> = (0..entries.len()).collect();
+    sorted.sort_by_key(|&index| {
+        let entry = &entries[index];
+        (
+            entry.form_id,
+            entry.plugin_index,
+            entry.source_record_offset,
+        )
+    });
+    let mut chain_positions = vec![0u32; entries.len()];
     let mut previous = None;
     let mut position = 0u32;
-    let mut insert = conn.prepare("INSERT INTO record_overrides VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)")?;
-    for entry in sorted {
+    for &index in &sorted {
+        let entry = &entries[index];
         let key = entry.form_id;
         if key != previous {
             position = 0;
             previous = key;
         }
+        chain_positions[index] = position;
+        position += 1;
+    }
+    // Preserve runtime-chain numbering while writing in the owned table's physical primary key.
+    sorted.sort_unstable_by_key(|&index| {
+        let entry = &entries[index];
+        (entry.plugin_index, entry.source_record_offset)
+    });
+    let mut insert = conn.prepare("INSERT INTO record_overrides VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)")?;
+    for index in sorted {
+        let entry = &entries[index];
+        let key = entry.form_id;
         // Unmappable headers retain NULL plus native identity and physical offset.
         let is_header = entry.record_type == *b"TES4";
+        let identity = super::source_identity::resolve(
+            &entry.record_type,
+            entry.source_form_id,
+            entry.plugin_index as usize,
+            order,
+        );
         insert.execute(params![
             key,
-            position,
+            chain_positions[index],
             entry.plugin_index,
             entry.source_form_id,
             entry.flags & 0x20 != 0,
@@ -168,9 +185,14 @@ pub(crate) fn write_tables(
                 ))
                 .transpose()?,
             is_header.then(|| source_paths[entry.plugin_index as usize].to_string_lossy()),
-            is_header.then(|| crate::cache::hash_bytes(super::SCHEMA_BYTES))
+            is_header.then(|| crate::cache::hash_bytes(super::SCHEMA_BYTES)),
+            identity.original_owner,
+            identity.full_local,
+            identity.state.as_str(),
+            entry.source_group_end,
+            entry.frame_complete,
+            entry.record_type.as_slice()
         ])?;
-        position += 1;
     }
     Ok(())
 }
@@ -211,7 +233,7 @@ pub struct HistoryField {
 }
 
 /// Reconstitute original slot/master assignment without reading any source plugin headers.
-fn stored_order(conn: &Connection) -> Result<(LoadOrder, Vec<PluginSource>)> {
+pub(crate) fn stored_order(conn: &Connection) -> Result<(LoadOrder, Vec<PluginSource>)> {
     let mut statement = conn.prepare("SELECT p.name,h.flags,h.plugin_masters,h.source_path,p.checksum FROM plugins p JOIN record_overrides h ON h.plugin_id=p.id AND h.record_type='TES4' AND h.source_record_offset=0 ORDER BY p.priority,p.id")?;
     let rows = statement.query_map([], |r| {
         Ok((
@@ -279,8 +301,13 @@ fn decode_version(
     );
     let length = file.metadata()?.len();
     ensure!(
-        u64::from(entry.source_record_size)
-            <= length.saturating_sub(entry.source_record_offset.saturating_add(24)),
+        entry.frame_complete
+            && entry.source_group_end <= length
+            && entry.source_record_offset.saturating_add(24) <= entry.source_group_end
+            && u64::from(entry.source_record_size)
+                <= entry
+                    .source_group_end
+                    .saturating_sub(entry.source_record_offset.saturating_add(24)),
         "truncated native record payload"
     );
     ensure!(
@@ -341,7 +368,7 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
         .filter_map(|row| row.ok())
         .filter_map(|(id, tag)| tag.as_bytes().try_into().ok().map(|tag| (id, tag)))
         .collect();
-    let mut statement = conn.prepare("SELECT chain_position,plugin_id,source_form_id,record_type,flags,source_record_offset,source_record_size,status,reason,source_cell_form_id,source_worldspace_form_id,source_topic_form_id,topic_group_offset FROM record_overrides WHERE form_id=?1 ORDER BY chain_position")?;
+    let mut statement = conn.prepare("SELECT chain_position,plugin_id,source_form_id,record_type,flags,source_record_offset,source_record_size,status,reason,source_cell_form_id,source_worldspace_form_id,source_topic_form_id,topic_group_offset,source_group_end,frame_complete,record_signature FROM record_overrides WHERE form_id=?1 ORDER BY chain_position")?;
     let rows = statement.query_map([form_id], |r| {
         Ok((
             r.get::<_, u32>(0)?,
@@ -357,6 +384,9 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
             r.get::<_, Option<u32>>(10)?,
             r.get::<_, Option<u32>>(11)?,
             r.get::<_, Option<u64>>(12)?,
+            r.get::<_, u64>(13)?,
+            r.get::<_, bool>(14)?,
+            r.get::<_, Vec<u8>>(15)?,
         ))
     })?;
     let mut versions = Vec::new();
@@ -365,7 +395,7 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
             position,
             index,
             source,
-            tag,
+            _tag,
             flags,
             offset,
             size,
@@ -375,6 +405,9 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
             world,
             topic,
             group,
+            containing_group_end,
+            frame_complete,
+            signature,
         ) = row?;
         let mut version = HistoryVersion {
             chain_position: position,
@@ -410,13 +443,15 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
                 form_id: Some(form_id),
                 plugin_index: index,
                 source_form_id: source,
-                record_type: tag
-                    .as_bytes()
+                record_type: signature
+                    .as_slice()
                     .try_into()
                     .map_err(|_| color_eyre::eyre::eyre!("invalid stored signature"))?,
                 flags,
                 source_record_offset: offset,
                 source_record_size: size,
+                source_group_end: containing_group_end,
+                frame_complete,
                 accepted: status == "accepted",
                 reason,
                 source_cell_form_id: cell,

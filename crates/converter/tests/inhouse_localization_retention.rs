@@ -630,3 +630,584 @@ async fn winning_full_and_light_banks_preserve_ids_and_bound_missing_text_warnin
         assert!(summary[1].as_str().unwrap().len() < 1024);
     }
 }
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MoveSqlCell {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+type MoveSqlRows = Vec<Vec<MoveSqlCell>>;
+type MoveSqlTables = std::collections::BTreeMap<String, MoveSqlRows>;
+
+/// Compare every SQL cell with its storage type, including physical index tables.
+fn move_sql_snapshot(database: &Connection) -> (MoveSqlRows, MoveSqlTables) {
+    /// Sort rows independently of SQLite's physical row traversal order.
+    fn scan(database: &Connection, sql: &str) -> Vec<Vec<MoveSqlCell>> {
+        let mut statement = database.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        let mut rows = statement.query([]).unwrap();
+        let mut found = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            let cells = (0..columns)
+                .map(|index| match row.get_ref(index).unwrap() {
+                    rusqlite::types::ValueRef::Null => MoveSqlCell::Null,
+                    rusqlite::types::ValueRef::Integer(v) => MoveSqlCell::Integer(v),
+                    rusqlite::types::ValueRef::Real(v) => MoveSqlCell::Real(v.to_bits()),
+                    rusqlite::types::ValueRef::Text(v) => MoveSqlCell::Text(v.to_vec()),
+                    rusqlite::types::ValueRef::Blob(v) => MoveSqlCell::Blob(v.to_vec()),
+                })
+                .collect::<Vec<_>>();
+            found.push(cells);
+        }
+        found.sort();
+        found
+    }
+    let schema = scan(database, "SELECT type,name,tbl_name,sql FROM sqlite_schema");
+    let names = database
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let tables = names
+        .into_iter()
+        .map(|name| {
+            let escaped = name.replace('"', "\"\"");
+            let rows = scan(database, &format!("SELECT * FROM \"{escaped}\""));
+            (name, rows)
+        })
+        .collect();
+    (schema, tables)
+}
+
+/// Compare typed records by identity while rejecting duplicate output rows.
+fn move_typed_snapshot(path: &Path) -> std::collections::BTreeMap<u32, serde_json::Value> {
+    let mut result = std::collections::BTreeMap::new();
+    for line in fs::read_to_string(path).unwrap().lines() {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        let id = u32::try_from(row["form_id"].as_u64().unwrap()).unwrap();
+        assert!(result.insert(id, row).is_none(), "duplicate typed identity");
+    }
+    result
+}
+
+#[test]
+/// A moved database retains all typed facts, SQL tables, localization and cache bytes.
+fn moved_localized_projection_complete_public_bundle_and_work_copy_remain_exact() {
+    use sha2::{Digest, Sha256};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let data = root.join("original-data");
+    fs::create_dir(&data).unwrap();
+    let generated = world();
+    fs::write(data.join("Skyrim.esm"), &generated).unwrap();
+    let ids = [100u32, 0, 17, 101];
+    let mut body = Vec::new();
+    for (index, string_id) in ids.into_iter().enumerate() {
+        body.extend(sound(0x0100_5500 + index as u32, string_id));
+    }
+    let native_plugin = native::plugin(&generated, &["Skyrim.esm"], 0x80, &body);
+    fs::write(data.join("MoveFixture.esp"), &native_plugin).unwrap();
+    write_strings(
+        &data,
+        "MoveFixture.esp",
+        "strings",
+        &strings(
+            &[(0, "Forbidden zero"), (100, "Resolved \u{20ac}"), (101, "")],
+            None,
+            false,
+        ),
+    );
+    let plugins = root.join("original-plugins.txt");
+    fs::write(&plugins, "*Skyrim.esm\n*MoveFixture.esp\n").unwrap();
+    let originals = [
+        data.join("Skyrim.esm"),
+        data.join("MoveFixture.esp"),
+        data.join("Strings/MoveFixture_english.strings"),
+        plugins.clone(),
+    ]
+    .into_iter()
+    .map(|path| {
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    })
+    .collect::<Vec<_>>();
+    let schema =
+        converter::records::schema_format::Schema::parse(converter::records::SCHEMA_BYTES).unwrap();
+    let signatures = schema
+        .records
+        .iter()
+        .map(|record| record.signature.as_bytes().try_into().unwrap())
+        .collect::<Vec<[u8; 4]>>();
+    assert!(signatures.contains(b"SNDR"));
+    let normal = root.join("default-output");
+    let copied = root.join("copied-output");
+    let work = root.join("fresh-database-work");
+    let a = inhouse::export_record_bundle_typed(&data, &plugins, &normal, &signatures).unwrap();
+    let b = inhouse::export_record_bundle_typed_with_database_work_dir(
+        &data,
+        &plugins,
+        &copied,
+        &signatures,
+        Some(&work),
+    )
+    .unwrap();
+    assert_eq!(a, b);
+    for (path, bytes) in originals {
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "original mutated: {}",
+            path.display()
+        );
+    }
+    let normal_db = Connection::open_with_flags(
+        normal.join("skyrim_world.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let copied_db = Connection::open_with_flags(
+        copied.join("skyrim_world.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(move_sql_snapshot(&normal_db), move_sql_snapshot(&copied_db));
+    let normal_typed = move_typed_snapshot(&normal.join("typed-records.jsonl"));
+    let copied_typed = move_typed_snapshot(&copied.join("typed-records.jsonl"));
+    assert_eq!(normal_typed, copied_typed);
+    let source_count: usize = copied_db
+        .query_row("SELECT count(*) FROM inhouse_source_records", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(copied_typed.len(), source_count);
+    assert!(
+        copied_db
+            .query_row("SELECT count(*) FROM record_overrides", [], |row| row
+                .get::<_, u64>(0))
+            .unwrap()
+            >= 4
+    );
+    for (index, string_id) in ids.into_iter().enumerate() {
+        let rid = 0x0100_5500 + index as u32;
+        let text = match string_id {
+            100 => Some("Resolved \u{20ac}"),
+            101 => Some(""),
+            _ => None,
+        };
+        let status = if string_id == 0 {
+            "null_id"
+        } else if text.is_some() {
+            "resolved"
+        } else {
+            "missing"
+        };
+        assert_eq!(
+            runtime_fields(&copied_db, rid, b"FNAM"),
+            vec![runtime_string_for_move_test(text.unwrap_or_default())]
+        );
+        assert_eq!(
+            localized(&copied_db, rid),
+            vec![expected(
+                1, "FNAM", "subtitle", "strings", string_id, text, status
+            )]
+        );
+        assert_eq!(
+            source(&copied_db, rid),
+            (rid, 1, sound(rid, string_id)[24..].to_vec())
+        );
+        let typed = &copied_typed[&rid];
+        assert_eq!(
+            typed["fields"][1]["value"],
+            serde_json::json!({"LocalizedString":string_id})
+        );
+        assert_eq!(
+            typed["fields"][1]["canonical_bytes"],
+            serde_json::json!(string_id.to_le_bytes())
+        );
+        assert_eq!(typed["localization"]["1"]["status"], status);
+        assert_eq!(typed["localization"]["1"]["text"], serde_json::json!(text));
+        assert_eq!(
+            typed["source_payload_sha256"],
+            format!("{:x}", Sha256::digest(&sound(rid, string_id)[24..]))
+        );
+    }
+    for name in [
+        "cell_cache.rkyv",
+        "cell_cache_preserved.rkyv",
+        "records-schema.json",
+        "record-reader.json",
+    ] {
+        assert_eq!(
+            fs::read(normal.join(name)).unwrap(),
+            fs::read(copied.join(name)).unwrap()
+        );
+    }
+    for name in ["skyrim_world.db", "inhouse-reader-diagnostics.json"] {
+        let source_bytes = fs::read(work.join(name)).unwrap();
+        let final_bytes = fs::read(copied.join(name)).unwrap();
+        assert_eq!(source_bytes, final_bytes);
+        assert_eq!(Sha256::digest(&source_bytes), Sha256::digest(&final_bytes));
+    }
+    let diagnostics: serde_json::Value =
+        serde_json::from_slice(&fs::read(copied.join("inhouse-reader-diagnostics.json")).unwrap())
+            .unwrap();
+    let normal_diagnostics: serde_json::Value =
+        serde_json::from_slice(&fs::read(normal.join("inhouse-reader-diagnostics.json")).unwrap())
+            .unwrap();
+    assert_eq!(diagnostics, normal_diagnostics);
+    assert_eq!(diagnostics["adapter"]["movefixture.esp"][0], 1);
+    assert!(!work.join("typed-records.jsonl").exists());
+    assert!(!work.join("cell_cache.rkyv").exists());
+}
+
+/// Localized native IDs are projected to terminated UTF-8 runtime strings.
+fn runtime_string_for_move_test(text: &str) -> Vec<u8> {
+    [text.as_bytes(), &[0]].concat()
+}
+
+#[test]
+/// Compare retained facts and both cache policies across full and deferred-view diagnostics.
+fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer() {
+    use converter::esm::inhouse::RecordBundleMode;
+    use sha2::{Digest, Sha256};
+    let temp = tempfile::tempdir().unwrap();
+    let retained = temp.path();
+    let data = retained.join("original-data");
+    fs::create_dir(&data).unwrap();
+    let generated = world(); // Actual exterior CELL/LAND/reference and authored terrain/LTEX.
+    fs::write(data.join("Skyrim.esm"), &generated).unwrap();
+    let mut body = Vec::new();
+    for (id, key) in [(0x0100_5500, 100), (0x0100_5501, 0), (0x0100_5502, 17)] {
+        body.extend(sound(id, key));
+    }
+    let mut vmad = Vec::new();
+    vmad.extend(5u16.to_le_bytes());
+    vmad.extend(2u16.to_le_bytes());
+    vmad.extend(1u16.to_le_bytes());
+    vmad.extend(12u16.to_le_bytes());
+    vmad.extend(b"ArchiveProbe");
+    vmad.push(0);
+    vmad.extend(0u16.to_le_bytes());
+    let before = native::named(b"ACTI", 0x0100_5600, &[native::subrecord(b"VMAD", &vmad)]);
+    let broken_payload = [5u32.to_le_bytes().as_slice(), &[0x78, 0x9c, 0]].concat();
+    let broken = native::record(b"STAT", 0x0100_5601, 0x40000, &broken_payload);
+    let after = native::named(
+        b"STAT",
+        0x0100_5602,
+        &[native::subrecord(b"OBND", &[0; 12])],
+    );
+    body.extend(before);
+    body.extend(broken);
+    body.extend(after);
+    // Remove the otherwise available terrain texture. Preserved ID4 versus runtime placeholder0
+    // forces the test to exercise the canonical LTEX lookup and both distinct cache policies.
+    body.extend(native::record(b"LTEX", 4, 0x20, &[]));
+    let original_patch = native::plugin(&generated, &["Skyrim.esm"], 0x80, &body);
+    fs::write(data.join("ArchiveProbe.esp"), &original_patch).unwrap();
+    write_strings(
+        &data,
+        "ArchiveProbe.esp",
+        "strings",
+        &strings(
+            &[
+                (0, "Never use null key"),
+                (100, "Resolved \u{20ac} archive"),
+            ],
+            None,
+            false,
+        ),
+    );
+    let order = retained.join("original-order.txt");
+    fs::write(&order, "*Skyrim.esm\n*ArchiveProbe.esp\n").unwrap();
+    let originals = [
+        data.join("Skyrim.esm"),
+        data.join("ArchiveProbe.esp"),
+        data.join("Strings/ArchiveProbe_english.strings"),
+        order.clone(),
+    ]
+    .into_iter()
+    .map(|path| {
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    })
+    .collect::<Vec<_>>();
+    let schema =
+        converter::records::schema_format::Schema::parse(converter::records::SCHEMA_BYTES).unwrap();
+    let signatures = schema
+        .records
+        .iter()
+        .map(|record| record.signature.as_bytes().try_into().unwrap())
+        .collect::<Vec<[u8; 4]>>();
+    let full = retained.join("full-default-output");
+    let archive = retained.join("archive-output");
+    let copied = retained.join("archive-copied-output");
+    let work = retained.join("archive-database-work");
+    let count = inhouse::export_record_bundle_typed(&data, &order, &full, &signatures).unwrap();
+    assert!(count > 0, "a nonempty cache pair is required");
+    for (output, working) in [(&archive, None), (&copied, Some(work.as_path()))] {
+        assert_eq!(
+            inhouse::export_record_bundle_typed_with_options(
+                &data,
+                &order,
+                output,
+                &signatures,
+                working,
+                RecordBundleMode::RecordArchiveOnly
+            )
+            .unwrap(),
+            count
+        );
+        let full_db = Connection::open(full.join("skyrim_world.db")).unwrap();
+        let archive_db = Connection::open(output.join("skyrim_world.db")).unwrap();
+        let (full_schema, full_tables) = move_sql_snapshot(&full_db);
+        let (archive_schema, archive_tables) = move_sql_snapshot(&archive_db);
+        assert_eq!(
+            full_schema, archive_schema,
+            "no SQL object silently omitted"
+        );
+        let deferred = [
+            "worldspaces",
+            "cells",
+            "references",
+            "exterior_spatial",
+            "land",
+            "statics",
+            "lights",
+            "npcs",
+            "movement_types",
+            "race_movement_links",
+            "movement_game_settings",
+            "waters",
+            "texture_sets",
+            "landscape_textures",
+            "grass_types",
+            "landscape_texture_grasses",
+            "scripts",
+        ];
+        for (name, rows) in &full_tables {
+            if deferred.contains(&name.as_str()) {
+                assert!(
+                    archive_tables[name].is_empty(),
+                    "view was not deferred: {name}"
+                );
+            } else if name.starts_with("exterior_spatial_") {
+                // Physical RTree structures are explicitly scoped: empty-tree nodes differ from full.
+                assert!(
+                    [
+                        "exterior_spatial_node",
+                        "exterior_spatial_parent",
+                        "exterior_spatial_rowid"
+                    ]
+                    .contains(&name.as_str())
+                );
+                if name == "exterior_spatial_node" {
+                    assert_eq!(
+                        archive_tables[name].len(),
+                        1,
+                        "empty RTree root node retained"
+                    );
+                } else {
+                    assert!(
+                        archive_tables[name].is_empty(),
+                        "empty RTree mapping retained"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    *rows, archive_tables[name],
+                    "unexpected nondeferred SQL change: {name}"
+                );
+            }
+        }
+        for table in ["cells", "references", "scripts"] {
+            assert!(
+                !full_tables[table].is_empty(),
+                "asymmetric full fixture must populate {table}"
+            );
+        }
+        let full_typed = move_typed_snapshot(&full.join("typed-records.jsonl"));
+        let archive_typed = move_typed_snapshot(&output.join("typed-records.jsonl"));
+        assert_eq!(
+            full_typed, archive_typed,
+            "entire typed DOM, occurrence order and all metadata"
+        );
+        assert!(
+            archive_typed
+                .values()
+                .all(|row| row.as_object().unwrap().len() == 20)
+        );
+        for id in [0x0100_5600u32, 0x0100_5602] {
+            assert!(archive_typed.contains_key(&id), "broken-mod neighbor lost");
+            let present: bool = archive_db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM records WHERE form_id=?1)",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "canonical neighbor lost");
+        }
+        let broken_count: (u32, u32) = archive_db.query_row(
+            "SELECT count(*),sum(status='skipped') FROM record_overrides WHERE source_form_id=?1",
+            [0x0100_5601u32], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(
+            broken_count,
+            (1, 1),
+            "complete physical skipped history retained"
+        );
+        for status in ["resolved", "null_id", "missing"] {
+            let present: bool = archive_db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM inhouse_localized_fields WHERE status=?1)",
+                    [status],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "localized key policy lost: {status}");
+        }
+        for name in [
+            "cell_cache.rkyv",
+            "cell_cache_preserved.rkyv",
+            "records-schema.json",
+            "inhouse-reader-diagnostics.json",
+        ] {
+            assert_eq!(
+                fs::read(full.join(name)).unwrap(),
+                fs::read(output.join(name)).unwrap(),
+                "preserved artifact {name}"
+            );
+        }
+        assert_ne!(
+            fs::read(output.join("cell_cache.rkyv")).unwrap(),
+            fs::read(output.join("cell_cache_preserved.rkyv")).unwrap(),
+            "missing LTEX must retain distinct preserved/runtime policies"
+        );
+        let scope: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("record-bundle-scope.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            scope["status"],
+            "COMPLETE_DIAGNOSTIC_ARCHIVE_RUNTIME_VIEWS_DEFERRED"
+        );
+        assert_eq!(scope["runtime_ready"], false);
+        assert_eq!(scope["runtime_views_materialized"], false);
+        assert_eq!(scope["whole_runtime_SQL_equivalence_claim"], false);
+        let preserved = scope["preserved_sql_tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        let deferred_manifest = scope["deferred_runtime_tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(preserved.is_disjoint(&deferred_manifest));
+        assert_eq!(deferred_manifest, deferred.into_iter().collect());
+        for table in archive_tables.keys() {
+            assert!(
+                preserved.contains(table.as_str())
+                    || deferred_manifest.contains(table.as_str())
+                    || [
+                        "exterior_spatial_node",
+                        "exterior_spatial_parent",
+                        "exterior_spatial_rowid"
+                    ]
+                    .contains(&table.as_str())
+                    || [
+                        "conversion_cache",
+                        "lod",
+                        "lod_chunks",
+                        "lod_build",
+                        "lod_chunks_spatial",
+                        "lod_chunks_spatial_node",
+                        "lod_chunks_spatial_parent",
+                        "lod_chunks_spatial_rowid"
+                    ]
+                    .contains(&table.as_str()),
+                "unclassified SQL table requires explicit scope review: {table}"
+            );
+        }
+        assert_eq!(
+            scope["unchanged_auxiliary_tables"],
+            serde_json::json!([
+                "conversion_cache",
+                "lod",
+                "lod_chunks",
+                "lod_build",
+                "lod_chunks_spatial",
+                "lod_chunks_spatial_node",
+                "lod_chunks_spatial_parent",
+                "lod_chunks_spatial_rowid"
+            ])
+        );
+        let identity: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("record-reader.json")).unwrap()).unwrap();
+        assert_eq!(identity["bundle_mode"], "record_archive_only");
+        assert_eq!(identity["runtime_ready"], false);
+    }
+    assert!(
+        !full.join("record-bundle-scope.json").exists(),
+        "default API output contract changed"
+    );
+    for name in ["skyrim_world.db", "inhouse-reader-diagnostics.json"] {
+        let working = fs::read(work.join(name)).unwrap();
+        let published = fs::read(copied.join(name)).unwrap();
+        assert_eq!(
+            Sha256::digest(&working),
+            Sha256::digest(&published),
+            "complete work-copy pin {name}"
+        );
+        assert_eq!(working, published, "complete work-copy bytes {name}");
+    }
+    for (path, bytes) in originals {
+        assert_eq!(fs::read(path).unwrap(), bytes, "original input changed");
+    }
+}
+
+#[test]
+/// A public export failure after scope creation leaves an explicit incomplete archive.
+fn failed_archive_does_not_publish_a_completed_scope_or_reader_identity() {
+    use converter::esm::inhouse::RecordBundleMode;
+    let temp = tempfile::tempdir().unwrap();
+    let retained = temp.path();
+    let data = retained.join("original-data");
+    fs::create_dir(&data).unwrap();
+    let generated = world();
+    let patch = native::plugin(&generated, &["AbsentMaster.esm"], 0, &[]);
+    fs::write(data.join("MissingDependency.esp"), &patch).unwrap();
+    let order = retained.join("original-order.txt");
+    fs::write(&order, "*MissingDependency.esp\n").unwrap();
+    let output = retained.join("failed-archive-output");
+    let result = inhouse::export_record_bundle_typed_with_options(
+        &data,
+        &order,
+        &output,
+        &[*b"ACTI"],
+        None,
+        RecordBundleMode::RecordArchiveOnly,
+    );
+    assert!(
+        result.is_err(),
+        "missing master must fail the public export"
+    );
+    let scope: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("record-bundle-scope.json")).unwrap())
+            .unwrap();
+    assert_eq!(scope["status"], "INCOMPLETE");
+    assert_eq!(scope["runtime_ready"], false);
+    assert!(!output.join("record-reader.json").exists());
+    assert_eq!(fs::read(data.join("MissingDependency.esp")).unwrap(), patch);
+    assert_eq!(
+        fs::read_to_string(order).unwrap(),
+        "*MissingDependency.esp\n"
+    );
+}

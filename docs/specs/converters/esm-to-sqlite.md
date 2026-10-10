@@ -98,17 +98,17 @@ CREATE TABLE IF NOT EXISTS cells (
 
 ### C. Hybrid Spatial Indexing Architecture (Exterior vs. Interior)
 
-To prevent `float32` precision loss at large exterior coordinates (e.g. Tamriel bounds $\pm 200,000$) and avoid coordinate collisions between interior local origins $(0,0,0)$ and exterior global space, Mudcrab uses a **Two-Tier Hybrid Spatial Strategy**:
+Exterior references use a spatial index with a worldspace filter; interior references use direct cell lookup:
 
-1. **Exterior Worldspace R-Tree (`exterior_spatial`):** Coordinates inside the R-Tree are stored normalized relative to the center of each $4096 \times 4096$ Skyrim cell origin, constraining bounding box values between $-2048.0$ and $+2048.0$. This guarantees high single-precision float accuracy.
+1. **Exterior Worldspace R-Tree (`exterior_spatial`):** The exporter inserts each reference's global X/Y/Z position as a point (equal minimum and maximum bounds). SQLite stores these bounds as single-precision values; the exporter applies no coordinate magnitude limit. `cell_id` and `worldspace_id` are auxiliary fields rather than spatial dimensions. Separate reference columns retain cell-local X/Y offsets.
 2. **Interior Cell Direct Lookup (`cell_id` Hash Index):** Interior dungeons and houses do not use R-Trees. All interior `REFR` objects are indexed directly by `cell_id` for $O(1)$ fast lookup when entering interior doors.
 
 ```sql
 -- R-Tree virtual table for Exterior 3D bounding box spatial queries
 CREATE VIRTUAL TABLE IF NOT EXISTS exterior_spatial USING rtree(
     id,            -- Matches REFR FormID
-    minX, maxX,    -- Local cell X offset (-2048.0 to +2048.0)
-    minY, maxY,    -- Local cell Y offset (-2048.0 to +2048.0)
+    minX, maxX,    -- Global reference X position
+    minY, maxY,    -- Global reference Y position
     minZ, maxZ,    -- World Z Height units
     +cell_id,      -- Exterior CELL FormID
     +worldspace_id -- Parent WorldSpace FormID (e.g. 0x0000003C for Tamriel)
