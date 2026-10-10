@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
 };
 pub mod binary;
@@ -22,7 +24,48 @@ pub mod mmap_reader;
 pub mod records;
 pub mod types;
 
+#[cfg(test)]
+mod plugin_table_tests;
+
 pub struct EsmParser;
+
+/// Populate the common plugin metadata contract without allocating each complete input.
+fn insert_plugins(conn: &Connection, plugin_paths: &[PathBuf]) -> Result<()> {
+    let mut statement = conn.prepare_cached(
+        "INSERT OR REPLACE INTO plugins (id, name, priority, checksum) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (priority, path) in plugin_paths.iter().enumerate() {
+        let mut file = File::open(path)
+            .wrap_err_with(|| format!("failed to open {} for plugin checksum", path.display()))?;
+        let checksum = plugin_checksum(&mut file)
+            .wrap_err_with(|| format!("failed to hash plugin {}", path.display()))?;
+        statement.execute(params![
+            priority as i64,
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            priority as i64,
+            checksum.as_slice()
+        ])?;
+    }
+    Ok(())
+}
+
+/// Hash every source byte with bounded scratch space and preserve the raw SHA-256 BLOB.
+fn plugin_checksum(reader: &mut impl Read) -> std::io::Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest.finalize().into())
+}
 
 impl EsmParser {
     /// Export using the selected frontend, returning exactly the projection input.
@@ -56,13 +99,7 @@ impl EsmParser {
         let master = Self::merge_plugins_with_load_order(plugin_paths, &order)?;
         let conn = Connection::open(db_path)?;
         create_tables(&conn)?;
-        for (priority, path) in plugin_paths.iter().enumerate() {
-            let checksum = Sha256::digest(std::fs::read(path)?);
-            conn.execute(
-                "INSERT OR REPLACE INTO plugins (id, name, priority, checksum) VALUES (?1, ?2, ?3, ?4)",
-                params![priority as i64, path.file_name().unwrap_or_default().to_string_lossy(), priority as i64, checksum.as_slice()],
-            )?;
-        }
+        insert_plugins(&conn, plugin_paths)?;
         export_to_db_with_load_order(&conn, &master, &order)?;
 
         Ok(master)

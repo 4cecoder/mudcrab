@@ -16,7 +16,6 @@ use crate::{
 };
 use color_eyre::Result;
 use rusqlite::{Connection, params};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -595,18 +594,7 @@ fn convert_plugins_with_dump(
     conn.pragma_update(Some(rusqlite::DatabaseName::Main), "cache_size", -65_536)?;
     conn.set_prepared_statement_cache_capacity(64);
     create_tables(&conn)?;
-    for (priority, path) in plugin_paths.iter().enumerate() {
-        let checksum = Sha256::digest(fs::read(path)?);
-        conn.prepare_cached(
-            "INSERT OR REPLACE INTO plugins(id,name,priority,checksum) VALUES (?1,?2,?3,?4)",
-        )?
-        .execute(params![
-            priority as i64,
-            path.file_name().unwrap_or_default().to_string_lossy(),
-            priority as i64,
-            checksum.as_slice()
-        ])?;
-    }
+    super::insert_plugins(&conn, plugin_paths)?;
     let terrain_offsets = decoded
         .records
         .values()

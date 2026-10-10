@@ -1299,6 +1299,7 @@ async fn pipeline_publishes_and_rebuilds_reference_and_cell_links() {
                 .filter(|entry| entry.output.ends_with(".ktx2"))
                 .count() as u64;
             manifest.schema_version = 24;
+            manifest.asset_configuration_hashes.clear();
             manifest.configuration_hash =
                 converter::cache::configuration_hash_for_schema(&config, 24).unwrap();
             manifest.save(&manifest_path).unwrap();

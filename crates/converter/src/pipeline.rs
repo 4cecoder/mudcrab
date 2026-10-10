@@ -3,8 +3,9 @@ use crate::{
     asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
     cache::{
         CONVERTER_SCHEMA_VERSION, CacheEntry, ConversionManifest, StagedOutput, StagingJournal,
-        can_reuse_scripts_and_archives, configuration_hash, configuration_hash_for_schema,
-        hash_bytes, hash_file, link_or_copy, load_staged_outputs,
+        asset_configuration_hash_for_schema, can_reuse_meshes, can_reuse_scripts_and_archives,
+        configuration_hash, configuration_hash_for_schema, hash_bytes, hash_file, link_or_copy,
+        load_staged_outputs,
     },
     config::{PipelineConfig, TextureEncoder},
     esm::{
@@ -52,6 +53,10 @@ use tokio::{
     task::spawn_blocking,
 };
 use walkdir::WalkDir;
+
+#[cfg(test)]
+#[path = "pipeline/rv_b_tests.rs"]
+mod rv_b_tests;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PipelineReport {
@@ -282,36 +287,7 @@ impl AssetPipeline {
         } else {
             ConversionManifest::load(&config.output_dir.join("conversion-manifest.json"))?
         };
-        let expected_configuration = configuration_hash(&config)?;
-        let metadata_configuration_is_compatible = loaded_manifest.configuration_hash
-            == expected_configuration
-            || ((can_reuse_scripts_and_archives(loaded_manifest.schema_version)
-                || loaded_manifest.schema_version == CONVERTER_SCHEMA_VERSION)
-                && loaded_manifest.configuration_hash
-                    == configuration_hash_for_schema(&config, loaded_manifest.schema_version)?);
-        let retained_configuration_is_compatible =
-            match &loaded_manifest.retained_asset_configuration_hash {
-                Some(recorded) => {
-                    recorded
-                        == &configuration_hash_for_schema(
-                            &config,
-                            loaded_manifest
-                                .retained_mesh_schema_version
-                                .unwrap_or(loaded_manifest.schema_version),
-                        )?
-                }
-                None => {
-                    loaded_manifest.retained_mesh_schema_version.is_none()
-                        && !config.output_dir.join("metadata-rebuild.json").exists()
-                }
-            };
-        let configuration_is_compatible =
-            metadata_configuration_is_compatible && retained_configuration_is_compatible;
-        let previous_manifest = if configuration_is_compatible {
-            loaded_manifest
-        } else {
-            ConversionManifest::default()
-        };
+        let previous_manifest = reusable_manifest(&config, loaded_manifest)?;
         let staging = config
             .resume_staging
             .clone()
@@ -418,6 +394,19 @@ impl AssetPipeline {
             retained_asset_configuration_hash: None,
             complete: false,
             configuration_hash: expected_configuration.clone(),
+            asset_configuration_hashes: ["nif", "dds", "pex"]
+                .into_iter()
+                .map(|kind| {
+                    Ok((
+                        kind.to_owned(),
+                        asset_configuration_hash_for_schema(
+                            config,
+                            CONVERTER_SCHEMA_VERSION,
+                            kind,
+                        )?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
             inputs_by_kind: Default::default(),
             failures: Default::default(),
             pruned_texture_references: Default::default(),
@@ -670,7 +659,6 @@ impl AssetPipeline {
                 staging,
                 previous,
                 staged: Arc::clone(&staged_outputs),
-                expected_configuration: &expected_configuration,
                 journal: &mut journal,
                 manifest: &mut manifest,
                 report: &mut report,
@@ -704,7 +692,6 @@ impl AssetPipeline {
                 staging,
                 previous,
                 staged: Arc::clone(&staged_outputs),
-                expected_configuration: &expected_configuration,
                 journal: &mut journal,
                 manifest: &mut manifest,
                 report: &mut report,
@@ -951,6 +938,78 @@ impl AssetPipeline {
     }
 }
 
+/// Keep raw archive candidates and select converted outputs using their original producer.
+/// Matching a retained metadata hash never upgrades the producer of the retained bytes.
+fn reusable_manifest(
+    config: &PipelineConfig,
+    mut manifest: ConversionManifest,
+) -> Result<ConversionManifest> {
+    let producer = manifest
+        .retained_mesh_schema_version
+        .unwrap_or(manifest.schema_version);
+    let unproven_retention = manifest.retained_mesh_schema_version.is_none()
+        && config.output_dir.join("metadata-rebuild.json").exists();
+    let provenance_is_consistent = producer <= manifest.schema_version && !unproven_retention;
+    let mut compatible = BTreeMap::new();
+    for kind in ["nif", "dds", "pex"] {
+        let producer_is_compatible = match kind {
+            "nif" => can_reuse_meshes(producer),
+            "dds" => producer == CONVERTER_SCHEMA_VERSION,
+            "pex" => {
+                producer == CONVERTER_SCHEMA_VERSION || can_reuse_scripts_and_archives(producer)
+            }
+            _ => unreachable!(),
+        };
+        let settings_match = if let Some(recorded) = manifest.asset_configuration_hashes.get(kind) {
+            recorded == &asset_configuration_hash_for_schema(config, producer, kind)?
+        } else {
+            // Older manifests have one combined proof. Require an exact known
+            // historical settings hash; an opaque stale schema cannot prove it.
+            let recorded = manifest
+                .retained_asset_configuration_hash
+                .as_deref()
+                .unwrap_or(&manifest.configuration_hash);
+            let mut settings = config.clone();
+            let mut matched = false;
+            for reader in [
+                crate::config::RecordReader::Legacy,
+                crate::config::RecordReader::Inhouse,
+            ] {
+                settings.record_reader = reader;
+                matched |= recorded == configuration_hash_for_schema(&settings, producer)?;
+            }
+            matched
+        };
+        compatible.insert(
+            kind,
+            provenance_is_consistent && producer_is_compatible && settings_match,
+        );
+    }
+    manifest.entries.retain(|_, entry| {
+        let kind = match Path::new(&entry.output)
+            .extension()
+            .and_then(|ext| ext.to_str())
+        {
+            Some(ext) if ext.eq_ignore_ascii_case("glb") => "nif",
+            Some(ext) if ext.eq_ignore_ascii_case("ktx2") => "dds",
+            Some(ext) if ext.eq_ignore_ascii_case("luau") => "pex",
+            _ => return false,
+        };
+        compatible[kind]
+    });
+    let outputs: BTreeSet<_> = manifest
+        .entries
+        .values()
+        .map(|entry| entry.output.clone())
+        .collect();
+    manifest
+        .pruned_texture_references
+        .retain(|output, _| outputs.contains(output));
+    // Archive extraction checks source hashes and cached bytes independently.
+    // It remains available even when every generated-output proof was rejected.
+    Ok(manifest)
+}
+
 struct ConversionBatch<'a> {
     config: &'a PipelineConfig,
     staging: &'a Path,
@@ -958,7 +1017,6 @@ struct ConversionBatch<'a> {
     /// Provenance of the outputs already in `staging`, keyed by canonical
     /// source key; empty when the cache is invalidated.
     staged: Arc<BTreeMap<String, StagedOutput>>,
-    expected_configuration: &'a str,
     journal: &'a mut StagingJournal,
     manifest: &'a mut ConversionManifest,
     report: &'a mut PipelineReport,
@@ -1076,7 +1134,9 @@ impl ConversionBatch<'_> {
         let cpu_jobs = self.config.cpu_jobs;
         let previous_entries = self.previous.entries.clone();
         let staged_outputs = Arc::clone(&self.staged);
-        let expected_configuration = self.expected_configuration.to_owned();
+        let expected_configuration =
+            asset_configuration_hash_for_schema(self.config, CONVERTER_SCHEMA_VERSION, source_ext)?;
+        let worker_configuration = expected_configuration.clone();
         let force_reconvert = force_reconvert.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
@@ -1297,8 +1357,8 @@ impl ConversionBatch<'_> {
                         // A staged output survives from an earlier run, so it
                         // is reused only when the journal says it was produced
                         // from the current source under the current schema and
-                        // configuration and its bytes still match the recorded
-                        // size and hash, or the `previous_entries` fallback
+                        // asset-kind settings, and its bytes still match the
+                        // recorded size and hash, or the `previous_entries` fallback
                         // finds the previous manifest's entry for the same
                         // source and its recorded output hash matches the
                         // staged bytes (a staging tree copied from a published
@@ -1306,7 +1366,7 @@ impl ConversionBatch<'_> {
                         // converted again.
                         let staged_is_current = !forced
                             && (staged_outputs.get(&key).is_some_and(|record| {
-                                record.is_current(&target, &hash, &expected_configuration)
+                                record.is_current(&target, &hash, &worker_configuration)
                             }) || previous_entries.get(&key).is_some_and(|entry| {
                                 entry.source_hash == hash
                                     && entry.output_hash == hash_file(&target).unwrap_or_default()
@@ -1523,7 +1583,7 @@ impl ConversionBatch<'_> {
                         };
                         if let Err(error) = self
                             .journal
-                            .record(&key, &staged_output(&entry, self.expected_configuration))
+                            .record(&key, &staged_output(&entry, &expected_configuration))
                         {
                             stop_batch(&cancelled, &mut first_error, error);
                             continue;
@@ -1546,7 +1606,7 @@ impl ConversionBatch<'_> {
                             // published entry is its provenance.
                             if let Err(error) = self
                                 .journal
-                                .record(&key, &staged_output(&entry, self.expected_configuration))
+                                .record(&key, &staged_output(&entry, &expected_configuration))
                             {
                                 stop_batch(&cancelled, &mut first_error, error);
                                 continue;
@@ -3770,6 +3830,7 @@ mod tests {
         fs::remove_file(output.join("lod-manifest.json")).unwrap();
         let mut legacy = published_manifest(&output);
         legacy.schema_version = 16;
+        legacy.asset_configuration_hashes.clear();
         legacy
             .save(&output.join("conversion-manifest.json"))
             .unwrap();
@@ -3819,6 +3880,7 @@ mod tests {
         let mut old: ConversionManifest =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         old.schema_version = 24;
+        old.asset_configuration_hashes.clear();
         old.configuration_hash = configuration_hash_for_schema(&config, 24).unwrap();
         old.save(&path).unwrap();
         let meshes: BTreeMap<_, _> = old
@@ -3846,6 +3908,7 @@ mod tests {
         let mut compatible: ConversionManifest =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         compatible.schema_version = 24;
+        compatible.asset_configuration_hashes.clear();
         compatible.configuration_hash = configuration_hash_for_schema(&config, 24).unwrap();
         compatible.save(&path).unwrap();
         fs::write(
@@ -5108,6 +5171,7 @@ mod tests {
         let expected_texture = fs::read(&texture).unwrap();
         let mut manifest = published_manifest(&output);
         manifest.schema_version = 23;
+        manifest.asset_configuration_hashes.clear();
         manifest.configuration_hash = configuration_hash_for_schema(&config, 23).unwrap();
         let stale = b"pre-LOD23 omitted distant container";
         fs::write(output.join(PRUNED_MESH), stale).unwrap();
@@ -5148,6 +5212,7 @@ mod tests {
             let manifest_path = output.join("conversion-manifest.json");
             let mut manifest = published_manifest(&output);
             manifest.schema_version = old_schema;
+            manifest.asset_configuration_hashes.clear();
             manifest.configuration_hash =
                 configuration_hash_for_schema(&config, old_schema).unwrap();
             // A verified old GLB must still be rebuilt: its publication semantics changed.
@@ -5186,6 +5251,7 @@ mod tests {
             // Schema migration must not erase a real configuration change.
             let mut manifest = published_manifest(&output);
             manifest.schema_version = old_schema;
+            manifest.asset_configuration_hashes.clear();
             manifest.configuration_hash =
                 configuration_hash_for_schema(&config, old_schema).unwrap();
             manifest.save(&manifest_path).unwrap();

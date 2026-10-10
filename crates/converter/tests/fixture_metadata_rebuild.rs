@@ -120,6 +120,7 @@ fn schema_four_source(source: &Path) {
         serde_json::from_slice(&fs::read(source.join("conversion-manifest.json")).unwrap())
             .unwrap();
     manifest.schema_version = 15;
+    manifest.asset_configuration_hashes.clear();
     manifest.configuration_hash =
         converter::cache::configuration_hash_for_schema(&PipelineConfig::new(".", "."), 15)
             .unwrap();
@@ -171,6 +172,7 @@ async fn native_retained_configuration_survives_rebuilds_without_becoming_cache_
     let mut manifest: ConversionManifest =
         serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     manifest.schema_version = 16;
+    manifest.asset_configuration_hashes.clear();
     manifest.configuration_hash = producer_hash.clone();
     manifest.save(&path).unwrap();
     let original = hash_file(&path).unwrap();
@@ -235,9 +237,11 @@ async fn metadata_rebuild_rejects_changed_native_producer_settings() {
             manifest.configuration_hash =
                 converter::cache::configuration_hash(&PipelineConfig::new(&data, &output)).unwrap();
             manifest.retained_mesh_schema_version = Some(16);
+            manifest.asset_configuration_hashes.clear();
             manifest.retained_asset_configuration_hash = Some(changed);
         } else {
             manifest.schema_version = 16;
+            manifest.asset_configuration_hashes.clear();
             manifest.configuration_hash = changed;
         }
         manifest.save(&path).unwrap();
@@ -334,6 +338,9 @@ async fn metadata_rebuild_preserves_retained_mesh_cache_contract() {
             let mut manifest: ConversionManifest =
                 serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             manifest.schema_version = source_schema;
+            if source_schema != converter::cache::CONVERTER_SCHEMA_VERSION {
+                manifest.asset_configuration_hashes.clear();
+            }
             manifest.configuration_hash = converter::cache::configuration_hash_for_schema(
                 &PipelineConfig::new(&data, &output),
                 source_schema,
@@ -426,6 +433,7 @@ async fn metadata_rebuild_rejects_unsupported_mesh_provenance() {
                 .unwrap();
         manifest.schema_version = schema;
         manifest.retained_mesh_schema_version = Some(mesh_schema);
+        manifest.asset_configuration_hashes.clear();
         manifest
             .save(&source.join("conversion-manifest.json"))
             .unwrap();
@@ -925,6 +933,9 @@ async fn v91_metadata_rebuild_rejects_ambiguous_lod_and_lighting_producers() {
         serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     for schema in [17, 18, 25] {
         manifest.schema_version = schema;
+        if schema != converter::cache::CONVERTER_SCHEMA_VERSION {
+            manifest.asset_configuration_hashes.clear();
+        }
         manifest.save(&path).unwrap();
         let output = directory.path().join(format!("derived-{schema}"));
         let error = rebuild(&data, &source, &output)

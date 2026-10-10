@@ -61,6 +61,11 @@ expression: manifest
       "source_hash": "[source_hash]"
     }
   },
+  "asset_configuration_hashes": {
+    "dds": "56b588cc8e2cc51e7fbdd4ee25f5b5db3bc9eeda24d7cc1c2d566329f513b760",
+    "nif": "57430a12a46f7610f7297f5513d6aa633dfa4c079ac40f01b96f251337dba01a",
+    "pex": "0d16fa82d1877173478e8277d014f2642b4dab09f7b916b370dff6681b7c3275"
+  },
   "complete": true,
   "configuration_hash": "5184a291c4189f9f220ce005f0329f91f78bb8771d85de5392f85b3f9da19cd3",
   "entries": {

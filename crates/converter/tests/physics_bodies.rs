@@ -311,6 +311,7 @@ async fn schema23_cached_mesh_rebuilds_body_dynamics_and_compatible_meshes_reuse
     let mut manifest: ConversionManifest =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
     manifest.schema_version = 23;
+    manifest.asset_configuration_hashes.clear();
     manifest.configuration_hash = configuration_hash_for_schema(&config, 23).unwrap();
     let entry = manifest.entries.get_mut("meshes/bodies.nif").unwrap();
     entry.output_size = old_bytes.len() as u64;
@@ -326,6 +327,7 @@ async fn schema23_cached_mesh_rebuilds_body_dynamics_and_compatible_meshes_reuse
     let mut compatible: ConversionManifest =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
     compatible.schema_version = 24;
+    compatible.asset_configuration_hashes.clear();
     compatible.configuration_hash = configuration_hash_for_schema(&config, 24).unwrap();
     compatible.save(&manifest_path).unwrap();
     let reused = run(config.clone()).await;

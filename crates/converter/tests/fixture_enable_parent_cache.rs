@@ -57,6 +57,7 @@ async fn producer_twenty_four_meshes_reuse_only_with_valid_proof() {
         let mesh_path = output.join(&mesh.output);
         let original_mesh = fs::read(&mesh_path).unwrap();
         original.schema_version = 24;
+        original.asset_configuration_hashes.clear();
         original.configuration_hash = configuration_hash_for_schema(&config, 24).unwrap();
         original
             .save(&output.join("conversion-manifest.json"))
