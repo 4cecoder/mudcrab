@@ -277,7 +277,7 @@ type CellMetadata = (Option<i32>, Option<i32>, Option<u32>);
 /// Synthetic records without a source load order have no formid_map entry.
 /// Export a legacy subset without replacing complete-load-order metadata.
 pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Result<()> {
-    export_records(conn, master, None, false, None, None, true)
+    export_records(conn, master, None, None, None, true)
 }
 
 /// Export a complete effective load order, replacing both grass projections.
@@ -288,7 +288,7 @@ pub fn export_to_db_with_load_order(
     master: &HashMap<u32, RawRecord>,
     order: &LoadOrder,
 ) -> Result<()> {
-    export_records(conn, master, Some(order), false, None, None, true)
+    export_records(conn, master, Some(order), None, None, true)
 }
 
 /// Export canonical decoded fields with Skyrim's texture slots and byte-wide XESP flags.
@@ -303,7 +303,6 @@ pub(crate) fn export_inhouse_to_db(
         conn,
         master,
         Some(order),
-        true,
         Some(unresolved_fields),
         Some(terrain_offsets),
         true,
@@ -317,7 +316,7 @@ pub(crate) fn export_inhouse_record_archive_to_db(
     master: &HashMap<u32, RawRecord>,
     order: &LoadOrder,
 ) -> Result<()> {
-    export_records(conn, master, Some(order), true, None, None, false)
+    export_records(conn, master, Some(order), None, None, false)
 }
 
 /// Keep unresolved text occurrences in the archive while nullable projections see no text.
@@ -369,7 +368,6 @@ fn export_records(
     conn: &Connection,
     master: &HashMap<u32, RawRecord>,
     order: Option<&LoadOrder>,
-    inhouse: bool,
     unresolved_fields: Option<&HashMap<u32, BTreeSet<usize>>>,
     terrain_offsets: Option<&HashMap<u32, u64>>,
     runtime_views: bool,
@@ -558,11 +556,10 @@ fn export_records(
                 let view = SubrecordView::new(&record.subrecords);
                 // ARMO has no MODL path; its world models live in the
                 // gendered world-model slots (male first, female fallback).
-                // The in-house frontend uses MOD4 for the female world model;
-                // legacy keeps its earlier MOD3 fallback for compatibility.
+                // Both frontends use MOD4 for the female world model.
                 let model = if type_str == "ARMO" {
                     view.get_string(b"MOD2")
-                        .or_else(|| view.get_string(if inhouse { b"MOD4" } else { b"MOD3" }))
+                        .or_else(|| view.get_string(b"MOD4"))
                 } else {
                     view.get_string(b"MODL")
                 };
@@ -641,8 +638,8 @@ fn export_records(
                         view.get_string(b"TX04"),
                         view.get_string(b"TX05"),
                         view.get_string(b"TX02"),
-                        view.get_string(if inhouse { b"TX07" } else { b"TX06" }),
-                        view.get_string(if inhouse { b"TX06" } else { b"TX07" }),
+                        view.get_string(b"TX07"),
+                        view.get_string(b"TX06"),
                     ],
                 )?;
             }
@@ -1213,8 +1210,10 @@ mod tests {
         assert_eq!(restitution, Some(30.0));
     }
 
+    /// Exports placeable world models, including ARMO male and female world slots.
     #[test]
     fn exports_world_models_for_every_placeable_base_type() {
+        /// Builds one synthetic base object with an optional model-slot payload.
         fn base(
             form_id: u32,
             record_type: &[u8; 4],
@@ -1254,10 +1253,10 @@ mod tests {
             base(6, b"LIGH", b"MODL", Some("Clutter\\Lantern01.nif")),
             base(7, b"WEAP", b"MODL", Some("Weapons\\Sword01.nif")),
             base(8, b"ARMO", b"MOD2", Some("Armor\\Helmet01.nif")),
-            base(9, b"ARMO", b"MOD3", Some("Armor\\HelmetFemale01.nif")),
+            base(9, b"ARMO", b"MOD4", Some("Armor\\HelmetFemale01.nif")),
             base(10, b"NPC_", b"MODL", None),
             // ARMO carries a binary MODL chunk that is not a path; with no
-            // MOD2/MOD3 present the row must store NULL, not garbage.
+            // MOD2/MOD4 present the row must store NULL, not garbage.
             base(11, b"ARMO", b"MODL", Some("G.\u{1}binary")),
         ]
         .into_iter()

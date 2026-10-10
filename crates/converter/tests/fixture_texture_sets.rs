@@ -63,8 +63,8 @@ fn texture_set_physical_slots_reach_the_correct_database_columns() {
         ("glow_path", 3),
         ("height_path", 4),
         ("environment_path", 5),
-        ("specular_path", 6),
-        ("detail_path", 7),
+        ("specular_path", 7),
+        ("detail_path", 6),
     ] {
         let stored: String = connection
             .query_row(
