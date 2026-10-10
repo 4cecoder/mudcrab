@@ -25,7 +25,7 @@ use std::{
 };
 
 /// Decoder/adapter behavior version for output changes outside the authored schema.
-pub const ADAPTER_VERSION: u32 = 7;
+pub const ADAPTER_VERSION: u32 = 8;
 
 /// Explicit diagnostic export scope; existing publication APIs always select Full.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
