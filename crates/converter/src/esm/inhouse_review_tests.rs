@@ -440,7 +440,11 @@ fn rv_a_runtime_invariant_actual_target_nulling_preserves_candidate_validation()
     let vtex = &field(nulled, b"VTEX").canonical_bytes;
     assert_eq!(vtex.len(), 20);
     assert_eq!(
-        vtex.chunks_exact(4).map(word).collect::<Vec<_>>(),
+        vtex.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| word(bytes))
+            .collect::<Vec<_>>(),
         [0x880, SELF_TEXTURE, 0, 0, 0]
     );
     assert_eq!(result.diagnostics["localizedpatch.esp"].skipped_records, 0);
