@@ -312,15 +312,46 @@ impl ConversionManifest {
 pub fn configuration_hash(config: &crate::config::PipelineConfig) -> Result<String> {
     // no_lod only selects regenerated outputs; it does not change converted asset
     // bytes. Resume invalidates database/LOD outputs before evaluating this proof.
-    configuration_hash_for_schema(config, CONVERTER_SCHEMA_VERSION)
+    current_configuration_hash_for_schema(config, CONVERTER_SCHEMA_VERSION)
 }
 
-/// Recreates the existing combined proof for a recorded producer schema.
+/// Recreate the historical combined proof for a recorded producer schema.
+/// Legacy proofs predate projection versions and omit the reader identity; this
+/// calculation remains byte-identical. New publication uses `configuration_hash`.
 /// Matching this known hash is the conservative fallback when per-kind settings
 /// are absent; an arbitrary historical hash cannot establish those settings.
 pub fn configuration_hash_for_schema(
     config: &crate::config::PipelineConfig,
     schema: u32,
+) -> Result<String> {
+    let identity = if config.record_reader == crate::config::RecordReader::Inhouse {
+        Some(crate::esm::inhouse::reader_identity_with_schemas(
+            config.record_reader,
+            config.schemas()?.as_ref(),
+        ))
+    } else {
+        None
+    };
+    configuration_hash_with_identity(config, schema, identity.as_ref())
+}
+
+/// Bind current metadata projections independently of per-kind asset settings.
+pub(crate) fn current_configuration_hash_for_schema(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+) -> Result<String> {
+    let identity = crate::esm::inhouse::reader_identity_with_schemas(
+        config.record_reader,
+        config.schemas()?.as_ref(),
+    );
+    configuration_hash_with_identity(config, schema, Some(&identity))
+}
+
+/// Hash the unchanged settings payload with an explicitly selected metadata identity.
+fn configuration_hash_with_identity(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+    identity: Option<&serde_json::Value>,
 ) -> Result<String> {
     let mut relevant = serde_json::json!({
         "schema": schema,
@@ -328,14 +359,9 @@ pub fn configuration_hash_for_schema(
         "texture_uastc_level": config.texture_uastc_level,
         "script_abi_version": config.script_abi_version,
     });
-    // Full reader identity belongs to rebuilt metadata provenance. Actual DDS
-    // roles remain in per-source proofs rather than this broad identity. Keep
-    // historical legacy hash calculations unchanged for known producer fallback.
-    if config.record_reader == crate::config::RecordReader::Inhouse {
-        relevant["record_reader"] = crate::esm::inhouse::reader_identity_with_schemas(
-            config.record_reader,
-            config.schemas()?.as_ref(),
-        );
+    // Actual DDS roles remain in per-source proofs rather than this broad identity.
+    if let Some(identity) = identity {
+        relevant["record_reader"] = identity.clone();
     }
     if schema >= 16 {
         relevant["texture_zstd_level"] = serde_json::json!(config.texture_zstd_level);
@@ -520,6 +546,25 @@ pub(crate) fn retained_configuration_matches(
         "script_abi_version": config.script_abi_version,
     });
     Ok(recorded == hash_bytes(&serde_json::to_vec(&native)?))
+}
+
+/// Verify full settings under their recorded projection contract without upgrading it.
+pub(crate) fn retained_configuration_matches_for_reader(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+    recorded: &str,
+    identity: &serde_json::Value,
+) -> Result<bool> {
+    if config.record_reader == crate::config::RecordReader::Legacy
+        && identity == &serde_json::json!({"mode": "legacy"})
+    {
+        return retained_configuration_matches(config, schema, recorded);
+    }
+    let current = crate::esm::inhouse::reader_identity_with_schemas(
+        config.record_reader,
+        config.schemas()?.as_ref(),
+    );
+    Ok(identity == &current && recorded == current_configuration_hash_for_schema(config, schema)?)
 }
 
 pub fn hash_bytes(bytes: &[u8]) -> String {

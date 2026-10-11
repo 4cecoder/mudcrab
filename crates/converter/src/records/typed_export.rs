@@ -73,11 +73,15 @@ struct FieldView<'a>(&'a DecodedField);
 impl Serialize for FieldView<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let field = self.0;
-        let mut output = serializer.serialize_struct("DecodedField", 4)?;
+        let mut output =
+            serializer.serialize_struct("DecodedField", 4 + usize::from(field.opaque))?;
         output.serialize_field("signature", &field.signature)?;
         output.serialize_field("name", &field.name)?;
         output.serialize_field("value", &ValueView(&field.value))?;
         output.serialize_field("canonical_bytes", &field.canonical_bytes)?;
+        if field.opaque {
+            output.serialize_field("opaque", &true)?;
+        }
         output.end()
     }
 }
@@ -454,6 +458,37 @@ mod tests {
                 serde_json::json!([0, 127, 128, 255])
             );
             check_value(&source.value, &actual["fields"][index]["value"]);
+        }
+    }
+
+    /// Unknown byte occurrences keep their opaque marker; authored bytes omit it.
+    #[test]
+    fn opaque_fields_match_materialized_classification_and_preserve_bytes() {
+        let bytes = vec![0x19, 0xa7, 0, 0x53];
+        let mut authored = field(Value::Bytes(bytes.clone()));
+        authored.signature = *b"DATA";
+        authored.canonical_bytes = bytes.clone();
+        let mut opaque = field(Value::Bytes(bytes.clone()));
+        opaque.signature = *b"ZZ01";
+        opaque.canonical_bytes = bytes;
+        opaque.opaque = true;
+        let mut record = record(vec![authored, opaque]);
+        record.supported = true;
+        let actual = written(&record, &BTreeMap::new());
+        assert_eq!(actual, materialized(&record, &BTreeMap::new()));
+        assert!(actual["fields"][0].get("opaque").is_none());
+        assert_eq!(actual["fields"][0].as_object().unwrap().len(), 4);
+        assert_eq!(actual["fields"][1]["opaque"], true);
+        assert_eq!(actual["fields"][1].as_object().unwrap().len(), 5);
+        for index in 0..2 {
+            assert_eq!(
+                actual["fields"][index]["value"]["Bytes"],
+                serde_json::json!([0x19, 0xa7, 0, 0x53])
+            );
+            assert_eq!(
+                actual["fields"][index]["canonical_bytes"],
+                serde_json::json!([0x19, 0xa7, 0, 0x53])
+            );
         }
     }
 

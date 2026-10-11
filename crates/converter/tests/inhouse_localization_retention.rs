@@ -1113,6 +1113,8 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
             .map(|value| value.as_str().unwrap())
             .collect::<std::collections::BTreeSet<_>>();
         assert!(preserved.is_disjoint(&deferred_manifest));
+        assert!(preserved.contains("inhouse_schema_addons"));
+        assert!(archive_tables["inhouse_schema_addons"].is_empty());
         assert_eq!(deferred_manifest, deferred.into_iter().collect());
         for table in archive_tables.keys() {
             assert!(

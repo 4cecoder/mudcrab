@@ -4,8 +4,8 @@ use crate::{
     cache::{
         CONVERTER_SCHEMA_VERSION, CacheEntry, ConversionManifest, StagedOutput, StagingJournal,
         asset_configuration_hash_for_schema, can_reuse_meshes, can_reuse_scripts_and_archives,
-        configuration_hash, configuration_hash_for_schema, hash_bytes, hash_file, link_or_copy,
-        load_staged_outputs,
+        configuration_hash, configuration_hash_for_schema, current_configuration_hash_for_schema,
+        hash_bytes, hash_file, link_or_copy, load_staged_outputs,
     },
     config::{PipelineConfig, TextureEncoder},
     esm::{
@@ -991,6 +991,7 @@ fn reusable_manifest(
                 crate::config::RecordReader::Inhouse,
             ] {
                 settings.record_reader = reader;
+                matched |= recorded == current_configuration_hash_for_schema(&settings, producer)?;
                 matched |= recorded == configuration_hash_for_schema(&settings, producer)?;
             }
             matched

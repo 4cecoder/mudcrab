@@ -14,7 +14,9 @@ usable winner. Real deletions still apply. LAND with rejected authored heights
 or incomplete framing is skipped; genuinely heightless texture/color records
 retain the existing default-height cache behavior.
 
-`record-reader.json` stamps the selected frontend. In-house identity includes the
+`record-reader.json` stamps the selected frontend. Legacy `projection_version=1`
+identifies the corrected TX06/TX07 and ARMO world-model projections independently
+of asset producer 26. In-house identity includes the
 authored schema SHA-256, adapter version and English localization choice, and
 `inhouse-reader-diagnostics.json` records bounded decoder and adapter issues.
 The manifest's `configuration_hash` keeps the full reader identity for metadata
@@ -38,7 +40,13 @@ Text requiring normalization is encoded as UTF-8 after decoding; already exact
 ASCII codes retain their original width and termination. Original source bytes
 remain available in provenance. The reader identity records both encoding contracts.
 Metadata rebuild uses the selected reader while validating retained assets under
-their original recorded reader configuration (unstamped older packs are legacy).
+their original recorded reader configuration. Older unstamped packs and the exact
+`{"mode":"legacy"}` stamp retain the historical unversioned legacy contract;
+they are not identified as projection version 1. New full configuration hashes
+include the versioned legacy identity, while `configuration_hash_for_schema`
+preserves historical legacy hash reproduction. Metadata retention validates each
+hash against its recorded reader contract; a versioned source cannot omit its
+retained asset-reader provenance and infer it from the current metadata reader.
 Provenance preserves that reader, producer schema and combined settings hash
 across repeated metadata rebuilds, together with any per-kind asset settings
 proofs. Retained models/textures keep their verified bytes and may carry older

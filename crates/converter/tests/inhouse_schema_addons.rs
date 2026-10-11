@@ -60,7 +60,7 @@ async fn publish(data: &Path, output: &Path) -> converter::PipelineReport {
     report
 }
 
-/// Read the canonical runtime record rather than accepting source-only preservation.
+/// Read the published canonical record rather than accepting source-only preservation.
 fn canonical_fields(output: &Path, form_id: u32) -> Vec<([u8; 4], Vec<u8>)> {
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     let bytes: Vec<u8> = db
@@ -118,6 +118,245 @@ async fn opaque_preservation_omits_rejected_known_fields_and_keeps_later_unknown
     assert_eq!(
         canonical_fields(&output, 0x1800),
         vec![fields[0].clone(), fields[2].clone(), fields[4].clone()]
+    );
+}
+
+/// Frame an independent native group with its fixed header and declared parent identity.
+fn group(kind: i32, label: u32, content: &[u8]) -> Vec<u8> {
+    let mut bytes = b"GRUP".to_vec();
+    bytes.extend_from_slice(&((content.len() + 24) as u32).to_le_bytes());
+    bytes.extend_from_slice(&label.to_le_bytes());
+    bytes.extend_from_slice(&kind.to_le_bytes());
+    bytes.extend_from_slice(&[0; 8]);
+    bytes.extend_from_slice(content);
+    bytes
+}
+
+/// Opaque projectile-reference radii stay canonical while declared reference radii remain runtime data.
+#[tokio::test]
+async fn opaque_reference_fields_do_not_enter_scalar_or_spatial_projections() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("Data");
+    let output = temp.path().join("pack");
+    generate(&data);
+    let plugin = data.join("Skyrim.esm");
+    let cell_id = 0x1900u32;
+    let projectile_id = 0x1901u32;
+    let neighbors = [
+        (0x1910u32, b"BeforeOpaqueReference\0".to_vec()),
+        (0x1930u32, b"AfterOpaqueReference\0".to_vec()),
+    ];
+    append(
+        &plugin,
+        &record(
+            b"KYWD",
+            neighbors[0].0,
+            &[(*b"EDID", neighbors[0].1.clone())],
+        ),
+    );
+    append(
+        &plugin,
+        &record(
+            b"PROJ",
+            projectile_id,
+            &[(*b"EDID", b"OpaqueRadiusProjectile\0".to_vec())],
+        ),
+    );
+    let cases = [
+        (
+            *b"PGRE",
+            0x1920u32,
+            projectile_id,
+            [4213.5f32, -8311.25, 93.75, 0.125, -0.375, 0.625],
+            1.5f32,
+            -17.5f32,
+        ),
+        (
+            *b"PMIS",
+            0x1921u32,
+            projectile_id,
+            [8291.25f32, 4187.5, -41.25, -0.25, 0.75, 1.25],
+            0.875f32,
+            263.75f32,
+        ),
+        (
+            *b"REFR",
+            0x1922u32,
+            3u32,
+            [123.25f32, -47.5, 68.75, 0.5, 0.25, -0.125],
+            2.25f32,
+            913.25f32,
+        ),
+    ];
+    let mut references = Vec::new();
+    let mut expected = Vec::new();
+    for (signature, id, base, transform, scale, radius) in cases {
+        let fields = vec![
+            (*b"EDID", format!("OpaqueRadius{id:08X}\0").into_bytes()),
+            (*b"NAME", base.to_le_bytes().to_vec()),
+            (*b"XRDS", radius.to_le_bytes().to_vec()),
+            (*b"XSCL", scale.to_le_bytes().to_vec()),
+            (
+                *b"DATA",
+                transform.into_iter().flat_map(f32::to_le_bytes).collect(),
+            ),
+        ];
+        let native = record(&signature, id, &fields);
+        expected.push((
+            signature,
+            id,
+            base,
+            transform,
+            scale,
+            radius,
+            fields,
+            native[24..].to_vec(),
+        ));
+        references.extend(native);
+    }
+    let mut world_children = record(
+        b"CELL",
+        cell_id,
+        &[
+            (*b"EDID", b"OpaqueRadiusExterior\0".to_vec()),
+            (
+                *b"XCLC",
+                [10i32.to_le_bytes(), (-7i32).to_le_bytes()].concat(),
+            ),
+        ],
+    );
+    world_children.extend(group(9, cell_id, &references));
+    append(&plugin, &group(1, 1, &world_children));
+    append(
+        &plugin,
+        &record(
+            b"KYWD",
+            neighbors[1].0,
+            &[(*b"EDID", neighbors[1].1.clone())],
+        ),
+    );
+    let original_plugin = fs::read(&plugin).unwrap();
+    publish(&data, &output).await;
+    let db = Connection::open(output.join("skyrim_world.db")).unwrap();
+    for (signature, id, base, transform, scale, radius, fields, payload) in expected {
+        assert_eq!(canonical_fields(&output, id), fields);
+        let (source_id, source_payload): (u32, Vec<u8>) = db
+            .query_row(
+                "SELECT source_form_id,payload FROM inhouse_source_records WHERE form_id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(source_id, id);
+        assert_eq!(source_payload, payload);
+        let decoded = history_record(&output, id);
+        let radius_field = decoded
+            .fields
+            .iter()
+            .find(|field| field.signature == *b"XRDS")
+            .unwrap();
+        let opaque = signature != *b"REFR";
+        assert_eq!(radius_field.opaque, opaque);
+        assert_eq!(radius_field.canonical_bytes, radius.to_le_bytes());
+        let runtime_radius: Option<f64> = db
+            .query_row(
+                "SELECT radius_override FROM \"references\" WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime_radius,
+            (!opaque).then_some(f64::from(radius)),
+            "opaque {signature:?} radius leaked into runtime columns"
+        );
+        type ReferenceProjection = (u32, u32, u32, bool, [f64; 6], f64, Vec<u8>);
+        let (
+            saved_cell,
+            saved_world,
+            saved_base,
+            exterior,
+            saved_transform,
+            saved_scale,
+            mirror,
+        ): ReferenceProjection = db.query_row(
+            "SELECT cell_id,worldspace_id,base_form_id,is_exterior,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,scale,data FROM \"references\" WHERE id=?1",
+            [id],
+            |row| Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                [
+                    row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                ],
+                row.get(10)?,
+                row.get(11)?,
+            )),
+        ).unwrap();
+        assert_eq!(
+            (saved_cell, saved_world, saved_base, exterior),
+            (cell_id, 1, base, true)
+        );
+        assert_eq!(saved_transform, transform.map(f64::from));
+        assert_eq!(saved_scale, f64::from(scale));
+        let canonical_mirror = rkyv::from_bytes::<
+            converter::esm::types::ArchivedRecordData,
+            rkyv::rancor::Error,
+        >(&mirror)
+        .unwrap();
+        let mirror_fields = canonical_mirror
+            .subrecords
+            .into_iter()
+            .map(|field| (field.tag, field.data))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mirror_fields, fields,
+            "reference data mirror lost opaque bytes"
+        );
+        let spatial: [f64; 6] = db
+            .query_row(
+                "SELECT minX,maxX,minY,maxY,minZ,maxZ FROM exterior_spatial WHERE id=?1",
+                [id],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ])
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            spatial,
+            [
+                transform[0],
+                transform[0],
+                transform[1],
+                transform[1],
+                transform[2],
+                transform[2],
+            ]
+            .map(f64::from)
+        );
+    }
+    for (id, editor_id) in neighbors {
+        assert_eq!(
+            canonical_fields(&output, id),
+            [(*b"EDID", editor_id.clone())]
+        );
+        assert_eq!(
+            history_record(&output, id).fields[0].canonical_bytes,
+            editor_id
+        );
+    }
+    assert_eq!(
+        fs::read(&plugin).unwrap(),
+        original_plugin,
+        "publication changed source input"
     );
 }
 

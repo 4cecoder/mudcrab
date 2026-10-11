@@ -116,6 +116,7 @@ async fn rebuild(
 }
 
 fn schema_four_source(source: &Path) {
+    fs::write(source.join("record-reader.json"), br#"{"mode":"legacy"}"#).unwrap();
     let mut manifest: ConversionManifest =
         serde_json::from_slice(&fs::read(source.join("conversion-manifest.json")).unwrap())
             .unwrap();
@@ -175,6 +176,7 @@ async fn native_retained_configuration_survives_rebuilds_without_becoming_cache_
     manifest.asset_configuration_hashes.clear();
     manifest.configuration_hash = producer_hash.clone();
     manifest.save(&path).unwrap();
+    fs::write(source.join("record-reader.json"), br#"{"mode":"legacy"}"#).unwrap();
     let original = hash_file(&path).unwrap();
     rebuild(&data, &source, &output).await.unwrap();
     rebuild(&data, &output, &repeated).await.unwrap();
@@ -239,10 +241,24 @@ async fn metadata_rebuild_rejects_changed_native_producer_settings() {
             manifest.retained_mesh_schema_version = Some(16);
             manifest.asset_configuration_hashes.clear();
             manifest.retained_asset_configuration_hash = Some(changed);
+            fs::write(
+                source.join("record-reader.json"),
+                serde_json::to_vec(&converter::esm::inhouse::reader_identity(
+                    converter::config::RecordReader::Legacy,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                source.join("metadata-rebuild.json"),
+                br#"{"retained_asset_record_reader":{"mode":"legacy"}}"#,
+            )
+            .unwrap();
         } else {
             manifest.schema_version = 16;
             manifest.asset_configuration_hashes.clear();
             manifest.configuration_hash = changed;
+            fs::write(source.join("record-reader.json"), br#"{"mode":"legacy"}"#).unwrap();
         }
         manifest.save(&path).unwrap();
         let error = rebuild(&data, &source, &output).await.unwrap_err();
@@ -341,11 +357,14 @@ async fn metadata_rebuild_preserves_retained_mesh_cache_contract() {
             if source_schema != converter::cache::CONVERTER_SCHEMA_VERSION {
                 manifest.asset_configuration_hashes.clear();
             }
-            manifest.configuration_hash = converter::cache::configuration_hash_for_schema(
-                &PipelineConfig::new(&data, &output),
-                source_schema,
-            )
-            .unwrap();
+            if source_schema != converter::cache::CONVERTER_SCHEMA_VERSION {
+                manifest.configuration_hash = converter::cache::configuration_hash_for_schema(
+                    &PipelineConfig::new(&data, &output),
+                    source_schema,
+                )
+                .unwrap();
+                fs::write(source.join("record-reader.json"), br#"{"mode":"legacy"}"#).unwrap();
+            }
             manifest.save(&path).unwrap();
         }
         rebuild(&data, &source, &output).await.unwrap();

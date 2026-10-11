@@ -10,7 +10,7 @@ use crate::{
     asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
     cache::{
         CONVERTER_SCHEMA_VERSION, ConversionManifest, configuration_hash, hash_bytes, hash_file,
-        retained_configuration_matches,
+        retained_configuration_matches_for_reader,
     },
     esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database},
     integration::finalize_world_database,
@@ -133,10 +133,11 @@ impl AssetPipeline {
             "missing retained producer configuration; rebuild from verified original assets"
         );
         ensure!(
-            retained_configuration_matches(
+            retained_configuration_matches_for_reader(
                 &source_settings,
                 manifest.schema_version,
-                &manifest.configuration_hash
+                &manifest.configuration_hash,
+                &source_reader,
             )?,
             "retained asset configuration does not match rebuild settings"
         );
@@ -145,10 +146,11 @@ impl AssetPipeline {
             .as_deref()
             .unwrap_or(&manifest.configuration_hash);
         ensure!(
-            retained_configuration_matches(
+            retained_configuration_matches_for_reader(
                 &retained_settings,
                 mesh_schema,
-                retained_configuration
+                retained_configuration,
+                &retained_reader,
             )?,
             "retained producer configuration does not match rebuild settings"
         );
@@ -193,9 +195,8 @@ fn source_reader_identity(source: &Path) -> Result<serde_json::Value> {
     if path.is_file() {
         Ok(serde_json::from_slice(&fs::read(path)?)?)
     } else {
-        Ok(crate::esm::inhouse::reader_identity(
-            crate::config::RecordReader::Legacy,
-        ))
+        // Absence is the historical unversioned contract, never the current projection.
+        Ok(serde_json::json!({"mode": "legacy"}))
     }
 }
 
@@ -211,7 +212,7 @@ fn retained_reader_identity(
             return Ok(reader.clone());
         }
         ensure!(
-            current["mode"] == "legacy",
+            current == &serde_json::json!({"mode": "legacy"}),
             "missing retained asset reader provenance"
         );
     }
@@ -269,7 +270,10 @@ fn settings_for_source_reader(
 ) -> Result<PipelineConfig> {
     let reader: crate::config::RecordReader = serde_json::from_value(identity["mode"].clone())?;
     ensure!(
-        identity == &crate::esm::inhouse::reader_identity_with_schemas(reader, &schemas),
+        identity == &crate::esm::inhouse::reader_identity_with_schemas(reader, &schemas)
+            || (reader == crate::config::RecordReader::Legacy
+                && identity == &serde_json::json!({"mode": "legacy"})
+                && schemas.identities().is_empty()),
         "unsupported source reader producer identity; use normal conversion to regenerate assets before metadata-only migration"
     );
     let mut settings = config.clone();
@@ -868,6 +872,86 @@ mod metadata_schema_controls {
 
     const ORIGINAL: &[u8] = br#"{"version":1,"name":"original_source","records":[{"signature":"ZMEX","source":"synthetic metadata fixture","fields":[{"signature":"SCAL","name":"value","kind":"u32"}]}]}"#;
     const REQUESTED: &[u8] = br#"{"version":1,"name":"requested_output","records":[{"signature":"ZMEX","source":"synthetic metadata fixture","fields":[{"signature":"SCAL","name":"value","kind":"i32"}]}]}"#;
+
+    /// Missing old stamps remain unversioned; later metadata cannot infer a newer asset reader.
+    #[test]
+    fn legacy_source_and_retained_reader_contracts_remain_distinct() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = serde_json::json!({"mode": "legacy"});
+        let current = crate::esm::inhouse::reader_identity(RecordReader::Legacy);
+        assert_ne!(current, original);
+        assert_eq!(source_reader_identity(temp.path()).unwrap(), original);
+        assert_eq!(
+            retained_reader_identity(temp.path(), &original).unwrap(),
+            original
+        );
+
+        let provenance_path = temp.path().join("metadata-rebuild.json");
+        fs::write(&provenance_path, b"{}").unwrap();
+        assert_eq!(
+            retained_reader_identity(temp.path(), &original).unwrap(),
+            original
+        );
+        assert!(retained_reader_identity(temp.path(), &current).is_err());
+
+        for metadata_reader in [
+            crate::esm::inhouse::reader_identity(RecordReader::Inhouse),
+            current,
+        ] {
+            fs::write(
+                temp.path().join("record-reader.json"),
+                serde_json::to_vec(&metadata_reader).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                &provenance_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "record_reader": metadata_reader,
+                    "retained_asset_record_reader": original,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let stamped = source_reader_identity(temp.path()).unwrap();
+            assert_eq!(stamped, metadata_reader);
+            assert_eq!(
+                retained_reader_identity(temp.path(), &stamped).unwrap(),
+                original
+            );
+        }
+    }
+
+    /// Only explicitly known legacy identities can authorize retained metadata settings.
+    #[test]
+    fn legacy_settings_accept_known_contracts_and_reject_unknown_projection_versions() {
+        let config = PipelineConfig::new("Data", "output");
+        for identity in [
+            serde_json::json!({"mode": "legacy"}),
+            crate::esm::inhouse::reader_identity(RecordReader::Legacy),
+        ] {
+            let settings = settings_for_source_reader(
+                &config,
+                &identity,
+                RuntimeSchemas::from_addon_bytes(&[]).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(settings.record_reader, RecordReader::Legacy);
+        }
+        for identity in [
+            serde_json::json!({"mode": "legacy", "projection_version": 0}),
+            serde_json::json!({"mode": "legacy", "projection_version": 2}),
+            serde_json::json!({"mode": "legacy", "unproven": true}),
+        ] {
+            assert!(
+                settings_for_source_reader(
+                    &config,
+                    &identity,
+                    RuntimeSchemas::from_addon_bytes(&[]).unwrap(),
+                )
+                .is_err()
+            );
+        }
+    }
 
     /// Source settings use saved documents even when requested paths and layouts differ.
     #[test]

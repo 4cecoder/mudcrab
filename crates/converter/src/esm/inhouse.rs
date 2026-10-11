@@ -26,6 +26,10 @@ use std::{
 /// Decoder/adapter behavior version for output changes outside the authored schema.
 pub const ADAPTER_VERSION: u32 = 9;
 
+/// Legacy metadata projection contract: corrected TX06/TX07 and ARMO world-model slots.
+/// This identity does not change the independent converted-asset producer/settings proofs.
+pub const LEGACY_PROJECTION_VERSION: u32 = 1;
+
 /// Explicit diagnostic export scope; existing publication APIs always select Full.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordBundleMode {
@@ -59,7 +63,9 @@ const DEFERRED_RUNTIME_TABLES: &[&str] = &[
 /// Identity binds decoder behavior and schema bytes so stale output cannot prove reuse.
 pub fn reader_identity(reader: RecordReader) -> serde_json::Value {
     match reader {
-        RecordReader::Legacy => serde_json::json!({"mode": "legacy"}),
+        RecordReader::Legacy => serde_json::json!({
+            "mode": "legacy", "projection_version": LEGACY_PROJECTION_VERSION,
+        }),
         RecordReader::Inhouse => serde_json::json!({
             "mode": "inhouse", "adapter_version": ADAPTER_VERSION,
             "schema_sha256": crate::cache::hash_bytes(records::SCHEMA_BYTES),
@@ -236,7 +242,7 @@ fn write_record_archive_scope(output: &Path, complete: bool, signatures: &[[u8; 
             "runtime_views_materialized": false,
             "preserved_sql_tables": ["schema_info", "plugins", "records", "formid_map",
                 "inhouse_source_records", "inhouse_localized_fields", "inhouse_terrain_source_order",
-                "inhouse_terrain_layers", "inhouse_unresolved_terrain_textures", "record_overrides", "inhouse_plugin_masters", "record_diagnostics"],
+                "inhouse_terrain_layers", "inhouse_unresolved_terrain_textures", "record_overrides", "inhouse_plugin_masters", "inhouse_schema_addons", "record_diagnostics"],
         "deferred_runtime_tables": DEFERRED_RUNTIME_TABLES,
         "unchanged_auxiliary_tables": ["conversion_cache", "lod", "lod_chunks", "lod_build",
             "lod_chunks_spatial", "lod_chunks_spatial_node", "lod_chunks_spatial_parent", "lod_chunks_spatial_rowid"],

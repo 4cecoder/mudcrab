@@ -534,12 +534,13 @@ fn export_records(
             }
             "REFR" | "ACHR" | "ACRE" | "PGRE" | "PMIS" => {
                 let cell_id = record.cell_form_id.unwrap_or(0);
-                insert_reference(
+                insert_reference_with_canonical_data(
                     &tx,
                     form_id,
                     cell_id,
                     cells.get(&cell_id).copied(),
                     record.flags,
+                    &record.subrecords,
                     &canonical_record.subrecords,
                 )?;
             }
@@ -850,7 +851,20 @@ pub fn insert_reference(
     header_flags: u32,
     subs: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<()> {
-    let view = SubrecordView::new(subs);
+    insert_reference_with_canonical_data(tx, form_id, cell_id, cell, header_flags, subs, subs)
+}
+
+/// Extract runtime reference columns from projected fields and preserve the canonical data mirror.
+fn insert_reference_with_canonical_data(
+    tx: &Transaction<'_>,
+    form_id: u32,
+    cell_id: u32,
+    cell: Option<CellMetadata>,
+    header_flags: u32,
+    projected_subrecords: &[(Vec<u8>, Vec<u8>)],
+    canonical_subrecords: &[(Vec<u8>, Vec<u8>)],
+) -> Result<()> {
+    let view = SubrecordView::new(projected_subrecords);
     let transform = view.get_f32_slice(b"DATA").unwrap_or_default();
     let pos = [
         *transform.first().unwrap_or(&0.0),
@@ -876,12 +890,12 @@ pub fn insert_reference(
     // streaming is spatial rather than tied to the owning CELL record.
     let local_x = is_exterior.then(|| pos[0] - (pos[0] / CELL_SIZE).floor() * CELL_SIZE);
     let local_y = is_exterior.then(|| pos[1] - (pos[1] / CELL_SIZE).floor() * CELL_SIZE);
-    let blob = serialize_subrecords(subs);
+    let blob = serialize_subrecords(canonical_subrecords);
     // `XRDS` is the reference's own radius, in the same Creation units as a
     // light's `DATA` radius and usually different from it: 10,810 of the
     // 12,148 `LIGH` references in Skyrim.esm carry one. It rides on glow and beam
-    // references as well, so any reference that has it keeps it; the engine
-    // reads it for light references only, where it overrides the base
+    // references as well, so a projected reference keeps its declared radius.
+    // The engine reads it for light references only, where it overrides the base
     // light's radius. It is a single little-endian `f32` and may be negative.
     let radius_override = view
         .find(b"XRDS")

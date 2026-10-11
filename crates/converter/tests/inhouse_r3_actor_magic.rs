@@ -173,9 +173,10 @@ fn actor_flags_signed_members_and_padding_preserve_native_roles() {
     assert_eq!(face.canonical_bytes, face_parts);
     let race = &result.records[&0x5807];
     let data = field(race, b"DATA");
-    let Value::Array(boosts) = member(&data.value, "skill_boosts") else {
-        panic!("expected seven native skill pairs")
-    };
+    let boosts = member(&data.value, "skill_boosts")
+        .materialized_array()
+        .expect("expected native skill pairs");
+    assert_eq!(boosts.len(), 7);
     assert_eq!(member(&boosts[5], "skill"), &Value::Signed(-1));
     assert_eq!(member(&boosts[5], "boost"), &Value::Signed(17));
     assert_eq!(member(&data.value, "size"), &Value::Unsigned(2));

@@ -33,6 +33,79 @@ fn asset_settings_are_independent_of_reader_metadata() {
     }
 }
 
+/// New legacy projections have distinct metadata proof without changing asset settings.
+#[test]
+fn legacy_projection_identity_separates_current_and_historical_full_hashes() {
+    let legacy = PipelineConfig::new("synthetic-data", "synthetic-output");
+    let historical = configuration_hash_for_schema(&legacy, 26).unwrap();
+    let identity = crate::esm::inhouse::reader_identity(RecordReader::Legacy);
+    assert_eq!(
+        identity,
+        serde_json::json!({"mode": "legacy", "projection_version": 1})
+    );
+    assert_ne!(configuration_hash(&legacy).unwrap(), historical);
+    assert_eq!(
+        configuration_hash_for_schema(&legacy, 15).unwrap(),
+        "9a58fda00b27d0f2a8e46afb9334ea869602556393a35bffd7fcb39582a08a4f"
+    );
+    let mut changed_identity = identity.clone();
+    changed_identity["projection_version"] = serde_json::json!(2);
+    assert_ne!(
+        configuration_hash(&legacy).unwrap(),
+        configuration_hash_with_identity(&legacy, 26, Some(&changed_identity)).unwrap()
+    );
+    for kind in ["nif", "dds", "pex"] {
+        let mut inhouse = legacy.clone();
+        inhouse.record_reader = RecordReader::Inhouse;
+        assert_eq!(
+            asset_configuration_hash_for_schema(&legacy, 26, kind).unwrap(),
+            asset_configuration_hash_for_schema(&inhouse, 26, kind).unwrap()
+        );
+    }
+}
+
+/// A recorded projection contract must match its own full settings proof.
+#[test]
+fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
+    let config = PipelineConfig::new("synthetic-data", "synthetic-output");
+    let old_identity = serde_json::json!({"mode": "legacy"});
+    let current_identity = crate::esm::inhouse::reader_identity(RecordReader::Legacy);
+    let historical = configuration_hash_for_schema(&config, 26).unwrap();
+    let current = configuration_hash(&config).unwrap();
+    for (identity, matching, other) in [
+        (&old_identity, historical.as_str(), current.as_str()),
+        (&current_identity, current.as_str(), historical.as_str()),
+    ] {
+        assert!(
+            retained_configuration_matches_for_reader(&config, 26, matching, identity).unwrap()
+        );
+        assert!(!retained_configuration_matches_for_reader(&config, 26, other, identity).unwrap());
+        let mut changed = config.clone();
+        changed.script_abi_version += 1;
+        assert!(
+            !retained_configuration_matches_for_reader(&changed, 26, matching, identity).unwrap()
+        );
+    }
+    assert!(
+        retained_configuration_matches_for_reader(
+            &config,
+            15,
+            "b23881a864cdcfe1609779a9a27fefab2de629b50ec339101d4e0ad592e7e435",
+            &old_identity,
+        )
+        .unwrap()
+    );
+    assert!(
+        !retained_configuration_matches_for_reader(
+            &config,
+            15,
+            "b23881a864cdcfe1609779a9a27fefab2de629b50ec339101d4e0ad592e7e435",
+            &current_identity,
+        )
+        .unwrap()
+    );
+}
+
 /// Changes to texture encoding settings do not discard unrelated mesh/script proof.
 #[test]
 fn texture_settings_invalidate_only_the_texture_kind() {

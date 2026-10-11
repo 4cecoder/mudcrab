@@ -149,6 +149,7 @@ fn legacy_pack(data: &Path, output: &Path, schema: u32) -> ConversionManifest {
         legacy.asset_configuration_hashes.clear();
     }
     legacy.configuration_hash = configuration_hash_for_schema(&config, schema).unwrap();
+    fs::write(output.join("record-reader.json"), br#"{"mode":"legacy"}"#).unwrap();
     for (slot, old_encoding) in [
         (2, TextureEncoding::ColorSrgb),
         (5, TextureEncoding::DataLinear),
