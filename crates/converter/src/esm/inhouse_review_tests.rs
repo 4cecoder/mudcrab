@@ -149,6 +149,7 @@ impl Fixture {
             &self.data,
             Some((&output, signatures)),
             RecordBundleMode::Full,
+            None,
             schema,
         )
         .unwrap();

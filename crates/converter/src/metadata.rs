@@ -20,6 +20,7 @@ use crate::{
         archive_load_order_priority, compile_lod_chunks, discover, overlay_loose_assets,
         publish_new_directory, sort_archives_by_load_order, staging_path, validate_artifacts,
     },
+    records::addons::RuntimeSchemas,
 };
 use color_eyre::{
     Result,
@@ -32,6 +33,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 use tokio::sync::mpsc::Sender;
@@ -41,6 +43,9 @@ use walkdir::WalkDir;
 struct MetadataProvenance {
     record_reader: serde_json::Value,
     retained_asset_record_reader: serde_json::Value,
+    /// Exact original add-on documents for the retained asset producer, across generations.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    retained_asset_schema_json: Vec<Vec<u8>>,
     source_converter_schema: u32,
     source_retained_mesh_schema: u32,
     source_manifest_hash: String,
@@ -48,6 +53,14 @@ struct MetadataProvenance {
     retained_asset_configuration_hash: String,
     retained_asset_hashes: BTreeMap<String, String>,
     replay_verified_pruned_assets: BTreeSet<String>,
+}
+
+/// Frozen source and original-asset schema facts validated before staging is created.
+struct SourceMetadata<'a> {
+    manifest_bytes: &'a [u8],
+    manifest: &'a mut ConversionManifest,
+    retained_reader: &'a serde_json::Value,
+    retained_schemas: &'a RuntimeSchemas,
 }
 
 impl AssetPipeline {
@@ -59,6 +72,7 @@ impl AssetPipeline {
         progress_tx: Sender<ProgressEvent>,
     ) -> Result<PipelineReport> {
         config.validate()?;
+        config.freeze_schema_addons()?;
         ensure!(
             config.resume_staging.is_none()
                 && !config.invalidate_cache
@@ -78,8 +92,20 @@ impl AssetPipeline {
         let mut manifest: ConversionManifest = serde_json::from_slice(&source_manifest)?;
         let source_reader = source_reader_identity(&source)?;
         let retained_reader = retained_reader_identity(&source, &source_reader)?;
-        let source_settings = settings_for_source_reader(&config, &source_reader)?;
-        let retained_settings = settings_for_source_reader(&config, &retained_reader)?;
+        let source_schemas = source_reader_schemas(&source, &source_reader)?;
+        ensure!(
+            source_schemas.identities() == manifest.schema_addons,
+            "source schema add-on manifest differs from its database provenance"
+        );
+        let retained_schemas = retained_reader_schemas(&source, &retained_reader, &source_schemas)?;
+        let source_settings = settings_for_source_reader(&config, &source_reader, source_schemas)?;
+        let retained_schema_documents = retained_schemas.addon_bytes().collect::<Vec<_>>();
+        let retained_settings = settings_for_source_reader(
+            &config,
+            &retained_reader,
+            RuntimeSchemas::from_addon_bytes(&retained_schema_documents)
+                .map_err(color_eyre::eyre::Error::msg)?,
+        )?;
         ensure!(
             (matches!(manifest.schema_version, 15 | 16 | 19..=24)
                 || manifest.schema_version == CONVERTER_SCHEMA_VERSION)
@@ -134,8 +160,12 @@ impl AssetPipeline {
             &source,
             &staging,
             &plugins,
-            &source_manifest,
-            &mut manifest,
+            SourceMetadata {
+                manifest_bytes: &source_manifest,
+                manifest: &mut manifest,
+                retained_reader: &retained_reader,
+                retained_schemas: &retained_schemas,
+            },
             &progress_tx,
         )
         .await;
@@ -188,18 +218,64 @@ fn retained_reader_identity(
     Ok(current.clone())
 }
 
+/// Reconstruct current source schemas from the pack rather than requested output add-ons.
+fn source_reader_schemas(source: &Path, identity: &serde_json::Value) -> Result<RuntimeSchemas> {
+    let reader: crate::config::RecordReader = serde_json::from_value(identity["mode"].clone())?;
+    if reader == crate::config::RecordReader::Legacy {
+        return RuntimeSchemas::from_addon_bytes(&[]).map_err(color_eyre::eyre::Error::msg);
+    }
+    let conn = Connection::open_with_flags(
+        source.join("skyrim_world.db"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    crate::records::history::stored_schemas(&conn)
+}
+
+/// Original asset schemas remain separate from later rebuilt metadata schema snapshots.
+fn retained_reader_schemas(
+    source: &Path,
+    identity: &serde_json::Value,
+    current: &RuntimeSchemas,
+) -> Result<RuntimeSchemas> {
+    let path = source.join("metadata-rebuild.json");
+    if !path.is_file() {
+        let documents = current.addon_bytes().collect::<Vec<_>>();
+        return RuntimeSchemas::from_addon_bytes(&documents).map_err(color_eyre::eyre::Error::msg);
+    }
+    let provenance: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    let documents: Vec<Vec<u8>> = if let Some(documents) =
+        provenance.get("retained_asset_schema_json")
+    {
+        serde_json::from_value(documents.clone())?
+    } else {
+        ensure!(
+            identity
+                .get("schema_addons")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "missing retained asset schema add-on documents; use normal conversion to regenerate assets"
+        );
+        Vec::new()
+    };
+    let references = documents.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    RuntimeSchemas::from_addon_bytes(&references).map_err(color_eyre::eyre::Error::msg)
+}
+
 /// Validate asset settings under their recorded reader without relabeling retained bytes.
 fn settings_for_source_reader(
     config: &PipelineConfig,
     identity: &serde_json::Value,
+    schemas: RuntimeSchemas,
 ) -> Result<PipelineConfig> {
     let reader: crate::config::RecordReader = serde_json::from_value(identity["mode"].clone())?;
     ensure!(
-        identity == &crate::esm::inhouse::reader_identity(reader),
+        identity == &crate::esm::inhouse::reader_identity_with_schemas(reader, &schemas),
         "unsupported source reader producer identity; use normal conversion to regenerate assets before metadata-only migration"
     );
     let mut settings = config.clone();
     settings.record_reader = reader;
+    settings.schema_addons.clear();
+    settings.runtime_schemas = Some(Arc::new(schemas));
     Ok(settings)
 }
 
@@ -272,15 +348,21 @@ fn matched_plugins(source: &Path, data: &Path) -> Result<(Vec<PathBuf>, Vec<Stri
     Ok((plugins, hashes))
 }
 
+/// Rebuild requested metadata while publishing the already verified original asset provenance.
 async fn rebuild_into(
     config: &PipelineConfig,
     source: &Path,
     staging: &Path,
     matched: &(Vec<PathBuf>, Vec<String>),
-    source_manifest: &[u8],
-    manifest: &mut ConversionManifest,
+    metadata: SourceMetadata<'_>,
     progress: &Sender<ProgressEvent>,
 ) -> Result<PipelineReport> {
+    let SourceMetadata {
+        manifest_bytes: source_manifest,
+        manifest,
+        retained_reader,
+        retained_schemas,
+    } = metadata;
     let (plugins, plugin_hashes) = matched;
     progress_event(
         progress,
@@ -291,11 +373,12 @@ async fn rebuild_into(
     let (retained, replay_verified_pruned_assets) =
         copy_verified_assets(source, staging, manifest)?;
     let provenance = MetadataProvenance {
-        record_reader: crate::esm::inhouse::reader_identity(config.record_reader),
-        retained_asset_record_reader: retained_reader_identity(
-            source,
-            &source_reader_identity(source)?,
-        )?,
+        record_reader: crate::esm::inhouse::reader_identity_with_schemas(
+            config.record_reader,
+            config.schemas()?.as_ref(),
+        ),
+        retained_asset_record_reader: retained_reader.clone(),
+        retained_asset_schema_json: retained_schemas.addon_bytes().map(<[u8]>::to_vec).collect(),
         source_converter_schema: manifest.schema_version,
         source_retained_mesh_schema: manifest
             .retained_mesh_schema_version
@@ -387,15 +470,24 @@ async fn rebuild_into(
             }
         }
     }
-    let merged =
-        EsmParser::convert_plugins_with_reader(plugins, &database, config.record_reader, &vfs)?;
+    let merged = EsmParser::convert_plugins_with_reader_and_schemas(
+        plugins,
+        &database,
+        config.record_reader,
+        &vfs,
+        Some(config.schemas()?.as_ref()),
+    )?;
     validate_database(&Connection::open(&database)?)?;
     if config.record_reader == crate::config::RecordReader::Inhouse {
         crate::esm::inhouse::write_terrain_caches(&merged, &database, staging)?;
     } else {
         write_cell_cache(&merged, &staging.join("cell_cache.rkyv"))?;
     }
-    crate::esm::inhouse::write_reader_identity(staging, config.record_reader)?;
+    crate::esm::inhouse::write_reader_identity_with_schemas(
+        staging,
+        config.record_reader,
+        config.schemas()?.as_ref(),
+    )?;
     report.artifacts.push(PathBuf::from("record-reader.json"));
     if config.record_reader == crate::config::RecordReader::Inhouse {
         report
@@ -495,6 +587,7 @@ async fn rebuild_into(
     manifest.retained_asset_configuration_hash =
         Some(provenance.retained_asset_configuration_hash.clone());
     manifest.configuration_hash = configuration_hash(config)?;
+    manifest.schema_addons = config.schemas()?.identities().to_vec();
     // No archive extraction cache is copied by this route.
     manifest.archives.clear();
     manifest.save(&staging.join("conversion-manifest.json"))?;
@@ -580,7 +673,15 @@ fn copy_verified_assets(
     let mut retained = BTreeMap::new();
     let mut replay = BTreeSet::new();
     for folder in ["meshes", "textures", "scripts"] {
-        for entry in WalkDir::new(source.join(folder)).follow_links(false) {
+        let folder = source.join(folder);
+        match folder.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        // A plugin-only pack may have no mesh/texture directory. The final expected-key
+        // check still rejects every missing recorded asset, including the runtime helper.
+        for entry in WalkDir::new(&folder).follow_links(false) {
             let entry = entry?;
             ensure!(
                 !entry.file_type().is_symlink(),
@@ -757,5 +858,118 @@ mod tests {
             copy_verified_assets(&source, &directory.path().join("tampered"), &mut manifest)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod metadata_schema_controls {
+    use super::*;
+    use crate::{cache::asset_configuration_hash_for_schema, config::RecordReader};
+
+    const ORIGINAL: &[u8] = br#"{"version":1,"name":"original_source","records":[{"signature":"ZMEX","source":"synthetic metadata fixture","fields":[{"signature":"SCAL","name":"value","kind":"u32"}]}]}"#;
+    const REQUESTED: &[u8] = br#"{"version":1,"name":"requested_output","records":[{"signature":"ZMEX","source":"synthetic metadata fixture","fields":[{"signature":"SCAL","name":"value","kind":"i32"}]}]}"#;
+
+    /// Source settings use saved documents even when requested paths and layouts differ.
+    #[test]
+    fn source_settings_bind_saved_schema_without_changing_asset_settings() {
+        let original = RuntimeSchemas::from_addon_bytes(&[ORIGINAL]).unwrap();
+        let identity =
+            crate::esm::inhouse::reader_identity_with_schemas(RecordReader::Inhouse, &original);
+        let mut config = PipelineConfig::new("Data", "output");
+        config.record_reader = RecordReader::Inhouse;
+        config
+            .schema_addons
+            .push("absent_requested_file.json".into());
+        config.runtime_schemas = Some(Arc::new(
+            RuntimeSchemas::from_addon_bytes(&[REQUESTED]).unwrap(),
+        ));
+        let source = settings_for_source_reader(&config, &identity, original).unwrap();
+        assert!(source.schema_addons.is_empty());
+        assert_eq!(
+            source.schemas().unwrap().identities()[0].name,
+            "original_source"
+        );
+        assert_ne!(
+            configuration_hash(&source).unwrap(),
+            configuration_hash(&config).unwrap()
+        );
+        for kind in ["nif", "dds", "pex"] {
+            assert_eq!(
+                asset_configuration_hash_for_schema(&source, CONVERTER_SCHEMA_VERSION, kind)
+                    .unwrap(),
+                asset_configuration_hash_for_schema(&config, CONVERTER_SCHEMA_VERSION, kind)
+                    .unwrap()
+            );
+        }
+        let legacy = settings_for_source_reader(
+            &config,
+            &crate::esm::inhouse::reader_identity(RecordReader::Legacy),
+            RuntimeSchemas::from_addon_bytes(&[]).unwrap(),
+        )
+        .unwrap();
+        assert!(legacy.schemas().unwrap().identities().is_empty());
+    }
+
+    /// Repeated rebuilds recover the original asset producer rather than current metadata add-ons.
+    #[test]
+    fn retained_asset_documents_stay_bound_to_original_reader() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = RuntimeSchemas::from_addon_bytes(&[ORIGINAL]).unwrap();
+        let current = RuntimeSchemas::from_addon_bytes(&[REQUESTED]).unwrap();
+        let identity =
+            crate::esm::inhouse::reader_identity_with_schemas(RecordReader::Inhouse, &original);
+        let path = temp.path().join("metadata-rebuild.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "retained_asset_record_reader": identity,
+                "retained_asset_schema_json": [ORIGINAL],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let recovered = retained_reader_schemas(temp.path(), &identity, &current).unwrap();
+        assert_eq!(recovered.identities(), original.identities());
+        assert_eq!(recovered.addon_bytes().next().unwrap(), ORIGINAL);
+        settings_for_source_reader(&PipelineConfig::new("Data", "output"), &identity, recovered)
+            .unwrap();
+
+        fs::write(&path, b"{}").unwrap();
+        assert!(retained_reader_schemas(temp.path(), &identity, &current).is_err());
+        let mut earlier = identity;
+        earlier["adapter_version"] = serde_json::json!(8);
+        assert!(
+            settings_for_source_reader(&PipelineConfig::new("Data", "output"), &earlier, original,)
+                .is_err()
+        );
+    }
+
+    /// Empty asset kinds can be absent while every recorded asset remains mandatory.
+    #[test]
+    fn plugin_only_packages_skip_absent_asset_folders_and_require_recorded_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("scripts")).unwrap();
+        fs::write(
+            source.join("scripts/papyrus_runtime.luau"),
+            include_bytes!("../../shared/src/papyrus_runtime.luau"),
+        )
+        .unwrap();
+        let mut manifest = ConversionManifest::default();
+        let (retained, _) =
+            copy_verified_assets(&source, &temp.path().join("staging"), &mut manifest).unwrap();
+        assert_eq!(retained.len(), 1);
+        manifest.entries.insert(
+            "meshes/missing.nif".into(),
+            crate::cache::CacheEntry {
+                source_hash: "synthetic_source".into(),
+                output: "meshes/missing.glb".into(),
+                output_size: 7,
+                output_hash: hash_bytes(b"missing"),
+            },
+        );
+        let error =
+            copy_verified_assets(&source, &temp.path().join("missing"), &mut manifest).unwrap_err();
+        assert!(format!("{error}").contains("missing manifest asset meshes/missing.glb"));
     }
 }

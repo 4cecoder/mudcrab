@@ -75,18 +75,45 @@ fn plugin_checksum(reader: &mut impl Read) -> std::io::Result<[u8; 32]> {
 
 impl EsmParser {
     /// Export using the selected frontend, returning exactly the projection input.
+    #[cfg(test)]
     pub(crate) fn convert_plugins_with_reader(
         plugin_paths: &[PathBuf],
         db_path: &Path,
         reader: crate::config::RecordReader,
         strings_root: &Path,
     ) -> Result<HashMap<u32, RawRecord>> {
+        Self::convert_plugins_with_reader_and_schemas(
+            plugin_paths,
+            db_path,
+            reader,
+            strings_root,
+            None,
+        )
+    }
+
+    /// Use a prevalidated, immutable schema batch throughout publication.
+    pub(crate) fn convert_plugins_with_reader_and_schemas(
+        plugin_paths: &[PathBuf],
+        db_path: &Path,
+        reader: crate::config::RecordReader,
+        strings_root: &Path,
+        schemas: Option<&crate::records::addons::RuntimeSchemas>,
+    ) -> Result<HashMap<u32, RawRecord>> {
         match reader {
             crate::config::RecordReader::Legacy => {
                 Self::convert_plugins_with_records(plugin_paths, db_path)
             }
             crate::config::RecordReader::Inhouse => {
-                inhouse::convert_plugins(plugin_paths, db_path, strings_root)
+                if let Some(schemas) = schemas {
+                    inhouse::convert_plugins_with_schemas(
+                        plugin_paths,
+                        db_path,
+                        strings_root,
+                        schemas,
+                    )
+                } else {
+                    inhouse::convert_plugins(plugin_paths, db_path, strings_root)
+                }
             }
         }
     }

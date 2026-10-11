@@ -42,6 +42,43 @@ documented pending CTDA/CIS1/CIS2 fields and `pending_conditions` references
 through that component. This avoids editing separately owned family files and
 does not alter unrelated opaque fields.
 
+## Runtime add-ons
+
+The in-house reader also accepts ordered JSON files through repeatable
+`--schema-addon FILE` options or `PipelineConfig.schema_addons`. Selecting
+add-ons with the legacy reader is a configuration error. The conversion freezes
+and validates the entire batch before creating or recovering output, using the
+same `Schema::parse` and `Schema::validate` rules as build-time assembly. A bad
+batch produces one error and contributes no declarations.
+
+An add-on has the strict envelope `version`, `name`, optional `definitions`, and
+`records`; its version is `1`. It cannot declare `sources` or `common_fields`.
+The name contains 1-128 ASCII letters, digits, `.`, `_`, or `-`, and cannot be
+`.` or `..`. Each batch contains at most 64 files, at most 8 MiB per file, and
+at most 32 MiB of total source JSON. Unknown keys, duplicate names, conflicting
+definitions, duplicate record declarations, and invalid field descriptors are
+rejected. Definitions may reuse built-in definitions by reference and may
+refer to other definitions supplied anywhere in the same batch. They cannot
+replace existing definitions.
+
+New record types use ordinary ordered fields and may declare `allow_unordered`.
+An existing record requires `extends: true`; the add-on supplies only new
+standalone subrecord fields. An extension cannot replace a known subrecord
+signature or decoded role name, change the record's ordering flag, or introduce
+a subrecord group. Structs, arrays, and unions within one subrecord remain
+available. Each extension matches independently anywhere in the native field
+sequence without advancing the built-in schema cursor. `repeat` permits repeated
+extension occurrences; a duplicate singleton is rejected as a known field.
+
+The pack records each add-on's name, exact-byte SHA-256, and declared order in
+its manifest and reader identity. `inhouse_schema_addons` retains the original
+JSON bytes beside the history so replay reconstructs the producing schema
+without reading the configured files again. The bundle fingerprint includes the
+built-in schema and ordered add-on identities; an empty batch retains the
+existing built-in fingerprint. Filesystem paths do not contribute to add-on
+identities. See the [worked mod example](../../../../docs/specs/modding/schema-addons.md)
+for invocation, native FormID remapping, preservation, and supported limits.
+
 ## Fields and values
 
 | Property | Meaning |
@@ -104,9 +141,11 @@ arrays, such as LAND's 1,089 height deltas, apply their offset to the parent.
 For ordered record types, the input cursor visits subrecords in file order and
 the schema cursor advances
 through optional fields to the next matching signature. An unknown signature
-does not advance the schema cursor: report it and continue. A known field
+does not advance the schema cursor: report it, preserve its bytes as an opaque
+canonical field at that physical position, and continue. A known field
 encountered after its ordered position is also a diagnostic; do not silently
-reinterpret it as a different field with the same signature.
+reinterpret it as a different field with the same signature or preserve it as
+an unknown opaque field.
 
 For the explicitly unordered types, recognized fields can occur before or after
 their position in the display-oriented definition. Unknown signatures still
@@ -130,10 +169,16 @@ repeated shared signatures from being treated as a global last-value map.
 
 Typed decoding is separate from source preservation. `records.data` retains its
 existing rkyv encoding and contains validated canonical subrecord bytes for
-consumers. The auxiliary `inhouse_source_records` table holds the original
+consumers together with safely framed unknown subrecords. Unknown occurrences
+retain their exact bytes and original order, including duplicates. Their typed
+representation is `Value::Bytes`; embedded FormIDs remain file-relative until
+a schema declares their layout. Explicit shared hooks such as VMAD on an
+otherwise opaque type still use their declared decoder. The auxiliary
+`inhouse_source_records` table holds the original
 decompressed payload, including unknown subrecords and padding; its embedded
 FormIDs remain file-relative. Malformed fields are omitted from canonical
-consumer bytes while their source payload remains available as provenance.
+consumer bytes, as are recognized fields rejected by ordered matching, while
+their source payload remains available as provenance.
 These omissions do not invent a value or damage valid neighbors.
 
 Localized field occurrences are retained even when their key is zero or absent
@@ -340,8 +385,9 @@ ARMO, LIGH, WATR, TXST, LTEX, GRAS, NPC_, RACE, MOVT, and GMST.
 
 Existing runtime tables determine the initial typed subset. Ordinary world-model
 types describe EDID, VMAD, OBND and the model group; their remaining gameplay
-fields remain verbatim in the auxiliary source payload rather than canonical
-`records.data`. Explicit `bytes` fields remain opaque canonical fields.
+fields, when unknown and safely framed, remain verbatim as opaque canonical
+fields in `records.data` and in the auxiliary source payload. Explicit `bytes`
+fields remain opaque canonical fields.
 `NPC_` describes identity, race, class, name
 and several common compound links; it does not claim full actor conversion.
 `NPC_` SPLO actor effects admit SPEL, SHOU and LVSP targets, as specified by the

@@ -1,9 +1,9 @@
 //! The authored, versioned schema contract shared by build validation and decoding.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A complete schema, with reusable authored definitions and source citations.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Schema {
     pub version: u32,
@@ -17,7 +17,7 @@ pub struct Schema {
 }
 
 /// File-order subrecord definitions for one supported record signature.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordSchema {
     pub signature: String,
@@ -29,7 +29,7 @@ pub struct RecordSchema {
 }
 
 /// A typed subrecord, struct member, array element, union or subrecord group.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FieldSchema {
     pub signature: Option<String>,

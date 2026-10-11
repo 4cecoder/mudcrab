@@ -195,6 +195,9 @@ pub struct ConversionManifest {
     pub complete: bool,
     #[serde(default)]
     pub configuration_hash: String,
+    /// Ordered identities of the runtime schema add-ons used by this pack.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schema_addons: Vec<crate::records::addons::SchemaAddonIdentity>,
     /// Original producer settings of each converted asset kind, independent of
     /// record-reader metadata. A metadata-only migration retains these values.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -329,7 +332,10 @@ pub fn configuration_hash_for_schema(
     // roles remain in per-source proofs rather than this broad identity. Keep
     // historical legacy hash calculations unchanged for known producer fallback.
     if config.record_reader == crate::config::RecordReader::Inhouse {
-        relevant["record_reader"] = crate::esm::inhouse::reader_identity(config.record_reader);
+        relevant["record_reader"] = crate::esm::inhouse::reader_identity_with_schemas(
+            config.record_reader,
+            config.schemas()?.as_ref(),
+        );
     }
     if schema >= 16 {
         relevant["texture_zstd_level"] = serde_json::json!(config.texture_zstd_level);

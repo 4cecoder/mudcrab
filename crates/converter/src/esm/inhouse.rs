@@ -70,6 +70,19 @@ pub fn reader_identity(reader: RecordReader) -> serde_json::Value {
     }
 }
 
+/// Bind the ordered add-on bytes to metadata without changing asset settings proofs.
+pub fn reader_identity_with_schemas(
+    reader: RecordReader,
+    schemas: &records::addons::RuntimeSchemas,
+) -> serde_json::Value {
+    let mut identity = reader_identity(reader);
+    if reader == RecordReader::Inhouse && !schemas.identities().is_empty() {
+        identity["schema_sha256"] = serde_json::json!(schemas.schema_sha256());
+        identity["schema_addons"] = serde_json::json!(schemas.identities());
+    }
+    identity
+}
+
 /// Export a fresh diagnostic record bundle without converting meshes, textures or scripts.
 /// Inputs stay read-only; retained STRINGS extraction is evidence workspace data.
 pub fn export_record_bundle(data: &Path, plugins_file: &Path, output: &Path) -> Result<usize> {
@@ -296,11 +309,25 @@ mod inhouse_review_tests;
 
 /// Stamp generated pack metadata after database/cache regeneration.
 pub(crate) fn write_reader_identity(staging: &Path, reader: RecordReader) -> Result<()> {
+    let schemas = records::addons::RuntimeSchemas::from_addon_bytes(&[])
+        .map_err(color_eyre::eyre::Error::msg)?;
+    write_reader_identity_with_schemas(staging, reader, &schemas)
+}
+
+/// Publish the same immutable schema provenance used by the decoder and history.
+pub(crate) fn write_reader_identity_with_schemas(
+    staging: &Path,
+    reader: RecordReader,
+    schemas: &records::addons::RuntimeSchemas,
+) -> Result<()> {
     let path = staging.join("record-reader.json");
     if path.is_file() {
         fs::remove_file(&path)?;
     }
-    fs::write(path, serde_json::to_vec_pretty(&reader_identity(reader))?)?;
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&reader_identity_with_schemas(reader, schemas))?,
+    )?;
     Ok(())
 }
 
@@ -478,6 +505,23 @@ pub(crate) fn convert_plugins(
     )
 }
 
+/// Decode and publish with a schema batch already checked before staging.
+pub(crate) fn convert_plugins_with_schemas(
+    plugin_paths: &[PathBuf],
+    db_path: &Path,
+    strings_root: &Path,
+    schemas: &records::addons::RuntimeSchemas,
+) -> Result<HashMap<u32, RawRecord>> {
+    convert_plugins_with_dump_and_schemas(
+        plugin_paths,
+        db_path,
+        strings_root,
+        None,
+        RecordBundleMode::Full,
+        Some(schemas),
+    )
+}
+
 /// Diagnostic export shares the exact decoder, winner and text lookup paths with publication.
 fn convert_plugins_with_dump(
     plugin_paths: &[PathBuf],
@@ -486,12 +530,25 @@ fn convert_plugins_with_dump(
     dump: Option<(&Path, &[[u8; 4]])>,
     mode: RecordBundleMode,
 ) -> Result<HashMap<u32, RawRecord>> {
+    convert_plugins_with_dump_and_schemas(plugin_paths, db_path, strings_root, dump, mode, None)
+}
+
+/// Preserve legacy entry points while threading one schema snapshot through all passes.
+fn convert_plugins_with_dump_and_schemas(
+    plugin_paths: &[PathBuf],
+    db_path: &Path,
+    strings_root: &Path,
+    dump: Option<(&Path, &[[u8; 4]])>,
+    mode: RecordBundleMode,
+    schemas: Option<&records::addons::RuntimeSchemas>,
+) -> Result<HashMap<u32, RawRecord>> {
     convert_plugins_with_dump_impl(
         plugin_paths,
         db_path,
         strings_root,
         dump,
         mode,
+        schemas,
         #[cfg(test)]
         None,
     )
@@ -504,8 +561,18 @@ fn convert_plugins_with_dump_impl(
     strings_root: &Path,
     dump: Option<(&Path, &[[u8; 4]])>,
     mode: RecordBundleMode,
+    schemas: Option<&records::addons::RuntimeSchemas>,
     #[cfg(test)] test_schema: Option<&records::schema_format::Schema>,
 ) -> Result<HashMap<u32, RawRecord>> {
+    let builtin;
+    let schemas = match schemas {
+        Some(schemas) => schemas,
+        None => {
+            builtin = records::addons::RuntimeSchemas::from_addon_bytes(&[])
+                .map_err(color_eyre::eyre::Error::msg)?;
+            &builtin
+        }
+    };
     let order_stage = records::profile::ProfileStage::start("read_load_order");
     let order = LoadOrder::read(plugin_paths)?;
     order_stage.finish(plugin_paths.len());
@@ -544,17 +611,19 @@ fn convert_plugins_with_dump_impl(
             preserve,
         )?
     } else {
-        records::read_plugins_with_validation_and_observer(
+        records::read_plugins_with_runtime_schemas(
             plugin_paths,
             &order,
+            schemas,
             validate_candidate,
             preserve,
         )?
     };
     #[cfg(not(test))]
-    let mut decoded = records::read_plugins_with_validation_and_observer(
+    let mut decoded = records::read_plugins_with_runtime_schemas(
         plugin_paths,
         &order,
+        schemas,
         validate_candidate,
         preserve,
     )?;
@@ -572,6 +641,8 @@ fn convert_plugins_with_dump_impl(
         .transpose()?;
     let projection_stage = records::profile::ProfileStage::start("typed_export_runtime_projection");
     let mut master = HashMap::with_capacity(decoded.records.len());
+    let prepared = records::prepare_runtime_schema(schemas);
+    let mut opaque_fields = HashMap::new();
     for record in decoded.records.values_mut() {
         let priority = record.load_order as usize;
         let plugin = &order.names[priority];
@@ -580,8 +651,21 @@ fn convert_plugins_with_dump_impl(
         let mut localized = Vec::new();
         let mut localization = BTreeMap::new();
         for (index, field) in record.fields.iter().enumerate() {
+            // Unsupported records retain their pre-existing runtime compatibility path.
+            if record.supported && field.opaque {
+                opaque_fields
+                    .entry(record.form_id)
+                    .or_insert_with(BTreeSet::new)
+                    .insert(index);
+                unresolved.insert(index);
+            }
             if let Value::LocalizedString(id) = &field.value {
-                let bank = records::string_table(&record.record_type, &field.name);
+                let bank = records::string_table_with_prepared(
+                    &prepared,
+                    &record.record_type,
+                    &field.signature,
+                    &field.name,
+                );
                 let table = tables
                     .entry((priority, bank.to_owned()))
                     .or_insert_with(|| {
@@ -659,15 +743,17 @@ fn convert_plugins_with_dump_impl(
             writer.write_all(b"\n")?;
         }
         // Typed fields and the source digest have been written before ownership moves.
-        let mut raw = take_runtime_record(record);
+        let mut raw = take_canonical_record(record);
         for (index, text) in runtime_text_updates {
             raw.subrecords[index].1 = text;
         }
-        let invalid = validate_inhouse_record(&raw)
+        let runtime = filtered_record(&raw, opaque_fields.get(&raw.form_id));
+        let runtime = runtime.as_ref().unwrap_or(&raw);
+        let invalid = validate_inhouse_record(runtime)
             .map_err(|error| error.to_string())
             .and_then(|_| {
                 if raw.record_type == *b"LAND" {
-                    validate_inhouse_land(&raw).map_err(|error| error.to_string())
+                    validate_inhouse_land(runtime).map_err(|error| error.to_string())
                 } else {
                     Ok(())
                 }
@@ -725,6 +811,17 @@ fn convert_plugins_with_dump_impl(
     }
     runtime_stage.finish(master.len());
     drop(unresolved_fields);
+    // Canonical SQL retains every opaque occurrence; caches see only runtime fields.
+    for (id, omitted) in &opaque_fields {
+        if let Some(raw) = master.get_mut(id) {
+            let mut index = 0;
+            raw.subrecords.retain(|_| {
+                let keep = !omitted.contains(&index);
+                index += 1;
+                keep
+            });
+        }
+    }
     // Keep the established rkyv records.data contract for runtime tools.
     // Auxiliary provenance holds verbatim source framing and file-relative IDs.
     let provenance_stage = records::profile::ProfileStage::start("source_database_export");
@@ -773,7 +870,13 @@ fn convert_plugins_with_dump_impl(
             params![id, record.source_form_id, record.load_order, String::from_utf8_lossy(&record.record_type), record.flags, record.raw_payload],
         )?;
     }
-    records::history::write_tables(&tx, &decoded.history, &order, plugin_paths)?;
+    records::history::write_tables_with_schemas(
+        &tx,
+        &decoded.history,
+        &order,
+        plugin_paths,
+        schemas,
+    )?;
     records::diagnostics::write_tables(
         &tx,
         order
@@ -847,6 +950,14 @@ fn validate_candidate(record: &records::DecodedRecord) -> std::result::Result<()
     for (index, text) in decoded_text_updates(record) {
         raw.subrecords[index].1 = text;
     }
+    if record.supported {
+        let mut index = 0;
+        raw.subrecords.retain(|_| {
+            let keep = !record.fields[index].opaque;
+            index += 1;
+            keep
+        });
+    }
     validate_inhouse_record(&raw).map_err(|error| error.to_string())?;
     if record.record_type == *b"LAND" {
         validate_inhouse_land(&raw).map_err(|error| error.to_string())?;
@@ -854,9 +965,22 @@ fn validate_candidate(record: &records::DecodedRecord) -> std::result::Result<()
     Ok(())
 }
 
+/// Exclude opaque occurrences from candidate runtime validation while retaining canonical SQL.
+fn filtered_record(record: &RawRecord, omitted: Option<&BTreeSet<usize>>) -> Option<RawRecord> {
+    let omitted = omitted?;
+    let mut filtered = record.clone();
+    let mut index = 0;
+    filtered.subrecords.retain(|_| {
+        let keep = !omitted.contains(&index);
+        index += 1;
+        keep
+    });
+    Some(filtered)
+}
+
 /// Move canonical buffers only after selected typed serialization has completed.
 /// Source payload, identity, provenance and rejection metadata survive for the existing SQL pass.
-fn take_runtime_record(record: &mut records::DecodedRecord) -> RawRecord {
+fn take_canonical_record(record: &mut records::DecodedRecord) -> RawRecord {
     let fields = std::mem::take(&mut record.fields);
     RawRecord {
         form_id: record.form_id,
@@ -1044,12 +1168,14 @@ mod runtime_move_tests {
             source_record_offset: 257,
             fields: vec![
                 DecodedField {
+                    opaque: false,
                     signature: *b"DATA",
                     name: "first".into(),
                     value: Value::Bytes(vec![9, 9]),
                     canonical_bytes: vec![1, 2, 3],
                 },
                 DecodedField {
+                    opaque: false,
                     signature: *b"DATA",
                     name: "second".into(),
                     value: Value::Struct(vec![(
@@ -1059,6 +1185,7 @@ mod runtime_move_tests {
                     canonical_bytes: vec![4, 5],
                 },
                 DecodedField {
+                    opaque: false,
                     signature: *b"FULL",
                     name: "localized".into(),
                     value: Value::LocalizedString(100),
@@ -1152,7 +1279,7 @@ mod runtime_move_tests {
             .map(|f| f.canonical_bytes.as_ptr())
             .collect::<Vec<_>>();
         let before = decoded.clone();
-        let raw = take_runtime_record(&mut decoded);
+        let raw = take_canonical_record(&mut decoded);
         assert_eq!(raw.subrecords, oracle.subrecords);
         assert_eq!(
             raw.subrecords,
@@ -1208,7 +1335,7 @@ mod runtime_move_tests {
             typed["source_payload_sha256"],
             "41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d"
         );
-        let mut runtime = take_runtime_record(&mut decoded);
+        let mut runtime = take_canonical_record(&mut decoded);
         runtime.subrecords[2].1 = runtime_string("different UTF8 runtime");
         assert_ne!(runtime.subrecords[2].1, vec![100, 0, 0, 0]);
         assert_eq!(decoded.raw_payload, b"source");
@@ -1222,7 +1349,7 @@ mod runtime_move_tests {
     fn empty_fields_still_preserve_source_and_runtime_header_metadata() {
         let mut decoded = record();
         decoded.fields.clear();
-        let raw = take_runtime_record(&mut decoded);
+        let raw = take_canonical_record(&mut decoded);
         assert!(raw.subrecords.is_empty());
         assert_eq!(raw.form_id, 0x0100_1234);
         assert_eq!(raw.load_order, 7);

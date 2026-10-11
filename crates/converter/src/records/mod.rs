@@ -1,4 +1,5 @@
 //! Authored schema-driven Skyrim records, independent of the legacy field decoder.
+pub mod addons;
 pub mod compact_array;
 pub mod deciders;
 mod decoder;
@@ -130,13 +131,16 @@ impl Serialize for Value {
     }
 }
 
-/// One matched subrecord and the validated bytes used by runtime projections.
+/// One typed or opaque subrecord occurrence with its canonical bytes.
 #[derive(Clone, Debug, Serialize)]
 pub struct DecodedField {
     pub signature: [u8; 4],
     pub name: String,
     pub value: Value,
     pub canonical_bytes: Vec<u8>,
+    /// True only for unrecognized bytes, never for an authored `bytes` descriptor.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub opaque: bool,
 }
 
 /// A winning record with source bytes distinct from resolved typed values.
@@ -170,7 +174,7 @@ pub struct DecodedRecord {
 }
 
 impl DecodedRecord {
-    /// Adapt checked typed fields to the existing runtime-table and terrain projections.
+    /// Adapt canonical bytes to the established record format, retaining opaque occurrences.
     pub fn to_raw_record(&self) -> RawRecord {
         RawRecord {
             form_id: self.form_id,
@@ -311,10 +315,7 @@ pub(crate) fn decode_text(bytes: &[u8]) -> String {
     decoder::decode_string(bytes)
 }
 
-/// Lookup uses the matched role name so repeated gender/rank signatures retain their text bank.
-pub(crate) fn string_table(record_type: &[u8; 4], field_name: &str) -> &'static str {
-    decoder::string_table(record_type, field_name)
-}
+pub(crate) use decoder::{prepare_runtime_schema, string_table_with_prepared};
 
 /// Scan in load order using the converter's single slot/master authority.
 pub fn read_plugins(plugin_paths: &[PathBuf], order: &LoadOrder) -> Result<ReadResult> {
@@ -344,6 +345,25 @@ pub(crate) fn read_plugins_with_validation_and_observer(
         order,
         schema(),
         decoder::prepared(),
+        validate,
+        observe,
+    )
+}
+
+/// Use a validated conversion-local schema for initial decode, replay and target checks.
+pub(crate) fn read_plugins_with_runtime_schemas(
+    plugin_paths: &[PathBuf],
+    order: &LoadOrder,
+    schemas: &addons::RuntimeSchemas,
+    validate: impl FnMut(&DecodedRecord) -> std::result::Result<(), String>,
+    observe: impl FnMut(&ReadResult),
+) -> Result<ReadResult> {
+    let prepared = decoder::prepare_runtime_schema(schemas);
+    read_plugins_with_prepared(
+        plugin_paths,
+        order,
+        schemas.schema(),
+        &prepared,
         validate,
         observe,
     )

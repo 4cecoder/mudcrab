@@ -33,6 +33,7 @@ struct Cli {
     io_jobs: Option<usize>,
     texture_encoder: TextureEncoder,
     record_reader: RecordReader,
+    schema_addons: Vec<PathBuf>,
     fail_fast: bool,
     invalidate_cache: bool,
     verify_cache: bool,
@@ -167,6 +168,7 @@ async fn main() -> Result<()> {
     config.fail_fast = cli.fail_fast;
     config.invalidate_cache = cli.invalidate_cache;
     config.record_reader = cli.record_reader;
+    config.schema_addons = cli.schema_addons.clone();
     config.verify_cache = cli.verify_cache;
     config.no_lod = cli.no_lod;
     config.texture_encoder = cli.texture_encoder;
@@ -469,6 +471,9 @@ fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
     if cli.record_reader == RecordReader::Inhouse {
         command.push_str(" --record-reader inhouse");
     }
+    for path in &cli.schema_addons {
+        command.push_str(&format!(" --schema-addon \"{}\"", path.display()));
+    }
     command
 }
 
@@ -668,7 +673,7 @@ fn parse_check(args: impl Iterator<Item = OsString>) -> Result<CheckCli> {
     })
 }
 
-/// Parse conversion options, preserving explicit selection inputs for resumed runs.
+/// Parse conversion options, preserving explicit selection inputs and schema add-on order.
 fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut positional = Vec::new();
     let mut report_json = None;
@@ -681,6 +686,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut io_jobs = None;
     let mut use_gpu = false;
     let mut record_reader = RecordReader::Legacy;
+    let mut schema_addons = Vec::new();
     let mut gpu_quality = None;
     let mut gpu_batch_mb = None;
     let mut fail_fast = false;
@@ -735,6 +741,9 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
                     Some("inhouse") => RecordReader::Inhouse,
                     _ => bail!("--record-reader must be legacy or inhouse"),
                 };
+            }
+            Some("--schema-addon") => {
+                schema_addons.push(next_path_value(&mut args, "--schema-addon")?);
             }
             Some("--gpu-quality") => {
                 gpu_quality = Some(parse_u32(
@@ -793,6 +802,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         io_jobs,
         texture_encoder,
         record_reader,
+        schema_addons,
         fail_fast,
         invalidate_cache,
         verify_cache,
@@ -858,6 +868,9 @@ Skyrim.ccc Creations are always active. --skyrim-ccc-file overrides the game-fol
 CCC path. --skyrim-ini-file explicitly supplies General sTestFile settings; no
 ambient profile is read. Without --plugins-file, automatic discovery is unchanged.
 
+--schema-addon <JSON> may be repeated with --record-reader inhouse to add record types
+and explicitly extend fields. The full batch is checked before conversion starts.
+
 --no-lod skips terrain LOD compilation in conversion and metadata rebuilds. Full-detail
 terrain and ordinary assets remain available. Omit it on a later run to build LOD.
 
@@ -883,6 +896,39 @@ changing those source assets. This route cannot resume or cooperatively cancel."
 
 #[cfg(test)]
 mod tests {
+    /// Repeated schema paths preserve input order through parsing and resume commands.
+    #[test]
+    fn schema_addon_cli_preserves_order_and_resume_flags() {
+        let cli = parse_cli(
+            [
+                "Data",
+                "Pack",
+                "--record-reader",
+                "inhouse",
+                "--schema-addon",
+                "first.json",
+                "--schema-addon",
+                "second.json",
+            ]
+            .map(OsString::from)
+            .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            cli.schema_addons,
+            vec![PathBuf::from("first.json"), PathBuf::from("second.json")]
+        );
+        let resume = resume_command("converter", &cli, Path::new("staging"));
+        assert!(resume.contains("--schema-addon \"first.json\" --schema-addon \"second.json\""));
+        assert!(
+            parse_cli(
+                ["Data", "--schema-addon", "--no-lod"]
+                    .map(OsString::from)
+                    .to_vec()
+            )
+            .is_err()
+        );
+    }
     use super::*;
 
     #[test]
@@ -1159,6 +1205,7 @@ mod tests {
             io_jobs: None,
             texture_encoder: TextureEncoder::Cpu,
             record_reader: RecordReader::Legacy,
+            schema_addons: Vec::new(),
             fail_fast: false,
             invalidate_cache: false,
             verify_cache: true,
