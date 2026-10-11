@@ -24,6 +24,9 @@ struct Cli {
     data: PathBuf,
     output: PathBuf,
     resume_staging: Option<PathBuf>,
+    plugins_file: Option<PathBuf>,
+    skyrim_ccc_file: Option<PathBuf>,
+    skyrim_ini_file: Option<PathBuf>,
     reuse_assets: Option<PathBuf>,
     report_json: Option<PathBuf>,
     cpu_jobs: Option<usize>,
@@ -45,7 +48,7 @@ struct CheckCli {
 
 #[derive(Debug)]
 enum Command {
-    Convert(Cli),
+    Convert(Box<Cli>),
     Check(CheckCli),
 }
 
@@ -158,6 +161,9 @@ async fn main() -> Result<()> {
     validate_metadata_report_path(&cli)?;
     let mut config = PipelineConfig::new(cli.data.clone(), cli.output.clone());
     config.resume_staging = cli.resume_staging.clone();
+    config.plugins_file = cli.plugins_file.clone();
+    config.skyrim_ccc_file = cli.skyrim_ccc_file.clone();
+    config.skyrim_ini_file = cli.skyrim_ini_file.clone();
     config.fail_fast = cli.fail_fast;
     config.invalidate_cache = cli.invalidate_cache;
     config.record_reader = cli.record_reader;
@@ -448,6 +454,15 @@ fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
             " --texture-encoder gpu --gpu-quality {quality} --gpu-batch-mb {batch_mb}"
         ));
     }
+    for (flag, path) in [
+        ("--plugins-file", &cli.plugins_file),
+        ("--skyrim-ccc-file", &cli.skyrim_ccc_file),
+        ("--skyrim-ini-file", &cli.skyrim_ini_file),
+    ] {
+        if let Some(path) = path {
+            command.push_str(&format!(" {flag} \"{}\"", path.display()));
+        }
+    }
     if cli.no_lod {
         command.push_str(" --no-lod");
     }
@@ -625,11 +640,12 @@ fn format_check_report(report: &converter::CheckReport) -> String {
     text
 }
 
+/// Select conversion or package checking without inflating the command enum.
 fn parse_command(args: Vec<OsString>) -> Result<Command> {
     if args.first().and_then(|argument| argument.to_str()) == Some("check") {
         return parse_check(args.into_iter().skip(1)).map(Command::Check);
     }
-    parse_cli(args).map(Command::Convert)
+    parse_cli(args).map(|cli| Command::Convert(Box::new(cli)))
 }
 
 fn parse_check(args: impl Iterator<Item = OsString>) -> Result<CheckCli> {
@@ -652,12 +668,15 @@ fn parse_check(args: impl Iterator<Item = OsString>) -> Result<CheckCli> {
     })
 }
 
-/// Parses the arguments of a conversion run.
+/// Parse conversion options, preserving explicit selection inputs for resumed runs.
 fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut positional = Vec::new();
     let mut report_json = None;
     let mut resume_staging = None;
     let mut reuse_assets = None;
+    let mut plugins_file = None;
+    let mut skyrim_ccc_file = None;
+    let mut skyrim_ini_file = None;
     let mut cpu_jobs = None;
     let mut io_jobs = None;
     let mut use_gpu = false;
@@ -677,6 +696,15 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
             }
             Some("--resume-staging") => {
                 resume_staging = Some(PathBuf::from(next_value(&mut args, "--resume-staging")?))
+            }
+            Some("--plugins-file") => {
+                plugins_file = Some(next_path_value(&mut args, "--plugins-file")?)
+            }
+            Some("--skyrim-ccc-file") => {
+                skyrim_ccc_file = Some(next_path_value(&mut args, "--skyrim-ccc-file")?)
+            }
+            Some("--skyrim-ini-file") => {
+                skyrim_ini_file = Some(next_path_value(&mut args, "--skyrim-ini-file")?)
             }
             Some("--reuse-assets") => {
                 reuse_assets = Some(PathBuf::from(next_value(&mut args, "--reuse-assets")?))
@@ -733,6 +761,12 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     if positional.is_empty() || positional.len() > 2 {
         bail!(usage());
     }
+    if (skyrim_ccc_file.is_some() || skyrim_ini_file.is_some()) && plugins_file.is_none() {
+        bail!("--skyrim-ccc-file and --skyrim-ini-file require --plugins-file");
+    }
+    if reuse_assets.is_some() && plugins_file.is_some() {
+        bail!("--reuse-assets uses recorded plugin order and cannot use --plugins-file");
+    }
     let texture_encoder = if use_gpu {
         TextureEncoder::Gpu {
             quality: gpu_quality.unwrap_or(converter::texture_gpu::DEFAULT_QUALITY),
@@ -750,6 +784,9 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
             .pop()
             .unwrap_or_else(|| PathBuf::from("modern_assets")),
         resume_staging,
+        plugins_file,
+        skyrim_ccc_file,
+        skyrim_ini_file,
         reuse_assets,
         report_json,
         cpu_jobs,
@@ -762,6 +799,15 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         no_lod,
         verbose,
     })
+}
+
+/// Require an explicit path without swallowing the next CLI flag.
+fn next_path_value(args: &mut impl Iterator<Item = OsString>, option: &str) -> Result<PathBuf> {
+    let value = next_value(args, option)?;
+    if value.to_string_lossy().starts_with('-') {
+        bail!("{option} requires a path value before the next option");
+    }
+    Ok(PathBuf::from(value))
 }
 
 fn next_value(args: &mut impl Iterator<Item = OsString>, option: &str) -> Result<OsString> {
@@ -802,9 +848,15 @@ fn usage() -> &'static str {
                  [--invalidate-cache] [--no-verify-cache] [--resume-staging DIR]
                  [--report-json FILE] [--verbose] [--reuse-assets DIR] [--no-lod]
                  [--record-reader legacy|inhouse]
+                 [--plugins-file FILE] [--skyrim-ccc-file FILE] [--skyrim-ini-file FILE]
        converter check <output directory> [--full]
 
 Converts a Skyrim Data directory into runtime assets.
+
+--plugins-file reads Windows-1252 player selection. Installed official masters and
+Skyrim.ccc Creations are always active. --skyrim-ccc-file overrides the game-folder
+CCC path. --skyrim-ini-file explicitly supplies General sTestFile settings; no
+ambient profile is read. Without --plugins-file, automatic discovery is unchanged.
 
 --no-lod skips terrain LOD compilation in conversion and metadata rebuilds. Full-detail
 terrain and ordinary assets remain available. Omit it on a later run to build LOD.
@@ -1040,6 +1092,57 @@ mod tests {
         );
     }
 
+    /// Selection inputs survive parsing and the command printed after interruption.
+    #[test]
+    fn explicit_plugin_paths_are_preserved_in_resume_commands() {
+        let cli = parse_cli(vec![
+            "Data".into(),
+            "--plugins-file".into(),
+            "player list.txt".into(),
+            "--skyrim-ccc-file".into(),
+            "game list.ccc".into(),
+            "--skyrim-ini-file".into(),
+            "test settings.ini".into(),
+        ])
+        .unwrap();
+        assert_eq!(cli.plugins_file, Some(PathBuf::from("player list.txt")));
+        assert_eq!(cli.skyrim_ccc_file, Some(PathBuf::from("game list.ccc")));
+        assert_eq!(
+            cli.skyrim_ini_file,
+            Some(PathBuf::from("test settings.ini"))
+        );
+        let resumed = resume_command("converter", &cli, Path::new("modern_assets.staging-1"));
+        for pair in [
+            "--plugins-file \"player list.txt\"",
+            "--skyrim-ccc-file \"game list.ccc\"",
+            "--skyrim-ini-file \"test settings.ini\"",
+        ] {
+            assert!(resumed.contains(pair), "{resumed}");
+        }
+        for flag in ["--plugins-file", "--skyrim-ccc-file", "--skyrim-ini-file"] {
+            assert!(parse_cli(vec!["Data".into(), flag.into()]).is_err());
+            assert!(parse_cli(vec!["Data".into(), flag.into(), "--no-lod".into()]).is_err());
+        }
+        assert!(
+            parse_cli(vec![
+                "Data".into(),
+                "--skyrim-ini-file".into(),
+                "settings.ini".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_cli(vec![
+                "Data".into(),
+                "--plugins-file".into(),
+                "plugins.txt".into(),
+                "--reuse-assets".into(),
+                "old_assets".into()
+            ])
+            .is_err()
+        );
+    }
+
     /// The resume command repeats the paths, quotes them, and keeps the GPU encoder flags.
     #[test]
     fn names_the_exact_command_that_resumes_a_kept_staging_folder() {
@@ -1047,6 +1150,9 @@ mod tests {
             data: PathBuf::from("C:/Games/Skyrim/Data"),
             output: PathBuf::from("C:/Modding/SkyrimConverted"),
             resume_staging: None,
+            plugins_file: None,
+            skyrim_ccc_file: None,
+            skyrim_ini_file: None,
             reuse_assets: None,
             report_json: None,
             cpu_jobs: None,

@@ -308,7 +308,7 @@ pub fn actuate_effects(
             Effect::None => {}
             Effect::Begin(config) => {
                 let (tx, rx) = crossbeam_channel::unbounded();
-                handle.cancellation = Some(runner::spawn(config, tx));
+                handle.cancellation = Some(runner::spawn(*config, tx));
                 commands.insert_resource(RunChannel { receiver: rx });
                 status.begin_run();
             }

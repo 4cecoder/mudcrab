@@ -13,7 +13,7 @@ use crate::{
         cell_cache::write_cell_cache,
         exporter::validate_database,
         lodsettings::{LodSettings, sidecar_path},
-        read_plugins_txt,
+        plugins_txt::read_with_notices,
     },
     integration::{IntegrationReport, finalize_world_database},
     lod::{
@@ -423,7 +423,14 @@ impl AssetPipeline {
                 progress_tx,
                 ProgressStage::Discovering,
                 None,
-                &format!("note: {notice}"),
+                &format!(
+                    "{}: {notice}",
+                    if config.plugins_file.is_some() {
+                        "warning"
+                    } else {
+                        "note"
+                    }
+                ),
             )
             .await;
         }
@@ -2080,7 +2087,13 @@ fn plugin_paths(
     notices: &mut Vec<String>,
 ) -> Result<Vec<PathBuf>> {
     if let Some(path) = &config.plugins_file {
-        return read_plugins_txt(path, &config.data_dir);
+        return read_with_notices(
+            path,
+            &config.data_dir,
+            config.skyrim_ccc_file.as_deref(),
+            config.skyrim_ini_file.as_deref(),
+            notices,
+        );
     }
     let discovered: Vec<_> = files
         .iter()
@@ -2115,14 +2128,10 @@ fn plugin_paths(
             .unwrap_or_default()
             .to_string_lossy()
             .to_ascii_lowercase();
-        let rank = match name.as_str() {
-            "skyrim.esm" => 0,
-            "update.esm" => 1,
-            "dawnguard.esm" => 2,
-            "hearthfires.esm" => 3,
-            "dragonborn.esm" => 4,
-            _ => 10,
-        };
+        let rank = crate::esm::OFFICIAL_MASTERS
+            .iter()
+            .position(|official| official.eq_ignore_ascii_case(&name))
+            .unwrap_or(10);
         (rank, name)
     });
     crate::esm::load_order::order_discovered_plugins(plugins)
