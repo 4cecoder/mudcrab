@@ -3529,7 +3529,7 @@ mod tests {
             .prepare("SELECT * FROM record_diagnostics ORDER BY diagnostic_id")
             .unwrap();
         let columns = query.column_count();
-        let rows = query
+        query
             .query_map([], |row| {
                 (0..columns)
                     .map(|column| row.get::<_, rusqlite::types::Value>(column))
@@ -3537,8 +3537,7 @@ mod tests {
             })
             .unwrap()
             .map(Result::unwrap)
-            .collect();
-        rows
+            .collect()
     }
 
     /// Match full baseline/contextual diagnostics when a leaf shifts later link
@@ -3598,7 +3597,7 @@ mod tests {
             ]
             .concat();
             std::fs::write(&path, &source_bytes).unwrap();
-            let order = LoadOrder::read(&[path.clone()]).unwrap();
+            let order = LoadOrder::read(std::slice::from_ref(&path)).unwrap();
             let kinds = HashMap::from([(0x1900, *b"NPC_"), (0x1880, *b"TEST")]);
             let scan = || ScannedRecord {
                 record_type: *b"TEST",
@@ -3810,7 +3809,7 @@ mod tests {
             ]
             .concat();
             std::fs::write(&path, &source_bytes).unwrap();
-            let order = LoadOrder::read(&[path.clone()]).unwrap();
+            let order = LoadOrder::read(std::slice::from_ref(&path)).unwrap();
             let kinds = HashMap::from([
                 (0x1900, *b"NPC_"),
                 (0x1901, *b"FACT"),
@@ -3998,7 +3997,7 @@ mod tests {
             ]
             .concat();
             std::fs::write(&path, &source_bytes).unwrap();
-            let order = LoadOrder::read(&[path.clone()]).unwrap();
+            let order = LoadOrder::read(std::slice::from_ref(&path)).unwrap();
             let kinds = HashMap::from([(0x1900, *b"NPC_"), (0x1880, *b"TEST")]);
             let scan = || ScannedRecord {
                 record_type: *b"TEST",
@@ -4196,7 +4195,7 @@ mod tests {
         ]
         .concat();
         std::fs::write(&path, &source_bytes).unwrap();
-        let order = LoadOrder::read(&[path.clone()]).unwrap();
+        let order = LoadOrder::read(std::slice::from_ref(&path)).unwrap();
         let kinds = HashMap::from([(0x1801, *b"FACT"), (0x1802, *b"NPC_")]);
         let mut diagnostics = PluginDiagnostics::default();
         let selected = decode_with_prepared(
