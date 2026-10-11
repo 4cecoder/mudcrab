@@ -237,7 +237,7 @@ fn rejects_malformed_land_and_alternate_texture_references() {
             0,
             record(kind, 0x800, 0, payload),
         );
-        assert!(EsmParser::merge_plugins(&[base]).is_err());
+        assert!(EsmParser::merge_plugins(&[base]).unwrap().is_empty());
     }
 }
 
@@ -316,7 +316,7 @@ fn group_parser_handles_deep_nesting_and_restores_sibling_context_in_file_order(
 }
 
 #[test]
-fn group_parser_rejects_partial_headers_in_nested_payloads_and_after_siblings() {
+fn group_parser_preserves_complete_records_around_partial_bounded_frames() {
     for length in 1..24 {
         let partial = vec![0; length];
         for input in [
@@ -328,8 +328,9 @@ fn group_parser_rejects_partial_headers_in_nested_payloads_and_after_siblings() 
             ]
             .concat(),
         ] {
-            let result = converter::esm::binary::parse_group(&input, None, None, &mut Vec::new());
-            assert!(result.unwrap_err().to_string().contains("trailing"));
+            let mut records = Vec::new();
+            converter::esm::binary::parse_group(&input, None, None, &mut records).unwrap();
+            assert_eq!(records.len(), usize::from(input.len() > 24 + length));
         }
     }
 }
@@ -388,9 +389,11 @@ fn rejects_duplicate_plugins_missing_masters_and_invalid_indices() {
     );
     assert!(LoadOrder::read(std::slice::from_ref(&patch)).is_err());
     assert!(LoadOrder::read(&[patch.clone(), base.clone()]).is_err());
-    assert!(EsmParser::merge_plugins(&[base, patch]).is_err());
+    let merged = EsmParser::merge_plugins(&[base, patch]).unwrap();
+    assert_eq!(merged.len(), 1);
+    assert!(merged.contains_key(&0x120));
     let oversized = plugin(dir.path(), "Oversized.esl", &[], 0x200, grass(0x1800, 35));
-    assert!(EsmParser::merge_plugins(&[oversized]).is_err());
+    assert!(EsmParser::merge_plugins(&[oversized]).unwrap().is_empty());
 }
 
 #[test]
@@ -476,7 +479,7 @@ fn out_of_range_master_index_resolves_to_the_plugin_itself() {
 }
 
 /// An out-of-range master index that lands on another record of the same plugin would
-/// silently replace it, so the merge rejects it whichever record comes first.
+/// silently replace it, so the conflicting candidate is omitted whichever comes first.
 #[test]
 fn out_of_range_master_index_may_not_replace_another_record() {
     for ids in [[0x0000_0800, 0x0200_0800], [0x0200_0800, 0x0000_0800]] {
@@ -492,13 +495,9 @@ fn out_of_range_master_index_may_not_replace_another_record() {
             ]
             .concat(),
         );
-        let error = format!("{:?}", EsmParser::merge_plugins(&[path]).unwrap_err());
-        assert!(
-            error.contains("both resolve to 00000800")
-                && error.contains("00000800")
-                && error.contains("02000800"),
-            "{error}"
-        );
+        let merged = EsmParser::merge_plugins(&[path]).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[&0x800].subrecords[0].1, b"First\0");
     }
 }
 

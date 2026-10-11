@@ -67,9 +67,9 @@ pub(crate) fn resolve(
         };
     }
     let owner = if index == masters.len() {
-        order.names[supplier].clone()
+        crate::esm::load_order::normalize_plugin_name(&order.names[supplier])
     } else {
-        masters[index].to_ascii_lowercase()
+        crate::esm::load_order::normalize_plugin_name(&masters[index])
     };
     let available = order.normal.contains_key(&owner) || order.light.contains_key(&owner);
     SourceIdentity {

@@ -528,7 +528,25 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
         .filter_map(|row| row.ok())
         .filter_map(|(id, tag)| tag.as_bytes().try_into().ok().map(|tag| (id, tag)))
         .collect();
-    let mut statement = conn.prepare("SELECT chain_position,plugin_id,source_form_id,record_type,flags,source_record_offset,source_record_size,status,reason,source_cell_form_id,source_worldspace_form_id,source_topic_form_id,topic_group_offset,source_group_end,frame_complete,record_signature FROM record_overrides WHERE form_id=?1 ORDER BY chain_position")?;
+    // The retained 18-column layout predates authenticated group bounds and raw signatures.
+    // Keep its available chain facts visible, but never infer missing replay authority.
+    let mut layout = conn.prepare("PRAGMA table_info(record_overrides)")?;
+    let columns = layout
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let retained_column = |name: &str| {
+        if columns.iter().any(|column| column == name) {
+            name.to_owned()
+        } else {
+            "NULL".to_owned()
+        }
+    };
+    let mut statement = conn.prepare(&format!(
+        "SELECT chain_position,plugin_id,source_form_id,record_type,flags,source_record_offset,source_record_size,status,reason,source_cell_form_id,source_worldspace_form_id,source_topic_form_id,topic_group_offset,{},{},{} FROM record_overrides WHERE form_id=?1 ORDER BY chain_position",
+        retained_column("source_group_end"),
+        retained_column("frame_complete"),
+        retained_column("record_signature")
+    ))?;
     let rows = statement.query_map([form_id], |r| {
         Ok((
             r.get::<_, u32>(0)?,
@@ -544,9 +562,9 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
             r.get::<_, Option<u32>>(10)?,
             r.get::<_, Option<u32>>(11)?,
             r.get::<_, Option<u64>>(12)?,
-            r.get::<_, u64>(13)?,
-            r.get::<_, bool>(14)?,
-            r.get::<_, Vec<u8>>(15)?,
+            r.get::<_, Option<u64>>(13)?,
+            r.get::<_, Option<bool>>(14)?,
+            r.get::<_, Option<Vec<u8>>>(15)?,
         ))
     })?;
     let mut versions = Vec::new();
@@ -589,6 +607,19 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
             diagnostics: PluginDiagnostics::default(),
         };
         let decoded = (|| -> Result<DecodedRecord> {
+            let containing_group_end = containing_group_end.ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "stored history lacks authenticated containing-group bounds"
+                )
+            })?;
+            let frame_complete = frame_complete.ok_or_else(|| {
+                color_eyre::eyre::eyre!("stored history lacks authenticated frame completeness")
+            })?;
+            let signature = signature.ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "stored history lacks an authenticated raw record signature"
+                )
+            })?;
             let schemas = schemas
                 .as_ref()
                 .map_err(|error| color_eyre::eyre::eyre!("{error}"))?;

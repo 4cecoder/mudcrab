@@ -321,7 +321,7 @@ async fn known_legacy_full_hashes_reuse_assets_without_kind_keys() {
         );
         assert_eq!(
             json_artifact(&fixture.output, "record-reader.json"),
-            serde_json::json!({"mode": "legacy", "projection_version": 1})
+            serde_json::json!({"mode": "legacy", "projection_version": crate::esm::inhouse::LEGACY_PROJECTION_VERSION})
         );
         let database = Connection::open(fixture.output.join("skyrim_world.db")).unwrap();
         let neighbor: String = database
@@ -626,7 +626,7 @@ async fn historical_legacy_reader_identity_survives_repeated_metadata_migrations
     );
     assert_eq!(
         json_artifact(&second_output, "record-reader.json"),
-        serde_json::json!({"mode": "legacy", "projection_version": 1})
+        serde_json::json!({"mode": "legacy", "projection_version": crate::esm::inhouse::LEGACY_PROJECTION_VERSION})
     );
     assert_ne!(
         manifest(&second_output).configuration_hash,

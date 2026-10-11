@@ -174,25 +174,40 @@ pub(crate) fn guarded_raw(
     })
 }
 
-/// Find a raw or reader-admitted latest candidate only within a proven owner/full-local key.
+/// Older producers used ASCII-only folding. Their exact former key can be derived from
+/// the authenticated stored plugin basename, without broadening source ownership.
+fn legacy_owner_key(owner: &str, sources: &[history::PluginSource]) -> String {
+    sources
+        .iter()
+        .find(|(name, _, _)| crate::esm::load_order::normalize_plugin_name(name) == owner)
+        .map(|(name, _, _)| name.to_ascii_lowercase())
+        .unwrap_or_else(|| owner.to_owned())
+}
+
+/// Find a raw or admitted latest candidate only within a proven owner/full-local key.
+/// Both saved key spellings refer to the same validated plugin-basename namespace.
 fn latest(
     conn: &Connection,
     identity: &source_identity::SourceIdentity,
+    sources: &[history::PluginSource],
     accepted_only: bool,
 ) -> Result<Option<(u32, u64)>> {
     if identity.state != source_identity::SourceIdentityState::Resolved {
         return Ok(None);
     }
+    let Some(owner) = identity.original_owner.as_deref() else {
+        return Ok(None);
+    };
     let sql = if accepted_only {
-        "SELECT plugin_id,source_record_offset FROM record_overrides WHERE original_owner=?1 AND full_local=?2 AND source_identity_state='resolved' AND status='accepted' ORDER BY plugin_id DESC,source_record_offset DESC LIMIT 1"
+        "SELECT plugin_id,source_record_offset FROM record_overrides WHERE original_owner IN (?1,?3) AND full_local=?2 AND source_identity_state='resolved' AND status='accepted' ORDER BY plugin_id DESC,source_record_offset DESC LIMIT 1"
     } else {
-        "SELECT plugin_id,source_record_offset FROM record_overrides WHERE original_owner=?1 AND full_local=?2 AND source_identity_state='resolved' ORDER BY plugin_id DESC,source_record_offset DESC LIMIT 1"
+        "SELECT plugin_id,source_record_offset FROM record_overrides WHERE original_owner IN (?1,?3) AND full_local=?2 AND source_identity_state='resolved' ORDER BY plugin_id DESC,source_record_offset DESC LIMIT 1"
     };
     use rusqlite::OptionalExtension;
     Ok(conn
         .query_row(
             sql,
-            params![identity.original_owner, identity.full_local],
+            params![owner, identity.full_local, legacy_owner_key(owner, sources)],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?)
@@ -268,14 +283,17 @@ pub fn visit_source_history(
                     && *full_local <= 0xffffff,
                 "source query requires a bounded original basename/full local"
             );
+            let owner = crate::esm::load_order::normalize_plugin_name(original_owner);
+            let legacy_owner = legacy_owner_key(&owner, &sources);
             (
                 format!(
-                    "{select} WHERE original_owner=?1 AND full_local=?2 AND source_identity_state='resolved' ORDER BY plugin_id,source_record_offset LIMIT {}",
+                    "{select} WHERE original_owner IN (?1,?3) AND full_local=?2 AND source_identity_state='resolved' ORDER BY plugin_id,source_record_offset LIMIT {}",
                     QUERY_VERSION_BOUND + 1
                 ),
                 vec![
-                    original_owner.to_ascii_lowercase().into(),
+                    owner.into(),
                     i64::from(*full_local).into(),
+                    legacy_owner.into(),
                 ],
             )
         }
@@ -305,15 +323,18 @@ pub fn visit_source_history(
         let local: Option<u32> = row.get(14)?;
         let state: String = row.get(15)?;
         ensure!(
-            owner == identity.original_owner
+            owner
+                .as_deref()
+                .map(crate::esm::load_order::normalize_plugin_name)
+                == identity.original_owner
                 && local == identity.full_local
                 && state == identity.state.as_str(),
             "stored source identity differs from master authority"
         );
         let offset: u64 = row.get(5)?;
         let candidate = (plugin, offset);
-        let source_latest = latest(&conn, &identity, false)?;
-        let admitted_latest = latest(&conn, &identity, true)?;
+        let source_latest = latest(&conn, &identity, &sources, false)?;
+        let admitted_latest = latest(&conn, &identity, &sources, true)?;
         let mut version = SourceVersion {
             runtime_form_id: row.get(0)?,
             plugin_id: plugin,
@@ -358,9 +379,10 @@ pub fn visit_source_history(
                 && source_latest.is_some()
                 && source_latest != Some(candidate);
         }
-        let (_, stored_path, checksum) = &sources[plugin as usize];
+        let (source_name, stored_path, checksum) = &sources[plugin as usize];
         let path: PathBuf = data
-            .map(|root| root.join(&version.supplying_plugin))
+            // Preserve the authenticated original filename spelling on case-sensitive hosts.
+            .map(|root| root.join(source_name))
             .unwrap_or_else(|| stored_path.clone());
         match guarded_raw(&path, checksum, &version) {
             Ok(raw) => {

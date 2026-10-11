@@ -21,6 +21,10 @@ pub(crate) fn validate_inhouse_land(record: &RawRecord) -> Result<()> {
                 && heights.iter().all(|h| h.is_finite())),
         "incomplete or non-finite authored VHGT"
     );
+    color_eyre::eyre::ensure!(
+        decode_normals(view.find(b"VNML").unwrap_or_default(), &heights).len() == count * 3,
+        "incomplete VNML"
+    );
     let colors = view.find(b"VCLR").unwrap_or_default();
     color_eyre::eyre::ensure!(
         colors.is_empty() || colors.len() == count * 3,
@@ -86,7 +90,8 @@ pub(crate) fn land_winners_by_cell(
 /// the later physical record in that plugin, supplies the complete cached terrain.
 /// FormID breaks ties only when source positions are missing or identical; it does
 /// not give full or light plugin identities precedence over their load order.
-/// All candidates retain validation before any previous cache is replaced.
+/// Only the selected terrain is decoded; an irrelevant losing candidate cannot
+/// prevent publication. Frontends validate candidates before replacing winners.
 pub fn write_cell_cache_with_source_order(
     records: &HashMap<u32, RawRecord>,
     source_offsets: &HashMap<u32, u64>,
@@ -149,9 +154,12 @@ fn write_cell_cache_layers(
         .collect();
     land_records.sort_unstable_by_key(|record| land_source_priority(record, source_offsets));
     for record in land_records {
+        let cell_id = record.cell_form_id.unwrap_or(record.form_id);
+        if winners[&cell_id] != record.form_id {
+            continue;
+        }
         let view = SubrecordView::new(&record.subrecords);
         let heightmap = view.find(b"VHGT").unwrap_or_default();
-        let cell_id = record.cell_form_id.unwrap_or(record.form_id);
         let (water_height, water_type_form_id) =
             water_by_cell.get(&cell_id).copied().unwrap_or((None, None));
         if let Some(bytes) = heightmap.get(..4) {
@@ -208,9 +216,6 @@ fn write_cell_cache_layers(
                 quadrant_layers.is_empty() || bases == 1,
                 "LAND {cell_id:08X} quadrant {quadrant} must be empty or have one BTXT"
             );
-        }
-        if winners[&cell_id] != record.form_id {
-            continue;
         }
         if let Some(preserved) = layer_overrides.get(&record.form_id) {
             match validate_preserved_layers(preserved) {
@@ -895,6 +900,27 @@ mod tests {
             cache.cells[0].vertex_colors,
             vec![expected_marker + 1; 33 * 33 * 3]
         );
+    }
+
+    #[test]
+    fn malformed_losing_land_does_not_block_selected_terrain_or_neighbors() {
+        let losing = selection_land(0x800, 1, f32::NAN, 7);
+        let selected = selection_land(0x801, 2, 11.0, 19);
+        let mut neighbor = selection_land(0x802, 1, 3.0, 7);
+        neighbor.cell_form_id = Some(0x9876);
+        let records = HashMap::from([
+            (losing.form_id, losing),
+            (selected.form_id, selected),
+            (neighbor.form_id, neighbor),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.rkyv");
+        assert_eq!(write_cell_cache(&records, &path).unwrap(), 2);
+        let cache = rkyv::from_bytes::<CellCache, Error>(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(cache.cells[0].cell_id, 0x7654);
+        assert_eq!(cache.cells[0].heights, vec![88.0; 33 * 33]);
+        assert_eq!(cache.cells[1].cell_id, 0x9876);
+        assert_eq!(cache.cells[1].heights, vec![24.0; 33 * 33]);
     }
 
     /// Physical order wins a same-plugin tie even when the later record has a smaller ID.

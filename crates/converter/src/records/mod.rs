@@ -141,6 +141,9 @@ pub struct DecodedField {
     /// True only for unrecognized bytes, never for an authored `bytes` descriptor.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub opaque: bool,
+    /// The selected localized leaf's bank, retained only for runtime publication.
+    #[serde(skip)]
+    pub localized_bank: Option<String>,
 }
 
 /// A winning record with source bytes distinct from resolved typed values.
@@ -495,11 +498,30 @@ fn read_plugins_with_prepared(
             }
             // A torn override cannot show what its missing tail held, so it never
             // replaces a complete earlier version; a first definition keeps its prefix.
+            // GMST winners use EditorID identity even when a later occurrence has a
+            // different native header ID. Resolve it without publishing a new alias.
+            let candidate_id = if record.record_type == *b"GMST" {
+                record
+                    .fields
+                    .iter()
+                    .find_map(|field| {
+                        if field.signature == *b"EDID"
+                            && let Value::String(name) = &field.value
+                        {
+                            gmst_ids.get(&name.to_ascii_lowercase()).copied()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(record.form_id)
+            } else {
+                record.form_id
+            };
             if record.flags & 0x20 == 0
                 && !record.payload_complete
                 && result
                     .records
-                    .get(&record.form_id)
+                    .get(&candidate_id)
                     .is_some_and(|previous| previous.payload_complete)
             {
                 if let Some(entry) = history.borrow_mut().last_mut() {

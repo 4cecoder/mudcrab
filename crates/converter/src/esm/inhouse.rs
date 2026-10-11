@@ -24,11 +24,11 @@ use std::{
 };
 
 /// Decoder/adapter behavior version for output changes outside the authored schema.
-pub const ADAPTER_VERSION: u32 = 9;
+pub const ADAPTER_VERSION: u32 = 10;
 
-/// Legacy metadata projection contract: corrected TX06/TX07 and ARMO world-model slots.
+/// Legacy metadata projection contract: corrected slots, faction links and local recovery.
 /// This identity does not change the independent converted-asset producer/settings proofs.
-pub const LEGACY_PROJECTION_VERSION: u32 = 1;
+pub const LEGACY_PROJECTION_VERSION: u32 = 2;
 
 /// Explicit diagnostic export scope; existing publication APIs always select Full.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -346,7 +346,7 @@ pub(crate) fn localized_string_paths(plugins: &[PathBuf]) -> BTreeSet<PathBuf> {
             ["strings", "dlstrings", "ilstrings"].map(|bank| {
                 PathBuf::from(format!(
                     "strings/{}_english.{bank}",
-                    stem.to_string_lossy().to_ascii_lowercase()
+                    super::load_order::normalize_plugin_name(&stem.to_string_lossy())
                 ))
             })
         })
@@ -666,12 +666,17 @@ fn convert_plugins_with_dump_impl(
                 unresolved.insert(index);
             }
             if let Value::LocalizedString(id) = &field.value {
-                let bank = records::string_table_with_prepared(
-                    &prepared,
-                    &record.record_type,
-                    &field.signature,
-                    &field.name,
-                );
+                let bank = match field.localized_bank.as_deref() {
+                    Some("dlstrings") => "dlstrings",
+                    Some("ilstrings") => "ilstrings",
+                    Some("strings") => "strings",
+                    _ => records::string_table_with_prepared(
+                        &prepared,
+                        &record.record_type,
+                        &field.signature,
+                        &field.name,
+                    ),
+                };
                 let table = tables
                     .entry((priority, bank.to_owned()))
                     .or_insert_with(|| {
@@ -797,7 +802,6 @@ fn convert_plugins_with_dump_impl(
     conn.pragma_update(Some(rusqlite::DatabaseName::Main), "cache_size", -65_536)?;
     conn.set_prepared_statement_cache_capacity(64);
     create_tables(&conn)?;
-    super::insert_plugins(&conn, plugin_paths)?;
     let terrain_offsets = decoded
         .records
         .values()
@@ -811,9 +815,16 @@ fn convert_plugins_with_dump_impl(
         "canonical_record_database_export"
     });
     if mode == RecordBundleMode::Full {
-        export_inhouse_to_db(&conn, &master, &order, &unresolved_fields, &terrain_offsets)?;
+        export_inhouse_to_db(
+            &conn,
+            &master,
+            &order,
+            plugin_paths,
+            &unresolved_fields,
+            &terrain_offsets,
+        )?;
     } else {
-        export_inhouse_record_archive_to_db(&conn, &master, &order)?;
+        export_inhouse_record_archive_to_db(&conn, &master, &order, plugin_paths)?;
     }
     runtime_stage.finish(master.len());
     drop(unresolved_fields);
@@ -1062,10 +1073,8 @@ fn child_case_insensitive(parent: &Path, name: &str) -> Option<PathBuf> {
         .ok()?
         .filter_map(|entry| entry.ok())
         .find(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(name)
+            super::load_order::normalize_plugin_name(&entry.file_name().to_string_lossy())
+                == super::load_order::normalize_plugin_name(name)
         })
         .map(|entry| entry.path())
 }
@@ -1175,6 +1184,7 @@ mod runtime_move_tests {
             fields: vec![
                 DecodedField {
                     opaque: false,
+                    localized_bank: None,
                     signature: *b"DATA",
                     name: "first".into(),
                     value: Value::Bytes(vec![9, 9]),
@@ -1182,6 +1192,7 @@ mod runtime_move_tests {
                 },
                 DecodedField {
                     opaque: false,
+                    localized_bank: None,
                     signature: *b"DATA",
                     name: "second".into(),
                     value: Value::Struct(vec![(
@@ -1192,6 +1203,7 @@ mod runtime_move_tests {
                 },
                 DecodedField {
                     opaque: false,
+                    localized_bank: None,
                     signature: *b"FULL",
                     name: "localized".into(),
                     value: Value::LocalizedString(100),
@@ -1513,7 +1525,7 @@ mod history_reuse_private_controls {
                     assert_eq!(version.runtime_form_id, Some(runtime));
                     assert_eq!(
                         version.identity.original_owner.as_deref(),
-                        Some(owner.to_ascii_lowercase().as_str())
+                        Some(crate::esm::load_order::normalize_plugin_name(owner).as_str())
                     );
                     assert_eq!(version.identity.full_local, Some(local));
                     assert!(

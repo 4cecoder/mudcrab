@@ -125,6 +125,7 @@ fn link_free_record_with_multiple_known_fields_keeps_all_values_and_bytes() {
         vec![
             DecodedField {
                 opaque: false,
+                localized_bank: None,
                 signature: *b"EDID",
                 name: "editor_id".into(),
                 value: Value::String("Independent\0λ".into()),
@@ -132,6 +133,7 @@ fn link_free_record_with_multiple_known_fields_keeps_all_values_and_bytes() {
             },
             DecodedField {
                 opaque: false,
+                localized_bank: None,
                 signature: *b"FULL",
                 name: "name".into(),
                 value: Value::LocalizedString(0x1809),
@@ -418,6 +420,7 @@ fn vmad_special_branch_still_validates_canonical_object_and_preserves_source() {
         *b"ACTI",
         vec![DecodedField {
             opaque: false,
+            localized_bank: None,
             signature: *b"VMAD",
             name: "scripts".into(),
             value: zero_value,

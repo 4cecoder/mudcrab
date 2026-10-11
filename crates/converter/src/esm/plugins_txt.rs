@@ -109,10 +109,9 @@ fn usable_plugins(paths: Vec<PathBuf>, warnings: &mut Warnings) -> Vec<PathBuf> 
         .enumerate()
         .map(|(i, path)| {
             (
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_ascii_lowercase(),
+                load_order::normalize_plugin_name(
+                    &path.file_name().unwrap_or_default().to_string_lossy(),
+                ),
                 i,
             )
         })
@@ -147,7 +146,7 @@ fn usable_plugins(paths: Vec<PathBuf>, warnings: &mut Warnings) -> Vec<PathBuf> 
                 continue;
             };
             for master in &header.masters {
-                let cause = match indices.get(&master.to_ascii_lowercase()) {
+                let cause = match indices.get(&load_order::normalize_plugin_name(master)) {
                     Some(&dependency) => missing[dependency].clone(),
                     None => Some(master.clone()),
                 };
@@ -205,7 +204,7 @@ pub(crate) fn read_with_notices(
         if entry.path().is_file() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if plugin_name(&name) {
-                installed.insert(name.to_ascii_lowercase(), entry.path());
+                installed.insert(load_order::normalize_plugin_name(&name), entry.path());
             }
         }
     }
@@ -226,7 +225,7 @@ pub(crate) fn read_with_notices(
         .unwrap_or_default();
     let test_names: HashSet<_> = test_files
         .iter()
-        .map(|name| name.to_ascii_lowercase())
+        .map(|name| load_order::normalize_plugin_name(name))
         .collect();
     let mut listed = Vec::new();
     let mut last = HashMap::new();
@@ -236,7 +235,7 @@ pub(crate) fn read_with_notices(
         if !plugin_name(name) {
             continue;
         }
-        let key = name.to_ascii_lowercase();
+        let key = load_order::normalize_plugin_name(name);
         if last.insert(key.clone(), listed.len()).is_some() {
             warnings.add(format!(
                 "duplicate plugins.txt entry {key}; keeping the last position and checkbox"
@@ -247,7 +246,7 @@ pub(crate) fn read_with_notices(
     let mut selected = Vec::new();
     let mut seen = HashSet::new();
     let mut add = |name: &str, warnings: &mut Warnings| {
-        let key = name.to_ascii_lowercase();
+        let key = load_order::normalize_plugin_name(name);
         if let Some(path) = installed.get(&key) {
             if seen.insert(key) {
                 selected.push(path.clone());
@@ -274,10 +273,10 @@ pub(crate) fn read_with_notices(
     }
     let mut unlisted: Vec<_> = test_files
         .iter()
-        .filter(|name| !last.contains_key(&name.to_ascii_lowercase()))
+        .filter(|name| !last.contains_key(&load_order::normalize_plugin_name(name)))
         .collect();
     unlisted.sort_by_key(|name| {
-        let key = name.to_ascii_lowercase();
+        let key = load_order::normalize_plugin_name(name);
         let modified = installed
             .get(&key)
             .and_then(|path| std::fs::metadata(path).ok())

@@ -41,7 +41,7 @@ fn legacy_projection_identity_separates_current_and_historical_full_hashes() {
     let identity = crate::esm::inhouse::reader_identity(RecordReader::Legacy);
     assert_eq!(
         identity,
-        serde_json::json!({"mode": "legacy", "projection_version": 1})
+        serde_json::json!({"mode": "legacy", "projection_version": crate::esm::inhouse::LEGACY_PROJECTION_VERSION})
     );
     assert_ne!(configuration_hash(&legacy).unwrap(), historical);
     assert_eq!(
@@ -49,7 +49,8 @@ fn legacy_projection_identity_separates_current_and_historical_full_hashes() {
         "9a58fda00b27d0f2a8e46afb9334ea869602556393a35bffd7fcb39582a08a4f"
     );
     let mut changed_identity = identity.clone();
-    changed_identity["projection_version"] = serde_json::json!(2);
+    changed_identity["projection_version"] =
+        serde_json::json!(crate::esm::inhouse::LEGACY_PROJECTION_VERSION + 1);
     assert_ne!(
         configuration_hash(&legacy).unwrap(),
         configuration_hash_with_identity(&legacy, 26, Some(&changed_identity)).unwrap()
@@ -70,11 +71,16 @@ fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
     let config = PipelineConfig::new("synthetic-data", "synthetic-output");
     let old_identity = serde_json::json!({"mode": "legacy"});
     let current_identity = crate::esm::inhouse::reader_identity(RecordReader::Legacy);
+    let previous_identity = serde_json::json!({"mode": "legacy", "projection_version": 1});
     let historical = configuration_hash_for_schema(&config, 26).unwrap();
     let current = configuration_hash(&config).unwrap();
+    let previous = legacy_projection_v1_configuration_hash(&config, 26).unwrap();
+    assert_ne!(previous, current);
+    assert_ne!(previous, historical);
     for (identity, matching, other) in [
         (&old_identity, historical.as_str(), current.as_str()),
         (&current_identity, current.as_str(), historical.as_str()),
+        (&previous_identity, previous.as_str(), current.as_str()),
     ] {
         assert!(
             retained_configuration_matches_for_reader(&config, 26, matching, identity).unwrap()

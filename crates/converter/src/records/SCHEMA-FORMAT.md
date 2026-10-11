@@ -132,7 +132,13 @@ not a display name. No schema field assumes UTF-8 for all plugin text.
 
 `bytes` marks opaque data. It is deliberate preservation, not a claim that
 links inside the payload have been decoded. `struct` members use byte offsets;
-padding is explicitly represented as bytes. Arrays validate the count, stride,
+padding is explicitly represented as bytes. Definitions are fully expanded
+before member spans, array element shape, union selection and group flattening
+are chosen. Decoding and target validation use the same occurrence order, so
+duplicate member labels retain their separate byte slots. Link-bearing members
+cannot overlap any other member: known overlap is a schema error, and
+payload-dependent overlap rejects only that field. Non-link overlap retains
+its existing preservation behavior. Arrays validate the count, stride,
 remaining byte divisibility, and bounds before accessing any element. Nested
 arrays, such as LAND's 1,089 height deltas, apply their offset to the parent.
 
@@ -187,6 +193,10 @@ NUL-terminated text value in those cases. `inhouse_localized_fields` records the
 canonical field index, signature, field name, bank, original string ID, winning
 load order, nullable resolved text and status (`resolved`, `null_id`, `missing`).
 An explicitly resolved empty string remains distinct from a null or missing ID.
+The selected localized leaf's explicit bank overrides its parent union or
+definition occurrence; an unspecified leaf inherits the nearest explicit bank,
+then defaults to STRINGS. This integration metadata is reconstructed by source
+replay and does not add a field to serialized typed records.
 Runtime nullable text projections omit only unresolved occurrences during
 extraction, so a missing NPC name remains NULL. Original ID bytes remain in the
 source payload; no decimal ID or raw four-byte key is presented as text.

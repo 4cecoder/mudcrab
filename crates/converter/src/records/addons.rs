@@ -383,14 +383,7 @@ fn fingerprint(identities: &[SchemaAddonIdentity]) -> String {
 
 /// Fully expand a definition occurrence with the validator's existing recursion bound.
 fn resolve_field(schema: &Schema, field: &FieldSchema) -> Result<FieldSchema, String> {
-    let mut field = field.clone();
-    for _ in 0..32 {
-        if field.definition.is_none() {
-            return Ok(field);
-        }
-        field = schema.resolve(&field)?;
-    }
-    Err("schema nesting or definition cycle exceeds 32 levels".into())
+    schema.resolve(field)
 }
 
 /// Index all existing subrecord leaves so no extension can change a built-in byte role.

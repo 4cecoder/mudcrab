@@ -325,9 +325,9 @@ fn remap(
         return Ok(0);
     }
     let owner = if index < masters.len() {
-        masters[index].to_ascii_lowercase()
+        crate::esm::load_order::normalize_plugin_name(&masters[index])
     } else {
-        context.order.names[context.plugin_index].clone()
+        crate::esm::load_order::normalize_plugin_name(&context.order.names[context.plugin_index])
     };
     if let Some(&slot) = context.order.light.get(&owner) {
         if value & 0x00ff_ffff > 0xfff {
@@ -508,6 +508,9 @@ pub(crate) fn decode_with_identity(
                 match value(&common, bytes, schema, context, diagnostics, &selection, 0) {
                     Ok((value, canonical_bytes)) => fields.push(DecodedField {
                         signature,
+                        localized_bank: selected_localized_bank(
+                            &common, bytes, schema, &selection, &value,
+                        ),
                         name: common.name,
                         value,
                         canonical_bytes,
@@ -534,6 +537,7 @@ pub(crate) fn decode_with_identity(
                 value: Value::Bytes(bytes.to_vec()),
                 canonical_bytes: bytes.to_vec(),
                 opaque: true,
+                localized_bank: None,
             });
             continue;
         };
@@ -560,6 +564,8 @@ pub(crate) fn decode_with_identity(
             };
             match decoded {
                 Ok((value, canonical_bytes)) => {
+                    let localized_bank =
+                        selected_localized_bank(field_schema, bytes, schema, &selection, &value);
                     if signature == *b"EDID"
                         && let Value::String(name) = &value
                     {
@@ -567,6 +573,7 @@ pub(crate) fn decode_with_identity(
                     }
                     fields.push(DecodedField {
                         signature,
+                        localized_bank,
                         name: field_schema.name.clone(),
                         value,
                         canonical_bytes,
@@ -636,6 +643,7 @@ pub(crate) fn decode_with_identity(
                     value: Value::Bytes(bytes.to_vec()),
                     canonical_bytes: bytes.to_vec(),
                     opaque: true,
+                    localized_bank: None,
                 });
             }
             continue;
@@ -676,6 +684,8 @@ pub(crate) fn decode_with_identity(
             0,
         ) {
             Ok((value, canonical_bytes)) => {
+                let localized_bank =
+                    selected_localized_bank(field_schema, bytes, schema, &selection, &value);
                 if signature == *b"EDID"
                     && let Value::String(name) = &value
                 {
@@ -686,6 +696,7 @@ pub(crate) fn decode_with_identity(
                 }
                 fields.push(DecodedField {
                     signature,
+                    localized_bank,
                     name: field_schema.name.clone(),
                     value,
                     canonical_bytes,
@@ -751,21 +762,128 @@ pub(crate) fn decode_with_identity(
 
 /// Obtain a primitive's binary width; variable-sized kinds supply explicit lengths.
 fn width(field: &FieldSchema) -> Option<usize> {
-    match field.kind.as_str() {
-        "u8" | "i8" => Some(1),
-        "u16" | "i16" => Some(2),
-        "u32" | "i32" | "f32" | "form_id" => Some(4),
-        "u64" | "i64" => Some(8),
-        _ => field.size,
+    super::schema_format::field_width(field)
+}
+
+/// Resolve each member before choosing its extent, including omitted optional tails.
+fn member_span(
+    member: &FieldSchema,
+    payload_size: usize,
+    schema: &Schema,
+) -> Result<Option<(FieldSchema, std::ops::Range<usize>)>, String> {
+    let member = schema.resolve(member)?;
+    if member.optional && member.offset >= payload_size {
+        return Ok(None);
     }
+    let size = width(&member)
+        .or_else(|| payload_size.checked_sub(member.offset))
+        .ok_or("member offset out of bounds")?;
+    let end = member
+        .offset
+        .checked_add(size)
+        .ok_or("member extent overflow")?;
+    if end > payload_size {
+        return Err(format!("{} member out of bounds", member.name));
+    }
+    let range = member.offset..end;
+    Ok(Some((member, range)))
+}
+
+/// Decode and target validation must agree on a singleton's offset and resolved width.
+fn array_element(
+    field: &FieldSchema,
+    stride: usize,
+    schema: &Schema,
+) -> Result<FieldSchema, String> {
+    if field.members.len() == 1 && field.members[0].offset == 0 {
+        schema.resolve(&field.members[0])
+    } else {
+        Ok(FieldSchema {
+            kind: "struct".into(),
+            size: Some(stride),
+            members: field.members.clone(),
+            ..Default::default()
+        })
+    }
+}
+
+/// Infer an array stride only after expanding its first member definition.
+fn array_stride(field: &FieldSchema, schema: &Schema) -> Result<usize, String> {
+    let declared = field
+        .count
+        .as_ref()
+        .and_then(|rule| rule.get("stride"))
+        .and_then(|value| value.as_u64())
+        .map(|value| usize::try_from(value).map_err(|_| "array stride overflow".to_owned()))
+        .transpose()?;
+    let stride = declared
+        .or(field.size)
+        .or_else(|| {
+            field
+                .members
+                .first()
+                .and_then(|member| schema.resolve(member).ok())
+                .as_ref()
+                .and_then(width)
+        })
+        .ok_or("array has no stride")?;
+    if stride == 0 {
+        return Err("zero array stride".into());
+    }
+    Ok(stride)
+}
+
+/// Retain the most-specific selected bank without changing the serialized value contract.
+fn selected_localized_bank(
+    field: &FieldSchema,
+    bytes: &[u8],
+    schema: &Schema,
+    selection: &super::deciders::Context<'_>,
+    decoded: &Value,
+) -> Option<String> {
+    if !matches!(decoded, Value::LocalizedString(_)) {
+        return None;
+    }
+    let mut field = field.clone();
+    let mut bank = None;
+    for _ in 0..32 {
+        field = schema.resolve(&field).ok()?;
+        if field.string_table.is_some() {
+            bank.clone_from(&field.string_table);
+        }
+        if field.kind == "union" {
+            field = decide(&field, bytes, schema, selection).ok()??.into_owned();
+        } else {
+            return (field.kind == "lstring").then(|| bank.unwrap_or_else(|| "strings".into()));
+        }
+    }
+    None
 }
 
 /// Choose a schema alternative using a small named Rust policy, never external tool code.
 fn decide<'a>(
     field: &'a FieldSchema,
     bytes: &[u8],
+    schema: &Schema,
     selection: &super::deciders::Context<'_>,
-) -> Result<Option<&'a FieldSchema>, String> {
+) -> Result<Option<Cow<'a, FieldSchema>>, String> {
+    // Named selectors inspect kinds, names and widths too. Resolve alternatives
+    // before dispatch, while ordinary built-in leaves remain borrowed.
+    let field = if field
+        .fields
+        .iter()
+        .any(|alternative| alternative.definition.is_some())
+    {
+        let mut resolved = field.clone();
+        resolved.fields = field
+            .fields
+            .iter()
+            .map(|alternative| schema.resolve(alternative))
+            .collect::<Result<Vec<_>, _>>()?;
+        Cow::Owned(resolved)
+    } else {
+        Cow::Borrowed(field)
+    };
     let decider = field.decider.as_deref().ok_or("union has no decider")?;
     let target = match decider {
         "gmst_value" => match selection.editor_id.as_bytes().first() {
@@ -780,20 +898,23 @@ fn decide<'a>(
             None
         }
         _ => {
-            return match super::deciders::select(decider, field, bytes, selection)? {
-                super::deciders::Selection::Alternative(index) => field
-                    .fields
-                    .get(index)
-                    .map(Some)
-                    .ok_or_else(|| format!("{decider} selected absent alternative {index}")),
-                super::deciders::Selection::Deferred => Ok(None),
+            let index = match super::deciders::select(decider, &field, bytes, selection)? {
+                super::deciders::Selection::Alternative(index) => index,
+                super::deciders::Selection::Deferred => return Ok(None),
             };
+            if index >= field.fields.len() {
+                return Err(format!("{decider} selected absent alternative {index}"));
+            }
+            return Ok(Some(match field {
+                Cow::Borrowed(field) => Cow::Borrowed(&field.fields[index]),
+                Cow::Owned(mut field) => Cow::Owned(field.fields.remove(index)),
+            }));
         }
     };
-    field
+    let index = field
         .fields
         .iter()
-        .find(|alternative| {
+        .position(|alternative| {
             target.map_or_else(
                 || {
                     alternative.size == Some(bytes.len())
@@ -802,8 +923,11 @@ fn decide<'a>(
                 |kind| alternative.kind == kind,
             )
         })
-        .map(Some)
-        .ok_or_else(|| format!("no {decider} alternative accepts {} bytes", bytes.len()))
+        .ok_or_else(|| format!("no {decider} alternative accepts {} bytes", bytes.len()))?;
+    Ok(Some(match field {
+        Cow::Borrowed(field) => Cow::Borrowed(&field.fields[index]),
+        Cow::Owned(mut field) => Cow::Owned(field.fields.remove(index)),
+    }))
 }
 
 /// Interpret one value within checked bytes, rewriting only typed link positions.
@@ -868,11 +992,11 @@ fn value_inner(
         );
     }
     if field.kind == "union" {
-        let Some(alternative) = decide(field, bytes, selection)? else {
+        let Some(alternative) = decide(field, bytes, schema, selection)? else {
             return Ok((Value::Deferred(bytes.to_vec()), bytes.to_vec()));
         };
         return value(
-            alternative,
+            &alternative,
             bytes,
             schema,
             context,
@@ -954,23 +1078,14 @@ fn value_inner(
         }
         "bytes" => Value::Bytes(bytes.to_vec()),
         "struct" => {
+            schema.check_member_overlaps(field, Some(bytes.len()))?;
             let mut values = Vec::new();
             let mut canonical = bytes.to_vec();
             for member in &field.members {
-                let member = schema.resolve(member)?;
-                if member.optional && member.offset >= bytes.len() {
+                let Some((member, range)) = member_span(member, bytes.len(), schema)? else {
                     continue;
-                }
-                let size = width(&member)
-                    .or_else(|| bytes.len().checked_sub(member.offset))
-                    .ok_or("member offset out of bounds")?;
-                let end = member
-                    .offset
-                    .checked_add(size)
-                    .ok_or("member extent overflow")?;
-                let slice = bytes
-                    .get(member.offset..end)
-                    .ok_or_else(|| format!("{} member out of bounds", member.name))?;
+                };
+                let slice = &bytes[range.clone()];
                 let (decoded, encoded) = value(
                     &member,
                     slice,
@@ -983,7 +1098,7 @@ fn value_inner(
                     },
                     depth + 1,
                 )?;
-                canonical[member.offset..end].copy_from_slice(&encoded);
+                canonical[range].copy_from_slice(&encoded);
                 values.push((member.name, decoded));
             }
             return Ok((Value::Struct(values), canonical));
@@ -1041,16 +1156,7 @@ fn array(
         .and_then(|rule| rule.get("kind"))
         .and_then(|value| value.as_str())
         .unwrap_or("remaining");
-    let stride = count_rule
-        .and_then(|rule| rule.get("stride"))
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize)
-        .or(field.size)
-        .or_else(|| field.members.first().and_then(width))
-        .ok_or("array has no stride")?;
-    if stride == 0 {
-        return Err("zero array stride".into());
-    }
+    let stride = array_stride(field, schema)?;
     let (offset, count) = match kind {
         "remaining" => (0, bytes.len() / stride),
         "fixed" => (
@@ -1079,16 +1185,7 @@ fn array(
     {
         return Err("array extent/count mismatch".into());
     }
-    let element = if field.members.len() == 1 && field.members[0].offset == 0 {
-        schema.resolve(&field.members[0])?
-    } else {
-        FieldSchema {
-            kind: "struct".into(),
-            size: Some(stride),
-            members: field.members.clone(),
-            ..Default::default()
-        }
-    };
+    let element = array_element(field, stride, schema)?;
     if field.decider.is_none()
         && let Some(compact) = super::compact_array::try_decode(
             &element,
@@ -1841,11 +1938,11 @@ fn validate_value_inner(
         return;
     }
     if field.kind == "union" {
-        if let Ok(Some(alternative)) = decide(&field, bytes, selection) {
+        if let Ok(Some(alternative)) = decide(&field, bytes, schema, selection) {
             validate_value(
                 decoded,
                 bytes,
-                alternative,
+                &alternative,
                 schema,
                 kinds,
                 diagnostics,
@@ -1879,16 +1976,14 @@ fn validate_value_inner(
         }
         Value::Struct(values) => {
             let parent = bytes.to_vec();
-            for (name, value) in values {
-                if let Some(member) = field.members.iter().find(|member| member.name == *name) {
-                    let size = width(member).unwrap_or(bytes.len().saturating_sub(member.offset));
-                    if let Some(slice) =
-                        bytes.get_mut(member.offset..member.offset.saturating_add(size))
-                    {
+            let mut values = values.iter_mut();
+            for member in &field.members {
+                if let Ok(Some((member, range))) = member_span(member, bytes.len(), schema) {
+                    if let Some((_, value)) = values.next() {
                         validate_value(
                             value,
-                            slice,
-                            member,
+                            &mut bytes[range],
+                            &member,
                             schema,
                             kinds,
                             diagnostics,
@@ -1936,15 +2031,7 @@ fn validate_value_inner(
             }
         }
         Value::Array(values) => {
-            let stride = field
-                .count
-                .as_ref()
-                .and_then(|rule| rule.get("stride"))
-                .and_then(|value| value.as_u64())
-                .map(|value| value as usize)
-                .or(field.size)
-                .or_else(|| field.members.first().and_then(width));
-            if let Some(stride) = stride.filter(|&stride| stride != 0) {
+            if let Ok(stride) = array_stride(&field, schema) {
                 let offset = usize::from(
                     field
                         .count
@@ -1953,19 +2040,16 @@ fn validate_value_inner(
                         .and_then(|value| value.as_str())
                         == Some("prefix_u32"),
                 ) * 4;
-                let element = if field.members.len() == 1 {
-                    field.members[0].clone()
-                } else {
-                    FieldSchema {
-                        kind: "struct".into(),
-                        members: field.members.clone(),
-                        ..Default::default()
-                    }
+                let Ok(element) = array_element(&field, stride, schema) else {
+                    return;
                 };
                 for (index, value) in values.iter_mut().enumerate() {
                     let previous = diagnostics.push_field(&format!("[{index}]"));
-                    let start = offset + index * stride;
-                    if let Some(slice) = bytes.get_mut(start..start + stride) {
+                    let range = index
+                        .checked_mul(stride)
+                        .and_then(|start| start.checked_add(offset))
+                        .and_then(|start| start.checked_add(stride).map(|end| start..end));
+                    if let Some(slice) = range.and_then(|range| bytes.get_mut(range)) {
                         validate_value(
                             value,
                             slice,
@@ -1987,6 +2071,10 @@ fn validate_value_inner(
 #[cfg(test)]
 #[path = "target_validation_tests.rs"]
 mod target_validation_tests;
+
+#[cfg(test)]
+#[path = "core_audit_regression_tests.rs"]
+mod core_audit_regression_tests;
 
 #[cfg(test)]
 mod tests {

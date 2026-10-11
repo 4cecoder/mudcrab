@@ -65,8 +65,8 @@ fn export(data: &Path, names: &[&str], label: &str, signatures: &[[u8; 4]]) -> P
     converter::esm::inhouse::export_record_bundle_typed(data, &order, &output, signatures).unwrap();
     let identity: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("record-reader.json")).unwrap()).unwrap();
-    // Adapter 9 includes the R4 terrain and R6 schema-add-on changes together.
-    assert_eq!(identity["adapter_version"], 9);
+    // Adapter 10 adds full-reader schema, GMST, localization and filename fixes.
+    assert_eq!(identity["adapter_version"], 10);
     output
 }
 

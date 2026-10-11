@@ -993,6 +993,12 @@ fn reusable_manifest(
                 settings.record_reader = reader;
                 matched |= recorded == current_configuration_hash_for_schema(&settings, producer)?;
                 matched |= recorded == configuration_hash_for_schema(&settings, producer)?;
+                if reader == crate::config::RecordReader::Legacy {
+                    matched |= recorded
+                        == crate::cache::legacy_projection_v1_configuration_hash(
+                            &settings, producer,
+                        )?;
+                }
             }
             matched
         };
@@ -2132,11 +2138,9 @@ fn plugin_paths(
         ));
     }
     plugins.sort_by_key(|path| {
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_ascii_lowercase();
+        let name = crate::esm::load_order::normalize_plugin_name(
+            &path.file_name().unwrap_or_default().to_string_lossy(),
+        );
         let rank = crate::esm::OFFICIAL_MASTERS
             .iter()
             .position(|official| official.eq_ignore_ascii_case(&name))
@@ -2151,28 +2155,26 @@ pub(crate) fn sort_archives_by_load_order(archives: &mut [PathBuf], plugins: &[P
     archives.sort_by_cached_key(|archive| {
         (
             archive_load_order_priority(archive, plugins).unwrap_or(usize::MAX),
-            archive
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase(),
+            crate::esm::load_order::normalize_plugin_name(
+                &archive.file_stem().unwrap_or_default().to_string_lossy(),
+            ),
         )
     });
 }
 
 /// Attach a full archive filename to the final matching active plugin.
 pub(crate) fn archive_load_order_priority(archive: &Path, plugins: &[PathBuf]) -> Option<usize> {
-    let filename = archive
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_ascii_lowercase();
+    let filename = crate::esm::load_order::normalize_plugin_name(
+        &archive.file_name().unwrap_or_default().to_string_lossy(),
+    );
     plugins
         .iter()
         .enumerate()
         .rev()
         .find_map(|(index, plugin)| {
-            let stem = plugin.file_stem()?.to_string_lossy().to_ascii_lowercase();
+            let stem = crate::esm::load_order::normalize_plugin_name(
+                &plugin.file_stem()?.to_string_lossy(),
+            );
             filename
                 .strip_prefix(&stem)
                 .is_some_and(|suffix| suffix.starts_with(" - ") || suffix.starts_with('.'))

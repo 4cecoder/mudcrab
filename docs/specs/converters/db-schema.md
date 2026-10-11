@@ -174,6 +174,12 @@ oversized or undecodable versions remain local diagnostics; other versions
 continue. The text view aligns authored field names and occurrences and marks
 differences. This is decoded source provenance, not a merge or patch format;
 partial decoding and unsupported semantic roles retain their existing limits.
+Retained 18-column history layouts remain queryable. If any of the three
+physical replay safety columns (group end, frame completeness or exact record
+signature) is absent or NULL, that version is reported as undecodable with its
+stored provenance; replay never invents missing bounds or reads unchecked bytes.
+Older ASCII-folded owner spellings are accepted only through an alias derived
+from the authenticated stored plugin basename and its original master list.
 
 These optional tooling tables do not change the runtime database
 contract, accepted version range or asset encodings. World and converter asset
@@ -441,8 +447,9 @@ ID. `plugin_name` is the lowercase owning filename, such as `skyrim.esm`;
 `internal_id` is the low 24 bits for full plugins or the low 12 bits for light
 plugins. Full and light slots are assigned independently. The pair
 `(plugin_name, internal_id)` survives changes to the load-order slots.
-`plugin_name` is the lowercase filename; join to `plugins` with
-`lower(plugins.name) = formid_map.plugin_name`.
+`plugin_name` uses the reader's shared Unicode lowercase filename key; join to
+`plugins` by applying that same normalization to `plugins.name`. SQLite's
+built-in `lower` alone does not normalize accented Windows-1252 case pairs.
 
 Ownership differs from override provenance: `records.load_order` identifies
 the winning plugin's priority. Game settings override by case-insensitive

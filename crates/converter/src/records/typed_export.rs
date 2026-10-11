@@ -296,6 +296,7 @@ mod tests {
     fn field(value: Value) -> DecodedField {
         DecodedField {
             opaque: false,
+            localized_bank: None,
             signature: *b"DATA",
             name: "same_role".into(),
             value,

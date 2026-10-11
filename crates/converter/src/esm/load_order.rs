@@ -7,6 +7,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Shared case-insensitive key for plugin basenames, including Windows-1252 case pairs.
+/// Keep this separate from ASCII record signatures and EditorID conventions.
+pub(crate) fn normalize_plugin_name(name: &str) -> String {
+    name.to_lowercase()
+}
+
 /// Whether Skyrim loads this plugin with the masters: ESM-flagged, or an `.esm`/`.esl` file.
 /// The ESL flag alone (an ESL-flagged `.esp`) narrows the slot but keeps regular priority.
 fn loads_with_masters(path: &Path, metadata: &PluginMetadata) -> bool {
@@ -25,11 +31,7 @@ pub(crate) fn order_explicit_plugins(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>
     let mut metadata = Vec::with_capacity(paths.len());
     let mut master_files = Vec::with_capacity(paths.len());
     for (index, path) in paths.iter().enumerate() {
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_ascii_lowercase();
+        let name = normalize_plugin_name(&path.file_name().unwrap_or_default().to_string_lossy());
         ensure!(
             indices.insert(name.clone(), index).is_none(),
             "duplicate plugin {name}"
@@ -52,7 +54,7 @@ pub(crate) fn order_explicit_plugins(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>
         let mut pending = vec![index];
         while let Some(dependent) = pending.pop() {
             for master in &metadata[dependent].masters {
-                let Some(&dependency) = indices.get(&master.to_ascii_lowercase()) else {
+                let Some(&dependency) = indices.get(&normalize_plugin_name(master)) else {
                     // LoadOrder::read reports missing masters with the dependent's name.
                     continue;
                 };
@@ -88,11 +90,7 @@ pub(crate) fn order_discovered_plugins(paths: Vec<PathBuf>) -> Result<Vec<PathBu
     let mut indices = HashMap::new();
     let mut metadata = Vec::with_capacity(paths.len());
     for (index, path) in paths.iter().enumerate() {
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_ascii_lowercase();
+        let name = normalize_plugin_name(&path.file_name().unwrap_or_default().to_string_lossy());
         ensure!(
             indices.insert(name.clone(), index).is_none(),
             "duplicate plugin {name}"
@@ -104,7 +102,7 @@ pub(crate) fn order_discovered_plugins(paths: Vec<PathBuf>) -> Result<Vec<PathBu
     for (index, header) in metadata.iter().enumerate() {
         let mut unique = BTreeSet::new();
         for master in &header.masters {
-            let dependency = *indices.get(&master.to_ascii_lowercase()).ok_or_else(|| {
+            let dependency = *indices.get(&normalize_plugin_name(master)).ok_or_else(|| {
                 color_eyre::eyre::eyre!(
                     "{}: required master {master} is missing",
                     paths[index].display()
@@ -168,11 +166,12 @@ impl LoadOrder {
     /// Read plugin headers, validating master order and assigning full and light slots.
     pub fn read(paths: &[PathBuf]) -> Result<Self> {
         Self::from_metadata_readers(paths.iter().map(|path| {
-            let name = path
-                .file_name()
-                .ok_or_else(|| color_eyre::eyre::eyre!("plugin has no filename"))?
-                .to_string_lossy()
-                .to_ascii_lowercase();
+            let name = normalize_plugin_name(
+                &path
+                    .file_name()
+                    .ok_or_else(|| color_eyre::eyre::eyre!("plugin has no filename"))?
+                    .to_string_lossy(),
+            );
             Ok((name, move || parse_plugin_metadata(path)))
         }))
     }
@@ -210,12 +209,12 @@ impl LoadOrder {
         };
         for row in rows {
             let (name, read_metadata) = row?;
-            let name = name.to_ascii_lowercase();
+            let name = normalize_plugin_name(&name);
             ensure!(!result.names.contains(&name), "duplicate plugin {name}");
             let metadata = read_metadata()?;
             for master in &metadata.masters {
                 ensure!(
-                    result.names.contains(&master.to_ascii_lowercase()),
+                    result.names.contains(&normalize_plugin_name(master)),
                     "{name}: master {master} must precede its dependent plugin"
                 );
             }

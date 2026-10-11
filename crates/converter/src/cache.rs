@@ -379,6 +379,18 @@ fn configuration_hash_with_identity(
     Ok(hash_bytes(&serde_json::to_vec(&relevant)?))
 }
 
+/// Reproduce the exact previous legacy projection proof for retained assets.
+pub(crate) fn legacy_projection_v1_configuration_hash(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+) -> Result<String> {
+    configuration_hash_with_identity(
+        config,
+        schema,
+        Some(&serde_json::json!({"mode": "legacy", "projection_version": 1})),
+    )
+}
+
 /// Settings that change one asset kind's bytes, excluding full reader metadata.
 ///
 /// Mesh conversion consumes NIF/skeleton/material source dependencies. Texture
@@ -559,6 +571,11 @@ pub(crate) fn retained_configuration_matches_for_reader(
         && identity == &serde_json::json!({"mode": "legacy"})
     {
         return retained_configuration_matches(config, schema, recorded);
+    }
+    if config.record_reader == crate::config::RecordReader::Legacy
+        && identity == &serde_json::json!({"mode": "legacy", "projection_version": 1})
+    {
+        return Ok(recorded == legacy_projection_v1_configuration_hash(config, schema)?);
     }
     let current = crate::esm::inhouse::reader_identity_with_schemas(
         config.record_reader,

@@ -99,6 +99,128 @@ async fn canonical_publication_keeps_unknown_fields_once_in_native_order() {
     assert_eq!(canonical_fields(&output, 0x1800), fields);
 }
 
+/// Selected union banks survive real publication, while one malformed leaf stays local.
+#[tokio::test]
+async fn localized_union_definitions_publish_selected_banks_and_valid_neighbors() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("Data");
+    let output = temp.path().join("pack");
+    generate(&data);
+    let addon = temp.path().join("localized-unions.json");
+    fs::write(
+        &addon,
+        serde_json::to_vec(&json!({
+            "version":1, "name":"localized-union-publication",
+            "definitions":{
+                "AuditLocalizedLeaf":{"kind":"lstring","size":4,"string_table":"ilstrings"},
+                "AuditLocalizedAlias":{"definition":"AuditLocalizedLeaf"}
+            },
+            "records":[{"signature":"ZLOC","fields":[
+                {"signature":"EDID","name":"editor_id","kind":"zstring"},
+                {"signature":"ZTXT","name":"selected_text","kind":"union","decider":"size",
+                 "string_table":"dlstrings","fields":[{"definition":"AuditLocalizedAlias"}]},
+                {"signature":"ZTAL","name":"valid_tail","kind":"u16"}
+            ]}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut bytes = header(&["Skyrim.esm"]);
+    bytes[8..12].copy_from_slice(&0x80u32.to_le_bytes());
+    for (id, name, text, tail) in [
+        (
+            0x0100_1810,
+            "BeforeBankFailure",
+            73u32.to_le_bytes().to_vec(),
+            0x5927u16,
+        ),
+        (
+            0x0100_1811,
+            "BrokenBankLeaf",
+            vec![0xD7, 0x29, 0x93],
+            0x173Au16,
+        ),
+        (
+            0x0100_1812,
+            "AfterBankFailure",
+            73u32.to_le_bytes().to_vec(),
+            0x82A6u16,
+        ),
+    ] {
+        bytes.extend(record(
+            b"ZLOC",
+            id,
+            &[
+                (*b"EDID", format!("{name}\0").into_bytes()),
+                (*b"ZTXT", text),
+                (*b"ZTAL", tail.to_le_bytes().to_vec()),
+            ],
+        ));
+    }
+    fs::write(data.join("BankProbe.esp"), &bytes).unwrap();
+    fs::write(data.join("plugins.txt"), "*Skyrim.esm\n*BankProbe.esp\n").unwrap();
+    let directory = data.join("Strings");
+    fs::create_dir_all(&directory).unwrap();
+    // Both are valid banks containing the same key and distinguishable text.
+    for (bank, text) in [
+        ("dlstrings", "WrongParentBank"),
+        ("ilstrings", "SelectedLeafBank"),
+    ] {
+        let payload = [
+            ((text.len() + 1) as u32).to_le_bytes().to_vec(),
+            format!("{text}\0").into_bytes(),
+        ]
+        .concat();
+        let table = [
+            1u32.to_le_bytes().to_vec(),
+            (payload.len() as u32).to_le_bytes().to_vec(),
+            73u32.to_le_bytes().to_vec(),
+            0u32.to_le_bytes().to_vec(),
+            payload,
+        ]
+        .concat();
+        fs::write(directory.join(format!("BankProbe_english.{bank}")), table).unwrap();
+    }
+    publish_config(mod_config(&data, &output, &[&addon])).await;
+    let db = Connection::open(output.join("skyrim_world.db")).unwrap();
+    for (id, tail) in [(0x0100_1810, 0x5927u16), (0x0100_1812, 0x82A6u16)] {
+        let fields = canonical_fields(&output, id);
+        assert_eq!(fields[1], (*b"ZTXT", b"SelectedLeafBank\0".to_vec()));
+        assert_eq!(fields[2], (*b"ZTAL", tail.to_le_bytes().to_vec()));
+        let row: (String, u32, String, String) = db.query_row(
+            "SELECT string_table,string_id,resolved_text,status FROM inhouse_localized_fields WHERE form_id=?1",
+            [id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert_eq!(
+            row,
+            (
+                "ilstrings".into(),
+                73,
+                "SelectedLeafBank".into(),
+                "resolved".into()
+            )
+        );
+        let history = history_record(&output, id);
+        assert_eq!(history.fields[1].value, Value::LocalizedString(73));
+        assert_eq!(
+            history.fields[1].localized_bank.as_deref(),
+            Some("ilstrings")
+        );
+    }
+    assert_eq!(
+        canonical_fields(&output, 0x0100_1811),
+        [
+            (*b"EDID", b"BrokenBankLeaf\0".to_vec()),
+            (*b"ZTAL", 0x173Au16.to_le_bytes().to_vec())
+        ]
+    );
+    let history = converter::records::history::read_history(&output, None, 0x0100_1811).unwrap();
+    assert_eq!(history.versions.len(), 1);
+    // Public replay reports rejected-field records as undecodable, preserving source provenance.
+    assert_eq!(history.versions[0].decode_status, "undecodable");
+    assert!(history.versions[0].record.is_none());
+    assert_eq!(fs::read(data.join("BankProbe.esp")).unwrap(), bytes);
+}
+
 /// Opaque preservation cannot reintroduce malformed or out-of-order recognized fields.
 #[tokio::test]
 async fn opaque_preservation_omits_rejected_known_fields_and_keeps_later_unknowns() {

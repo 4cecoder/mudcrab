@@ -10,13 +10,21 @@ legacy record decoder for supported records. Unknown record types remain opaque.
 Malformed fields and records are omitted with bounded per-plugin diagnostics;
 valid neighboring records continue through publication. Semantic terrain and
 movement failures are caught per record before a candidate replaces an earlier
-usable winner. Real deletions still apply. LAND with rejected authored heights
+usable winner. Legacy decoding recovers at checked record boundaries or the end
+of the current bounded group, and never searches corrupt payload bytes for a
+replacement header. Malformed optional native links are cleared or their
+occurrences omitted; malformed required links omit only their record candidate.
+Invalid TES4/MAST metadata and load-order authority remain conversion errors.
+Real deletions still apply. LAND with rejected authored heights
 or incomplete framing is skipped; genuinely heightless texture/color records
 retain the existing default-height cache behavior.
 
-`record-reader.json` stamps the selected frontend. Legacy `projection_version=1`
-identifies the corrected TX06/TX07 and ARMO world-model projections independently
-of asset producer 26. In-house identity includes the
+`record-reader.json` stamps the selected frontend. Legacy `projection_version=2`
+adds corrected faction links, strict native-link ownership and local recovery to
+version 1's corrected TX06/TX07 and ARMO world-model projections, independently
+of asset producer 26. In-house adapter version 10 identifies corrected schema
+layouts, GMST winner admission, union localization and filename namespaces.
+In-house identity includes the
 authored schema SHA-256, adapter version and English localization choice, and
 `inhouse-reader-diagnostics.json` records bounded decoder and adapter issues.
 The manifest's `configuration_hash` keeps the full reader identity for metadata
@@ -33,7 +41,9 @@ missing IDs yield empty canonical text and retain their original ID, bank,
 winning plugin and status in `inhouse_localized_fields`; nullable runtime name
 columns remain NULL. Missing nonzero keys produce counted warnings. Explicitly
 resolved empty text remains distinguishable from unresolved text. Other language
-selection is not implemented.
+selection is not implemented. A selected union or definition leaf's explicit
+bank overrides its parent's bank; an unspecified leaf inherits the parent bank,
+then defaults to STRINGS.
 Ordinary plugin text and English string banks use Windows-1252, including bytes
 that happen to form valid UTF-8. VMAD strings use their independent UTF-8 format.
 Text requiring normalization is encoded as UTF-8 after decoding; already exact
@@ -42,7 +52,9 @@ remain available in provenance. The reader identity records both encoding contra
 Metadata rebuild uses the selected reader while validating retained assets under
 their original recorded reader configuration. Older unstamped packs and the exact
 `{"mode":"legacy"}` stamp retain the historical unversioned legacy contract;
-they are not identified as projection version 1. New full configuration hashes
+they are not identified as a versioned projection. Exact version-1 legacy stamps
+and full hashes remain recognized as that earlier retained-asset contract.
+New full configuration hashes
 include the versioned legacy identity, while `configuration_hash_for_schema`
 preserves historical legacy hash reproduction. Metadata retention validates each
 hash against its recorded reader contract; a versioned source cannot omit its
@@ -54,6 +66,15 @@ TXST role encodings. Explicit retention does not upgrade their producer or grant
 normal cache eligibility: a later normal conversion checks the original producer
 and current settings, source dependencies and resolved texture encoding.
 Unknown source producer identities are rejected by the retained-asset route.
+Plugin filename keys use Unicode lowercase after native Windows-1252 decoding,
+including accented case pairs. Record signatures and GMST EditorIDs retain their
+separate ASCII conventions. Filename spelling remains available in source proof;
+neither Unicode normalization nor general Unicode case folding is implemented.
+Complete load-order database exports replace canonical/runtime rows, identity
+maps and derived spatial/LOD state transactionally. Public plugin conversion
+replaces plugin metadata in that same export transaction. Subset exports retain
+unrelated rows and remove an updated reference's obsolete exterior spatial row.
+Caller tables and asset conversion proofs survive complete snapshot replacement.
 This route copies no archive extraction cache and clears its manifest entries;
 the next normal run extracts those archives once before recording new reusable
 source/integrity proofs.

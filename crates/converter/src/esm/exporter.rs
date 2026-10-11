@@ -10,6 +10,7 @@ use crate::{
 use rusqlite::{Connection, Result, Statement, ToSql, Transaction, params};
 use std::{
     collections::{BTreeSet, HashMap},
+    path::PathBuf,
     str::from_utf8,
 };
 
@@ -277,10 +278,11 @@ type CellMetadata = (Option<i32>, Option<i32>, Option<u32>);
 /// Synthetic records without a source load order have no formid_map entry.
 /// Export a legacy subset without replacing complete-load-order metadata.
 pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Result<()> {
-    export_records(conn, master, None, None, None, true, false)
+    export_records(conn, master, None, None, None, None, true, false)
 }
 
-/// Export a complete effective load order, replacing both grass projections.
+/// Replace the complete canonical/runtime snapshot for an effective load order.
+/// Plugin metadata remains caller-managed; subset exports retain unrelated rows.
 /// Record stable owning-plugin/local-ID pairs separately from the winning
 /// override priority in records.load_order.
 pub fn export_to_db_with_load_order(
@@ -288,7 +290,26 @@ pub fn export_to_db_with_load_order(
     master: &HashMap<u32, RawRecord>,
     order: &LoadOrder,
 ) -> Result<()> {
-    export_records(conn, master, Some(order), None, None, true, false)
+    export_records(conn, master, Some(order), None, None, None, true, false)
+}
+
+/// Replace plugin metadata and the complete legacy snapshot in one transaction.
+pub(super) fn export_plugins_to_db(
+    conn: &Connection,
+    master: &HashMap<u32, RawRecord>,
+    order: &LoadOrder,
+    plugin_paths: &[PathBuf],
+) -> Result<()> {
+    export_records(
+        conn,
+        master,
+        Some(order),
+        Some(plugin_paths),
+        None,
+        None,
+        true,
+        false,
+    )
 }
 
 /// Export canonical decoded fields with Skyrim's texture slots and byte-wide XESP flags.
@@ -296,6 +317,7 @@ pub(crate) fn export_inhouse_to_db(
     conn: &Connection,
     master: &HashMap<u32, RawRecord>,
     order: &LoadOrder,
+    plugin_paths: &[PathBuf],
     unresolved_fields: &HashMap<u32, BTreeSet<usize>>,
     terrain_offsets: &HashMap<u32, u64>,
 ) -> Result<()> {
@@ -303,6 +325,7 @@ pub(crate) fn export_inhouse_to_db(
         conn,
         master,
         Some(order),
+        Some(plugin_paths),
         Some(unresolved_fields),
         Some(terrain_offsets),
         true,
@@ -316,8 +339,66 @@ pub(crate) fn export_inhouse_record_archive_to_db(
     conn: &Connection,
     master: &HashMap<u32, RawRecord>,
     order: &LoadOrder,
+    plugin_paths: &[PathBuf],
 ) -> Result<()> {
-    export_records(conn, master, Some(order), None, None, false, true)
+    export_records(
+        conn,
+        master,
+        Some(order),
+        Some(plugin_paths),
+        None,
+        None,
+        false,
+        true,
+    )
+}
+
+/// Recreate reader-owned outputs while preserving caller tables and asset-cache proofs.
+/// DDL participates in the export transaction, so an export error restores the old snapshot.
+fn replace_complete_snapshot(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        r#"DROP TABLE IF EXISTS record_diagnostics;
+        DROP TABLE IF EXISTS inhouse_plugin_masters;
+        DROP TABLE IF EXISTS record_overrides;
+        DROP TABLE IF EXISTS inhouse_schema_addons;
+        DROP TABLE IF EXISTS inhouse_unresolved_terrain_textures;
+        DROP TABLE IF EXISTS inhouse_terrain_layers;
+        DROP TABLE IF EXISTS inhouse_terrain_source_order;
+        DROP TABLE IF EXISTS inhouse_localized_fields;
+        DROP TABLE IF EXISTS inhouse_source_records;
+        DROP TABLE IF EXISTS script_property_values;
+        DROP TABLE IF EXISTS script_properties;
+        DROP TABLE IF EXISTS scripts;
+        DROP TABLE IF EXISTS landscape_texture_grasses;
+        DROP TABLE IF EXISTS grass_types;
+        DROP TABLE IF EXISTS landscape_textures;
+        DROP TABLE IF EXISTS texture_sets;
+        DROP TABLE IF EXISTS waters;
+        DROP TABLE IF EXISTS movement_game_settings;
+        DROP TABLE IF EXISTS race_movement_links;
+        DROP TABLE IF EXISTS movement_types;
+        DROP TABLE IF EXISTS npcs;
+        DROP TABLE IF EXISTS lights;
+        DROP TABLE IF EXISTS statics;
+        DROP TABLE IF EXISTS land;
+        DROP TABLE IF EXISTS exterior_spatial;
+        DROP TABLE IF EXISTS "references";
+        DROP TABLE IF EXISTS cells;
+        DROP TABLE IF EXISTS worldspaces;
+        DROP TABLE IF EXISTS records;
+        DROP TABLE IF EXISTS formid_map;
+        DROP TABLE IF EXISTS lod_chunks_spatial;
+        DROP TABLE IF EXISTS lod_chunks;
+        DROP TABLE IF EXISTS lod_build;
+        DROP TABLE IF EXISTS lod;"#,
+    )?;
+    create_tables(tx)?;
+    tx.execute("DELETE FROM schema_info", [])?;
+    tx.execute(
+        "INSERT INTO schema_info(version) VALUES (?1)",
+        [shared::WORLD_DATABASE_SCHEMA_VERSION],
+    )?;
+    Ok(())
 }
 
 /// Keep unresolved text occurrences in the archive while nullable projections see no text.
@@ -344,7 +425,7 @@ fn runtime_projection(
     })
 }
 
-/// Reject unusable movement records before the tolerant frontend exports them.
+/// Validate movement projections before either frontend replaces a usable predecessor.
 pub(crate) fn validate_inhouse_record(record: &RawRecord) -> Result<()> {
     let view = SubrecordView::new(&record.subrecords);
     match &record.record_type {
@@ -375,6 +456,7 @@ fn export_records(
     conn: &Connection,
     master: &HashMap<u32, RawRecord>,
     order: Option<&LoadOrder>,
+    plugin_paths: Option<&[PathBuf]>,
     unresolved_fields: Option<&HashMap<u32, BTreeSet<usize>>>,
     terrain_offsets: Option<&HashMap<u32, u64>>,
     runtime_views: bool,
@@ -382,6 +464,17 @@ fn export_records(
 ) -> Result<()> {
     conn.set_prepared_statement_cache_capacity(64);
     let tx = conn.unchecked_transaction()?;
+    if order.is_some() {
+        replace_complete_snapshot(&tx)?;
+        if let Some(paths) = plugin_paths {
+            tx.execute("DELETE FROM plugins", [])?;
+            super::insert_plugins(&tx, paths).map_err(|error| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                    error.to_string(),
+                )))
+            })?;
+        }
+    }
     if scalar_scripts {
         // In-house exports own the complete script snapshot; legacy partial APIs retain theirs.
         super::inhouse_script_properties::replace_snapshot_tables(&tx)?;
@@ -398,20 +491,6 @@ fn export_records(
             .execute([])?;
         tx.prepare_cached("DELETE FROM race_movement_links")?
             .execute([])?;
-    }
-    // Only the load-order export owns a complete snapshot. The movement
-    // annotator uses export_to_db with a subset and must retain unrelated grass
-    // and the database's existing schema stamp.
-    if order.is_some() {
-        // A reused older database gains the current tables in create_tables;
-        // stamp it inside this transaction so a failed export keeps the old one.
-        tx.prepare_cached("UPDATE schema_info SET version=?1")?
-            .execute([shared::WORLD_DATABASE_SCHEMA_VERSION])?;
-        if runtime_views {
-            tx.prepare_cached("DELETE FROM landscape_texture_grasses")?
-                .execute([])?;
-            tx.prepare_cached("DELETE FROM grass_types")?.execute([])?;
-        }
     }
     let mut cells: HashMap<u32, CellMetadata> = HashMap::new();
     let unordered_offsets = HashMap::new();
@@ -919,6 +998,9 @@ fn insert_reference_with_canonical_data(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)")?.execute(
         params![form_id, cell_id, worldspace_id, base_form_id, is_exterior, pos[0], pos[1], pos[2], local_x, local_y, rot[0], rot[1], rot[2], scale, radius_override, header_flags, enable_parent_id, enable_parent_flags, blob],
     )?;
+    // A subset update can move an existing reference into an interior.
+    tx.prepare_cached("DELETE FROM exterior_spatial WHERE id=?1")?
+        .execute([form_id])?;
     if is_exterior {
         tx.prepare_cached("INSERT OR REPLACE INTO exterior_spatial(id, minX, maxX, minY, maxY, minZ, maxZ, cell_id, worldspace_id) VALUES (?1, ?2, ?2, ?3, ?3, ?4, ?4, ?5, ?6)")?.execute( params![form_id, pos[0], pos[1], pos[2], cell_id, worldspace_id])?;
     }

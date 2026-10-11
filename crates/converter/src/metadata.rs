@@ -272,7 +272,9 @@ fn settings_for_source_reader(
     ensure!(
         identity == &crate::esm::inhouse::reader_identity_with_schemas(reader, &schemas)
             || (reader == crate::config::RecordReader::Legacy
-                && identity == &serde_json::json!({"mode": "legacy"})
+                && (identity == &serde_json::json!({"mode": "legacy"})
+                    || identity
+                        == &serde_json::json!({"mode": "legacy", "projection_version": 1}))
                 && schemas.identities().is_empty()),
         "unsupported source reader producer identity; use normal conversion to regenerate assets before metadata-only migration"
     );
@@ -338,7 +340,7 @@ fn matched_plugins(source: &Path, data: &Path) -> Result<(Vec<PathBuf>, Vec<Stri
             "invalid plugin name {name}"
         );
         ensure!(
-            seen.insert(name.to_ascii_lowercase()),
+            seen.insert(crate::esm::load_order::normalize_plugin_name(&name)),
             "duplicate plugin name {name}"
         );
         let path = data.join(&name);
@@ -927,6 +929,7 @@ mod metadata_schema_controls {
         let config = PipelineConfig::new("Data", "output");
         for identity in [
             serde_json::json!({"mode": "legacy"}),
+            serde_json::json!({"mode": "legacy", "projection_version": 1}),
             crate::esm::inhouse::reader_identity(RecordReader::Legacy),
         ] {
             let settings = settings_for_source_reader(
@@ -939,7 +942,7 @@ mod metadata_schema_controls {
         }
         for identity in [
             serde_json::json!({"mode": "legacy", "projection_version": 0}),
-            serde_json::json!({"mode": "legacy", "projection_version": 2}),
+            serde_json::json!({"mode": "legacy", "projection_version": 3}),
             serde_json::json!({"mode": "legacy", "unproven": true}),
         ] {
             assert!(
