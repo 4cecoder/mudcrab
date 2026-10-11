@@ -17,6 +17,16 @@ use bevy::{
 };
 use serde::Serialize;
 
+/// The Bevy release this engine tracks, as a run fingerprint records it: the major and minor
+/// release, without the patch (`0.19`, not `0.19.0`), because the patch release is what the
+/// workspace's `bevy` requirement allows to move on its own and it does not change what a report
+/// measures.
+///
+/// One named constant rather than a literal at the field, because the fingerprint is what two
+/// reports are compared on: the Bevy bump has to move it in one place, and
+/// `the_fingerprint_bevy_version_matches_the_workspace_manifest` fails until it does.
+pub const BEVY_VERSION: &str = "0.19";
+
 /// Whether this run records measurement data: a benchmark report (`--benchmark-frames` or
 /// `--benchmark-duration`) or a profile bundle (`--profile-output`).
 ///
@@ -69,6 +79,8 @@ pub struct RunFingerprint {
     /// `--profile-dirty-worktree`: whether the worktree had uncommitted changes.
     pub dirty_worktree: bool,
     pub engine_version: &'static str,
+    /// The Bevy release the run was built against ([`BEVY_VERSION`]), which the unit tests assert
+    /// against the workspace's own `bevy` requirement.
     pub bevy_version: &'static str,
     /// `release` or `debug`, from the build itself.
     pub build_profile: &'static str,
@@ -167,7 +179,7 @@ impl RunFingerprint {
             commit: config.profile_commit.clone(),
             dirty_worktree: config.profile_dirty_worktree,
             engine_version: env!("CARGO_PKG_VERSION"),
-            bevy_version: "0.19",
+            bevy_version: BEVY_VERSION,
             build_profile: if cfg!(debug_assertions) {
                 "debug"
             } else {
@@ -251,7 +263,7 @@ mod tests {
             value["engine_version"],
             serde_json::json!(env!("CARGO_PKG_VERSION"))
         );
-        assert_eq!(value["bevy_version"], serde_json::json!("0.19"));
+        assert_eq!(value["bevy_version"], serde_json::json!(BEVY_VERSION));
         assert_eq!(
             value["build_profile"],
             serde_json::json!(if cfg!(debug_assertions) {
@@ -355,6 +367,56 @@ mod tests {
         assert_eq!(
             fingerprint_without_renderer().cell_cache_version,
             shared::CELL_CACHE_VERSION
+        );
+    }
+
+    /// The workspace manifest's `bevy` version requirement, as its `Cargo.toml` declares it.
+    ///
+    /// `crates/engine` is two directories below the workspace root, so the manifest is
+    /// `<CARGO_MANIFEST_DIR>/../../Cargo.toml`. It is read at test time rather than embedded, so the
+    /// test fails on the manifest as it is now, not as it was when this file last compiled.
+    fn workspace_bevy_requirement() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+        let manifest = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
+        let declaration = manifest
+            .lines()
+            .map(str::trim)
+            .find_map(|line| {
+                // The key must be exactly `bevy`: the name is followed by `=`, so `bevy_ecs = ...`
+                // and the like are left alone.
+                let rest = line.strip_prefix("bevy")?.trim_start();
+                Some(rest.strip_prefix('=')?.trim_start())
+            })
+            .expect("the workspace manifest declares a `bevy` dependency");
+        // `bevy = { version = "0.19.0", features = [...] }` names the requirement after `version`;
+        // the bare `bevy = "0.19"` form is the requirement itself.
+        let after_key = declaration
+            .split_once("version")
+            .map_or(declaration, |(_, rest)| rest)
+            .trim_start();
+        let after_key = after_key.strip_prefix('=').unwrap_or(after_key).trim_start();
+        after_key
+            .strip_prefix('"')
+            .and_then(|quoted| quoted.split('"').next())
+            .expect("the workspace's bevy declaration carries a quoted version requirement")
+            .to_owned()
+    }
+
+    /// The fingerprint's `bevy_version` is the workspace's own Bevy requirement, so a Bevy bump
+    /// cannot leave the fingerprint claiming the release that was there before.
+    ///
+    /// The requirement only has to *begin* with the recorded version: the workspace tracks the patch
+    /// release (`0.19.0`) while a report compares on the release (`0.19`). A digit after the constant
+    /// is not a match — `0.190` is a different release, not a patch of this one.
+    #[test]
+    fn the_fingerprint_bevy_version_matches_the_workspace_manifest() {
+        let requirement = workspace_bevy_requirement();
+        assert!(
+            requirement == BEVY_VERSION
+                || requirement.starts_with(&format!("{BEVY_VERSION}.")),
+            "the workspace requires bevy `{requirement}` but the fingerprint records \
+             `{BEVY_VERSION}`: move BEVY_VERSION when Bevy is bumped"
         );
     }
 }

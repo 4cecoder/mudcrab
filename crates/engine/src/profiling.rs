@@ -60,9 +60,11 @@ const MESH_ALLOCATOR_UNAVAILABLE: &str =
 const RENDER_ASSET_UNAVAILABLE: &str =
     "the render world has not measured the live GPU-side count for this asset type in this run";
 
-/// Why a scene count is `null`: the inventory is sampled every 60th frame, so a run that rendered
-/// no sampled frame has none.
-const SCENE_INVENTORY_UNAVAILABLE: &str = "the scene inventory was not sampled in this run";
+/// Why a scene count is `null`: the inventory is sampled every 60th frame of the run, so a measured
+/// window that holds none of those frames has no count of its own — and the warm-up's count is not
+/// reported in its place.
+const SCENE_INVENTORY_UNAVAILABLE: &str =
+    "the scene inventory was not sampled inside the measured window";
 
 /// Why a pipeline-statistics counter is `null` on a device that supports them: none was recorded,
 /// which is what a run with no rendered frame looks like.
@@ -163,6 +165,11 @@ pub struct ProfilingState {
     gpu_memory_frames: u64,
     counters: BTreeMap<String, u64>,
     gauges: BTreeMap<String, f64>,
+    /// The counts [`ProfilingState::stage_scene_inventory`] took this frame, waiting for
+    /// `sample_frame` to say whether the frame is inside the measured window. They are kept apart
+    /// from `gauges` so a count taken during the warm-up cannot be reported as a measured one, and
+    /// they hold at most the frame's own inventory: staging replaces them.
+    staged_inventory: Option<BTreeMap<String, f64>>,
     timeline: Vec<TimelineEvent>,
     memory: Vec<MemorySample>,
 }
@@ -180,6 +187,7 @@ impl Default for ProfilingState {
             gpu_memory_frames: 0,
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
+            staged_inventory: None,
             timeline: Vec::new(),
             memory: Vec::new(),
         }
@@ -216,8 +224,25 @@ impl ProfilingState {
         *counter = counter.saturating_add(amount);
     }
 
+    /// Records a gauge outright: the last value written is what the bundle carries, whatever frame
+    /// it was written in.
+    ///
+    /// The scene inventory is the one gauge set the report reads a measured number out of, so it
+    /// does not come through here — it is staged with [`ProfilingState::stage_scene_inventory`] and
+    /// kept only if the frame is inside the measured window.
     pub fn set_gauge(&mut self, name: impl Into<String>, value: f64) {
         self.gauges.insert(name.into(), value);
+    }
+
+    /// Stages the scene inventory taken this frame, to be kept only if the frame turns out to be
+    /// inside the measured window.
+    ///
+    /// The inventory runs in `Update` and the benchmark samples in `Last`, so the frame's
+    /// measured-ness is not known when the counts are taken; `sample_frame` — later in the same
+    /// frame — commits them to `gauges` or drops them. A staged inventory is never carried into a
+    /// later frame, so a warm-up count cannot be reported as a measured one.
+    fn stage_scene_inventory(&mut self, counts: BTreeMap<String, f64>) {
+        self.staged_inventory = Some(counts);
     }
 
     pub fn event(
@@ -252,8 +277,9 @@ impl ProfilingState {
     /// cannot leak into a later frame's samples. Because the readback lags, a measurement taken in
     /// the first measured frames can describe a pass recorded a frame or two earlier, in the
     /// warm-up; there is no per-camera record to split that, and dropping a fixed number of frames
-    /// instead would be a guess about the latency. The process-memory timeline stays whole-run: it
-    /// is a growth curve, not one of the frame statistics.
+    /// instead would be a guess about the latency. The scene inventory taken earlier in the frame
+    /// is kept under the same rule. The process-memory timeline stays whole-run: it is a growth
+    /// curve, not one of the frame statistics.
     pub fn sample_frame(
         &mut self,
         diagnostics: &DiagnosticsStore,
@@ -262,6 +288,14 @@ impl ProfilingState {
         gpu_memory_measured: bool,
     ) {
         self.frame = self.frame.saturating_add(1);
+        // The scene inventory is staged earlier in the same frame (it runs in `Update`, this sample
+        // in `Last`), so this is where its frame's measured-ness is known. The staged counts are
+        // taken either way — a warm-up inventory is dropped, never left to be committed by a later
+        // measured frame.
+        let staged = self.staged_inventory.take();
+        if measured && let Some(counts) = staged {
+            self.gauges.extend(counts);
+        }
         if measured {
             self.measured_frames = self.measured_frames.saturating_add(1);
             if gpu_memory_measured {
@@ -358,8 +392,10 @@ impl ProfilingState {
     /// backend can report (see [`SceneReport`]).
     ///
     /// The counts come from the inventory `sample_scene_inventory` takes every 60th frame (the mesh
-    /// entities, terrain patches and water surfaces of the world), and the entity count from Bevy's
-    /// own diagnostic, which `entity_count` carries. A count that was never sampled is `null` with
+    /// entities, terrain patches and water surfaces of the world) and `sample_frame` keeps only when
+    /// that frame is inside the measured window — the same window as the counters below and the
+    /// entity count, never the warm-up's numbers. The entity count comes from Bevy's own diagnostic,
+    /// which `entity_count` carries. A count that was never sampled inside the window is `null` with
     /// the reason in `unavailable`, never a zero: zero mesh entities in a synthetic scene is a
     /// count, a missing sample is not.
     pub fn scene_report(
@@ -557,11 +593,17 @@ impl ProfilingState {
             .iter()
             .map(|(name, samples)| (name.clone(), summarize(samples)))
             .collect();
-        let gpu_supported = render.keys().any(|path| path.ends_with("/elapsed_gpu"));
-        let pipeline_statistics_supported = render.keys().any(|path| {
-            path.ends_with("/vertex_shader_invocations")
-                || path.ends_with("/compute_shader_invocations")
-        });
+        // The device's answer, read from the run fingerprint rather than inferred from which pass
+        // paths were sampled: warm-up samples are dropped, so a device that supports timestamp
+        // queries but sampled no pass inside the measured window would otherwise say `false` here
+        // while the report says `true`. The report takes these two flags from the same fingerprint,
+        // so the bundle and the report cannot disagree; a run with no renderer says `false` in both,
+        // which is what the report's own section states for such a run.
+        let device = fingerprint.and_then(|value| value.renderer.as_ref());
+        let timestamp_queries_supported =
+            device.is_some_and(|value| value.timestamp_queries_supported);
+        let pipeline_statistics_supported =
+            device.is_some_and(|value| value.pipeline_statistics_supported);
         write_json(
             &root.join("metadata.json"),
             &Metadata {
@@ -589,7 +631,7 @@ impl ProfilingState {
         write_json(
             &root.join("gpu-passes.json"),
             &GpuProfile {
-                timestamp_queries_supported: gpu_supported,
+                timestamp_queries_supported,
                 pipeline_statistics_supported,
                 metrics: render.clone(),
                 unavailable: unavailable_render_metrics(&render),
@@ -673,6 +715,13 @@ fn take_render_measurements(
     }
 }
 
+/// Takes the scene inventory every 60th frame — the mesh entities, terrain patches and water
+/// surfaces of the world — and stages it for the frame's `sample_frame` to keep or drop.
+///
+/// The system runs in `Update`, before the benchmark's own sampling in `Last`, so it cannot know
+/// whether the frame is inside the measured window. The counts it stages are kept only if it is
+/// (see [`ProfilingState::stage_scene_inventory`]): a run whose measured window holds none of these
+/// frames reports the counts as `null` with a reason rather than the warm-up's numbers.
 #[allow(clippy::too_many_arguments)]
 fn sample_scene_inventory(
     mut profiler: ResMut<ProfilingState>,
@@ -689,16 +738,18 @@ fn sample_scene_inventory(
         return;
     }
     let started = Instant::now();
-    profiler.set_gauge("scene/mesh_entities", meshes.iter().count() as f64);
-    profiler.set_gauge("scene/terrain_patches", terrain.iter().count() as f64);
-    profiler.set_gauge(
-        "scene/visible_terrain_patches",
+    let mut counts = BTreeMap::new();
+    counts.insert("scene/mesh_entities".to_owned(), meshes.iter().count() as f64);
+    counts.insert("scene/terrain_patches".to_owned(), terrain.iter().count() as f64);
+    counts.insert(
+        "scene/visible_terrain_patches".to_owned(),
         terrain.iter().filter(|visible| visible.get()).count() as f64,
     );
-    profiler.set_gauge("scene/water_surfaces", water.iter().count() as f64);
-    profiler.set_gauge("scene/bounded_instances", bounds.iter().count() as f64);
-    profiler.set_gauge("assets/meshes", mesh_assets.len() as f64);
-    profiler.set_gauge("assets/images", images.len() as f64);
+    counts.insert("scene/water_surfaces".to_owned(), water.iter().count() as f64);
+    counts.insert("scene/bounded_instances".to_owned(), bounds.iter().count() as f64);
+    counts.insert("assets/meshes".to_owned(), mesh_assets.len() as f64);
+    counts.insert("assets/images".to_owned(), images.len() as f64);
+    profiler.stage_scene_inventory(counts);
     profiler.record_elapsed("profiling/scene_inventory", started);
 }
 
@@ -879,6 +930,12 @@ struct CpuProfile {
     gauges: BTreeMap<String, f64>,
 }
 
+/// The profile bundle's per-pass GPU metrics.
+///
+/// The two capability flags are the device's own answer, taken from the run fingerprint in
+/// `metadata.json` (see [`write_bundle`](ProfilingState::write_bundle)): the same flags the report's
+/// `gpu_passes` section carries, so the bundle and the report cannot disagree about the device.
+/// Which paths were *sampled* is not an answer to that question — a warm-up-only run samples none.
 #[derive(Serialize)]
 struct GpuProfile {
     timestamp_queries_supported: bool,
@@ -1680,6 +1737,58 @@ mod tests {
         );
     }
 
+    /// The scene counts are the measured window's, like every other number in the section: an
+    /// inventory taken while the benchmark is warming up is dropped, and a measured window that
+    /// holds no inventory of its own reports `null` with a reason rather than the warm-up's count.
+    #[test]
+    fn the_scene_inventory_is_kept_only_from_a_measured_frame() {
+        let diagnostics = DiagnosticsStore::default();
+        let mut profiler = ProfilingState::default();
+
+        // The inventory runs in `Update` and the benchmark samples in `Last`, so the counts are
+        // staged first and the sample of the same frame is what decides them. A warm-up frame's
+        // inventory is dropped.
+        profiler.stage_scene_inventory(BTreeMap::from([(
+            "scene/mesh_entities".to_owned(),
+            3.0,
+        )]));
+        profiler.sample_frame(&diagnostics, None, false, true);
+        let scene = profiler.scene_report(Some(11), Some(&renderer(true, true)));
+        assert_eq!(scene.mesh_entities, None, "a warm-up count is not measured");
+        assert_eq!(
+            scene.unavailable["mesh_entities"],
+            SCENE_INVENTORY_UNAVAILABLE
+        );
+        assert_eq!(scene.measured_frames, 0);
+
+        // It is not carried either: a measured frame that took no inventory of its own keeps none.
+        profiler.sample_frame(&diagnostics, None, true, true);
+        assert_eq!(
+            profiler
+                .scene_report(Some(11), Some(&renderer(true, true)))
+                .mesh_entities,
+            None,
+            "the warm-up count must not be committed by a later measured frame"
+        );
+
+        // An inventory taken inside a measured frame is the count the section reports.
+        profiler.stage_scene_inventory(BTreeMap::from([
+            ("scene/mesh_entities".to_owned(), 7.0),
+            ("scene/terrain_patches".to_owned(), 9.0),
+            ("scene/water_surfaces".to_owned(), 2.0),
+        ]));
+        profiler.sample_frame(&diagnostics, None, true, true);
+        let scene = profiler.scene_report(Some(11), Some(&renderer(true, true)));
+        assert_eq!(scene.mesh_entities, Some(7));
+        assert_eq!(scene.terrain_patches, Some(9));
+        assert_eq!(scene.water_surfaces, Some(2));
+        assert!(
+            !scene.unavailable.contains_key("mesh_entities"),
+            "a measured count is not unavailable"
+        );
+        assert_eq!(scene.measured_frames, 2);
+    }
+
     /// The CPU section splits Bevy's main schedules from the engine's own spans, keeps the
     /// asset-arrival counts out of both (they are counts, not milliseconds), and says that Bevy
     /// offers no render-world schedule timing.
@@ -1801,6 +1910,54 @@ mod tests {
         assert!(
             metadata.get("commit").is_none(),
             "the fields the fingerprint duplicates must not be written twice"
+        );
+    }
+
+    /// The bundle's device capabilities are the fingerprint's, not an inference from which pass
+    /// paths happened to be sampled: a Vulkan-like device that sampled no pass still writes `true`,
+    /// the same answer the report's `gpu_passes` section gives for that run.
+    #[test]
+    fn the_bundle_takes_the_device_capabilities_from_the_fingerprint() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            profile_output_dir: Some(directory.path().to_owned()),
+            profile_scenario: "vulkan".into(),
+            ..Default::default()
+        };
+        let profiler = ProfilingState::default();
+        let frame = serde_json::json!({
+            "average_fps": 90.0,
+            "frame_ms_p95": 14.0,
+            "passed": true
+        });
+        let mut fingerprint = RunFingerprint::collect(&config, None, None, None, false);
+        fingerprint.renderer = Some(renderer(true, true));
+        assert!(
+            profiler.render_metrics.is_empty(),
+            "the run sampled no pass, which is what must not be read as a missing capability"
+        );
+        profiler
+            .write_bundle(
+                &config,
+                &frame,
+                None,
+                &RendererMetrics::default(),
+                None,
+                Some(&fingerprint),
+            )
+            .unwrap();
+        let gpu: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.path().join("gpu-passes.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            gpu["timestamp_queries_supported"],
+            serde_json::json!(true),
+            "the device supports timestamp queries even with no sampled pass"
+        );
+        assert_eq!(
+            gpu["pipeline_statistics_supported"],
+            serde_json::json!(true),
+            "the sampled paths do not answer what the device supports"
         );
     }
 }
