@@ -168,6 +168,9 @@ pub struct DecodedRecord {
     /// Source record-header offset, including for records requiring deferred replay.
     pub source_record_offset: u64,
     pub fields: Vec<DecodedField>,
+    /// First-pass selectors awaiting the winning catalogue; excluded from every export.
+    #[serde(skip)]
+    pub(crate) deferred_fields: Vec<decoder::DeferredField>,
     /// Known fields rejected during decoding or ordered matching, distinct from source absence.
     pub rejected_fields: Vec<[u8; 4]>,
     /// False when a subrecord boundary prevented scanning the remaining payload safely.
@@ -210,6 +213,12 @@ pub struct PluginDiagnostics {
     pub(crate) event_log: diagnostics::EventLog,
     #[serde(skip)]
     pub(crate) event_context: diagnostics::EventContext,
+    /// Temporary first-pass contexts for unresolved leaves, moved into replay metadata.
+    #[serde(skip)]
+    pub(crate) deferred_contexts: Vec<diagnostics::EventContext>,
+    /// First-pass link observations retained only for roots with deferred selectors.
+    #[serde(skip)]
+    pub(crate) deferred_link_events: Option<Vec<decoder::DeferredLinkEvent>>,
 }
 
 impl PluginDiagnostics {

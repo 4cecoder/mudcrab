@@ -285,6 +285,7 @@ mod tests {
             topic_group_offset: Some(u64::MAX),
             source_record_offset: 0x1_0000_0001,
             fields,
+            deferred_fields: Vec::new(),
             rejected_fields: vec![*b"TRDT", *b"DATA"],
             payload_complete: false,
             raw_payload: b"source".to_vec(),

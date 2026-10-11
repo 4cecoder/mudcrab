@@ -632,7 +632,7 @@ fn rv_a_recovered_first_definition_is_revalidated_before_admission() {
     );
 }
 
-/// Inject inconsistent retained source only to cover the defensive baseline-error branch.
+/// Inject inconsistent retained source to cover defensive deferred-replay recovery.
 /// Real plugin bytes are immutable during conversion; this is explicitly not a native repro.
 #[test]
 fn rv_a_injected_baseline_failure_omits_unresolved_first_definition_fields() {
@@ -702,7 +702,7 @@ fn rv_a_injected_baseline_failure_omits_unresolved_first_definition_fields() {
             .fields
             .iter()
             .all(|field| !contains_deferred(&field.value)),
-        "baseline Err must not retain unresolved canonical bytes"
+        "inconsistent retained source must not retain unresolved canonical bytes"
     );
     assert!(
         recovered

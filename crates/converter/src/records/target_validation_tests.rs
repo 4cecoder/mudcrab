@@ -37,6 +37,7 @@ fn record(id: u32, signature: [u8; 4], fields: Vec<DecodedField>) -> DecodedReco
         topic_group_offset: None,
         source_record_offset: 0x1_0000_0041,
         fields,
+        deferred_fields: Vec::new(),
         rejected_fields: vec![*b"BAD_"],
         payload_complete: false,
         raw_payload: vec![0x51, 0x19, 0x80, 0x07],

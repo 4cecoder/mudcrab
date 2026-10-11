@@ -1017,12 +1017,20 @@ impl<'a> RuntimeFieldSelection<'a> {
         record.subrecords = Vec::with_capacity(original_len);
         for (index, (signature, bytes)) in source.into_iter().enumerate() {
             if omitted.contains(&index) {
-                hidden.push(OmittedSubrecord { index, signature, bytes });
+                hidden.push(OmittedSubrecord {
+                    index,
+                    signature,
+                    bytes,
+                });
             } else {
                 record.subrecords.push((signature, bytes));
             }
         }
-        Self { record, omitted: hidden, original_len }
+        Self {
+            record,
+            omitted: hidden,
+            original_len,
+        }
     }
 }
 
@@ -1279,6 +1287,7 @@ mod runtime_move_tests {
             payload_complete: false,
             raw_payload: b"source".to_vec(),
             supported: false,
+            deferred_fields: Vec::new(),
         }
     }
 
@@ -1308,7 +1317,9 @@ mod runtime_move_tests {
         let mut raw = opaque_race();
         let expected = raw.clone();
         let canonical = crate::esm::extractors::serialize_subrecords(&raw.subrecords);
-        let pointers = raw.subrecords.iter()
+        let pointers = raw
+            .subrecords
+            .iter()
             .map(|(signature, bytes)| (signature.as_ptr(), bytes.as_ptr()))
             .collect::<Vec<_>>();
         assert!(validate_inhouse_record(&raw).is_err());
@@ -1317,24 +1328,39 @@ mod runtime_move_tests {
             assert_eq!(runtime.subrecords.len(), 3);
             for (selected, original) in [1usize, 3, 4].into_iter().enumerate() {
                 assert_eq!(runtime.subrecords[selected], expected.subrecords[original]);
-                assert_eq!(runtime.subrecords[selected].0.as_ptr(), pointers[original].0);
-                assert_eq!(runtime.subrecords[selected].1.as_ptr(), pointers[original].1);
+                assert_eq!(
+                    runtime.subrecords[selected].0.as_ptr(),
+                    pointers[original].0
+                );
+                assert_eq!(
+                    runtime.subrecords[selected].1.as_ptr(),
+                    pointers[original].1
+                );
             }
             validate_inhouse_record(runtime)
         });
         result.unwrap();
         assert_eq!(format!("{raw:?}"), format!("{expected:?}"));
         assert_eq!(raw.subrecords, expected.subrecords);
-        assert_eq!(crate::esm::extractors::serialize_subrecords(&raw.subrecords), canonical);
+        assert_eq!(
+            crate::esm::extractors::serialize_subrecords(&raw.subrecords),
+            canonical
+        );
         for (index, (signature, bytes)) in raw.subrecords.iter().enumerate() {
             assert_eq!((signature.as_ptr(), bytes.as_ptr()), pointers[index]);
         }
-        let rejected = with_filtered_record(&mut raw, Some(&BTreeSet::from([5usize])),
-            validate_inhouse_record);
+        let rejected = with_filtered_record(
+            &mut raw,
+            Some(&BTreeSet::from([5usize])),
+            validate_inhouse_record,
+        );
         assert!(rejected.unwrap_err().to_string().contains("WKMV"));
         assert_eq!(format!("{raw:?}"), format!("{expected:?}"));
         assert_eq!(raw.subrecords, expected.subrecords);
-        assert_eq!(crate::esm::extractors::serialize_subrecords(&raw.subrecords), canonical);
+        assert_eq!(
+            crate::esm::extractors::serialize_subrecords(&raw.subrecords),
+            canonical
+        );
         for (index, (signature, bytes)) in raw.subrecords.iter().enumerate() {
             assert_eq!((signature.as_ptr(), bytes.as_ptr()), pointers[index]);
         }
@@ -1352,7 +1378,11 @@ mod runtime_move_tests {
         let mut raw = opaque_race();
         let expected = raw.clone();
         let canonical = crate::esm::extractors::serialize_subrecords(&raw.subrecords);
-        let pointers = raw.subrecords.iter().map(|(_, bytes)| bytes.as_ptr()).collect::<Vec<_>>();
+        let pointers = raw
+            .subrecords
+            .iter()
+            .map(|(_, bytes)| bytes.as_ptr())
+            .collect::<Vec<_>>();
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             with_filtered_record(&mut raw, Some(&BTreeSet::from([0usize, 2, 5])), |_| {
                 panic!("authored validation unwind");
@@ -1361,7 +1391,10 @@ mod runtime_move_tests {
         assert!(panicked.is_err());
         assert_eq!(format!("{raw:?}"), format!("{expected:?}"));
         assert_eq!(raw.subrecords, expected.subrecords);
-        assert_eq!(crate::esm::extractors::serialize_subrecords(&raw.subrecords), canonical);
+        assert_eq!(
+            crate::esm::extractors::serialize_subrecords(&raw.subrecords),
+            canonical
+        );
         for (index, (_, bytes)) in raw.subrecords.iter().enumerate() {
             assert_eq!(bytes.as_ptr(), pointers[index]);
         }
@@ -1391,17 +1424,35 @@ mod runtime_move_tests {
             let (source, priority, tag, flags, payload): (u32, u32, String, u32, Vec<u8>) = conn.query_row(
                 "SELECT source_form_id,load_order,record_type,flags,payload FROM inhouse_source_records WHERE form_id=?1",
                 [original.form_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).unwrap();
-            assert_eq!((source, priority, tag, flags, payload),
-                (original.source_form_id, original.load_order, "INFO".into(), original.flags, original.raw_payload));
+            assert_eq!(
+                (source, priority, tag, flags, payload),
+                (
+                    original.source_form_id,
+                    original.load_order,
+                    "INFO".into(),
+                    original.flags,
+                    original.raw_payload
+                )
+            );
         }
-        let ids = conn.prepare("SELECT form_id FROM inhouse_source_records ORDER BY form_id").unwrap()
-            .query_map([], |row| row.get::<_, u32>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        let ids = conn
+            .prepare("SELECT form_id FROM inhouse_source_records ORDER BY form_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, u32>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(ids, [earlier_id, earlier_id + 17]);
     }
 
     /// Frame own subrecords without using production encoding or schema helpers.
     fn source_subrecord(tag: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
-        [tag.as_slice(), &u16::try_from(bytes.len()).unwrap().to_le_bytes(), bytes].concat()
+        [
+            tag.as_slice(),
+            &u16::try_from(bytes.len()).unwrap().to_le_bytes(),
+            bytes,
+        ]
+        .concat()
     }
 
     /// Preserve independent header sentinels for exact source-offset/raw-history assertions.
@@ -1426,7 +1477,8 @@ mod runtime_move_tests {
         let output = directory.path().join("output");
         fs::create_dir(&data).unwrap();
         fs::create_dir(&output).unwrap();
-        let schema = records::schema_format::Schema::parse(br#"{
+        let schema = records::schema_format::Schema::parse(
+            br#"{
             "version":1,"records":[
                 {"signature":"RACE","fields":[
                     {"signature":"EDID","name":"editor_id","kind":"zstring"},
@@ -1435,45 +1487,98 @@ mod runtime_move_tests {
                 {"signature":"STAT","fields":[
                     {"signature":"EDID","name":"editor_id","kind":"zstring"}
                 ]}
-            ]}"#).unwrap();
+            ]}"#,
+        )
+        .unwrap();
         let race_id = 0x1600u32;
         let neighbor_id = 0x1700u32;
-        let race_payload = [source_subrecord(b"EDID", b"RetainedRejectedRace\0"),
-            source_subrecord(b"WKMV", &17u32.to_le_bytes())].concat();
+        let race_payload = [
+            source_subrecord(b"EDID", b"RetainedRejectedRace\0"),
+            source_subrecord(b"WKMV", &17u32.to_le_bytes()),
+        ]
+        .concat();
         let header = source_frame(b"TES4", 0, 0x80, &source_subrecord(b"HEDR", &[0; 12]));
         let race_offset = header.len() as u64;
         let race_frame = source_frame(b"RACE", race_id, 0, &race_payload);
         let neighbor_payload = source_subrecord(b"EDID", b"UsableAfterRejectedRace\0");
-        let original = [header, race_frame.clone(), source_frame(b"STAT", neighbor_id, 0, &neighbor_payload)].concat();
+        let original = [
+            header,
+            race_frame.clone(),
+            source_frame(b"STAT", neighbor_id, 0, &neighbor_payload),
+        ]
+        .concat();
         let plugin = data.join("Synthetic.esm");
         fs::write(&plugin, &original).unwrap();
         let database = output.join("skyrim_world.db");
-        let master = convert_plugins_with_dump_impl(std::slice::from_ref(&plugin), &database, &data,
-            Some((&output, &[*b"RACE", *b"STAT"])), RecordBundleMode::Full, None, Some(&schema)).unwrap();
+        let master = convert_plugins_with_dump_impl(
+            std::slice::from_ref(&plugin),
+            &database,
+            &data,
+            Some((&output, &[*b"RACE", *b"STAT"])),
+            RecordBundleMode::Full,
+            None,
+            Some(&schema),
+        )
+        .unwrap();
         assert_eq!(master.len(), 1);
         assert!(master.contains_key(&neighbor_id));
         assert!(!master.contains_key(&race_id));
         let conn = Connection::open(&database).unwrap();
-        let source: Vec<u8> = conn.query_row("SELECT payload FROM inhouse_source_records WHERE form_id=?1",
-            [race_id], |row| row.get(0)).unwrap();
+        let source: Vec<u8> = conn
+            .query_row(
+                "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+                [race_id],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(source, race_payload);
-        let present: u32 = conn.query_row("SELECT count(*) FROM records WHERE form_id=?1", [race_id], |row| row.get(0)).unwrap();
+        let present: u32 = conn
+            .query_row(
+                "SELECT count(*) FROM records WHERE form_id=?1",
+                [race_id],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(present, 0);
-        let rows: u32 = conn.query_row("SELECT count(*) FROM inhouse_source_records", [], |row| row.get(0)).unwrap();
+        let rows: u32 = conn
+            .query_row("SELECT count(*) FROM inhouse_source_records", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(rows, 2);
-        let accepted: (String, u64) = conn.query_row("SELECT status,source_record_offset FROM record_overrides WHERE form_id=?1",
-            [race_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        let accepted: (String, u64) = conn
+            .query_row(
+                "SELECT status,source_record_offset FROM record_overrides WHERE form_id=?1",
+                [race_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(accepted, ("accepted".into(), race_offset));
         drop(conn);
         let typed = fs::read_to_string(output.join("typed-records.jsonl")).unwrap();
-        let typed = typed.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|row| row["form_id"] == race_id).unwrap();
-        assert_eq!(typed["source_payload_sha256"], crate::cache::hash_bytes(&race_payload));
-        assert_eq!(typed["fields"][1]["value"], serde_json::json!({"LocalizedString":17}));
+        let typed = typed
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|row| row["form_id"] == race_id)
+            .unwrap();
+        assert_eq!(
+            typed["source_payload_sha256"],
+            crate::cache::hash_bytes(&race_payload)
+        );
+        assert_eq!(
+            typed["fields"][1]["value"],
+            serde_json::json!({"LocalizedString":17})
+        );
         let database_pin = crate::cache::hash_file(&database).unwrap();
         let mut seen = 0;
-        let summary = records::history_source::visit_source_history(&output, None,
-            records::history_source::SourceQuery::Physical { plugin_id: 0, source_record_offset: race_offset }, |version| {
+        let summary = records::history_source::visit_source_history(
+            &output,
+            None,
+            records::history_source::SourceQuery::Physical {
+                plugin_id: 0,
+                source_record_offset: race_offset,
+            },
+            |version| {
                 assert_eq!(version.runtime_form_id, Some(race_id));
                 assert_eq!(version.status, "accepted");
                 assert!(version.accepted_source_winner);
@@ -1483,7 +1588,9 @@ mod runtime_move_tests {
                 assert_eq!(raw.stored_payload.as_deref(), Some(race_payload.as_slice()));
                 seen += 1;
                 Ok(())
-            }).unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(seen, 1);
         assert!(summary.fully_raw_available);
         assert_eq!(crate::cache::hash_file(&database).unwrap(), database_pin);
