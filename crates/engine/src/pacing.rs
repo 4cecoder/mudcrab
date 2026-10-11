@@ -408,6 +408,15 @@ pub fn horizontal_distance(a: Vec3, b: Vec3) -> f32 {
     Vec2::new(a.x - b.x, a.z - b.z).length()
 }
 
+/// The frame delta the loading frame-time windows are measured with: the real wall-clock delta,
+/// never the virtual clock. Bevy clamps `Time<Virtual>` at 250 ms, so a one-second hitch would
+/// otherwise be recorded as 250 ms, which is exactly the stall those windows exist to catch. The
+/// report's own `frame_ms_*` fields still use the clamped clock; the windows deliberately do not.
+/// This is the single place the clock for them is chosen.
+fn window_delta_ms(real: &Time<Real>) -> f64 {
+    real.delta_secs_f64() * 1000.0
+}
+
 /// Evaluates the world-ready predicate each frame, runs the benchmark jump, and keeps the tracker.
 /// Runs at the end of the streaming chain, after the planner and the readiness scans.
 #[allow(clippy::too_many_arguments)]
@@ -420,9 +429,8 @@ pub(crate) fn track_world_ready(
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut tracker: ResMut<PacingTracker>,
     mut profiler: ResMut<ProfilingState>,
-    // The window frame times are real wall-clock deltas. The virtual `Time` Bevy's schedules see is
-    // clamped (250 ms by default), so a one-second hitch would read as 250 ms. The report's own
-    // `frame_ms_*` still use that clamped clock; the windows deliberately do not.
+    // The window frame times come from the real clock; `window_delta_ms` is the one place that
+    // choice is made, so it is also the one place a test has to pin.
     real_time: Res<Time<Real>>,
 ) {
     let Ok(mut camera) = camera.single_mut() else {
@@ -443,7 +451,7 @@ pub(crate) fn track_world_ready(
         elapsed_millis,
         ready,
         config.benchmark_jump.is_some(),
-        real_time.delta_secs_f64() * 1000.0,
+        window_delta_ms(&real_time),
     );
     if let Some(grid) = config.benchmark_jump.filter(|_| jump_now) {
         let position = benchmark_jump_position(&config, &cache, origin.0, grid);
@@ -466,6 +474,8 @@ pub(crate) fn track_world_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::time::{TimeUpdateStrategy, Virtual};
+    use std::time::Duration;
 
     /// A tracker as a benchmark run leaves it: the frame-time windows are kept.
     fn benchmark_tracker() -> PacingTracker {
@@ -702,6 +712,105 @@ mod tests {
         let report = plain.report(&EngineConfig::default(), 0);
         assert!(report.jump_load_window.is_none());
         assert_eq!(report.frames_after_ready.unwrap().frames, 1);
+    }
+
+    /// A bare app whose time advances by exactly 1000 ms per update: the real clock's delta is
+    /// 1000 ms and the virtual clock's is Bevy's 250 ms clamp of it. The caller adds its own
+    /// resources, entities and systems before the first update.
+    fn thousand_millisecond_frames() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            1000,
+        )));
+        app
+    }
+
+    /// The window delta comes from the real wall clock. A 1000 ms frame leaves the two clocks far
+    /// apart — the virtual one is clamped to 250 ms — and `window_delta_ms` reads the real one. Had
+    /// the helper taken `&Time<Virtual>`, this would read 250.
+    #[test]
+    fn the_window_delta_is_the_real_clock_not_the_clamped_virtual_one() {
+        let mut app = thousand_millisecond_frames();
+        // Two frames: the plugin's first is its own warm-up, and a full second is the delta from
+        // there on.
+        app.update();
+        app.update();
+
+        let virtual_clock = app.world().resource::<Time<Virtual>>();
+        assert_eq!(
+            virtual_clock.delta_secs_f64() * 1000.0,
+            250.0,
+            "the premise: Bevy clamps the virtual delta, so reading it would hide the hitch"
+        );
+        let real = app.world().resource::<Time<Real>>();
+        assert_eq!(real.delta_secs_f64() * 1000.0, 1000.0);
+        assert_eq!(window_delta_ms(real), 1000.0);
+    }
+
+    /// An empty `CellCache`: `track_world_ready` requires the resource, and a run with no jump
+    /// configured never reads it. The directory is returned because the map must outlive the app.
+    fn empty_cell_cache() -> (tempfile::TempDir, CellCache) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cell_cache.rkyv");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: vec![],
+        })
+        .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        (directory, CellCache::open(&path).unwrap())
+    }
+
+    /// The system itself, not just the helper: `track_world_ready` in a Bevy app, on frames whose
+    /// real delta is 1000 ms and whose virtual delta is the 250 ms clamp of it, must record the
+    /// 1000 ms. The tracker starts already latched ready — that predicate needs a populated
+    /// streaming world, which is not what this test is about — so the clock is all the system can
+    /// get the window frame times from. A system reading `Time<Virtual>`, the regression this pins,
+    /// would record 250 ms.
+    #[test]
+    fn track_world_ready_records_the_window_frame_time_from_the_real_clock() {
+        let (_cache_directory, cache) = empty_cell_cache();
+        let mut app = thousand_millisecond_frames();
+        app.insert_resource(EngineConfig {
+            benchmark_duration_secs: Some(1.0),
+            ..default()
+        })
+        .insert_resource(RenderOrigin(IVec2::ZERO))
+        .insert_resource(StreamingWorld::default())
+        .insert_resource(StreamingMetrics::default())
+        .insert_resource(cache)
+        .insert_resource(PacingTracker {
+            first_ready: ReadyLatch {
+                latched: Some(Mark {
+                    millis: 0.0,
+                    frames: 1,
+                }),
+                ..default()
+            },
+            ..default()
+        })
+        .init_resource::<ProfilingState>()
+        .add_systems(Update, track_world_ready);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+
+        // A benchmark run, so the system keeps the windows; every frame is a one-second hitch.
+        for _ in 0..3 {
+            app.update();
+        }
+
+        let tracker = app.world().resource::<PacingTracker>();
+        assert!(
+            !tracker.frames_after_ready.is_empty(),
+            "the system must record the frames of the window"
+        );
+        for frame_ms in &tracker.frames_after_ready {
+            assert_eq!(
+                *frame_ms, 1000.0,
+                "the window keeps the real clock's frame times, not the virtual clock's 250 ms"
+            );
+        }
     }
 
     /// A normal play session is not a benchmark: nothing bounds its length, so the tracker keeps no

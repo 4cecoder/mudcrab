@@ -12,6 +12,7 @@ pub mod prepass_vertex_alpha;
 pub mod profiling;
 pub mod render;
 pub mod render_timing;
+mod renderer_init;
 pub mod schedule_timing;
 pub mod shots;
 pub mod sky;

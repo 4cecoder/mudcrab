@@ -193,8 +193,10 @@ window scans.
   of the start offset (`setup_world`'s camera offset, Y 1200 by default; the cell centre supplies X
   and Z), on the first frame the world is ready. The report names the target in `jump_target`.
   `time_to_world_ready_after_jump_ms` and `frames_to_world_ready_after_jump` are measured from the
-  jump to the start of the next two-frame ready run (`jump_issued` says whether it happened). A
-  target cell with no terrain logs a warning and uses ground height 0. A coordinate outside ±512 is
+  jump to the start of the next two-frame ready run (`jump_issued` says whether it happened). A jump
+  into a cell whose window is already resident still latches only after those two ready frames, so it
+  reports a near-zero reload; that is correct and not a measurement bug. A target cell with no terrain
+  logs a warning and uses ground height 0. A coordinate outside ±512 is
   dropped with a warning when the arguments are parsed. The jump is ignored, with a warning, when
   `--auto-fly-speed`, `--streaming-fixture`, `--shots` or `--acceptance-screenshot` is also set,
   because the first two keep driving the camera, a shots run poses it for each shot and the
@@ -408,3 +410,31 @@ workload differs. Then, with the scenario inputs, resolution, build profile and 
 start with frame P95/P99 and inspect the top CPU spans, GPU passes and streaming timeline in the
 same run. A missing GPU counter means unsupported instrumentation, not a zero value. Real-asset and
 target-hardware sign-off remains an execution result, not something the repository can pre-certify.
+
+## Load speed defaults: models per frame and IO threads
+
+Once a converted model has loaded, the engine hands it to Bevy's scene spawner, at most
+`--max-model-spawns-per-frame` models a frame (default 32, `0` = no limit). The asset IO pool keeps
+its automatic size: a quarter of the hardware threads, at least 1 and at most 4
+(`--io-threads <n>` overrides it). The arming limit was 4 a frame before.
+
+Measured on a Ryzen 7 5800X (16 threads, release build) on a full conversion made with upstream
+main's converter on 2026-10-02, with a benchmark that jumps the camera to cell 4,-21 once the start
+area is loaded (the jump and the loading-window frame times come from the separate pacing
+measurement change). "Worst frame while loading" is the worst frame from the jump until the world is
+ready again.
+
+| IO threads, models a frame | runs | world ready | ready after jump | worst frame while loading |
+| --- | --- | --- | --- | --- |
+| 4, 4 (before) | 4 | 1.77-2.00 s | 2.36-2.80 s | 14.7-20.4 ms |
+| 4, 16 | 5 | 0.85-1.03 s | 1.10-1.14 s | 15.5-20.2 ms |
+| 4, 32 (default) | 5 | 0.75-0.82 s | 0.82-1.01 s | 15.2-18.4 ms |
+| 4, no limit | 2 | 0.75-0.76 s | 0.92-0.94 s | 16.2-17.0 ms |
+| 8, 4 | 2 | 1.71-2.01 s | 2.42-2.73 s | 27.5-33.6 ms |
+| 8, 16 | 3 | 0.80-0.95 s | 0.93-1.18 s | 26.3-38.0 ms |
+
+A fly-through at 5000 units/s with stream radius 3 shows the same: the mean wait from a model's
+load request to the model appearing falls from 692-704 ms at 4 a frame to 168 ms at 32, while the
+worst frame (20.5 -> 22.2 ms), p95 (10.2 -> 10.8 ms) and peak memory (1.51 GiB both) barely move.
+More IO threads did not load faster (the ranges overlap) and lengthened the worst loading frame, so
+the automatic size stays; the load was waiting on the arming limit, not on IO.

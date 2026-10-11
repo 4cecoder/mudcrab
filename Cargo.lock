@@ -2352,6 +2352,7 @@ dependencies = [
  "memmap2",
  "mesh-tools",
  "mlua",
+ "mo2",
  "nom 8.0.0",
  "nom-derive",
  "project-wormhole-esm",
@@ -2847,6 +2848,7 @@ dependencies = [
  "sha2",
  "shared",
  "tempfile",
+ "wgpu",
  "windows-sys 0.61.2",
 ]
 
@@ -4118,9 +4120,11 @@ dependencies = [
  "bevy",
  "converter",
  "crossbeam-channel",
+ "mo2",
  "rusqlite",
  "serde_json",
  "shared",
+ "tempfile",
  "tokio",
  "winreg",
 ]
@@ -4425,6 +4429,16 @@ dependencies = [
  "luajit-src",
  "luau0-src",
  "pkg-config",
+]
+
+[[package]]
+name = "mo2"
+version = "0.1.0"
+dependencies = [
+ "color-eyre",
+ "serde",
+ "tempfile",
+ "walkdir",
 ]
 
 [[package]]

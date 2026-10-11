@@ -18,7 +18,7 @@ use shared::collision::CollisionAsset;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs,
-    io::Write,
+    io::{Read, Write},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
 };
@@ -26,11 +26,28 @@ use walkdir::WalkDir;
 
 pub struct MeshConverter;
 
-pub(crate) fn nif_source_hash(path: &Path) -> Result<String> {
+/// Hashes a NIF and its dependencies using the pre-repair cache contract.
+/// Legacy pruned packages retain this checksum and require exact source replay.
+pub(crate) fn nif_unrepaired_source_hash(path: &Path) -> Result<String> {
     let mut hash = crate::cache::hash_file(path)?;
     for dependency in MeshConverter::dependency_paths(path) {
         hash.push(':');
         hash.push_str(&crate::cache::hash_file(&dependency)?);
+    }
+    Ok(hash)
+}
+
+/// Hashes a NIF with the scoped repair revision and source-texture presence.
+/// Writer and retained-asset verifier supply the same canonical model key and
+/// their package's source snapshot, so current Data overrides cannot relabel it.
+pub(crate) fn nif_source_hash(
+    path: &Path,
+    model: &str,
+    source_textures: &BTreeSet<String>,
+) -> Result<String> {
+    let mut hash = nif_unrepaired_source_hash(path)?;
+    if let Some(suffix) = volcanic_normal_cache_suffix(model, source_textures) {
+        hash.push_str(&suffix);
     }
     Ok(hash)
 }
@@ -56,18 +73,33 @@ impl MeshConverter {
         find_skeleton(nif_path).into_iter().collect()
     }
 
+    /// Converts a NIF into a GLB with collision and material metadata, using static geometry as a fallback.
     pub fn convert_nif_to_glb<P: AsRef<Path>>(nif_path: P, glb_output_path: P) -> Result<()> {
         let nif_path = nif_path.as_ref();
+        let skeleton = find_skeleton(nif_path);
+        Self::convert_nif_to_glb_with_skeleton(
+            nif_path,
+            glb_output_path.as_ref(),
+            skeleton.as_deref(),
+        )
+    }
+
+    /// Converts using an explicitly resolved winning skeleton, without physical-neighbor fallback.
+    pub fn convert_nif_to_glb_with_skeleton(
+        nif_path: &Path,
+        glb_output_path: &Path,
+        skeleton_path: Option<&Path>,
+    ) -> Result<()> {
         let (nif, diagnostics, material_contract) = open_nif_resilient(nif_path)?;
         let mut collision = collision::from_nif(nif_path, &nif)?;
         let skeleton = if nif.has_skeleton() {
-            let skeleton_path = find_skeleton(nif_path).ok_or_else(|| {
+            let skeleton_path = skeleton_path.ok_or_else(|| {
                 color_eyre::eyre::eyre!(
                     "skinned NIF requires a skeleton, but none was found near {}",
                     nif_path.display()
                 )
             })?;
-            Some(open_nif_resilient(&skeleton_path)?.0)
+            Some(open_nif_resilient(skeleton_path)?.0)
         } else {
             None
         };
@@ -100,13 +132,14 @@ impl MeshConverter {
         if model.static_meshes.is_empty() && model.skeletal_meshes.is_empty() {
             ensure!(
                 is_deferred_dynamic_mesh(nif_path)
+                    || is_geometry_template(&nif)
                     || !diagnostics
                         .block_types
                         .keys()
                         .any(|block_type| is_declared_geometry_block(block_type)),
                 "NIF declares mesh geometry, but no supported geometry was converted"
             );
-            let output = glb_output_path.as_ref();
+            let output = glb_output_path;
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -117,7 +150,7 @@ impl MeshConverter {
                 &embed_collision(empty_scene_glb(&name), &collision)?,
             );
         }
-        let output = glb_output_path.as_ref();
+        let output = glb_output_path;
         let mut glb = catch_unwind(AssertUnwindSafe(|| model.to_glb(name.clone())))
             .map_err(|_| color_eyre::eyre::eyre!("NIF GLB export panicked"))?;
         if glb_bounds_from_bytes(&glb).is_err() && !used_static_fallback {
@@ -198,6 +231,11 @@ impl MeshConverter {
         open_nif_resilient(path).map(|(_, diagnostics, _)| diagnostics)
     }
 
+    /// Loads a NIF and reports whether its declared geometry consists only of empty overlay templates.
+    pub fn is_geometry_template(path: &Path) -> Result<bool> {
+        open_nif_resilient(path).map(|(nif, _, _)| is_geometry_template(&nif))
+    }
+
     /// Extracts the validated per-shape NIF material contract without
     /// publishing glTF/PBR decisions that belong to the next pipeline stage.
     pub fn inspect_nif_materials(path: &Path) -> Result<Vec<NifShapeMaterial>> {
@@ -238,14 +276,28 @@ impl MeshConverter {
     /// textures are mandatory; auxiliary maps remain explicitly optional until
     /// the shader contract requires them.
     pub fn glb_texture_dependencies(path: &Path) -> Result<Vec<TextureDependency>> {
-        let bytes =
-            fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
-        let document = glb_json_from_bytes(&bytes)
-            .wrap_err_with(|| format!("failed to inspect textures in {}", path.display()))?;
+        let mut file = fs::File::open(path)?;
+        let mut header = [0u8; 20];
+        file.read_exact(&mut header)?;
+        let length = u32::from_le_bytes(header[8..12].try_into().unwrap());
+        let json_length = u32::from_le_bytes(header[12..16].try_into().unwrap());
+        ensure!(
+            &header[..4] == b"glTF"
+                && &header[16..20] == b"JSON"
+                && u32::from_le_bytes(header[4..8].try_into().unwrap()) == 2
+                && u64::from(length) == file.metadata()?.len()
+                && u64::from(json_length) + 20 <= u64::from(length),
+            "invalid GLB JSON chunk in {}",
+            path.display()
+        );
+        // Dependency scans need JSON only, not potentially gigabytes of geometry.
+        let document =
+            serde_json::from_reader(std::io::BufReader::new(file.take(u64::from(json_length))))
+                .wrap_err_with(|| format!("failed to inspect textures in {}", path.display()))?;
         Ok(texture_dependencies(&document))
     }
 
-    /// Removes image URIs with no file on disk from every GLB under `root`.
+    /// Repairs the scoped volcanic normal path, then removes image URIs with no file on disk.
     ///
     /// NIF sources occasionally reference textures Bethesda never shipped.
     /// Those references survive material publishing as dangling URIs, which
@@ -253,7 +305,8 @@ impl MeshConverter {
     /// with every texture and core or OPEN_SKYRIM material slot that points at
     /// them, so the mesh renders with its remaining maps instead of failing to
     /// load. Files without dangling URIs are left untouched. Returns one
-    /// report per rewritten file, ordered by path.
+    /// report per rewritten file, ordered by path. The two shipped volcanic grass models may
+    /// retain their normal through the published DLC02 replacement before pruning.
     pub fn prune_dangling_texture_uris(root: &Path) -> Result<Vec<PrunedGlb>> {
         Self::prune_dangling_texture_uris_with_sources(root, &BTreeSet::new())
     }
@@ -286,44 +339,144 @@ impl MeshConverter {
         glbs.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
         let mut pruned = Vec::new();
         for glb_path in glbs {
-            if let Some(report) = prune_dangling_uris_in_glb(root, &glb_path, source_textures)? {
+            if let Some(report) =
+                prune_dangling_uris_in_glb(root, &glb_path, source_textures, false)?
+            {
                 pruned.push(report);
             }
         }
         Ok(pruned)
     }
+
+    /// Repairs the two shipped volcanic grass normals after DDS conversion, before publishing
+    /// sampler aliases. A source at the original path always wins, even if its conversion failed.
+    pub(crate) fn repair_volcanic_grass_normals(
+        root: &Path,
+        source_textures: &BTreeSet<String>,
+    ) -> Result<Vec<PrunedGlb>> {
+        let mut repaired = Vec::new();
+        for model in VOLCANIC_GRASS_MODELS {
+            let glb = root.join(format!("{model}.glb"));
+            if glb.is_file()
+                && let Some(report) = prune_dangling_uris_in_glb(root, &glb, source_textures, true)?
+            {
+                repaired.push(report);
+            }
+        }
+        Ok(repaired)
+    }
 }
 
-/// One GLB rewritten by [`MeshConverter::prune_dangling_texture_uris`].
+const VOLCANIC_GRASS_MODELS: [&str; 2] = [
+    "meshes/landscape/grass/dlc02volcanicashgrass01",
+    "meshes/landscape/grass/dlc02volcanicashgrass02",
+];
+const VOLCANIC_NORMAL: &str = "textures/landscape/grass/volcanicashgrass02_n.ktx2";
+const VOLCANIC_NORMAL_TARGET: &str = "textures/dlc02/landscape/grass/volcanicashgrass02_n.ktx2";
+const VOLCANIC_NORMAL_SOURCE: &str = "textures/landscape/grass/volcanicashgrass02_n.dds";
+const VOLCANIC_NORMAL_TARGET_SOURCE: &str =
+    "textures/dlc02/landscape/grass/volcanicashgrass02_n.dds";
+
+/// Whether a canonical mesh key belongs to the two shipped models affected by issue #86.
+fn volcanic_grass_model(model: &str) -> bool {
+    model
+        .strip_suffix(".glb")
+        .or_else(|| model.strip_suffix(".nif"))
+        .is_some_and(|stem| VOLCANIC_GRASS_MODELS.contains(&stem))
+}
+
+/// Replaces only the authored missing normal path, retaining sampler and transfer suffixes.
+pub(crate) fn volcanic_normal_replacement(
+    model: &str,
+    runtime_key: &str,
+    sources: &BTreeSet<String>,
+) -> Option<String> {
+    if !volcanic_grass_model(model)
+        || sources.contains(VOLCANIC_NORMAL_SOURCE)
+        || crate::asset_path::runtime_texture_source(runtime_key).as_deref()
+            != Some(VOLCANIC_NORMAL)
+    {
+        return None;
+    }
+    Some(format!(
+        "textures/dlc02/{}",
+        runtime_key.strip_prefix("textures/")?
+    ))
+}
+
+/// Invalidates only the two affected meshes when this repair or either source presence changes.
+pub(crate) fn volcanic_normal_cache_suffix(
+    model: &str,
+    sources: &BTreeSet<String>,
+) -> Option<String> {
+    volcanic_grass_model(model).then(|| {
+        format!(
+            ":volcanic-normal-repair:1:original={}:target={}",
+            sources.contains(VOLCANIC_NORMAL_SOURCE),
+            sources.contains(VOLCANIC_NORMAL_TARGET_SOURCE)
+        )
+    })
+}
+
+/// One GLB rewritten by scoped texture-path repair or dangling-reference pruning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrunedGlb {
     /// GLB path relative to the pruned root, with `/` separators.
     pub glb: String,
     /// Removed image URIs exactly as they appeared in the document.
     pub removed_uris: Vec<String>,
+    /// Original image URIs mapped to repaired URIs; all texture uses retain their indices.
+    pub repaired_uris: BTreeMap<String, String>,
 }
 
+/// Repairs scoped texture paths in the pipeline wrapper, then optionally prunes missing images.
+/// The bytes-level pruning helpers remain repair-free for legacy GLB replay during verified reuse.
 fn prune_dangling_uris_in_glb(
     root: &Path,
     glb_path: &Path,
     source_textures: &BTreeSet<String>,
+    repair_only: bool,
 ) -> Result<Option<PrunedGlb>> {
     let bytes =
         fs::read(glb_path).wrap_err_with(|| format!("failed to read {}", glb_path.display()))?;
-    let Some((pruned, removed_uris)) =
-        prune_glb_texture_bytes_with_sources(root, glb_path, &bytes, source_textures)?
-    else {
-        return Ok(None);
-    };
-    write_glb_atomic(glb_path, &pruned)?;
     let relative = glb_path
         .strip_prefix(root)
         .unwrap_or(glb_path)
         .to_string_lossy()
         .replace('\\', "/");
+    // The repair needs JSON inspection only for the two allowlisted models. Other meshes
+    // retain the bytes helper's single parse, including full-install directory scans.
+    let (repaired, repaired_uris) = if volcanic_grass_model(&relative) {
+        let mut document = glb_json_from_bytes(&bytes)
+            .wrap_err_with(|| format!("failed to inspect textures in {}", glb_path.display()))?;
+        let repairs = repair_volcanic_grass_normal(root, glb_path, &mut document, source_textures);
+        let repaired = if repairs.is_empty() {
+            bytes
+        } else {
+            rebuild_glb_with_document(&bytes, &document)
+                .wrap_err_with(|| format!("failed to rebuild {}", glb_path.display()))?
+        };
+        (repaired, repairs)
+    } else {
+        (bytes, BTreeMap::new())
+    };
+    // A repair-only pass preserves every image, texture use and sampler. In particular, it
+    // never remaps indices through prune_document_images when no references were removed.
+    let pruned = if repair_only {
+        None
+    } else {
+        prune_glb_texture_bytes_with_sources(root, glb_path, &repaired, source_textures)?
+    };
+    let (rewritten, removed_uris) = match pruned {
+        Some(pruned) => pruned,
+        None if !repaired_uris.is_empty() => (repaired, Vec::new()),
+        None => return Ok(None),
+    };
+    write_glb_atomic(glb_path, &rewritten)?;
     Ok(Some(PrunedGlb {
         glb: relative,
         removed_uris,
+        repaired_uris,
     }))
 }
 
@@ -371,6 +524,62 @@ fn prune_glb_texture_bytes_with_sources(
         pruned,
         missing.into_iter().map(|(_, uri)| uri).collect(),
     )))
+}
+
+/// Repairs normal images only when the authored source is absent and the target published.
+fn repair_volcanic_grass_normal(
+    root: &Path,
+    glb: &Path,
+    document: &mut serde_json::Value,
+    sources: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut repairs = BTreeMap::new();
+    let Ok(relative) = glb.strip_prefix(root) else {
+        return repairs;
+    };
+    let model = relative.to_string_lossy().replace('\\', "/");
+    if !volcanic_grass_model(&model)
+        || sources.contains(VOLCANIC_NORMAL_SOURCE)
+        || root.join(VOLCANIC_NORMAL).is_file()
+        || !root.join(VOLCANIC_NORMAL_TARGET).is_file()
+    {
+        return repairs;
+    }
+    let normal_images: HashSet<usize> = document["materials"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|material| material["normalTexture"]["index"].as_u64())
+        .filter_map(|index| usize::try_from(index).ok())
+        .filter_map(|index| document["textures"].get(index)?["source"].as_u64())
+        .filter_map(|index| usize::try_from(index).ok())
+        .collect();
+    if let Some(images) = document["images"].as_array_mut() {
+        for (index, image) in images.iter_mut().enumerate() {
+            let Some(uri) = image["uri"].as_str() else {
+                continue;
+            };
+            if !normal_images.contains(&index) || texture_uri_resolves(root, glb, uri) {
+                continue;
+            }
+            let Ok(resolved) = crate::asset_path::resolve_asset_uri(root, glb, uri) else {
+                continue;
+            };
+            let Ok(relative) = resolved.strip_prefix(root) else {
+                continue;
+            };
+            let key = relative.to_string_lossy().replace('\\', "/");
+            if let Some(replacement) = volcanic_normal_replacement(&model, &key, sources) {
+                let replacement = format!("../../../{replacement}");
+                repairs.insert(uri.to_owned(), replacement.clone());
+                image["uri"] = serde_json::Value::String(replacement);
+            }
+        }
+    }
+    if !repairs.is_empty() {
+        document["extras"]["mudcrab"]["texturePathRepairs"] = serde_json::json!(repairs);
+    }
+    repairs
 }
 
 fn texture_uri_resolves(root: &Path, glb_path: &Path, uri: &str) -> bool {
@@ -625,6 +834,25 @@ fn is_declared_geometry_block(block_type: &str) -> bool {
     )
 }
 
+/// Returns whether all declared geometry blocks are NiTriShape templates without geometry data.
+fn is_geometry_template(nif: &NifFile) -> bool {
+    let mut templates = 0;
+    for (index, block) in nif.blocks.iter().enumerate() {
+        if !nif
+            .header
+            .get_block_type(index)
+            .is_ok_and(is_declared_geometry_block)
+        {
+            continue;
+        }
+        match block {
+            NifBlock::NiTriShape(shape) if shape.data == u32::MAX => templates += 1,
+            _ => return false,
+        }
+    }
+    templates > 0
+}
+
 fn is_deferred_dynamic_mesh(path: &Path) -> bool {
     let normalized = path
         .to_string_lossy()
@@ -832,6 +1060,9 @@ fn apply_vertex_color_contract(
     Ok(())
 }
 
+/// Loads Skyrim NIF blocks within their declared sizes, recording parse failures as unhandled blocks.
+///
+/// Returns the parsed file, diagnostics, and validated material contract.
 fn open_nif_resilient(
     path: &Path,
 ) -> Result<(NifFile, NifParseDiagnostics, Vec<NifShapeMaterial>)> {
@@ -874,7 +1105,7 @@ fn open_nif_resilient(
             .entry(block_type.clone())
             .or_default() += 1;
         let parsed = catch_unwind(AssertUnwindSafe(|| {
-            NifBlock::parse(raw, block_type.clone())
+            NifBlock::parse_with_version(raw, block_type.clone(), header.bethesda_version)
         }));
         let block = match parsed {
             Ok(Ok((_, NifBlock::Unhandled))) => {
@@ -1035,6 +1266,9 @@ fn nif_scene_depth(blocks: &[NifBlock]) -> usize {
         .unwrap_or(0)
 }
 
+/// Parses a little-endian Skyrim NIF header for Bethesda versions 83 or 100.
+///
+/// Returns the remaining block bytes and header, rejecting unsupported versions and excessive counts.
 pub(crate) fn parse_skyrim_header<'a>(
     bytes: &'a [u8],
     path: &Path,
@@ -1054,6 +1288,11 @@ pub(crate) fn parse_skyrim_header<'a>(
         path.display()
     );
     let user_version = cursor.u32()?;
+    ensure!(
+        nif_version == 0x1402_0007 && user_version == 12,
+        "unsupported NIF version {nif_version:#010x}, user version {user_version} in {}",
+        path.display()
+    );
     let block_count = cursor.u32()?;
     ensure!(
         block_count <= 1_000_000,
@@ -1061,6 +1300,11 @@ pub(crate) fn parse_skyrim_header<'a>(
         path.display()
     );
     let bethesda_version = cursor.u32()?;
+    ensure!(
+        matches!(bethesda_version, 83 | 100),
+        "unsupported Bethesda NIF version {bethesda_version} in {}",
+        path.display()
+    );
     let author = cursor.sized_string8_optional()?;
     let process_script = cursor.sized_string8_optional()?;
     let export_script = cursor.sized_string8_optional()?;
@@ -1650,8 +1894,38 @@ fn texture_uri(document: &serde_json::Value, texture_index: usize) -> Option<&st
         .as_str()
 }
 
-fn find_skeleton(nif_path: &Path) -> Option<PathBuf> {
-    let parent = nif_path.parent()?;
+/// Resolves skeletons in a canonical, relative-path winning asset index.
+/// Repair callers must include archive assets and overlay winning loose files before resolving.
+pub fn resolve_skeleton(
+    relative: &Path,
+    sources: &std::collections::BTreeMap<PathBuf, PathBuf>,
+) -> Option<PathBuf> {
+    let relative = PathBuf::from(
+        relative
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase(),
+    );
+    for candidate in skeleton_candidates(&relative) {
+        if let Some(source) = sources.get(&candidate) {
+            return Some(source.clone());
+        }
+    }
+    let (root, actor) = actor_root(&relative)?;
+    let actor_dir = root.join(actor);
+    sources.iter().find_map(|(path, source)| {
+        let suffix = path.strip_prefix(&actor_dir).ok()?;
+        (suffix.components().count() <= 4
+            && path.file_name()?.to_string_lossy().starts_with("skeleton")
+            && path.extension()?.eq_ignore_ascii_case("nif"))
+        .then(|| source.clone())
+    })
+}
+
+fn skeleton_candidates(nif_path: &Path) -> Vec<PathBuf> {
+    let Some(parent) = nif_path.parent() else {
+        return Vec::new();
+    };
     let mut candidates = vec![
         parent.join("skeleton.nif"),
         parent.join("skeleton_female.nif"),
@@ -1671,6 +1945,14 @@ fn find_skeleton(nif_path: &Path) -> Option<PathBuf> {
                 .join("character assets female")
                 .join("skeleton_female.nif"),
         ]);
+    }
+    candidates
+}
+
+fn find_skeleton(nif_path: &Path) -> Option<PathBuf> {
+    let mut candidates = skeleton_candidates(nif_path);
+    if let Some((actors_root, actor_name)) = actor_root(nif_path) {
+        let actor_dir = actors_root.join(actor_name);
         if let Some(found) = WalkDir::new(&actor_dir)
             .max_depth(4)
             .follow_links(false)
@@ -1837,6 +2119,35 @@ mod tests {
         assert_eq!(check(Some(Vec::new())), 0);
     }
 
+    /// Verifies legacy skin partitions parse without an SSE vertex buffer and fail under the wrong layout.
+    #[test]
+    fn skin_partition_uses_legacy_layout_and_rejects_oversized_sse_buffer() {
+        // Counts from the KS Hairdos file that previously requested 56,716,014,720 bytes.
+        let mut bytes = 1u32.to_le_bytes().to_vec();
+        for count in [9938u16, 13522, 2, 0, 4] {
+            bytes.extend_from_slice(&count.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0; 4]); // two bones
+        bytes.extend_from_slice(&[0, 0, 1]); // no vertex map/weights; faces present
+        for _ in 0..13522 {
+            bytes.extend_from_slice(&[0, 0, 1, 0, 2, 0]);
+        }
+        bytes.extend_from_slice(&[0, 0, 0]); // no bone indices; partition flags
+        let (remaining, block) =
+            NifBlock::parse_with_version(&bytes, "NiSkinPartition".into(), 83).unwrap();
+        assert!(remaining.is_empty());
+        let NifBlock::NiSkinPartition(partition) = block else {
+            panic!("wrong block type")
+        };
+        assert_eq!(partition.triangles.len(), 13522);
+        assert!(partition.vertex_data.is_empty());
+        assert!(NifBlock::parse_with_version(&bytes, "NiSkinPartition".into(), 100).is_err());
+        let mut sse = vec![0; 8]; // zero partitions and zero vertex bytes
+        sse.extend_from_slice(&4u32.to_le_bytes());
+        sse.extend_from_slice(&1u64.to_le_bytes()); // four-byte vertex stride
+        assert!(NifBlock::parse_with_version(&sse, "NiSkinPartition".into(), 100).is_ok());
+    }
+
     #[test]
     fn rejects_invalid_nif_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
@@ -1881,6 +2192,21 @@ mod tests {
         let output = directory.path().join("static-fallback.glb");
         MeshConverter::convert_nif_to_glb(&path, &output).unwrap();
         MeshConverter::glb_bounds(&output).unwrap();
+    }
+
+    #[test]
+    fn merged_skeleton_uses_winner_not_physical_neighbor() {
+        let dir = tempfile::tempdir().unwrap();
+        let lower = dir.path().join("low/skeleton.nif");
+        let winner = dir.path().join("overwrite/skeleton.nif");
+        let relative = Path::new("meshes/actors/character/armor/body.nif");
+        let key = PathBuf::from("meshes/actors/character/character assets/skeleton.nif");
+        let mut sources = std::collections::BTreeMap::from([(key.clone(), lower.clone())]);
+        assert_eq!(resolve_skeleton(relative, &sources), Some(lower));
+        sources.insert(key.clone(), winner.clone());
+        assert_eq!(resolve_skeleton(relative, &sources), Some(winner));
+        sources.remove(&key);
+        assert_eq!(resolve_skeleton(relative, &sources), None);
     }
 
     #[test]
@@ -2108,6 +2434,148 @@ mod tests {
         let glb = root.join("meshes/a/model.glb");
         fs::write(&glb, glb_bytes(document, b"\x01\x02\x03\x04\x05")).unwrap();
         glb
+    }
+
+    /// Legacy byte replay never repairs; the pipeline's repair-only pass preserves unrelated images.
+    #[test]
+    fn volcanic_legacy_prune_replay_stays_repair_free_and_repair_only_preserves_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let glb = root.join("meshes/landscape/grass/dlc02volcanicashgrass01.glb");
+        fs::create_dir_all(glb.parent().unwrap()).unwrap();
+        let target = root.join(VOLCANIC_NORMAL_TARGET);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, b"published target").unwrap();
+        let original = "../../../textures/landscape/grass/volcanicashgrass02_n.ktx2";
+        let missing = "../../../textures/unrelated-missing.ktx2";
+        let document = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "images": [{"uri": original}, {"uri": missing}],
+            "textures": [{"source": 0, "sampler": 1}, {"source": 1, "sampler": 0}],
+            "samplers": [{"wrapS": 33071}, {"wrapS": 10497}],
+            "materials": [{
+                "normalTexture": {"index": 0},
+                "emissiveTexture": {"index": 1},
+                "extensions": {"KHR_materials_specular": {"specularTexture": {"index": 0}}}
+            }]
+        });
+        let bytes = glb_bytes(&document, b"geometry survives both paths");
+        let (legacy, removed) = prune_glb_texture_bytes(root, &glb, &bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed, [original, missing]);
+        let legacy_document = glb_json_from_bytes(&legacy).unwrap();
+        assert!(legacy_document["images"].as_array().unwrap().is_empty());
+        assert!(legacy_document.get("extras").is_none());
+
+        fs::write(&glb, &bytes).unwrap();
+        let reports = MeshConverter::repair_volcanic_grass_normals(root, &BTreeSet::new()).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].removed_uris.is_empty());
+        let replacement = "../../../textures/dlc02/landscape/grass/volcanicashgrass02_n.ktx2";
+        assert_eq!(reports[0].repaired_uris.get(original).unwrap(), replacement);
+        let repaired = glb_json_from_bytes(&fs::read(&glb).unwrap()).unwrap();
+        assert_eq!(repaired["images"][0]["uri"], replacement);
+        assert_eq!(repaired["images"][1]["uri"], missing);
+        assert_eq!(repaired["textures"], document["textures"]);
+        assert_eq!(repaired["materials"], document["materials"]);
+        assert_eq!(repaired["samplers"], document["samplers"]);
+        assert_eq!(
+            repaired["extras"]["mudcrab"]["texturePathRepairs"][original],
+            replacement
+        );
+    }
+
+    /// The shipped two-model repair preserves all uses and does not affect other assets.
+    #[test]
+    fn volcanic_normal_repair_is_scoped_preserves_overrides_and_all_texture_uses() {
+        for model in [
+            "dlc02volcanicashgrass01",
+            "dlc02volcanicashgrass02",
+            "control",
+        ] {
+            for suffix in ["", ".opensky-wrap0", ".opensky-wrap1", ".opensky-wrap2"] {
+                for (original, target, original_source) in [
+                    (false, true, false),
+                    (true, true, true),
+                    (false, false, false),
+                    (false, true, true),
+                ] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let root = temp.path();
+                    let glb = root.join(format!("meshes/landscape/grass/{model}.glb"));
+                    fs::create_dir_all(glb.parent().unwrap()).unwrap();
+                    for (present, path) in [
+                        (
+                            original,
+                            "textures/landscape/grass/volcanicashgrass02_n.ktx2",
+                        ),
+                        (
+                            target,
+                            "textures/dlc02/landscape/grass/volcanicashgrass02_n.ktx2",
+                        ),
+                    ] {
+                        if present {
+                            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+                            fs::write(root.join(path), b"texture").unwrap();
+                            fs::write(
+                                root.join(path.replace(".ktx2", &format!("{suffix}.ktx2"))),
+                                b"texture",
+                            )
+                            .unwrap();
+                        }
+                    }
+                    let document = serde_json::json!({"asset":{"version":"2.0"},
+                    "images":[{"uri":format!("../../../textures/landscape/grass/volcanicashgrass02_n{suffix}.ktx2")}],
+                    "textures":[{"source":0,"sampler":0},{"source":0,"sampler":1}], "samplers":[{"wrapS":10497,"wrapT":10497},{"wrapS":33071,"wrapT":33648}],
+                    "materials":[{"normalTexture":{"index":1},"extensions":{"KHR_materials_specular":{"specularTexture":{"index":1}}}}]});
+                    let before = glb_bytes(&document, b"distinct geometry bytes");
+                    fs::write(&glb, &before).unwrap();
+                    let sources = if original_source {
+                        BTreeSet::from([
+                            "textures/landscape/grass/volcanicashgrass02_n.dds".to_owned()
+                        ])
+                    } else {
+                        BTreeSet::new()
+                    };
+                    MeshConverter::prune_dangling_texture_uris_with_sources(root, &sources)
+                        .unwrap();
+                    let after = fs::read(&glb).unwrap();
+                    let actual = glb_json_from_bytes(&after).unwrap();
+                    let repaired = model != "control" && !original && !original_source && target;
+                    if original || original_source || repaired {
+                        assert_eq!(
+                            actual["images"][0]["uri"],
+                            if repaired {
+                                format!(
+                                    "../../../textures/dlc02/landscape/grass/volcanicashgrass02_n{suffix}.ktx2"
+                                )
+                            } else {
+                                format!(
+                                    "../../../textures/landscape/grass/volcanicashgrass02_n{suffix}.ktx2"
+                                )
+                            }
+                        );
+                        assert_eq!(actual["textures"], document["textures"]);
+                        assert_eq!(actual["materials"], document["materials"]);
+                        assert_eq!(actual["samplers"], document["samplers"]);
+                    } else {
+                        assert!(actual["images"].as_array().unwrap().is_empty());
+                        assert!(actual["materials"][0].get("normalTexture").is_none());
+                    }
+                    let before_len =
+                        u32::from_le_bytes(before[12..16].try_into().unwrap()) as usize;
+                    let after_len = u32::from_le_bytes(after[12..16].try_into().unwrap()) as usize;
+                    assert_eq!(&before[20 + before_len..], &after[20 + after_len..]);
+                    assert!(
+                        MeshConverter::prune_dangling_texture_uris_with_sources(root, &sources)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert_eq!(fs::read(&glb).unwrap(), after);
+                }
+            }
+        }
     }
 
     #[test]
