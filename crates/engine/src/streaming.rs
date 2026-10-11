@@ -6,6 +6,7 @@ use crate::{
         PLACED_OBJECT_RENDER_LAYERS, QUADRANT_WEIGHT_SAMPLES, TerrainExtension, TerrainMaterial,
         WATER_LAYER, WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
+    swap_bridge::{SwapSurface, SwapWaiting},
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
@@ -1061,6 +1062,18 @@ fn spawn_cell(
                     },
                     extension,
                 });
+                // The quadrant declares what its draw needs, for the render→main swap bridge
+                // (`crate::swap_bridge`): the material it draws with and every image that material
+                // binds. The images are the ones the readiness pass validates below, and the
+                // declaration is re-made there if a normal map has to be dropped.
+                let surface = SwapSurface::new(
+                    material.id().untyped(),
+                    images
+                        .color
+                        .iter()
+                        .chain(images.normal.iter())
+                        .map(|handle| handle.id()),
+                );
                 let mut patch = parent.spawn((
                     Name::new(format!("Terrain quadrant {quadrant}")),
                     Mesh3d(meshes.add(mesh)),
@@ -1074,6 +1087,11 @@ fn spawn_cell(
                         images: images.color,
                         normals: images.normal,
                     },
+                    // Waiting for the render world from birth: the bridge removes the marker once
+                    // the render world has drawn the quadrant. Nothing in this change reads the
+                    // marker; the quadrant is still revealed by `track_surface_readiness`.
+                    SwapWaiting,
+                    surface,
                 ));
                 if let Some(grid) = terrain_grid {
                     patch.insert(TerrainCoverage {
@@ -2100,6 +2118,16 @@ fn track_surface_readiness(
                         {
                             material.extension.drop_normal_maps();
                         }
+                        // The swap bridge waits on the images the material binds, so the failed
+                        // normal maps leave the quadrant's declaration with them: an image that
+                        // will never reach the render world is one the surface could never stop
+                        // waiting for, and a later change could fail a settle loudly.
+                        let bound: Vec<_> =
+                            pending.images.iter().map(|handle| handle.id()).collect();
+                        commands
+                            .entity(entity)
+                            .entry::<SwapSurface>()
+                            .and_modify(move |mut surface| surface.set_images(bound));
                         profiler.increment("terrain/normal_map_fallbacks", 1);
                         normals_dropped = true;
                         SurfaceDependencyState::Ready

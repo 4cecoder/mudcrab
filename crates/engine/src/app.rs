@@ -210,6 +210,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             ConsolePlugin,
             crate::nif_material::NifMaterialPlugin,
         ))
+        // The render→main "prepared and drawable" bridge. Registered for every
+        // run: it is what publishes the render world's own answer to "is this surface drawn?" into
+        // the main world, and it changes nothing else about the frame.
+        .add_plugins(crate::swap_bridge::SwapBridgePlugin)
         // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
         // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
         .add_plugins(crate::lights::LightsPlugin);
