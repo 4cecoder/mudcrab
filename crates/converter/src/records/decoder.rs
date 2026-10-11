@@ -3513,9 +3513,17 @@ mod tests {
         copied
     }
 
+    /// Create the real empty history snapshot required by diagnostic publication.
+    fn replay_probe_database() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let order = LoadOrder::from_metadata(Vec::new(), Vec::new()).unwrap();
+        super::super::history::write_tables(&conn, &[], &order, &[]).unwrap();
+        conn
+    }
+
     /// Compare all published diagnostic identity, provenance, action and text columns.
     fn replay_probe_events(source: &PluginDiagnostics) -> Vec<Vec<rusqlite::types::Value>> {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = replay_probe_database();
         super::super::diagnostics::write_tables(&conn, [(0, &source.event_log)]).unwrap();
         let mut query = conn
             .prepare("SELECT * FROM record_diagnostics ORDER BY diagnostic_id")
@@ -3683,7 +3691,7 @@ mod tests {
             );
             if !bad_alternative {
                 assert_eq!(actual_diagnostics.invalid_links, 3);
-                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                let conn = replay_probe_database();
                 super::super::diagnostics::write_tables(
                     &conn,
                     [(0, &actual_diagnostics.event_log)],
@@ -4262,9 +4270,9 @@ mod tests {
             [0x71, 0xA5, 0xFF, 0, 0x91]
         );
         assert!(selected.fields[3].opaque);
-        let diagnostics = &result.diagnostics["Owner.esm"];
+        let diagnostics = &result.diagnostics[&order.names[selected.load_order as usize]];
         assert_eq!(diagnostics.invalid_links, 4);
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = replay_probe_database();
         super::super::diagnostics::write_tables(&conn, [(0, &diagnostics.event_log)]).unwrap();
         let paths = conn
             .prepare("SELECT field FROM record_diagnostics ORDER BY field")
@@ -4415,7 +4423,7 @@ mod tests {
             result.records[&0x0100_1881].fields[1].value,
             Value::Unsigned(0x2468_1379)
         );
-        let diagnostics = &result.diagnostics["Owner.esm"];
+        let diagnostics = &result.diagnostics[&order.names[record.load_order as usize]];
         assert_eq!(
             (
                 diagnostics.skipped_records,
@@ -4428,7 +4436,7 @@ mod tests {
         );
         assert!(diagnostics.first_by_category["field"].contains("expected 4 bytes, got 1"));
         assert!(diagnostics.first_by_category["link"].contains("02001888"));
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let conn = replay_probe_database();
         super::super::diagnostics::write_tables(&conn, [(1, &diagnostics.event_log)]).unwrap();
         let events: Vec<(String, i64, Option<u32>, String)> = conn.prepare("SELECT field,occurrence,link_value,category FROM record_diagnostics WHERE source_form_id=6272 ORDER BY field").unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap().map(Result::unwrap).collect();
         assert_eq!(
@@ -4528,7 +4536,7 @@ mod tests {
         );
         assert_eq!(diagnostics.first_example, oracle.first_example);
         assert_eq!(diagnostics.first_by_category, oracle.first_by_category);
-        let oracle_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let oracle_conn = replay_probe_database();
         super::super::diagnostics::write_tables(&oracle_conn, [(1, &oracle.event_log)]).unwrap();
         // IDs are PK-ordered by the private event key; comparing every published
         // column also checks path, ordinal, original link, reason and provenance.
