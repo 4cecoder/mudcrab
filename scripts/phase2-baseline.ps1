@@ -340,6 +340,30 @@ function Get-FrameMetric($Report, [string]$Metric) {
     return $null
 }
 
+# The engine's own acceptance verdict on the repeats of one window. A baseline run measures through a
+# failed gate — the engine exits non-zero over one, and the report it wrote is still a measurement — so
+# the gate that failed is recorded beside the numbers instead of being lost or hidden. `runs_failed_gates`
+# counts the repeats whose report says `passed: false`, `runs` is every repeat of the window, and
+# `failed_gates` is the sorted union of the names in those reports' `thresholds` whose value is the
+# boolean `false`: the numeric thresholds beside them are neutralised in a baseline run, so a `false`
+# boolean is a real gate. A report that does not carry `passed` is not counted as a failed one.
+function Get-Acceptance($Reports) {
+    $failedRuns = 0
+    $failedGates = @()
+    foreach ($report in $Reports) {
+        if ($report.passed -eq $false) { $failedRuns++ }
+        if ($null -eq $report.thresholds) { continue }
+        foreach ($name in @($report.thresholds.Keys)) {
+            if ($report.thresholds[$name] -is [bool] -and -not $report.thresholds[$name]) { $failedGates += $name }
+        }
+    }
+    return [ordered]@{
+        runs_failed_gates = $failedRuns
+        runs = $Reports.Count
+        failed_gates = @($failedGates | Sort-Object -Unique)
+    }
+}
+
 # One window of one scenario: what every repeat measured, reduced to medians and spreads, plus the
 # provenance that says what the window actually was — the run's fingerprint and the scenario inputs
 # it was started with — so it can be set against another run's window. The maps are per pass, per
@@ -350,6 +374,7 @@ function Get-WindowReport($Reports, [string]$Kind, $Inputs) {
     $window = [ordered]@{
         window = $Kind
         runs = $Reports.Count
+        acceptance = Get-Acceptance $Reports
         scenario_inputs = $Inputs
         fingerprint = $first.fingerprint
     }
@@ -543,6 +568,18 @@ function Get-MarkdownTable($Name, $Window, [string]$Kind) {
         $lines += @(
             "",
             "Passes with fewer samples than the $($lagging.frames) frames the window measured: $($lagging.passes -join ', ') - fewer samples than frames (GPU readback lag or a pass that did not run every frame)"
+        )
+    }
+    # Under the window's table, the gates the engine's own verdict failed it on: the numbers above are
+    # the measurements of runs that failed a gate, so a reader has to see which gate and how many runs.
+    $acceptance = $Window.acceptance
+    if ($acceptance -and $acceptance.runs_failed_gates -gt 0) {
+        # A failed run with no boolean threshold recorded is possible in principle (a numeric threshold
+        # that is not neutralised); naming nothing is clearer than an empty list of names.
+        $names = if (@($acceptance.failed_gates).Count -gt 0) { @($acceptance.failed_gates) -join ', ' } else { "no named threshold failed" }
+        $lines += @(
+            "",
+            "Acceptance gates failed in $($acceptance.runs_failed_gates) of $($acceptance.runs) runs: $names. The numbers above are still measurements of those runs."
         )
     }
     # A short resource table: byte figures in MiB, GPU counters as counts with their unit in the row
@@ -796,8 +833,11 @@ foreach ($name in $requested) {
                 -DenseLegacyGridX $DenseLegacyGridX -DenseLegacyGridY $DenseLegacyGridY `
                 -WaterGridX $WaterGridX -WaterGridY $WaterGridY
             if ($null -eq $windowArguments) { $windowArguments = $arguments }
+            # A baseline measures a window; it is not the acceptance campaign, so a window the engine
+            # ended on a failed gate is kept with its gate recorded (`acceptance`, below) rather than
+            # thrown away. Every check that says the report is this repeat's still applies.
             $report = Invoke-EngineWindow -Engine $engine -Arguments $arguments -RunDirectory $runDirectory `
-                -Label "Baseline run $name/$kind/run-$run" -AsHashtable
+                -Label "Baseline run $name/$kind/run-$run" -AsHashtable -AllowGateFailure
             if ($null -eq $report.fingerprint) {
                 throw "$reportLabel recorded no run fingerprint in $runDirectory, so the window cannot be shown to be comparable with the others"
             }

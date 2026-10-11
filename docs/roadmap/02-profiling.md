@@ -400,7 +400,13 @@ cannot drift apart).
   map takes the union of its keys across the repeats and each entry keeps `samples`, the number of
   repeats that measured it, so a pass or span only one repeat recorded is still visible. A window a
   scenario does not have is `null` with the reason in the scenario's `streaming_unavailable`.
-  Nothing is zero-filled here either: a counter the report left `null` stays `null`.
+  Nothing is zero-filled here either: a counter the report left `null` stays `null`. When the engine
+  ends a repeat on a failed acceptance gate the window records `acceptance`: `runs_failed_gates` (the
+  repeats whose report says `passed: false`), `runs` (the repeat count) and `failed_gates` (the sorted
+  union of the `thresholds` names whose value is the boolean `false`); a baseline run measures through
+  an engine gate rather than failing on it, because the report a gated run wrote is still a
+  measurement, and only a report that cannot be shown to be this repeat's (missing, stale, malformed,
+  zero frames, another run's) throws.
 - **`baseline.md`.** One short table per scenario window, whose "median (min-max over N runs)"
   cells are exactly what `baseline.json` holds; a short memory table (CPU asset bytes in MiB, the
   GPU counters as counts with their unit); the slowest GPU passes and CPU spans; and every
@@ -409,7 +415,10 @@ cannot drift apart).
   are printed beside those tables — "Measured frames" for the GPU passes, the pipeline statistics
   and the GPU counters — and every pass whose sample count is below its window's measured frames is
   listed under the table as "fewer samples than frames (GPU readback lag or a pass that did not run
-  every frame)".
+  every frame)". Under the table of a window whose `acceptance.runs_failed_gates` is above zero, one
+  line names the gates and the runs: "Acceptance gates failed in N of M runs: <names>. The numbers
+  above are still measurements of those runs." — the numbers stand, they are just read with the
+  failed gate in view.
 - **Comparing baselines.** With `-CompareTo <baseline.json>` (or, without it, an existing
   `baseline.json` in `-Out`; a `-CompareTo` path that does not exist is refused rather than
   ignored), the new numbers are set against the old ones using the profiling campaign's noise

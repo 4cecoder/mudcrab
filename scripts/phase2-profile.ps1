@@ -256,13 +256,19 @@ function Get-RegressionComparison {
 # also writes as `acceptance.json`). Throws when the engine exits non-zero, and when the report it
 # reads back cannot be shown to have been written by this invocation: a successful exit with a stale
 # or absent report would otherwise count an old run (or nothing) as a fresh repeat.
+#
+# `-AllowGateFailure` keeps every one of those report checks but not the exit code as a failure of its
+# own: the engine exits non-zero when a window's acceptance gates fail, and that window did measure.
+# The report is returned only when its own `passed` agrees the run failed; a report that says the run
+# passed means the engine failed for some other reason, which no campaign may count as a repeat.
 function Invoke-EngineWindow {
     param(
         [Parameter(Mandatory)][string]$Engine,
         [Parameter(Mandatory)][string[]]$Arguments,
         [Parameter(Mandatory)][string]$RunDirectory,
         [Parameter(Mandatory)][string]$Label,
-        [switch]$AsHashtable
+        [switch]$AsHashtable,
+        [switch]$AllowGateFailure
     )
     New-Item -ItemType Directory -Force -Path $RunDirectory | Out-Null
     $reportPath = Join-Path $RunDirectory "frame-metrics.json"
@@ -286,9 +292,12 @@ function Invoke-EngineWindow {
         Pop-Location
         $ErrorActionPreference = $previous
     }
-    if ($exitCode -ne 0) { throw "$Label failed with exit code $exitCode" }
+    if ($exitCode -ne 0 -and -not $AllowGateFailure) { throw "$Label failed with exit code $exitCode" }
+    # How the report checks below name the exit they found no report behind. The engine's exit code is
+    # read rather than assumed: with -AllowGateFailure a repeat can reach them after exiting non-zero.
+    $exitNote = if ($exitCode -eq 0) { "exited 0" } else { "exited $exitCode" }
     if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
-        throw "$Label exited 0 but wrote no report in $RunDirectory`: the repeat measured nothing"
+        throw "$Label $exitNote but wrote no report in $RunDirectory`: the repeat measured nothing"
     }
     $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json -AsHashtable
     if ($report.format_version -ne $script:benchmarkReportFormatVersion) {
@@ -309,7 +318,13 @@ function Invoke-EngineWindow {
             throw "$Label read a bundle in $RunDirectory belonging to scenario '$($metadata.scenario)', not '$expectedScenario'"
         }
     } elseif ($expectedRunId) {
-        throw "$Label exited 0 but wrote no profiling bundle in $RunDirectory (no metadata.json), so the repeat cannot be identified"
+        throw "$Label $exitNote but wrote no profiling bundle in $RunDirectory (no metadata.json), so the repeat cannot be identified"
+    }
+    # Reached with a non-zero exit only under -AllowGateFailure, and the report is about to stand for
+    # that exit: it must be the gate failure the engine exited over. A missing `passed` is not a false
+    # one, and neither is `true` — both mean the engine failed for another reason.
+    if ($exitCode -ne 0 -and $report.passed -ne $false) {
+        throw "$Label exited $exitCode but its report says the run passed: the engine failed for another reason"
     }
     if ($AsHashtable) { return $report }
     return (Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json)
