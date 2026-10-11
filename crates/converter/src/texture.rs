@@ -548,6 +548,9 @@ fn write_native_ktx2(
     let mip_count = levels.len();
     let (dfd, type_size) = ktx2::dfd::Basic::from_format(format)
         .map_err(|error| color_eyre::eyre::eyre!("no KTX2 descriptor for {format:?}: {error:?}"))?;
+    // The file's own texel block size, bytesPlane[0] of the descriptor written
+    // below: the value the level-data alignment rule keys off.
+    let texel_block_bytes = u64::from(dfd.bytes_planes[0]);
     let dfd_bytes = ktx2::dfd::Block::Basic(dfd).to_vec();
     let level_count = u32::try_from(mip_count).wrap_err("too many DDS mip levels")?;
     let header = ktx2::Header {
@@ -584,7 +587,11 @@ fn write_native_ktx2(
         let compressed = compress_level(level_data, zstd_level)?;
         stored.push((compressed, level_data.len() as u64));
     }
-    let indexes = append_ktx2_levels_spec_order(&mut output, &stored);
+    let indexes = append_ktx2_levels_spec_order(
+        &mut output,
+        &stored,
+        ktx2_level_data_alignment(texel_block_bytes, zstd_level > 0),
+    );
 
     let mut header = header;
     if zstd_level > 0 {
@@ -609,27 +616,88 @@ fn compress_level(level: &[u8], zstd_level: i32) -> Result<Vec<u8>> {
     zstd::stream::encode_all(level, zstd_level).wrap_err("Zstandard supercompression failed")
 }
 
+/// Least common multiple of two byte counts, for the KTX 2.0 level-data
+/// alignment rule.
+fn lcm(a: u64, b: u64) -> u64 {
+    let (mut x, mut y) = (a, b);
+    while y != 0 {
+        let remainder = x % y;
+        x = y;
+        y = remainder;
+    }
+    a / x * b
+}
+
+/// The alignment KTX 2.0 gives a level's `byteOffset` (sections 3.9.7 and
+/// 3.10): `lcm(texel block byte size, 4)` for uncompressed data, and no
+/// constraint at all (1) for supercompressed data, whose level data is
+/// stored contiguously.
+pub(crate) fn ktx2_level_data_alignment(texel_block_bytes: u64, supercompressed: bool) -> u64 {
+    if supercompressed {
+        return 1;
+    }
+    lcm(texel_block_bytes.max(1), 4)
+}
+
+/// Rounds a byte count up to the next multiple of `alignment`, which the
+/// KTX 2.0 level layout requires to be non-zero.
+pub(crate) fn ktx2_align_up(value: u64, alignment: u64) -> u64 {
+    value.div_ceil(alignment) * alignment
+}
+
+/// Byte size of the texel block a finished KTX2 file declares: `bytesPlane[0]`
+/// of its basic data format descriptor, the field the section 3.9.7
+/// alignment rule keys off. One byte when the file has no basic block: an
+/// uncompressed texel there is a single byte.
+pub(crate) fn ktx2_texel_block_bytes<Data: AsRef<[u8]>>(reader: &ktx2::Reader<Data>) -> u64 {
+    reader
+        .basic_dfd()
+        .map_or(1, |dfd| u64::from(dfd.bytes_planes[0]))
+}
+
+/// The exact level-data alignment of a finished KTX2 file, read from its own
+/// header supercompression scheme and descriptor.
+pub(crate) fn ktx2_level_alignment<Data: AsRef<[u8]>>(reader: &ktx2::Reader<Data>) -> u64 {
+    ktx2_level_data_alignment(
+        ktx2_texel_block_bytes(reader),
+        reader.header().supercompression_scheme.is_some(),
+    )
+}
+
+/// End of a KTX2 file's metadata: the level index table, the data format
+/// descriptor, and the key/value and supercompression global data. Level
+/// data starts here, rounded up by the level-data alignment.
+pub(crate) fn ktx2_metadata_end(header: &ktx2::Header) -> u64 {
+    let index = &header.index;
+    let level_table_end = ktx2::Header::LENGTH as u64
+        + u64::from(header.level_count.max(1)) * ktx2::LevelIndex::LENGTH as u64;
+    let dfd_end = u64::from(index.dfd_byte_offset) + u64::from(index.dfd_byte_length);
+    let kvd_end = u64::from(index.kvd_byte_offset) + u64::from(index.kvd_byte_length);
+    let sgd_end = index.sgd_byte_offset + index.sgd_byte_length;
+    level_table_end.max(dfd_end).max(kvd_end).max(sgd_end)
+}
+
 /// Lays out finished level payloads in the order the KTX 2.0 spec requires
 /// for mip level data: the smallest level first, the base level last
 /// (section 3.7). `stored` holds each level's stored bytes and uncompressed
 /// byte length in index order (base level first, section 3.9.7); the
 /// returned index entries stay in index order, with offsets pointing at
-/// the payloads where they now sit. The 16-byte padding between levels
-/// keeps every offset a multiple of 16, which satisfies the alignment rule
-/// of sections 3.9.7 and 3.10 — lcm(texel block size, 4) for uncompressed
-/// data, no alignment for supercompressed data — for every format we write
-/// (texel blocks of 1, 4, 8 and 16 bytes).
+/// the payloads where they now sit. Levels are packed at the exact
+/// alignment `alignment` bytes gives them: every level starts where the
+/// previous level, in file order, ends rounded up to it, and the first
+/// level starts at the end of the metadata rounded up the same way — the
+/// layout section 3.9.7 and the KTX-Software validator expect, with no
+/// slack beyond that.
 fn append_ktx2_levels_spec_order(
     output: &mut Vec<u8>,
     stored: &[(Vec<u8>, u64)],
+    alignment: u64,
 ) -> Vec<ktx2::LevelIndex> {
     let mut indexes = Vec::with_capacity(stored.len());
     // Reversed: the smallest level, the last index entry, is written first.
     for (bytes, uncompressed) in stored.iter().rev() {
-        while !output.len().is_multiple_of(16) {
-            output.push(0);
-        }
-        let byte_offset = output.len() as u64;
+        let byte_offset = ktx2_align_up(output.len() as u64, alignment);
+        output.resize(byte_offset as usize, 0);
         output.extend_from_slice(bytes);
         indexes.push(ktx2::LevelIndex {
             byte_offset,
@@ -660,18 +728,25 @@ pub(crate) fn supercompress_ktx2_levels(ktx2: &[u8], zstd_level: i32) -> Result<
         header.supercompression_scheme.is_none(),
         "KTX2 is already supercompressed"
     );
-    let first_data_offset = reader
-        .levels()
-        .map(|level| level.data.as_ptr() as usize - ktx2.as_ptr() as usize)
-        .min()
-        .unwrap_or(ktx2.len());
-    let mut output = ktx2[..first_data_offset].to_vec();
+    // The output is supercompressed, so its level data is contiguous: keep the
+    // metadata only, dropping the alignment padding the uncompressed input
+    // left between it and its first level.
+    let metadata_end = ktx2_metadata_end(&header) as usize;
+    ensure!(
+        metadata_end <= ktx2.len(),
+        "KTX2 metadata ends past the end of the file"
+    );
+    let mut output = ktx2[..metadata_end].to_vec();
     let mut stored = Vec::with_capacity(reader.levels().len());
     for level in reader.levels() {
         let compressed = compress_level(level.data, zstd_level)?;
         stored.push((compressed, level.data.len() as u64));
     }
-    let indexes = append_ktx2_levels_spec_order(&mut output, &stored);
+    let indexes = append_ktx2_levels_spec_order(
+        &mut output,
+        &stored,
+        ktx2_level_data_alignment(ktx2_texel_block_bytes(&reader), true),
+    );
     header.supercompression_scheme = Some(ktx2::SupercompressionScheme::Zstandard);
     output[..ktx2::Header::LENGTH].copy_from_slice(&header.as_bytes());
     for (level, index) in indexes.iter().enumerate() {
@@ -863,7 +938,8 @@ fn combine_ktx2_mip_levels(template: &[u8], levels: &[Vec<u8>]) -> Result<Vec<u8
             .ok_or_else(|| color_eyre::eyre::eyre!("encoded DDS mip {mip} has no data"))?;
         stored.push((encoded.data.to_vec(), encoded.uncompressed_byte_length));
     }
-    let indexes = append_ktx2_levels_spec_order(&mut output, &stored);
+    let indexes =
+        append_ktx2_levels_spec_order(&mut output, &stored, ktx2_level_alignment(&template_reader));
     for (level, index) in indexes.iter().enumerate() {
         let start = ktx2::Header::LENGTH + level * ktx2::LevelIndex::LENGTH;
         output[start..start + ktx2::LevelIndex::LENGTH].copy_from_slice(&index.as_bytes());
@@ -1185,7 +1261,8 @@ fn combine_ktx2_volume(
         }
         stored.push((payload, uncompressed_length));
     }
-    let indexes = append_ktx2_levels_spec_order(&mut output, &stored);
+    let indexes =
+        append_ktx2_levels_spec_order(&mut output, &stored, ktx2_level_alignment(&template_reader));
     for (level, index) in indexes.iter().enumerate() {
         let start = ktx2::Header::LENGTH + level * ktx2::LevelIndex::LENGTH;
         output[start..start + ktx2::LevelIndex::LENGTH].copy_from_slice(&index.as_bytes());
@@ -1271,7 +1348,8 @@ fn combine_ktx2_cubemap_faces(faces: &[Vec<u8>]) -> Result<Vec<u8>> {
             .collect::<Vec<u8>>();
         stored.push((payload, face_uncompressed.saturating_mul(6)));
     }
-    let indexes = append_ktx2_levels_spec_order(&mut output, &stored);
+    let indexes =
+        append_ktx2_levels_spec_order(&mut output, &stored, ktx2_level_alignment(&readers[0]));
     for (level, index) in indexes.iter().enumerate() {
         let start = ktx2::Header::LENGTH + level * ktx2::LevelIndex::LENGTH;
         output[start..start + ktx2::LevelIndex::LENGTH].copy_from_slice(&index.as_bytes());
@@ -2370,8 +2448,8 @@ mod tests {
     }
 
     /// Without supercompression the native writer must still store the
-    /// levels smallest-first, with every offset a multiple of
-    /// lcm(texel block size, 4): 16 for BC3 blocks.
+    /// levels smallest-first, packed at exactly lcm(texel block size, 4):
+    /// 16 bytes for BC3 blocks, with no slack beyond the alignment.
     #[test]
     fn uncompressed_native_mips_store_level_data_smallest_first() {
         let mut dds = Dds::new_dxgi(NewDxgiParams {
@@ -2408,6 +2486,63 @@ mod tests {
             offset += level.data.len();
         }
         assert_eq!(offset, dds.data.len(), "trailing DDS bytes");
+    }
+
+    /// An 8-byte-block format is packed at exactly the lcm(8, 4) = 8
+    /// alignment section 3.10 gives it, not at a wider one: this file's
+    /// metadata ends where 8- and 16-byte alignment disagree, so 16-byte
+    /// padding would put every offset elsewhere and this test would fail.
+    #[test]
+    fn uncompressed_native_bc1_mips_pack_at_the_exact_eight_byte_alignment() {
+        let mut dds = Dds::new_dxgi(NewDxgiParams {
+            height: 8,
+            width: 8,
+            depth: None,
+            format: DxgiFormat::BC1_UNorm,
+            mipmap_levels: Some(3),
+            array_layers: None,
+            caps2: None,
+            is_cubemap: false,
+            resource_dimension: D3D10ResourceDimension::Texture2D,
+            alpha_mode: AlphaMode::Straight,
+        })
+        .unwrap();
+        for (index, byte) in dds.data.iter_mut().enumerate() {
+            *byte = (index * 7 + 3) as u8;
+        }
+        let mut bytes = Vec::new();
+        dds.write(&mut bytes).unwrap();
+
+        let ktx =
+            TextureConverter::convert_uncompressed(&bytes, TextureEncoding::DataLinear).unwrap();
+        let reader = ktx2::Reader::new(&ktx).unwrap();
+        let header = reader.header();
+        assert_eq!(header.supercompression_scheme, None);
+        assert_eq!(reader.levels().len(), 3);
+        assert_eq!(ktx2_texel_block_bytes(&reader), 8, "BC1 texel blocks");
+
+        let metadata_end = ktx2_metadata_end(&header);
+        assert!(
+            metadata_end % 16 != 0 && metadata_end % 16 != 8,
+            "the metadata ends at {metadata_end} bytes, which rounds up to the same \
+             offset at 8- and 16-byte alignment: this test could not tell the two apart"
+        );
+        assert_ktx2_spec_level_order(&ktx);
+
+        // File order: the 2x2, 4x4 and 8x8 levels hold one, one and four BC1
+        // blocks, so 8, 8 and 32 bytes at the exact 8-byte alignment.
+        let mut offsets: Vec<u64> = reader
+            .levels()
+            .map(|level| (level.data.as_ptr() as usize - ktx.as_ptr() as usize) as u64)
+            .collect();
+        offsets.reverse();
+        let first = ktx2_align_up(metadata_end, 8);
+        assert_eq!(offsets, [first, first + 8, first + 16]);
+        assert_eq!(
+            ktx.len() as u64,
+            first + 16 + 32,
+            "the base level must end the file"
+        );
     }
 
     /// BC5 has no sRGB VkFormat, so a colour slot still takes the UASTC
@@ -3815,26 +3950,16 @@ mod tests {
         assert_eq!(metadata.faces, 1);
     }
 
-    /// Least common multiple, for the KTX 2.0 level-offset alignment rule
-    /// (section 3.9.7 / 3.10: lcm(texel block size, 4) for uncompressed
-    /// data).
-    fn lcm(a: u64, b: u64) -> u64 {
-        let (mut x, mut y) = (a, b);
-        while y != 0 {
-            let remainder = x % y;
-            x = y;
-            y = remainder;
-        }
-        a / x * b
-    }
-
     /// Asserts the mip level layout every KTX2 writer must produce: level
     /// data smallest-first as KTX 2.0 section 3.7 requires, with the level
     /// index largest-first (section 3.9.7), so level 0 has the largest
-    /// offset and offsets strictly decrease as the level number rises;
-    /// levels never overlap; every offset meets the section 3.10 alignment
-    /// rule (lcm(texel block size, 4) for uncompressed data, no constraint
-    /// for supercompressed); and the last level ends inside the file.
+    /// offset and offsets strictly decrease as the level number rises, and
+    /// levels packed at exactly the section 3.10 alignment the file's own
+    /// format gives them (`ktx2_level_alignment`: lcm(texel block size, 4)
+    /// for uncompressed data, no constraint for supercompressed): each level
+    /// starts where the previous one, in file order, ends rounded up to that
+    /// alignment, the first starts at the end of the metadata rounded up the
+    /// same way, and the base level ends the file.
     fn assert_ktx2_spec_level_order(bytes: &[u8]) {
         let reader = ktx2::Reader::new(bytes).expect("readable KTX2");
         let header = reader.header();
@@ -3855,44 +3980,24 @@ mod tests {
             "level index does not match the reader"
         );
 
-        let alignment = if header.supercompression_scheme.is_some() {
-            1
-        } else {
-            // bytesPlane[0] of the basic DFD block is the texel block size.
-            let texel_block = reader
-                .basic_dfd()
-                .map_or(1u64, |dfd| dfd.bytes_planes[0].into());
-            lcm(texel_block, 4)
-        };
-        for (level, entry) in entries.iter().enumerate() {
+        let alignment = ktx2_level_alignment(&reader);
+        let mut expected = ktx2_align_up(ktx2_metadata_end(&header), alignment);
+        // File order: the smallest level, the last index entry, comes first.
+        for level in (0..level_count).rev() {
+            let entry = &entries[level];
             assert_eq!(
-                entry.byte_offset % alignment,
-                0,
-                "level {level} offset {} is not {alignment}-aligned",
+                entry.byte_offset, expected,
+                "level {level} must start at {expected}, the {alignment}-byte \
+                 alignment packing puts it at, not at {}",
                 entry.byte_offset
             );
-            assert!(
-                entry.byte_offset + entry.byte_length <= bytes.len() as u64,
-                "level {level} ends outside the file"
-            );
-            if level + 1 < entries.len() {
-                let smaller = &entries[level + 1];
-                // The smaller level sits earlier in the file: strictly before
-                // this level's payload starts. Ties are only possible for a
-                // zero-length level.
-                assert!(
-                    smaller.byte_offset < entry.byte_offset
-                        || (smaller.byte_offset == entry.byte_offset && smaller.byte_length == 0),
-                    "level {} must sit before level {level} in the file",
-                    level + 1
-                );
-                assert!(
-                    smaller.byte_offset + smaller.byte_length <= entry.byte_offset,
-                    "level {} overlaps level {level}",
-                    level + 1
-                );
-            }
+            expected = ktx2_align_up(expected + entry.byte_length, alignment);
         }
+        assert_eq!(
+            expected,
+            bytes.len() as u64,
+            "the base level must end the file"
+        );
     }
 
     fn decode_zstd_level(bytes: &[u8], mip: usize) -> Vec<u8> {

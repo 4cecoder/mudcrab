@@ -2,6 +2,8 @@
 //! Basis Universal emits, so GPU- and CPU-encoded textures are
 //! interchangeable at runtime.
 
+use crate::texture::{ktx2_align_up, ktx2_level_data_alignment};
+
 // KHR Data Format constants (KTX2 / Khronos Data Format spec).
 const KHR_DF_MODEL_UASTC: u32 = 166;
 const KHR_DF_PRIMARIES_BT709: u32 = 1;
@@ -13,6 +15,10 @@ const KHR_DF_CHANNEL_UASTC_RGBA: u32 = 3;
 const HEADER_LEN: usize = 80;
 const LEVEL_INDEX_LEN: usize = 24;
 const IDENTIFIER: &[u8; 12] = b"\xABKTX 20\xBB\r\n\x1A\n";
+
+/// Texel block byte size of UASTC 4x4: `bytesPlane[0]` of the descriptor
+/// below, and the size the KTX 2.0 level-data alignment rule keys off.
+const UASTC_TEXEL_BLOCK_BYTES: u32 = 16;
 
 /// Writes a little-endian `u32` at `offset`.
 fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
@@ -43,7 +49,7 @@ fn uastc_dfd(srgb: bool, has_alpha: bool) -> Vec<u8> {
         2 | (block_size << 16), // versionNumber 2 | blockSize
         KHR_DF_MODEL_UASTC | (KHR_DF_PRIMARIES_BT709 << 8) | (transfer << 16), // straight alpha
         3 | (3 << 8),           // 4x4x1x1 texel block (minus one)
-        16,                     // bytesPlane0
+        UASTC_TEXEL_BLOCK_BYTES, // bytesPlane0
         0,                      // bytesPlane4..7
         (127 << 16) | (channel << 24), // bitOffset 0, bitLength 128 - 1
         0,                      // samplePosition
@@ -83,13 +89,14 @@ pub fn write_uastc(
     put_u32(&mut out, 60, kvd.len() as u32);
     out.extend_from_slice(&kvd);
     // KTX 2.0 section 3.7: level data is stored smallest-first, while the level index
-    // (section 3.9.7) keeps the base level at entry 0.
+    // (section 3.9.7) keeps the base level at entry 0. Levels sit at the exact
+    // alignment the format gives them — lcm(texel block byte size, 4), 16 bytes for
+    // UASTC 4x4, this file carrying no supercompression.
+    let alignment = ktx2_level_data_alignment(u64::from(UASTC_TEXEL_BLOCK_BYTES), false);
     for (level, data) in levels.iter().enumerate().rev() {
-        while !out.len().is_multiple_of(16) {
-            out.push(0);
-        }
+        let offset = ktx2_align_up(out.len() as u64, alignment);
+        out.resize(offset as usize, 0);
         let start = HEADER_LEN + level * LEVEL_INDEX_LEN;
-        let offset = out.len() as u64;
         put_u64(&mut out, start, offset);
         put_u64(&mut out, start + 8, data.len() as u64);
         put_u64(&mut out, start + 16, data.len() as u64);
