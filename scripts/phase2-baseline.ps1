@@ -228,24 +228,83 @@ function Format-FieldValue($Value) {
     return "$Value"
 }
 
+# What the converted data set a window loaded actually is, as the conversion's own manifest describes
+# it: the `configuration_hash` and `schema_version` of the `conversion-manifest.json` in the asset
+# directory the run was pointed at. The directory path identifies nothing by itself — a warm
+# re-conversion, or an added mod, leaves the path and the schema unchanged — so the manifest fields
+# are what a comparison checks. A data set that could not be read that way (the window was started
+# without `--assets`, the manifest file is missing, or it does not parse) is `null` with the reason
+# returned beside it, never a guessed identity.
+function Get-AssetsIdentity([string]$ResolvedAssets) {
+    if (-not $ResolvedAssets) {
+        return [ordered]@{
+            configuration_hash = $null; schema_version = $null
+            unavailable = "this window was started without -Assets, so it loaded no converted data set"
+        }
+    }
+    $manifestPath = Join-Path $ResolvedAssets "conversion-manifest.json"
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        return [ordered]@{
+            configuration_hash = $null; schema_version = $null
+            unavailable = "the data set at $ResolvedAssets carries no conversion-manifest.json"
+        }
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -AsHashtable
+    } catch {
+        return [ordered]@{
+            configuration_hash = $null; schema_version = $null
+            unavailable = "conversion-manifest.json could not be read ($($_.Exception.Message))"
+        }
+    }
+    if ($manifest -isnot [System.Collections.IDictionary]) {
+        return [ordered]@{
+            configuration_hash = $null; schema_version = $null
+            unavailable = "conversion-manifest.json is not a JSON object"
+        }
+    }
+    $configurationHash = if ($manifest.Contains("configuration_hash")) { $manifest.configuration_hash } else { $null }
+    $schemaVersion = if ($manifest.Contains("schema_version")) { $manifest.schema_version } else { $null }
+    # An empty hash is what a manifest written before the producer recorded one carries: it names no
+    # data set either, so it is recorded as unread rather than as an identity.
+    $unavailable = $null
+    if ([string]::IsNullOrEmpty([string]$configurationHash)) {
+        $unavailable = "conversion-manifest.json records no configuration_hash for the data set"
+    } elseif ($null -eq $schemaVersion) {
+        $unavailable = "conversion-manifest.json records no schema_version for the data set"
+    }
+    return [ordered]@{
+        configuration_hash = $configurationHash
+        schema_version = $schemaVersion
+        unavailable = $unavailable
+    }
+}
+
 # The inputs a window's scenario was started with, taken from the engine arguments that produced it
 # and the report itself, so two windows' numbers can be shown to describe the same workload: where
 # the camera was, how the scenario flew it (`--auto-fly-speed`, absent when the camera was left
 # standing still), the synthetic scene's instance count, and the resolved asset set the run loaded.
 # The asset set is recorded as its full path, so the same set named by a different relative path is
-# the same identity and a different set is a difference.
+# the same identity and a different set is a difference — and by its own manifest identity, because
+# that path can hold a re-converted or modded set without changing.
 function Get-ScenarioInputs($Arguments, $Report, [int]$DurationSeconds) {
     $worldspace = Get-ArgumentValue $Arguments "--worldspace"
     $gridX = Get-ArgumentValue $Arguments "--grid-x"
     $gridY = Get-ArgumentValue $Arguments "--grid-y"
     $flySpeed = Get-ArgumentValue $Arguments "--auto-fly-speed"
     $syntheticInstances = Get-ArgumentValue $Arguments "--synthetic-instances"
+    $assetsIdentity = Get-AssetsIdentity (Get-ArgumentValue $Arguments "--assets")
     return [ordered]@{
         worldspace = $worldspace
         grid = if ($null -eq $gridX -and $null -eq $gridY) { $null } else { [ordered]@{ x = [int]$gridX; y = [int]$gridY } }
         fly_speed = if ($null -eq $flySpeed) { $null } else { [int]$flySpeed }
         synthetic_instances = if ($null -eq $syntheticInstances) { $null } else { [int]$syntheticInstances }
         assets = Get-ArgumentValue $Arguments "--assets"
+        assets_identity = [ordered]@{
+            configuration_hash = $assetsIdentity.configuration_hash
+            schema_version = $assetsIdentity.schema_version
+        }
+        assets_identity_unavailable = $assetsIdentity.unavailable
         stream_radius = $Report.fingerprint.graphics.stream_radius
         duration_seconds = $DurationSeconds
         warmup_frames = $Report.warmup_frames
@@ -507,7 +566,10 @@ function Get-SummaryLine($Summary) {
 # arrived in format 2, and the workload fields the comparison checks in scenario_inputs — the flight
 # speed, the synthetic instance count and the resolved asset set — in format 3. An older file neither
 # carries those fields nor the `measured_frames` a window now keeps, so it cannot be checked against
-# this run: a comparison with it is refused rather than made on fields it does not carry.
+# this run: a comparison with it is refused rather than made on fields it does not carry. The data
+# set's own identity (`assets_identity`, and the reason beside it) was added to that same map without
+# a version change: a format-3 file written before it carries no such field, and the window comparison
+# refuses it as a missing input rather than comparing numbers whose data set it cannot name.
 $script:baselineFormatVersion = 3
 
 # Why a file can never be compared with this run, as a readable reason, or `$null` when its format
@@ -529,9 +591,16 @@ function Get-BaselineProblem($Baseline) {
 # resolution, driver, renderer or world-data schema. A different commit is expected — comparing
 # across commits is what the baseline is for — but everything else that changes the numbers must be
 # the same on both sides.
-function Assert-Comparable($Old, $NewFingerprint, [string]$Path) {
+#
+# The hardware label is checked here as well as the fingerprint's renderer fields: the label holds the
+# CPU as well as the GPU and its driver, and the fingerprint does not carry the CPU, so two machines
+# with the same adapter and driver would otherwise compare as one.
+function Assert-Comparable($Old, $NewFingerprint, [string]$Path, [string]$NewHardware) {
     $problem = Get-BaselineProblem $Old
     if ($problem) { throw "Cannot compare with ${Path}: $problem" }
+    if ([string]$Old.hardware -ne [string]$NewHardware) {
+        throw "Cannot compare with ${Path}: the two campaigns' hardware labels differ ($(Format-FieldValue $Old.hardware) -> $(Format-FieldValue $NewHardware)). The label names the CPU, GPU and driver the numbers were measured on, and streaming timings are CPU-sensitive; rerun the baseline on this machine to compare against it"
+    }
     $oldInvariant = Get-FingerprintInvariant $Old.fingerprint
     $newInvariant = Get-FingerprintInvariant $NewFingerprint
     if ($null -eq $oldInvariant -or $null -eq $newInvariant) {
@@ -544,8 +613,9 @@ function Assert-Comparable($Old, $NewFingerprint, [string]$Path) {
 }
 
 # Refuses a comparison between two windows that are not the same workload: the scenario inputs
-# (worldspace, grid, flight speed, synthetic instance count, asset set, stream radius, duration,
-# warm-up), the effective graphics settings and the world database opened must match.
+# (worldspace, grid, flight speed, synthetic instance count, asset path and its conversion-manifest
+# identity, stream radius, duration, warm-up), the effective graphics settings and the world database
+# opened must match.
 function Assert-WindowComparable($OldWindow, $NewWindow, [string]$Path, [string]$Scope) {
     $differences = @(Get-FieldDifferences $OldWindow.scenario_inputs $NewWindow.scenario_inputs)
     $differences += Get-FieldDifferences $OldWindow.fingerprint.graphics $NewWindow.fingerprint.graphics "graphics"
@@ -724,7 +794,7 @@ foreach ($name in $requested) {
                 # nobody can set against the older baseline — unless the baseline was picked up from
                 # -Out, in which case it is dropped with one warning and the campaign goes on.
                 if ($previous) {
-                    $refusal = Get-ComparisonRefusal { Assert-Comparable -Old $previous -NewFingerprint $campaignFingerprint -Path $comparePath }
+                    $refusal = Get-ComparisonRefusal { Assert-Comparable -Old $previous -NewFingerprint $campaignFingerprint -Path $comparePath -NewHardware $hardware }
                     if ($refusal) {
                         Write-Warning "$refusal The campaign continues without a comparison"
                         $previous = $null
@@ -825,15 +895,17 @@ if ($previous) {
         "## Comparison against $comparePath",
         "",
         "- Compared with commit $($previous.commit), generated $($previous.generated_at); this run is commit $($identity.commit).",
-        "- The two runs were checked to share resolution, build profile, driver, backend, adapter, schemas, graphics settings and scenario inputs; the commit is the field allowed to differ.",
+        "- The two runs were checked to share the machine (the hardware label, backend, adapter and driver), resolution, build profile, schemas, graphics settings and scenario inputs — the data set's `configuration_hash` and manifest `schema_version` among them; the commit is the field allowed to differ.",
         "",
-        "| Metric | Baseline | Current | Change % | Status |",
-        "|---|---:|---:|---:|---|"
+        "| Window | Metric | Baseline | Current | Change % | Status |",
+        "|---|---|---:|---:|---:|---|"
     )
     foreach ($scope in @($baselineReport.comparison.metrics.Keys)) {
+        # The scope (`<scenario>/<window>`) is printed with every row: the same metric name appears in
+        # every window's rows, and a bare `average_fps` row says nothing about what was measured.
         foreach ($metric in @($baselineReport.comparison.metrics[$scope].Keys)) {
             $value = $baselineReport.comparison.metrics[$scope][$metric]
-            $markdown += "| $metric | $([Math]::Round($value.baseline, 4)) | $([Math]::Round($value.current, 4)) | $([Math]::Round($value.regression_percent, 2)) | $($value.status) |"
+            $markdown += "| $scope | $metric | $([Math]::Round($value.baseline, 4)) | $([Math]::Round($value.current, 4)) | $([Math]::Round($value.regression_percent, 2)) | $($value.status) |"
         }
     }
 }

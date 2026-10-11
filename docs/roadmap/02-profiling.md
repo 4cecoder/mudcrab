@@ -45,7 +45,12 @@ per-frame sampling for any of them.
 `metadata.json` (format version 2):
 
 - `commit`, `dirty_worktree` — the `--profile-commit` / `--profile-dirty-worktree` values.
-- `engine_version`, `bevy_version`, `build_profile` — `release` or `debug`, from the build itself.
+- `engine_version`, `bevy_version`, `build_profile` — `release` or `debug`, from the build itself
+  (`cfg!(debug_assertions)`) and nothing finer: cargo's `quick` profile inherits `release` (Cargo.toml
+  marks it "not for measuring"), so a `quick` build reports `release`, and an engine report from any
+  other cargo profile that says `release` cannot be told apart from a real `release` run — although
+  `phase2-baseline.ps1` only ever runs the `release` engine binary, so a `quick` build is never
+  measured by that command.
 - `renderer` — the adapter Bevy selected: `backend` (`Vulkan`, `Dx12`, `Metal`, …), `adapter`,
   `driver`, `driver_info`, `device_type` (`DiscreteGpu`, …), and the device features the GPU
   diagnostics depend on (`timestamp_queries_supported`, `pipeline_statistics_supported`). `null`
@@ -87,9 +92,12 @@ Two things to know when reading one:
   (`shadow_directional_light_<light>_cascade_<cascade>`, `shadow_point_light_<light>_<face>`,
   `shadow_spot_light_<light>`), but Bevy's standard shadow node does not open a diagnostic span for
   them (only its meshlet path does), so those passes are normally absent from the report rather than
-  zero. A missing row means "not measured here". Bevy 0.20 (release candidate, October 2026) adds a
-  GPU span around the point and spot shadow loop (bevy PR #25398) but still none for directional
-  cascades, so cascade GPU time needs a frame capture (RenderDoc or PIX) until Bevy measures it.
+  zero. A missing row means "not measured here". Bevy 0.20 (0.20.0 was released 2026-10-08) adds more
+  GPU tracing spans (bevy PR #25398, merged 2026-08-19): one around the auxiliary-view loop (a point
+  light's six shadow views, a spot light's one) and a `per_view_shadow_pass` span whose documentation
+  says it renders the directional light shadows. This engine is on Bevy 0.19 and measures none of
+  them yet, so cascade and point/spot shadow GPU time needs a frame capture (RenderDoc or PIX) until
+  it moves to 0.20.
 
 When the device cannot time GPU work — any backend but Vulkan and DX12 — `passes` is empty and
 `unavailable.elapsed_gpu` carries the reason; a run with no renderer at all gets "no renderer in
@@ -156,7 +164,13 @@ Run every scenario with converted assets and coordinates selected during integra
 ```
 
 Results go to `target/profiling/<timestamp>-<cpu>-<gpu>`. The runner uses medians to reduce noise.
-Pass `-UpdateBaseline` to write `profiling-baseline.json`. Against an existing baseline, material
+Pass `-UpdateBaseline` to write `profiling-baseline.json`, which stores each scenario's `place`
+beside its medians — its worldspace and grid, or `synthetic` for a scene that runs in no world
+place. A stored entry with no place (a baseline written before places were recorded) or one measured
+in another place describes a different scene — `dense` moved from 18,-5 to Riverwood — so that
+scenario's comparison is skipped with one warning line naming the scenario and the reason, and the
+campaign is not failed for it; re-run once with `-UpdateBaseline` to record places. Against an
+existing baseline, material
 regressions over 5% are warnings and regressions over 10% fail the campaign. Fixed noise floors of
 5 FPS, 1.5 ms and 0.05 GiB prevent sub-millisecond scheduler jitter and sample granularity from being
 amplified into false percentage regressions. Higher FPS is better; lower frame latency and memory
@@ -294,7 +308,10 @@ the run could not measure it.
   inventing one. What does exist for render-world work is the report's own `render_world` section
   and the `render_world/*` spans in `cpu.spans` (main world, extract, the wait for the render
   thread, the render thread's phases), and per pass `render/<pass>/elapsed_cpu` in the bundle's
-  `gpu-passes.json`.
+  `gpu-passes.json`. The two kinds of span cover different windows: the `streaming/*` spans are
+  recorded on every frame of the run, warm-up frames included, while the `render_world/*` spans come
+  from the render-timing collector, which records only while the measured window is open, so those
+  describe the measured frames alone.
 
 ## The baseline command
 
@@ -310,8 +327,13 @@ pwsh -File scripts/phase2-baseline.ps1                                       # s
 The world scenes use the same places as `docs/roadmap/02-acceptance.md` in Tamriel (`0x3c`), with
 the references within two cells of each: rural at grid 0,0 (about 1,050), dense at 3,-12 (Riverwood,
 about 2,900, the densest cell neighbourhood in Tamriel) and water at 7,-2 (about 1,580).
-`-RuralGridX`, `-DenseGridX`, `-WaterGridX` and their `Y` partners override them. Both scripts and
-the acceptance runner agree on these places.
+`-RuralGridX`, `-DenseGridX`, `-WaterGridX` and their `Y` partners override them. Rural and dense
+are the same default in all three commands; water is not: `phase2-baseline.ps1` defaults it to 7,-2,
+and the acceptance campaign's documented command line passes 7,-2, while `phase2-profile.ps1` keeps
+its own water default of grid 0,0 and `phase2-acceptance.ps1` shares that 0,0 default — the place
+its own rural scene already measures. A water run is this standard place only when the command it
+runs under is given these coordinates, and a stored baseline for another place is not compared (see
+**Comparing baselines** below).
 
 `dense-legacy` is the old dense place, 18,-5 (about 1,530 references; `-DenseLegacyGridX`/`Y`). It
 is accepted by every script but is not in `-Scenario all` or the default sets, and is kept for one
@@ -356,8 +378,14 @@ cannot drift apart).
   still), the `synthetic_instances` it rendered, and the resolved full path of the `assets` set it
   loaded. The window comparison checks every one of them, so a rerun at another flight speed,
   another instance count or against another asset set is refused rather than scored against a
-  different workload. Format 3 added those fields and the `measured_frames` below; a format-2 file
-  does not carry them and cannot be compared with a run of this script.
+  different workload. The data set's identity is among them: `assets_identity` holds the
+  `configuration_hash` and `schema_version` recorded in that directory's `conversion-manifest.json`
+  (`null`, with the reason in `assets_identity_unavailable`, when the window loaded no data set or
+  the manifest could not be read), so two runs whose `assets` path is the same but whose conversion
+  or mod set is not are refused too. Format 3 added those fields and the `measured_frames` below; a
+  format-2 file does not carry them and cannot be compared with a run of this script — nor can a
+  format-3 file written before `assets_identity` existed, which the window comparison refuses as a
+  missing input.
   The measurements follow: frame metrics (count, mean, p50, p95, p99, worst, average FPS) as
   median/min/max over the repeats, `gpu_passes.passes` (per pass, the median over the repeats)
   with `gpu_passes.measured_frames` (the frames the pass samples rest on, median/min/max over the
@@ -388,10 +416,17 @@ cannot drift apart).
   one warning line and the campaign runs without a comparison; `-CompareTo` names a comparison the
   user asked for, so a file like that is refused there instead. A requested comparison is refused
   before the remaining windows are run when the two runs differ in any field that changes the
-  numbers: renderer backend, adapter or driver, resolution, build
+  numbers: the machine — the campaign-level `hardware` label (CPU, GPU and driver) and the
+  fingerprint's renderer backend, adapter and driver — resolution, build
   profile, graphics settings, world-database and cell-cache schemas, or any window's scenario
-  inputs (flight speed, synthetic instance count and asset set included). A different **commit** is
-  expected and allowed — comparing a branch against the baseline
+  inputs (flight speed, synthetic instance count and the data set included). The data set is checked
+  twice: as the resolved `assets` path, and as its own identity — `assets_identity` records the
+  `configuration_hash` and `schema_version` of the `conversion-manifest.json` in that directory,
+  `null` with the reason in `assets_identity_unavailable` when it could not be read that way — so a
+  re-conversion or an added mod at the same path is refused rather than scored as the same workload.
+  A `baseline.json` written before its windows carried `assets_identity` is refused by that check
+  rather than compared against; record the field once with `-UpdateBaseline`. A different **commit**
+  is expected and allowed — comparing a branch against the baseline
   it was measured from is the point of the command. `-Out` defaults to `target/phase2-baseline`, so
   a rerun compares with the previous baseline by default; each window's report bundle stays under
   `-Out/runs/`, and `baseline.json`'s `run_directory` says which campaign's bundles belong to it.

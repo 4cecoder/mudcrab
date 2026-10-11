@@ -202,6 +202,22 @@ function Get-ArgumentValue {
     return $null
 }
 
+# Where a scenario's camera ran, as the string a stored baseline records for it: `<worldspace>
+# <gridX>,<gridY>` for a world scene, taken from the arguments the engine was actually started with,
+# and `synthetic` for a scene that runs in no world place (the fixture and synthetic scenes).
+#
+# A scene's size is a property of the place's data, not of the scenario's name: `dense` moved from
+# 18,-5 to Riverwood (3,-12, about twice as dense), so a baseline entry stored under the name `dense`
+# can describe a place this run did not measure.
+function Get-ScenarioPlace {
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    $worldspace = Get-ArgumentValue -Arguments $Arguments -Name "--worldspace"
+    $gridX = Get-ArgumentValue -Arguments $Arguments -Name "--grid-x"
+    $gridY = Get-ArgumentValue -Arguments $Arguments -Name "--grid-y"
+    if (-not $worldspace -or $null -eq $gridX -or $null -eq $gridY) { return "synthetic" }
+    return "$worldspace $gridX,$gridY"
+}
+
 function Get-Median {
     param([double[]]$Values)
     $ordered = @($Values | Sort-Object)
@@ -348,6 +364,7 @@ $results = @{}
 $regressionFailed = $false
 foreach ($name in $requested) {
     $runs = @()
+    $place = $null
     for ($run = 1; $run -le $Repetitions; $run++) {
         $runDirectory = Join-Path $campaign "$name\run-$run"
         $arguments = Get-ScenarioArguments -Name $name -RunDirectory $runDirectory -Commit $commit -Hardware $hardware `
@@ -356,10 +373,17 @@ foreach ($name in $requested) {
             -RuralGridX $RuralGridX -RuralGridY $RuralGridY -DenseGridX $DenseGridX -DenseGridY $DenseGridY `
             -DenseLegacyGridX $DenseLegacyGridX -DenseLegacyGridY $DenseLegacyGridY `
             -WaterGridX $WaterGridX -WaterGridY $WaterGridY
+        # Read from the first run's arguments: every repeat of a scenario is started the same way, and
+        # the arguments are what the engine was actually given.
+        if ($run -eq 1) { $place = Get-ScenarioPlace -Arguments $arguments }
         $runs += Invoke-EngineWindow -Engine $engine -Arguments $arguments -RunDirectory $runDirectory -Label "Profiling run $name/run-$run"
     }
 
     $median = [ordered]@{
+        # Where these medians were measured, stored beside them in the baseline (see
+        # Get-ScenarioPlace): a scenario is compared by name, and the entry a baseline holds for that
+        # name only describes this run's numbers when it was measured in the same place.
+        place = $place
         average_fps = Get-Median @($runs.average_fps)
         frame_ms_p95 = Get-Median @($runs.frame_ms_p95)
         frame_ms_p99 = Get-Median @($runs.frame_ms_p99)
@@ -368,18 +392,38 @@ foreach ($name in $requested) {
     }
     $comparison = [ordered]@{ scenario = $name; repetitions = $Repetitions; median = $median; regressions = @() }
     if ($baselineData.ContainsKey($name)) {
-        foreach ($metric in @("average_fps", "frame_ms_p95", "frame_ms_p99", "peak_process_memory_gib", "process_memory_growth_gib")) {
-            $old = [double]$baselineData[$name][$metric]
-            $new = [double]$median[$metric]
-            if ($old -le 0) { continue }
-            $regression = Get-RegressionComparison -Metric $metric -Old $old -New $new
-            if ($regression.status -eq "fail") { $regressionFailed = $true }
-            $comparison.regressions += [ordered]@{
-                metric = $metric; baseline = $old; current = $new
-                regression_percent = $regression.regression_percent
-                regression_absolute = $regression.regression_absolute
-                noise_floor = $regression.noise_floor
-                status = $regression.status
+        # A stored entry measured in another place — or one written before places were recorded at all
+        # — does not describe this run's numbers, so the scenario is not scored against it: the
+        # comparison is skipped, with the reason in one warning line and in `comparison.json`, and the
+        # campaign is not failed for it. Scoring such an entry reports a fake regression: `dense` is
+        # Riverwood now, about twice as dense as the place its older entry measured.
+        $storedEntry = $baselineData[$name]
+        $storedPlace = $null
+        if ($storedEntry -is [System.Collections.IDictionary] -and $storedEntry.Contains("place")) { $storedPlace = $storedEntry.place }
+        $skipReason = if ($null -eq $storedPlace) {
+            'the stored baseline records no place for it (it was written before places were stored, and `dense` has since moved to Riverwood); rerun with -UpdateBaseline to store one'
+        } elseif ([string]$storedPlace -ne [string]$place) {
+            "stored place $storedPlace, run place $place"
+        } else {
+            $null
+        }
+        if ($skipReason) {
+            $comparison.baseline_skipped = $skipReason
+            Write-Warning "Not comparing ${name} with ${baselinePath}: $skipReason"
+        } else {
+            foreach ($metric in @("average_fps", "frame_ms_p95", "frame_ms_p99", "peak_process_memory_gib", "process_memory_growth_gib")) {
+                $old = [double]$baselineData[$name][$metric]
+                $new = [double]$median[$metric]
+                if ($old -le 0) { continue }
+                $regression = Get-RegressionComparison -Metric $metric -Old $old -New $new
+                if ($regression.status -eq "fail") { $regressionFailed = $true }
+                $comparison.regressions += [ordered]@{
+                    metric = $metric; baseline = $old; current = $new
+                    regression_percent = $regression.regression_percent
+                    regression_absolute = $regression.regression_absolute
+                    noise_floor = $regression.noise_floor
+                    status = $regression.status
+                }
             }
         }
     }

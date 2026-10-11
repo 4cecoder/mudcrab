@@ -122,6 +122,27 @@ function Get-RegressionComparison([string]$Metric, [double]$Old, [double]$New) {
     }
 }
 
+# Where a scenario's camera ran, as the string a stored baseline records for it: `<worldspace>
+# <gridX>,<gridY>` for a world scenario, taken from the arguments the engine was actually started
+# with, and `synthetic` for a scenario started in no world place (the fixture scenes and the
+# synthetic benchmark).
+#
+# A scene's size is a property of the place's data, not of the scenario's name: `dense` moved from
+# 18,-5 to Riverwood (3,-12, about twice as dense), so an entry stored under the name `dense` can
+# describe a place this campaign did not measure.
+function Get-ScenarioPlace([string[]]$Arguments) {
+    $worldspace = $null; $gridX = $null; $gridY = $null
+    for ($index = 0; $index -lt ($Arguments.Count - 1); $index++) {
+        switch ($Arguments[$index]) {
+            "--worldspace" { $worldspace = $Arguments[$index + 1] }
+            "--grid-x" { $gridX = $Arguments[$index + 1] }
+            "--grid-y" { $gridY = $Arguments[$index + 1] }
+        }
+    }
+    if (-not $worldspace -or $null -eq $gridX -or $null -eq $gridY) { return "synthetic" }
+    return "$worldspace $gridX,$gridY"
+}
+
 function Invoke-RecordedCommand {
     param([string]$Name, [string]$Executable, [string[]]$Arguments, [string]$LogDirectory)
     $log = Join-Path $LogDirectory "$Name.log"
@@ -360,6 +381,10 @@ else {
                 }
                 if ($runs.Count -gt 0) {
                     $performance[$scenario.name] = [ordered]@{
+                        # Where these medians were measured, stored beside them in the baseline (see
+                        # Get-ScenarioPlace): the entry a baseline holds for this scenario's name only
+                        # describes this campaign's numbers when it was measured in the same place.
+                        place = Get-ScenarioPlace $scenario.arguments
                         average_fps = Get-Median @($runs.average_fps); frame_ms_p95 = Get-Median @($runs.frame_ms_p95)
                         frame_ms_p99 = Get-Median @($runs.frame_ms_p99); peak_process_memory_gib = Get-Median @($runs.peak_process_memory_gib)
                         process_memory_growth_gib = Get-Median @($runs.process_memory_growth_gib)
@@ -426,6 +451,27 @@ if ($baselineAvailable) {
 foreach ($scenario in $performance.Keys) {
     if (-not $baselineData.ContainsKey($scenario)) {
         [void]$warnings.Add("no baseline was available for scenario $scenario")
+        continue
+    }
+    # A stored entry measured in another place — or one written before places were recorded at all —
+    # does not describe this campaign's numbers, so the scenario is not scored against it: the
+    # comparison is skipped, with the reason in one warning line and in `comparison.json`, instead of
+    # failing the campaign on a fake regression (`dense` is Riverwood now, about twice as dense as the
+    # place its older entry measured).
+    $storedEntry = $baselineData[$scenario]
+    $storedPlace = $null
+    if ($storedEntry -is [System.Collections.IDictionary] -and $storedEntry.Contains("place")) { $storedPlace = $storedEntry.place }
+    $place = $performance[$scenario].place
+    $skipReason = if ($null -eq $storedPlace) {
+        'the stored baseline records no place for it (it was written before places were stored, and `dense` has since moved to Riverwood); rerun with -UpdateBaseline to store one'
+    } elseif ([string]$storedPlace -ne [string]$place) {
+        "stored place $storedPlace, run place $place"
+    } else {
+        $null
+    }
+    if ($skipReason) {
+        $comparisons += [ordered]@{ scenario = $scenario; skipped = $skipReason }
+        [void]$warnings.Add("not comparing $scenario with the baseline: $skipReason")
         continue
     }
     foreach ($metric in @("average_fps", "frame_ms_p95", "frame_ms_p99", "peak_process_memory_gib", "process_memory_growth_gib")) {
