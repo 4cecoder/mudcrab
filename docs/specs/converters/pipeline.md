@@ -105,14 +105,24 @@ SQL/binding instrumentation is not part of production export.
 In-house terrain publication selects the latest accepted LAND by plugin priority
 and physical record order when several identities share a cell. It retains
 normalized original texture IDs, slots and blend weights in
-`inhouse_terrain_layers` and `cell_cache_preserved.rkyv`. The runtime
-`cell_cache.rkyv` keeps those slots and weights with explicit zero-ID placeholders
-for absent, deleted or wrong-kind texture targets. Native null assignments are
-resolved before this replacement, so they do not displace a nonnull assignment
-or revive discarded weights. Runtime material construction accepts placeholders
-in any slot; a nonzero texture with missing converted images still fails its
+`inhouse_terrain_layers` and `cell_cache_preserved.rkyv`, including every active
+layer beyond the runtime material's capacity. The runtime `cell_cache.rkyv`
+retains its existing one-base-plus-five-overlay limit per quadrant. It removes
+overlays with the smallest sum of authored opacity, breaking ties by removing
+the highest slot first, and emits one bounded warning per affected cell with
+drop counts for all four quadrants. Retained slots and weights use explicit
+zero-ID placeholders for absent, deleted or wrong-kind texture targets;
+cleared IDs participate in the same ranking as their source assignments.
+Native null assignments are resolved before this replacement, so they do not
+displace a nonnull assignment or revive discarded weights. Runtime material
+construction accepts placeholders in any slot; a nonzero texture with missing
+converted images still fails its
 existing lookup checks. Original native fields and padding remain in the source
-table independently of these derived caches.
+table independently of these derived caches, including superseded slot
+assignments, native NULLs and their weights. The preserved cache is auxiliary;
+the engine continues to load only the runtime cache. The cache layout and
+runtime selection are unchanged; normal conversion and metadata rebuild
+regenerate both caches and the layer table.
 
 Explicit player selection is available through `--plugins-file FILE`. Optional `--skyrim-ccc-file FILE` overrides the game-folder Creation list, and `--skyrim-ini-file FILE` supplies General test-file settings without reading ambient profiles. These options also exist as `PipelineConfig.plugins_file`, `skyrim_ccc_file` and `skyrim_ini_file`. Selection rules and recoverable missing-master behavior are documented in [the database specification](db-schema.md). Automatic discovery remains the default.
 

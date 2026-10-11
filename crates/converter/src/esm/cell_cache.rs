@@ -34,10 +34,8 @@ pub(crate) fn validate_inhouse_land(record: &RawRecord) -> Result<()> {
             .filter(|layer| layer.quadrant == quadrant)
             .collect();
         color_eyre::eyre::ensure!(
-            entries.is_empty()
-                || (entries.len() <= 6
-                    && entries.iter().filter(|layer| layer.is_base).count() == 1),
-            "invalid terrain layer count"
+            entries.is_empty() || entries.iter().filter(|layer| layer.is_base).count() == 1,
+            "terrain quadrant must have one base layer"
         );
     }
     Ok(())
@@ -100,7 +98,7 @@ pub fn write_cell_cache_with_source_order(
 /// Capture decoded global texture identities before missing-target clearing.
 /// Resolve native duplicate slots and NULL assignments once, while their distinction
 /// remains available. The caller may then clear unusable texture IDs without losing
-/// the retained assignment's weights.
+/// the retained assignment's weights. Runtime capacity does not limit this source projection.
 pub(crate) fn preserved_texture_layers(record: &RawRecord) -> Result<Vec<TerrainLayer>> {
     let (mut layers, _) = extract_texture_layers(&record.subrecords)?;
     normalize_texture_layers(&mut layers);
@@ -112,11 +110,34 @@ pub(crate) fn preserved_texture_layers(record: &RawRecord) -> Result<Vec<Terrain
 /// zero-ID placeholders. Overrides must come from accepted decoded source records;
 /// they are not normalized again. Malformed auxiliary layers fall back locally to
 /// the ordinary record layers and cannot discard valid neighboring terrain.
+/// Only this runtime projection drops the weakest overlays beyond six layers per quadrant.
 pub(crate) fn write_cell_cache_with_preserved_layers(
     records: &HashMap<u32, RawRecord>,
     source_offsets: &HashMap<u32, u64>,
     layer_overrides: &HashMap<u32, Vec<TerrainLayer>>,
     path: &Path,
+) -> Result<usize> {
+    write_cell_cache_layers(records, source_offsets, layer_overrides, path, true)
+}
+
+/// Archive every normalized source layer without imposing the runtime material's capacity.
+/// This auxiliary cache is for preservation; the engine continues to load `cell_cache.rkyv`.
+pub(crate) fn write_preserved_cell_cache_with_source_layers(
+    records: &HashMap<u32, RawRecord>,
+    source_offsets: &HashMap<u32, u64>,
+    layer_overrides: &HashMap<u32, Vec<TerrainLayer>>,
+    path: &Path,
+) -> Result<usize> {
+    write_cell_cache_layers(records, source_offsets, layer_overrides, path, false)
+}
+
+/// Share terrain selection and validation while applying capacity only to runtime output.
+fn write_cell_cache_layers(
+    records: &HashMap<u32, RawRecord>,
+    source_offsets: &HashMap<u32, u64>,
+    layer_overrides: &HashMap<u32, Vec<TerrainLayer>>,
+    path: &Path,
+    runtime: bool,
 ) -> Result<usize> {
     let water_by_cell = water_by_cell(records);
     let winners = land_winners_by_cell(records, source_offsets);
@@ -184,8 +205,8 @@ pub(crate) fn write_cell_cache_with_preserved_layers(
                 .collect();
             let bases = quadrant_layers.iter().filter(|layer| layer.is_base).count();
             color_eyre::eyre::ensure!(
-                quadrant_layers.is_empty() || (bases == 1 && quadrant_layers.len() <= 6),
-                "LAND {cell_id:08X} quadrant {quadrant} must be empty or have one BTXT and at most five ATXT layers"
+                quadrant_layers.is_empty() || bases == 1,
+                "LAND {cell_id:08X} quadrant {quadrant} must be empty or have one BTXT"
             );
         }
         if winners[&cell_id] != record.form_id {
@@ -200,6 +221,15 @@ pub(crate) fn write_cell_cache_with_preserved_layers(
                         .or_insert_with(|| (0, format!("LAND {:08X}: {error}", record.form_id)));
                     *count += 1;
                 }
+            }
+        }
+        if runtime {
+            let dropped = limit_runtime_texture_layers(&mut layers);
+            if dropped.iter().any(|count| *count != 0) {
+                eprintln!(
+                    "warning: LAND {cell_id:08X} (record {:08X}, source priority {}): runtime terrain capacity is one base plus five overlays per quadrant; dropped weakest overlays by summed opacity (highest slot on ties), counts by quadrant {dropped:?}",
+                    record.form_id, record.load_order,
+                );
             }
         }
         cells_by_id.insert(
@@ -509,6 +539,7 @@ fn extract_texture_layers(
     Ok((layers, dropped_layers))
 }
 
+/// Resolve native NULL assignments and implicit bases without discarding excess source layers.
 fn normalize_texture_layers(layers: &mut Vec<TerrainLayer>) {
     // Official plugins contain null BTXT/ATXT references. They mean that no
     // texture is assigned, not that form 00000000 must resolve at runtime.
@@ -529,6 +560,22 @@ fn normalize_texture_layers(layers: &mut Vec<TerrainLayer>) {
                 weights: Vec::new(),
             });
         }
+    }
+    layers.sort_by_key(|layer| {
+        (
+            layer.quadrant,
+            !layer.is_base,
+            layer.layer,
+            layer.texture_form_id,
+        )
+    });
+}
+
+/// Keep the existing runtime subset and return bounded per-quadrant drop counts.
+/// Cleared texture IDs remain placeholders; their weights participate in the same ranking.
+fn limit_runtime_texture_layers(layers: &mut Vec<TerrainLayer>) -> [usize; 4] {
+    let mut dropped = [0; 4];
+    for quadrant in 0..4 {
         while layers
             .iter()
             .filter(|layer| layer.quadrant == quadrant)
@@ -549,16 +596,10 @@ fn normalize_texture_layers(layers: &mut Vec<TerrainLayer>) {
                 .map(|(index, _)| index)
                 .expect("an over-capacity quadrant must contain an overlay");
             layers.remove(weakest);
+            dropped[usize::from(quadrant)] += 1;
         }
     }
-    layers.sort_by_key(|layer| {
-        (
-            layer.quadrant,
-            !layer.is_base,
-            layer.layer,
-            layer.texture_form_id,
-        )
-    });
+    dropped
 }
 
 /// Validate already normalized source layers without treating cleared IDs as NULL.
@@ -613,10 +654,8 @@ fn validate_preserved_layers(layers: &[TerrainLayer]) -> Result<()> {
             .filter(|layer| layer.quadrant == quadrant)
             .collect();
         color_eyre::eyre::ensure!(
-            entries.is_empty()
-                || (entries.len() <= 6
-                    && entries.iter().filter(|layer| layer.is_base).count() == 1),
-            "terrain quadrant must be empty or have one base and at most five overlays"
+            entries.is_empty() || entries.iter().filter(|layer| layer.is_base).count() == 1,
+            "terrain quadrant must be empty or have one base"
         );
     }
     Ok(())
@@ -660,6 +699,7 @@ mod tests {
     use crate::test_strategies::{arbitrary_bytes, config};
     use proptest::prelude::*;
 
+    /// Native duplicate and NULL assignments exercise source normalization before clearing.
     fn preservation_land() -> RawRecord {
         let assignment = |tag: &[u8; 4], texture: u32, slot: u16| {
             let mut bytes = texture.to_le_bytes().to_vec();
@@ -755,6 +795,7 @@ mod tests {
         assert!(preserved_texture_layers(&land).is_err());
     }
 
+    /// Invalid auxiliary structures fall back locally while usable neighboring cells publish.
     #[test]
     fn preserved_layers_invalid_auxiliary_data_falls_back_and_publishes_neighbors() {
         let land = preservation_land();
@@ -780,13 +821,7 @@ mod tests {
                 6 => {
                     layers.remove(0);
                 }
-                7 => {
-                    for slot in 3..8 {
-                        let mut extra = copy_texture_layers(&layers[1..2]).remove(0);
-                        extra.layer = slot;
-                        layers.push(extra);
-                    }
-                }
+                7 => layers[0].layer = 3,
                 8 => layers[1].weights[0].opacity = 1.25,
                 9 => layers.reverse(),
                 _ => unreachable!(),
@@ -1368,8 +1403,9 @@ mod tests {
         assert!(extract_texture_layers(&[(b"ATXT".to_vec(), alpha)]).is_err());
     }
 
+    /// Source normalization keeps the implicit base and every authored nonnull overlay.
     #[test]
-    fn supplies_implicit_base_and_drops_the_weakest_excess_overlay() {
+    fn preserves_implicit_base_and_excess_overlays_before_runtime_capacity() {
         let mut layers = (0..6)
             .map(|layer| TerrainLayer {
                 texture_form_id: u32::from(layer) + 1,
@@ -1383,10 +1419,70 @@ mod tests {
             })
             .collect::<Vec<_>>();
         normalize_texture_layers(&mut layers);
+        assert_eq!(layers.len(), 7);
+        validate_preserved_layers(&layers).unwrap();
+        let dropped = limit_runtime_texture_layers(&mut layers);
+        assert_eq!(dropped, [0, 0, 1, 0]);
         assert_eq!(layers.len(), 6);
         assert!(layers[0].is_base);
         assert_eq!(layers[0].texture_form_id, 0);
         assert!(!layers.iter().any(|layer| layer.texture_form_id == 5));
+    }
+
+    /// Runtime trimming counts each quadrant independently and keeps cleared-ID weights.
+    #[test]
+    fn runtime_capacity_keeps_placeholders_and_uses_highest_slot_to_break_weight_ties() {
+        let mut layers = Vec::new();
+        for quadrant in [0, 2] {
+            layers.push(TerrainLayer {
+                texture_form_id: 0x2000 + u32::from(quadrant),
+                quadrant,
+                layer: 0,
+                is_base: true,
+                weights: Vec::new(),
+            });
+            let overlays = if quadrant == 0 { 7 } else { 6 };
+            for slot in 1..=overlays {
+                layers.push(TerrainLayer {
+                    // This is a cleared target, not a native NULL assignment.
+                    texture_form_id: if slot == 1 {
+                        0
+                    } else {
+                        0x3000 + u32::from(slot)
+                    },
+                    quadrant,
+                    layer: slot,
+                    is_base: false,
+                    weights: vec![TerrainWeight {
+                        vertex: slot + 10,
+                        opacity: if slot >= 5 { 0.25 } else { 0.75 },
+                    }],
+                });
+            }
+        }
+        validate_preserved_layers(&layers).unwrap();
+        assert_eq!(limit_runtime_texture_layers(&mut layers), [2, 0, 1, 0]);
+        for quadrant in [0, 2] {
+            let retained = layers.iter().filter(|layer| layer.quadrant == quadrant);
+            assert_eq!(retained.clone().count(), 6);
+            assert_eq!(
+                retained.map(|layer| layer.layer).collect::<Vec<_>>(),
+                [0, 1, 2, 3, 4, 5]
+            );
+            let placeholder = layers
+                .iter()
+                .find(|layer| layer.quadrant == quadrant && layer.layer == 1 && !layer.is_base)
+                .unwrap();
+            assert_eq!(placeholder.texture_form_id, 0);
+            assert_eq!(
+                placeholder.weights,
+                [TerrainWeight {
+                    vertex: 11,
+                    opacity: 0.75
+                }]
+            );
+        }
+        assert_eq!(limit_runtime_texture_layers(&mut layers), [0; 4]);
     }
 
     #[test]
