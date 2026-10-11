@@ -2,7 +2,7 @@
 use super::{DecodedRecord, PluginDiagnostics, Value, decoder, scanner};
 use crate::esm::{binary::PluginMetadata, load_order::LoadOrder};
 use color_eyre::{Result, eyre::ensure};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, Statement, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -97,7 +97,7 @@ pub(crate) fn write_tables(
     paths: &[PathBuf],
 ) -> Result<()> {
     // Complete conversion replaces this owned tooling snapshot atomically with provenance.
-    // Recreate only this table so a retained older optional-history schema is not reused.
+    // Recreate owned history tables so a retained older tooling schema is not reused.
     conn.execute_batch("DROP TABLE IF EXISTS record_overrides;
         CREATE TABLE record_overrides(
         form_id INTEGER, chain_position INTEGER NOT NULL,
@@ -107,13 +107,14 @@ pub(crate) fn write_tables(
         status TEXT NOT NULL CHECK(status IN ('accepted','skipped','header')), reason TEXT,
         source_cell_form_id INTEGER, source_worldspace_form_id INTEGER,
         source_topic_form_id INTEGER, topic_group_offset INTEGER,
-        plugin_masters TEXT, source_path TEXT, schema_sha256 TEXT,
+        source_path TEXT, schema_sha256 TEXT,
         original_owner TEXT, full_local INTEGER, source_identity_state TEXT NOT NULL,
         source_group_end INTEGER NOT NULL, frame_complete INTEGER NOT NULL CHECK(frame_complete IN (0,1)),
         record_signature BLOB NOT NULL CHECK(length(record_signature)=4),
         PRIMARY KEY(plugin_id,source_record_offset)) WITHOUT ROWID;
         CREATE INDEX record_overrides_chain ON record_overrides(form_id,chain_position);
         CREATE INDEX record_overrides_source ON record_overrides(original_owner,full_local,plugin_id,source_record_offset);")?;
+    write_master_table(conn, order)?;
     let source_paths = paths
         .iter()
         .map(|p| p.canonicalize())
@@ -145,7 +146,7 @@ pub(crate) fn write_tables(
         let entry = &entries[index];
         (entry.plugin_index, entry.source_record_offset)
     });
-    let mut insert = conn.prepare("INSERT INTO record_overrides VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)")?;
+    let mut insert = conn.prepare("INSERT INTO record_overrides VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)")?;
     for index in sorted {
         let entry = &entries[index];
         let key = entry.form_id;
@@ -179,11 +180,6 @@ pub(crate) fn write_tables(
             entry.source_worldspace_form_id,
             entry.source_topic_form_id,
             entry.topic_group_offset,
-            is_header
-                .then(|| serde_json::to_string(
-                    &order.metadata[entry.plugin_index as usize].masters
-                ))
-                .transpose()?,
             is_header.then(|| source_paths[entry.plugin_index as usize].to_string_lossy()),
             is_header.then(|| crate::cache::hash_bytes(super::SCHEMA_BYTES)),
             identity.original_owner,
@@ -193,6 +189,28 @@ pub(crate) fn write_tables(
             entry.frame_complete,
             entry.record_type.as_slice()
         ])?;
+    }
+    Ok(())
+}
+
+/// Preserve native MAST order as scalar rows; a zero-master plugin has only its TES4 row.
+fn write_master_table(conn: &Connection, order: &LoadOrder) -> Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS inhouse_plugin_masters;
+        CREATE TABLE inhouse_plugin_masters(
+            plugin_id INTEGER NOT NULL, master_index INTEGER NOT NULL CHECK(master_index>=0),
+            master_name TEXT NOT NULL,
+            PRIMARY KEY(plugin_id,master_index)) WITHOUT ROWID;",
+    )?;
+    let mut insert = conn.prepare("INSERT INTO inhouse_plugin_masters VALUES(?1,?2,?3)")?;
+    for (plugin_id, metadata) in order.metadata.iter().enumerate() {
+        for (master_index, master) in metadata.masters.iter().enumerate() {
+            insert.execute(params![
+                i64::try_from(plugin_id)?,
+                i64::try_from(master_index)?,
+                master
+            ])?;
+        }
     }
     Ok(())
 }
@@ -233,30 +251,65 @@ pub struct HistoryField {
 }
 
 /// Reconstitute original slot/master assignment without reading any source plugin headers.
+/// New packs use scalar ordered master rows; retained older packs keep read compatibility.
 pub(crate) fn stored_order(conn: &Connection) -> Result<(LoadOrder, Vec<PluginSource>)> {
-    let mut statement = conn.prepare("SELECT p.name,h.flags,h.plugin_masters,h.source_path,p.checksum FROM plugins p JOIN record_overrides h ON h.plugin_id=p.id AND h.record_type='TES4' AND h.source_record_offset=0 ORDER BY p.priority,p.id")?;
+    let normalized: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='inhouse_plugin_masters')",
+        [], |r| r.get(0),
+    )?;
+    let legacy_column = if normalized {
+        "NULL"
+    } else {
+        "h.plugin_masters"
+    };
+    let mut statement = conn.prepare(&format!("SELECT h.plugin_id,p.name,h.flags,h.source_path,p.checksum,{legacy_column} FROM plugins p JOIN record_overrides h ON h.plugin_id=p.id AND h.record_type='TES4' AND h.source_record_offset=0 ORDER BY p.priority,p.id"))?;
+    let mut master_statement = normalized.then(|| conn.prepare(
+        "SELECT master_index,master_name FROM inhouse_plugin_masters WHERE plugin_id=?1 ORDER BY master_index"
+    )).transpose()?;
     let rows = statement.query_map([], |r| {
         Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, u32>(1)?,
-            r.get::<_, String>(2)?,
+            r.get::<_, u32>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, u32>(2)?,
             r.get::<_, String>(3)?,
             r.get::<_, Vec<u8>>(4)?,
+            r.get::<_, Option<String>>(5)?,
         ))
     })?;
     let mut names = Vec::new();
     let mut metadata = Vec::new();
     let mut sources = Vec::new();
     for row in rows {
-        let (name, flags, masters, source, checksum) = row?;
+        let (plugin_id, name, flags, source, checksum, legacy_masters) = row?;
+        let masters = if let Some(statement) = &mut master_statement {
+            read_normalized_masters(statement, plugin_id)?
+        } else {
+            let legacy_masters = legacy_masters.ok_or_else(|| {
+                color_eyre::eyre::eyre!("plugin {plugin_id}: missing stored legacy master list")
+            })?;
+            serde_json::from_str(&legacy_masters)?
+        };
         names.push(name.clone());
-        metadata.push(PluginMetadata {
-            flags,
-            masters: serde_json::from_str(&masters)?,
-        });
+        metadata.push(PluginMetadata { flags, masters });
         sources.push((name, source.into(), checksum));
     }
     Ok((LoadOrder::from_metadata(names, metadata)?, sources))
+}
+
+/// Reject ambiguous edited SQL ordinals before rebuilding file-relative master indices.
+fn read_normalized_masters(statement: &mut Statement<'_>, plugin_id: u32) -> Result<Vec<String>> {
+    let mut rows = statement.query([plugin_id])?;
+    let mut masters = Vec::new();
+    while let Some(row) = rows.next()? {
+        let master_index: i64 = row.get(0)?;
+        ensure!(
+            master_index == i64::try_from(masters.len())?,
+            "plugin {plugin_id}: stored master ordinal {master_index} is not contiguous; expected {}",
+            masters.len()
+        );
+        masters.push(row.get(1)?);
+    }
+    Ok(masters)
 }
 
 /// Hash a source handle, then read only the requested native record with bounded allocation.
@@ -566,4 +619,209 @@ pub fn display(report: &HistoryReport) -> String {
         ));
     }
     output
+}
+
+#[cfg(test)]
+mod normalized_masters_tests {
+    use super::*;
+
+    /// Use a different native master order from global full/light slot order.
+    fn fixture_order() -> LoadOrder {
+        LoadOrder::from_metadata(
+            ["Base.esm", "Second.esm", "Light.esl", "Patch.esp"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            vec![
+                PluginMetadata {
+                    flags: 0,
+                    masters: vec![],
+                },
+                PluginMetadata {
+                    flags: 0,
+                    masters: vec![],
+                },
+                PluginMetadata {
+                    flags: 0x200,
+                    masters: vec![],
+                },
+                PluginMetadata {
+                    flags: 0,
+                    masters: vec!["Light.esl".into(), "Base.esm".into(), "Second.esm".into()],
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Build only stored SQL metadata; historical fixtures can include their old JSON column.
+    fn metadata_database(legacy: bool) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        let legacy_column = if legacy { ",plugin_masters TEXT" } else { "" };
+        conn.execute_batch(&format!(
+            "CREATE TABLE plugins(
+            id INTEGER PRIMARY KEY,name TEXT,priority INTEGER,checksum BLOB);
+            CREATE TABLE record_overrides(
+                plugin_id INTEGER,record_type TEXT,source_record_offset INTEGER,
+                flags INTEGER,source_path TEXT{legacy_column});"
+        ))
+        .unwrap();
+        let order = fixture_order();
+        for (plugin_id, name) in order.names.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO plugins VALUES(?1,?2,?1,?3)",
+                params![plugin_id as u32, name, vec![0x39u8; 32]],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO record_overrides(plugin_id,record_type,source_record_offset,flags,source_path) VALUES(?1,'TES4',0,?2,?3)",
+                params![plugin_id as u32, order.metadata[plugin_id].flags, name]).unwrap();
+        }
+        if legacy {
+            // This intentionally models the retained old-pack storage format only.
+            conn.execute_batch("UPDATE record_overrides SET plugin_masters='[]';
+                UPDATE record_overrides SET plugin_masters='[\"Light.esl\",\"Base.esm\",\"Second.esm\"]' WHERE plugin_id=3;")
+                .unwrap();
+        }
+        conn
+    }
+
+    /// Compare owner mapping independently of the SQL insertion or reader iteration order.
+    fn assert_authority(order: &LoadOrder, sources: &[PluginSource]) {
+        assert_eq!(
+            order.names,
+            ["base.esm", "second.esm", "light.esl", "patch.esp"]
+        );
+        assert!(
+            order.metadata[..3]
+                .iter()
+                .all(|header| header.masters.is_empty())
+        );
+        assert_eq!(
+            order.metadata[3].masters,
+            ["Light.esl", "Base.esm", "Second.esm"]
+        );
+        assert_eq!(sources.len(), 4);
+        assert_eq!(
+            super::super::source_identity::header_runtime_id(b"STAT", 0x00000abc, 3, order),
+            Some(0xfe000abc)
+        );
+        assert_eq!(
+            super::super::source_identity::header_runtime_id(b"STAT", 0x01000123, 3, order),
+            Some(0x00000123)
+        );
+        assert_eq!(
+            super::super::source_identity::header_runtime_id(b"STAT", 0x02000678, 3, order),
+            Some(0x01000678)
+        );
+    }
+
+    /// New history writes contain scalar masters, no JSON column, and explicit zero-master headers.
+    #[test]
+    fn normalized_producer_roundtrips_native_order_and_zero_masters() {
+        let conn = metadata_database(false);
+        let order = fixture_order();
+        let temp = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = order
+            .names
+            .iter()
+            .map(|name| {
+                let path = temp.path().join(name);
+                std::fs::write(&path, []).unwrap();
+                path
+            })
+            .collect();
+        let entries: Vec<_> = (0..order.names.len())
+            .map(|index| {
+                header_entry(
+                    scanner::ObservedHeader {
+                        record_type: *b"TES4",
+                        source_form_id: 0,
+                        flags: order.metadata[index].flags,
+                        source_record_offset: 0,
+                        source_record_size: 0,
+                        source_group_end: 24,
+                        frame_complete: true,
+                        cell_form_id: None,
+                        worldspace_form_id: None,
+                        source_topic_form_id: None,
+                        topic_group_offset: None,
+                        failure: None,
+                    },
+                    &order,
+                    index,
+                )
+            })
+            .collect();
+        write_tables(&conn, &entries, &order, &paths).unwrap();
+        let json_columns: i64 = conn.query_row("SELECT count(*) FROM pragma_table_info('record_overrides') WHERE name='plugin_masters'", [], |row| row.get(0)).unwrap();
+        let zero_master_headers: i64 = conn.query_row("SELECT count(*) FROM record_overrides h WHERE h.record_type='TES4' AND NOT EXISTS(SELECT 1 FROM inhouse_plugin_masters m WHERE m.plugin_id=h.plugin_id)", [], |row| row.get(0)).unwrap();
+        assert_eq!((json_columns, zero_master_headers), (0, 3));
+        let rows = conn.prepare("SELECT plugin_id,master_index,master_name FROM inhouse_plugin_masters ORDER BY plugin_id,master_index").unwrap()
+            .query_map([], |row| Ok((row.get::<_,u32>(0)?,row.get::<_,u32>(1)?,row.get::<_,String>(2)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(
+            rows,
+            [
+                (3, 0, "Light.esl".into()),
+                (3, 1, "Base.esm".into()),
+                (3, 2, "Second.esm".into())
+            ]
+        );
+        let (stored, sources) = stored_order(&conn).unwrap();
+        assert_authority(&stored, &sources);
+    }
+
+    /// Normalized ordinals determine authority even when scalar rows were inserted in reverse order.
+    #[test]
+    fn normalized_reader_uses_ordinals_and_ignores_stale_legacy_json() {
+        let conn = metadata_database(true);
+        write_master_table(&conn, &fixture_order()).unwrap();
+        conn.execute_batch("DELETE FROM inhouse_plugin_masters;
+            INSERT INTO inhouse_plugin_masters VALUES(3,2,'Second.esm'),(3,1,'Base.esm'),(3,0,'Light.esl');
+            UPDATE record_overrides SET plugin_masters='not JSON';")
+            .unwrap();
+        let (order, sources) = stored_order(&conn).unwrap();
+        assert_authority(&order, &sources);
+    }
+
+    /// A missing first or interior ordinal is an explicit stored-metadata failure without fallback.
+    #[test]
+    fn normalized_reader_rejects_sparse_ordinals() {
+        for removed in [0u32, 1] {
+            let conn = metadata_database(true);
+            write_master_table(&conn, &fixture_order()).unwrap();
+            conn.execute(
+                "DELETE FROM inhouse_plugin_masters WHERE plugin_id=3 AND master_index=?1",
+                [removed],
+            )
+            .unwrap();
+            let error = stored_order(&conn).err().unwrap().to_string();
+            assert!(
+                error.contains("plugin 3") && error.contains("not contiguous"),
+                "{error}"
+            );
+        }
+    }
+
+    /// An edited unconstrained table cannot reinterpret a negative ordinal as a valid index.
+    #[test]
+    fn normalized_reader_rejects_negative_ordinals() {
+        let conn = metadata_database(false);
+        conn.execute_batch("CREATE TABLE inhouse_plugin_masters(plugin_id INTEGER,master_index INTEGER,master_name TEXT);
+            INSERT INTO inhouse_plugin_masters VALUES(3,-1,'Base.esm');")
+            .unwrap();
+        let error = stored_order(&conn).err().unwrap().to_string();
+        assert!(
+            error.contains("ordinal -1") && error.contains("expected 0"),
+            "{error}"
+        );
+    }
+
+    /// Retained packs with only the former JSON column rebuild the same full/light authority.
+    #[test]
+    fn retained_legacy_pack_remains_readable() {
+        let conn = metadata_database(true);
+        let (order, sources) = stored_order(&conn).unwrap();
+        assert_authority(&order, &sources);
+    }
 }

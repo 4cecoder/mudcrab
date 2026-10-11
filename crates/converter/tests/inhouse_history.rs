@@ -125,7 +125,7 @@ async fn history_rejects_bad_stored_masters_cleanly() {
     let output = temp.path().join("pack");
     publish(&data, &output).await;
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
-    db.execute("UPDATE record_overrides SET plugin_masters='[\"Absent.esm\"]' WHERE record_type='TES4' AND plugin_id=2", []).unwrap();
+    db.execute("UPDATE inhouse_plugin_masters SET master_name='Absent.esm' WHERE plugin_id=2 AND master_index=0", []).unwrap();
     drop(db);
     let cli = std::process::Command::new(env!("CARGO_BIN_EXE_inhouse-records"))
         .arg("history")

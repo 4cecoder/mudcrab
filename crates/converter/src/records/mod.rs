@@ -2,6 +2,7 @@
 pub mod compact_array;
 pub mod deciders;
 mod decoder;
+pub mod diagnostics;
 pub mod history;
 pub mod history_source;
 pub(crate) mod profile;
@@ -187,7 +188,7 @@ impl DecodedRecord {
     }
 }
 
-/// Bounded per-plugin diagnostics retain one example, independent of record count.
+/// Bounded summaries accompany complete disk-backed diagnostic events.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct PluginDiagnostics {
     pub skipped_records: u64,
@@ -198,10 +199,14 @@ pub struct PluginDiagnostics {
     pub compatibility_headers: u64,
     pub first_example: Option<String>,
     pub first_by_category: BTreeMap<String, String>,
+    #[serde(skip)]
+    pub(crate) event_log: diagnostics::EventLog,
+    #[serde(skip)]
+    pub(crate) event_context: diagnostics::EventContext,
 }
 
 impl PluginDiagnostics {
-    /// Count an observation or failure without allocating another retained example.
+    /// Journal every observation while retaining one bounded example per category.
     pub(crate) fn note(&mut self, category: &str, example: impl FnOnce() -> String) {
         match category {
             "record" => self.skipped_records += 1,
@@ -210,13 +215,69 @@ impl PluginDiagnostics {
             "compatibility" => self.compatibility_headers += 1,
             _ => self.invalid_links += 1,
         }
+        let example = example();
+        let mut context = self.event_context.clone();
+        if category != "link" {
+            context.link_value = None;
+            context.occurrence = 0;
+        }
+        self.event_log.append(&context, category, &example);
         if !self.first_by_category.contains_key(category) {
-            let example = example();
+            let example = diagnostics::bounded_summary(example);
             if self.first_example.is_none() {
                 self.first_example = Some(example.clone());
             }
             self.first_by_category.insert(category.to_owned(), example);
         }
+    }
+
+    /// Reset context at a physical record or framing boundary.
+    pub(crate) fn set_record(
+        &mut self,
+        offset: u64,
+        signature: Option<[u8; 4]>,
+        source_id: Option<u32>,
+        form_id: Option<u32>,
+        stage: &'static str,
+    ) {
+        self.event_context = diagnostics::EventContext {
+            source_record_offset: Some(offset),
+            source_form_id: source_id,
+            form_id,
+            record_type: signature,
+            stage,
+            ..Default::default()
+        };
+    }
+
+    /// Identify a native or canonical field occurrence and restart its link ordinal.
+    pub(crate) fn set_field(&mut self, field: String) {
+        self.event_context.field = Some(field);
+        self.event_context.link_value = None;
+        self.event_context.occurrence = 0;
+        self.event_context.action = None;
+    }
+
+    /// Keep nested member and array paths without retaining payload copies.
+    pub(crate) fn push_field(&mut self, member: &str) -> Option<String> {
+        let previous = self.event_context.field.clone();
+        self.event_context.field = Some(match &previous {
+            Some(parent) => format!("{parent}.{member}"),
+            None => member.to_owned(),
+        });
+        previous
+    }
+
+    /// Restore the parent path after a bounded recursive decode or validation.
+    pub(crate) fn pop_field(&mut self, previous: Option<String>) {
+        self.event_context.field = previous;
+        self.event_context.link_value = None;
+    }
+
+    /// Distinguish equal link values at different positions within one field.
+    pub(crate) fn link(&mut self, value: u32) {
+        self.event_context.link_value = Some(value);
+        self.event_context.occurrence += 1;
     }
 }
 
@@ -356,6 +417,13 @@ fn read_plugins_with_prepared(
                     if let Some(entry) = history.borrow_mut().last_mut() {
                         entry.reason = Some(error.clone());
                     }
+                    if diagnostics
+                        .event_context
+                        .form_id
+                        .is_some_and(|id| result.records.contains_key(&id))
+                    {
+                        diagnostics.event_context.action = Some("kept_earlier_version");
+                    }
                     diagnostics.note("record", || error);
                     return;
                 }
@@ -364,6 +432,13 @@ fn read_plugins_with_prepared(
                 result.headers.push(record);
                 return;
             }
+            diagnostics.set_record(
+                record.source_record_offset,
+                Some(record.record_type),
+                Some(record.source_form_id),
+                Some(record.form_id),
+                "admission",
+            );
             if let Some(entry) = history.borrow_mut().last_mut() {
                 entry.form_id = Some(record.form_id);
                 entry.editor_id = (record.record_type == *b"GMST")
@@ -385,6 +460,9 @@ fn read_plugins_with_prepared(
             {
                 if let Some(entry) = history.borrow_mut().last_mut() {
                     entry.reason = Some(format!("unusable runtime candidate: {error}"));
+                }
+                if result.records.contains_key(&record.form_id) {
+                    diagnostics.event_context.action = Some("kept_earlier_version");
                 }
                 diagnostics.note("record", || {
                     format!(
@@ -408,6 +486,7 @@ fn read_plugins_with_prepared(
                     entry.reason =
                         Some("incomplete override keeps the earlier complete version".into());
                 }
+                diagnostics.event_context.action = Some("kept_earlier_version");
                 diagnostics.note("record", || {
                     format!(
                         "{} {:08X}: incomplete override keeps the earlier complete version",

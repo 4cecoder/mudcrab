@@ -54,6 +54,7 @@ pub(crate) fn scan_plugin(
     mut observe: impl FnMut(ObservedHeader),
     mut receive: impl FnMut(ScannedRecord, &mut PluginDiagnostics),
 ) -> Result<()> {
+    diagnostics.set_record(0, None, None, None, "framing");
     let file = File::open(path).wrap_err_with(|| format!("open {}", path.display()))?;
     if file.metadata()?.len() < 24 {
         diagnostics.note("record", || "input shorter than TES4 header".into());
@@ -103,6 +104,7 @@ fn scan_bytes_observed(
             topic = parent_topic;
             continue;
         }
+        diagnostics.set_record(position as u64, None, None, None, "framing");
         if end - position < 24 {
             diagnostics.note("record", || {
                 format!("incomplete frame at byte {position}; skipping containing group remainder")
@@ -113,6 +115,13 @@ fn scan_bytes_observed(
         let header = &bytes[position..position + 24];
         let signature: [u8; 4] = header[..4].try_into().expect("fixed header");
         let size = u32_at(header, 4) as usize;
+        diagnostics.set_record(
+            position as u64,
+            Some(signature),
+            (signature != *b"GRUP").then(|| u32_at(header, 12)),
+            None,
+            "framing",
+        );
         if signature == *b"GRUP" {
             if size < 24 || size > end - position || parents.len() >= 4096 {
                 diagnostics.note("record", || {

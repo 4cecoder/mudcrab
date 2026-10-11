@@ -183,6 +183,7 @@ fn subrecords<'a>(
     let mut extended = None;
     let mut complete = true;
     while position < payload.len() {
+        diagnostics.set_field(format!("payload[byte:{position}]"));
         if payload.len() - position < 6 {
             complete = false;
             diagnostics.note("field", || {
@@ -193,6 +194,10 @@ fn subrecords<'a>(
         let signature: [u8; 4] = payload[position..position + 4]
             .try_into()
             .expect("checked subrecord");
+        diagnostics.set_field(format!(
+            "{}[byte:{position}]",
+            String::from_utf8_lossy(&signature)
+        ));
         let short = u16::from_le_bytes(
             payload[position + 4..position + 6]
                 .try_into()
@@ -244,6 +249,7 @@ fn remap(
     optional: bool,
     diagnostics: &mut PluginDiagnostics,
 ) -> Result<u32, String> {
+    diagnostics.link(value);
     if value == 0 {
         return Ok(0);
     }
@@ -319,6 +325,14 @@ pub(crate) fn decode_with_identity(
     diagnostics: &mut PluginDiagnostics,
     identity: &mut impl FnMut(&str),
 ) -> Result<DecodedRecord, String> {
+    diagnostics.set_record(
+        scanned.source_record_offset,
+        Some(scanned.record_type),
+        Some(scanned.source_form_id),
+        None,
+        "decode",
+    );
+    diagnostics.set_field("record_header".into());
     // Original ownership stays strict; required headers retain supplier-self runtime compatibility.
     let source_identity = super::source_identity::resolve(
         &scanned.record_type,
@@ -327,6 +341,7 @@ pub(crate) fn decode_with_identity(
         context.order,
     );
     let id = remap(scanned.source_form_id, context, false, diagnostics)?;
+    diagnostics.event_context.form_id = Some(id);
     if id == 0 && !matches!(&scanned.record_type, b"GMST" | b"TES4") {
         return Err("non-GMST record has null FormID".into());
     }
@@ -342,17 +357,26 @@ pub(crate) fn decode_with_identity(
     }
     let cell = scanned
         .cell_form_id
-        .map(|id| remap(id, context, true, diagnostics))
+        .map(|id| {
+            diagnostics.set_field("cell_group".into());
+            remap(id, context, true, diagnostics)
+        })
         .transpose()?
         .filter(|&id| id != 0);
     let world = scanned
         .worldspace_form_id
-        .map(|id| remap(id, context, true, diagnostics))
+        .map(|id| {
+            diagnostics.set_field("worldspace_group".into());
+            remap(id, context, true, diagnostics)
+        })
         .transpose()?
         .filter(|&id| id != 0);
     let topic = scanned
         .source_topic_form_id
-        .map(|id| remap(id, context, true, diagnostics))
+        .map(|id| {
+            diagnostics.set_field("GRUP7".into());
+            remap(id, context, true, diagnostics)
+        })
         .transpose()?
         .filter(|&id| id != 0);
     let record_schema = prepared.get(&scanned.record_type);
@@ -367,12 +391,17 @@ pub(crate) fn decode_with_identity(
     let mut rejected_info_response: Option<(usize, usize)> = None;
     // Weights belong to their physical layer anchor, including an anchor that was rejected.
     let mut rejected_land_layer: Option<(usize, usize)> = None;
+    diagnostics.set_field("payload_framing".into());
     let framed = subrecords(&scanned.payload, diagnostics, scanned.source_form_id);
     let link_kind = |source_id| {
         let id = remap(source_id, context, true, &mut PluginDiagnostics::default()).ok()?;
         context.winning_types?.get(&id).copied()
     };
     for (position, &(signature, bytes)) in framed.fields.iter().enumerate() {
+        diagnostics.set_field(format!(
+            "{}[source:{position}]",
+            String::from_utf8_lossy(&signature)
+        ));
         let land_anchor =
             scanned.record_type == *b"LAND" && matches!(&signature, b"BTXT" | b"ATXT");
         if land_anchor {
@@ -663,6 +692,22 @@ fn value(
     selection: &super::deciders::Context<'_>,
     depth: usize,
 ) -> Result<(Value, Vec<u8>), String> {
+    let previous = diagnostics.push_field(&field.name);
+    let result = value_inner(field, bytes, schema, context, diagnostics, selection, depth);
+    diagnostics.pop_field(previous);
+    result
+}
+
+/// Decode a scoped member; the wrapper restores diagnostic paths on every return.
+fn value_inner(
+    field: &FieldSchema,
+    bytes: &[u8],
+    schema: &Schema,
+    context: &Context<'_>,
+    diagnostics: &mut PluginDiagnostics,
+    selection: &super::deciders::Context<'_>,
+    depth: usize,
+) -> Result<(Value, Vec<u8>), String> {
     if depth >= 32 {
         return Err("value nesting exceeds 32".into());
     }
@@ -935,6 +980,7 @@ fn array(
     let mut canonical = bytes.to_vec();
     let mut values = Vec::with_capacity(count);
     for index in 0..count {
+        let previous = diagnostics.push_field(&format!("[{index}]"));
         let start = offset + index * stride;
         let (decoded, encoded) = value(
             &element,
@@ -946,6 +992,7 @@ fn array(
             depth,
         )?;
         canonical[start..start + stride].copy_from_slice(&encoded);
+        diagnostics.pop_field(previous);
         values.push(decoded);
     }
     Ok((Value::Array(values), canonical))
@@ -1011,6 +1058,9 @@ fn merge_new_diagnostics(
     baseline: &PluginDiagnostics,
     resolved: PluginDiagnostics,
 ) {
+    target
+        .event_log
+        .merge_new_from(&resolved.event_log, &baseline.event_log);
     let additions = [
         (
             "record",
@@ -1131,6 +1181,17 @@ fn reject_deferred_candidate(
     reason: String,
 ) {
     set_deferred_history(result, record, false, reason.clone());
+    let diagnostics = result
+        .diagnostics
+        .entry(order.names[record.load_order as usize].clone())
+        .or_default();
+    diagnostics.set_record(
+        record.source_record_offset,
+        Some(record.record_type),
+        Some(record.source_form_id),
+        Some(record.form_id),
+        "admission",
+    );
     result
         .diagnostics
         .entry(order.names[record.load_order as usize].clone())
@@ -1293,7 +1354,22 @@ pub(crate) fn resolve_deferred(
                         true
                     }
                 });
-                for signature in &omitted {
+                for (position, signature) in omitted.iter().enumerate() {
+                    let diagnostics = result
+                        .diagnostics
+                        .entry(order.names[priority].clone())
+                        .or_default();
+                    diagnostics.set_record(
+                        record.source_record_offset,
+                        Some(record.record_type),
+                        Some(record.source_form_id),
+                        Some(record.form_id),
+                        "admission",
+                    );
+                    diagnostics.set_field(format!(
+                        "{}[omitted:{position}]",
+                        String::from_utf8_lossy(signature)
+                    ));
                     if !record.rejected_fields.contains(signature) {
                         record.rejected_fields.push(*signature);
                     }
@@ -1425,7 +1501,16 @@ pub(crate) fn validate_targets_with_prepared(
         let record_schema = prepared.get(&record.record_type);
         let plugin = order.names.get(record.load_order as usize).cloned();
         let mut diagnostics = PluginDiagnostics::default();
+        diagnostics.set_record(
+            record.source_record_offset,
+            Some(record.record_type),
+            Some(record.source_form_id),
+            Some(record.form_id),
+            "targets",
+        );
+        diagnostics.set_field("GRUP7".into());
         if let Some(topic) = record.topic_form_id {
+            diagnostics.link(topic);
             if kinds.get(&topic) != Some(b"DIAL") {
                 diagnostics.note("link", || {
                     format!(
@@ -1436,6 +1521,7 @@ pub(crate) fn validate_targets_with_prepared(
                 record.topic_form_id = None;
             }
         } else if record.source_topic_form_id == Some(0) {
+            diagnostics.link(0);
             diagnostics.note("link", || {
                 format!("INFO {:08X} GRUP7 has a null owner", record.form_id)
             });
@@ -1480,6 +1566,11 @@ pub(crate) fn validate_targets_with_prepared(
         };
         let link_kind = |id| kinds.get(&id).copied();
         for (position, field) in record.fields.iter_mut().enumerate() {
+            diagnostics.set_field(format!(
+                "{}[canonical:{position}].{}",
+                String::from_utf8_lossy(&field.signature),
+                field.name
+            ));
             let field_schema = record_schema
                 .and_then(|prepared| {
                     prepared
@@ -1511,6 +1602,7 @@ pub(crate) fn validate_targets_with_prepared(
                 // Canonical VMAD links are already global; check all primary and alias objects.
                 let validation =
                     super::vmad::decode(&field.canonical_bytes, &record.record_type, |id| {
+                        diagnostics.link(id);
                         if id == 0 || id < 0x800 || kinds.contains_key(&id) {
                             return Ok(id);
                         }
@@ -1553,6 +1645,7 @@ pub(crate) fn validate_targets_with_prepared(
             && let Some(plugin) = plugin
         {
             let target = result.diagnostics.entry(plugin).or_default();
+            target.event_log.merge_from(&diagnostics.event_log);
             target.invalid_links += diagnostics.invalid_links;
             if target.first_example.is_none() {
                 target.first_example = diagnostics.first_example;
@@ -1566,6 +1659,21 @@ pub(crate) fn validate_targets_with_prepared(
 
 /// Walk the same schema offsets used by decoding when nulling a mistyped or dangling link.
 fn validate_value(
+    decoded: &mut Value,
+    bytes: &mut [u8],
+    field: &FieldSchema,
+    schema: &Schema,
+    kinds: &HashMap<u32, [u8; 4]>,
+    diagnostics: &mut PluginDiagnostics,
+    selection: &super::deciders::Context<'_>,
+) {
+    let previous = diagnostics.push_field(&field.name);
+    validate_value_inner(decoded, bytes, field, schema, kinds, diagnostics, selection);
+    diagnostics.pop_field(previous);
+}
+
+/// Validate within the scoped member, preserving the existing canonical mutation policy.
+fn validate_value_inner(
     decoded: &mut Value,
     bytes: &mut [u8],
     field: &FieldSchema,
@@ -1619,6 +1727,7 @@ fn validate_value(
     }
     match decoded {
         Value::FormId(id) if *id != 0 => {
+            diagnostics.link(*id);
             // Hardcoded IDs (including the player) need not have a plugin record.
             let allowed = kinds.get(id).map_or(*id < 0x800, |kind| {
                 field
@@ -1725,6 +1834,7 @@ fn validate_value(
                     }
                 };
                 for (index, value) in values.iter_mut().enumerate() {
+                    let previous = diagnostics.push_field(&format!("[{index}]"));
                     let start = offset + index * stride;
                     if let Some(slice) = bytes.get_mut(start..start + stride) {
                         validate_value(
@@ -1737,6 +1847,7 @@ fn validate_value(
                             selection,
                         );
                     }
+                    diagnostics.pop_field(previous);
                 }
             }
         }

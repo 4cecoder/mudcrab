@@ -989,6 +989,8 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
             "grass_types",
             "landscape_texture_grasses",
             "scripts",
+            "script_properties",
+            "script_property_values",
         ];
         for (name, rows) in &full_tables {
             if deferred.contains(&name.as_str()) {

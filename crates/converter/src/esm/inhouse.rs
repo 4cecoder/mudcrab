@@ -52,6 +52,8 @@ const DEFERRED_RUNTIME_TABLES: &[&str] = &[
     "grass_types",
     "landscape_texture_grasses",
     "scripts",
+    "script_properties",
+    "script_property_values",
 ];
 
 /// Identity binds decoder behavior and schema bytes so stale output cannot prove reuse.
@@ -61,6 +63,7 @@ pub fn reader_identity(reader: RecordReader) -> serde_json::Value {
         RecordReader::Inhouse => serde_json::json!({
             "mode": "inhouse", "adapter_version": ADAPTER_VERSION,
             "schema_sha256": crate::cache::hash_bytes(records::SCHEMA_BYTES),
+            "diagnostics_version": records::diagnostics::SCHEMA_VERSION,
             "language": "english",
             "text_encoding": "windows-1252", "vmad_text_encoding": "utf-8",
         }),
@@ -220,7 +223,7 @@ fn write_record_archive_scope(output: &Path, complete: bool, signatures: &[[u8; 
             "runtime_views_materialized": false,
             "preserved_sql_tables": ["schema_info", "plugins", "records", "formid_map",
                 "inhouse_source_records", "inhouse_localized_fields", "inhouse_terrain_source_order",
-                "inhouse_terrain_layers", "record_overrides"],
+                "inhouse_terrain_layers", "inhouse_unresolved_terrain_textures", "record_overrides", "inhouse_plugin_masters", "record_diagnostics"],
         "deferred_runtime_tables": DEFERRED_RUNTIME_TABLES,
         "unchanged_auxiliary_tables": ["conversion_cache", "lod", "lod_chunks", "lod_build",
             "lod_chunks_spatial", "lod_chunks_spatial_node", "lod_chunks_spatial_parent", "lod_chunks_spatial_rowid"],
@@ -317,24 +320,58 @@ pub(crate) fn localized_string_paths(plugins: &[PathBuf]) -> BTreeSet<PathBuf> {
         .collect()
 }
 
-/// Bounded diagnostics retain one concrete example per plugin.
+/// Bounded summaries accompany disk-backed details for every adapter observation.
 #[derive(Default)]
-struct Warnings(BTreeMap<String, (u64, String)>);
+struct Warnings {
+    summary: BTreeMap<String, (u64, String)>,
+    logs: BTreeMap<String, records::diagnostics::EventLog>,
+}
 
 impl Warnings {
-    /// Count a local decode or lookup issue without accumulating every failing record.
-    fn skipped(&mut self, plugin: &str, message: String) {
-        let entry = self.0.entry(plugin.to_owned()).or_insert((0, message));
+    /// Journal each issue while retaining only one bounded summary example per plugin.
+    fn skipped(
+        &mut self,
+        plugin: &str,
+        context: records::diagnostics::EventContext,
+        message: String,
+    ) {
+        self.logs
+            .entry(plugin.to_owned())
+            .or_default()
+            .append(&context, "adapter", &message);
+        let entry = self
+            .summary
+            .entry(plugin.to_owned())
+            .or_insert_with(|| (0, records::diagnostics::bounded_summary(message)));
         entry.0 += 1;
     }
 
     /// Emit deterministic plugin summaries after usable neighbors are exported.
     fn report(&self) {
-        for (plugin, (count, first)) in &self.0 {
+        for (plugin, (count, first)) in &self.summary {
             eprintln!(
                 "warning: {plugin}: inhouse adapter reported {count} local decode/lookup issues (first: {first})"
             );
         }
+    }
+}
+
+/// Identify an adapter observation without retaining another payload or typed record.
+fn adapter_context(
+    record: &records::DecodedRecord,
+    stage: &'static str,
+    field: Option<String>,
+    action: &'static str,
+) -> records::diagnostics::EventContext {
+    records::diagnostics::EventContext {
+        source_record_offset: Some(record.source_record_offset),
+        source_form_id: Some(record.source_form_id),
+        form_id: Some(record.form_id),
+        record_type: Some(record.record_type),
+        stage,
+        field,
+        action: Some(action),
+        ..Default::default()
     }
 }
 
@@ -486,6 +523,12 @@ fn convert_plugins_with_dump_impl(
                 }
                 Err(error) => warnings.skipped(
                     &order.names[record.load_order as usize],
+                    adapter_context(
+                        record,
+                        "terrain_provenance",
+                        Some("texture_layers".into()),
+                        "skipped",
+                    ),
                     format!("{:08X} terrain layer provenance: {error}", record.form_id),
                 ),
             }
@@ -544,7 +587,16 @@ fn convert_plugins_with_dump_impl(
                     .or_insert_with(|| {
                         read_plugin_strings(&plugin_paths[priority], strings_root, bank)
                             .unwrap_or_else(|error| {
-                                warnings.skipped(plugin, format!("localized table: {error}"));
+                                warnings.skipped(
+                                    plugin,
+                                    records::diagnostics::EventContext {
+                                        stage: "localization_bank",
+                                        field: Some(bank.to_owned()),
+                                        action: Some("unresolved"),
+                                        ..Default::default()
+                                    },
+                                    format!("localized table: {error}"),
+                                );
                                 HashMap::new()
                             })
                     });
@@ -581,6 +633,16 @@ fn convert_plugins_with_dump_impl(
                     if *id != 0 {
                         warnings.skipped(
                             plugin,
+                            adapter_context(
+                                record,
+                                "localization",
+                                Some(format!(
+                                    "{}[canonical:{index}].{}",
+                                    String::from_utf8_lossy(&field.signature),
+                                    field.name
+                                )),
+                                "unresolved",
+                            ),
                             format!(
                                 "{:08X} {} missing localized ID {id}",
                                 record.form_id, field.name
@@ -613,6 +675,7 @@ fn convert_plugins_with_dump_impl(
         if let Err(error) = invalid {
             warnings.skipped(
                 plugin,
+                adapter_context(record, "runtime_projection", None, "skipped"),
                 format!(
                     "{:08X} {}: {error}",
                     raw.form_id,
@@ -668,7 +731,7 @@ fn convert_plugins_with_dump_impl(
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch("CREATE TABLE IF NOT EXISTS inhouse_source_records(form_id INTEGER PRIMARY KEY, source_form_id INTEGER NOT NULL, load_order INTEGER NOT NULL, record_type TEXT NOT NULL, flags INTEGER NOT NULL, payload BLOB NOT NULL); DELETE FROM inhouse_source_records;")?;
     tx.execute_batch("CREATE TABLE IF NOT EXISTS inhouse_localized_fields(form_id INTEGER NOT NULL, field_index INTEGER NOT NULL, signature TEXT NOT NULL, field_name TEXT NOT NULL, string_table TEXT NOT NULL, string_id INTEGER NOT NULL, load_order INTEGER NOT NULL, resolved_text TEXT, status TEXT NOT NULL CHECK(status IN ('resolved','null_id','missing')), PRIMARY KEY(form_id,field_index)); DELETE FROM inhouse_localized_fields; CREATE TABLE IF NOT EXISTS inhouse_terrain_source_order(form_id INTEGER PRIMARY KEY, source_record_offset INTEGER NOT NULL); DELETE FROM inhouse_terrain_source_order;")?;
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS inhouse_terrain_layers(form_id INTEGER PRIMARY KEY, cell_id INTEGER NOT NULL, load_order INTEGER NOT NULL, layer_data BLOB NOT NULL, unresolved_texture_ids TEXT NOT NULL); DELETE FROM inhouse_terrain_layers;")?;
+    super::inhouse_terrain_diagnostics::replace_snapshot_tables(&tx)?;
     for (id, layers) in preserved_layers {
         let Some(record) = master.get(&id) else {
             continue;
@@ -684,9 +747,10 @@ fn convert_plugins_with_dump_impl(
             })
             .collect::<BTreeSet<_>>();
         tx.prepare_cached(
-            "INSERT INTO inhouse_terrain_layers(form_id,cell_id,load_order,layer_data,unresolved_texture_ids) VALUES (?1,?2,?3,?4,?5)")?.execute(
-            params![id, record.cell_form_id.unwrap_or(id), record.load_order, rkyv::to_bytes::<rkyv::rancor::Error>(&layers)?.as_slice(), serde_json::to_string(&unresolved)?],
+            "INSERT INTO inhouse_terrain_layers(form_id,cell_id,load_order,layer_data) VALUES (?1,?2,?3,?4)")?.execute(
+            params![id, record.cell_form_id.unwrap_or(id), record.load_order, rkyv::to_bytes::<rkyv::rancor::Error>(&layers)?.as_slice()],
         )?;
+        super::inhouse_terrain_diagnostics::write_unresolved_texture_ids(&tx, id, &unresolved)?;
     }
     for field in localized_fields {
         tx.prepare_cached(
@@ -710,6 +774,26 @@ fn convert_plugins_with_dump_impl(
         )?;
     }
     records::history::write_tables(&tx, &decoded.history, &order, plugin_paths)?;
+    records::diagnostics::write_tables(
+        &tx,
+        order
+            .names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| {
+                decoded
+                    .diagnostics
+                    .get(name)
+                    .map(|diagnostics| (index, &diagnostics.event_log))
+            })
+            .chain(
+                order
+                    .names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, name)| warnings.logs.get(name).map(|log| (index, log))),
+            ),
+    )?;
     tx.commit()?;
     provenance_stage.finish(decoded.records.len());
     if let Some(staging) = db_path.parent() {
@@ -720,7 +804,7 @@ fn convert_plugins_with_dump_impl(
         fs::write(
             path,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "decoder": decoded.diagnostics, "adapter": warnings.0,
+                "decoder": decoded.diagnostics, "adapter": warnings.summary,
             }))?,
         )?;
     }
