@@ -20,6 +20,7 @@ use crate::esm::{load_order::LoadOrder, records::RawRecord};
 use color_eyre::Result;
 use schema_format::Schema;
 use serde::{Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -198,6 +199,79 @@ impl DecodedRecord {
     }
 }
 
+/// A bounded total order for one diagnostic, independent of its observation order.
+/// Known physical offsets precede unknown provenance; record IDs, field paths and
+/// observation details break ties. Full-text hashes distinguish truncated prefixes.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DiagnosticSummaryKey {
+    source_record_offset: (bool, u64),
+    source_form_id: (bool, u32),
+    form_id: (bool, u32),
+    record_type: Option<[u8; 4]>,
+    field: Option<String>,
+    occurrence: u64,
+    stage: &'static str,
+    category: String,
+    action: Option<&'static str>,
+    link_value: Option<u32>,
+    reason: String,
+    full_text_hash: [u8; 32],
+}
+
+impl DiagnosticSummaryKey {
+    /// Rank physical source coordinates before bounded field and observation details.
+    pub(crate) fn new(context: &diagnostics::EventContext, category: &str, reason: &str) -> Self {
+        let mut identity = Sha256::new();
+        for text in [context.field.as_deref(), Some(category), Some(reason)] {
+            identity.update([u8::from(text.is_some())]);
+            if let Some(text) = text {
+                identity.update((text.len() as u64).to_le_bytes());
+                identity.update(text.as_bytes());
+            }
+        }
+        Self {
+            source_record_offset: (
+                context.source_record_offset.is_none(),
+                context.source_record_offset.unwrap_or_default(),
+            ),
+            source_form_id: (
+                context.source_form_id.is_none(),
+                context.source_form_id.unwrap_or_default(),
+            ),
+            form_id: (
+                context.form_id.is_none(),
+                context.form_id.unwrap_or_default(),
+            ),
+            record_type: context.record_type,
+            field: context
+                .field
+                .as_deref()
+                .map(|field| Self::bounded(field, 512)),
+            occurrence: context.occurrence,
+            stage: context.stage,
+            category: Self::bounded(category, 2048),
+            action: context.action,
+            link_value: context.link_value,
+            reason: Self::bounded(reason, 2048),
+            full_text_hash: identity.finalize().into(),
+        }
+    }
+
+    /// Authored examples without internal keys sort after physical provenance by text.
+    fn fallback(reason: &str) -> Self {
+        Self::new(&diagnostics::EventContext::default(), "", reason)
+    }
+
+    /// Retain a complete UTF-8 prefix without copying unbounded source text first.
+    fn bounded(text: &str, limit: usize) -> String {
+        let mut end = text.len().min(limit);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end].to_owned()
+    }
+}
+
 /// Bounded summaries accompany complete disk-backed diagnostic events.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct PluginDiagnostics {
@@ -209,6 +283,10 @@ pub struct PluginDiagnostics {
     pub compatibility_headers: u64,
     pub first_example: Option<String>,
     pub first_by_category: BTreeMap<String, String>,
+    #[serde(skip)]
+    pub(crate) first_summary_key: Option<DiagnosticSummaryKey>,
+    #[serde(skip)]
+    pub(crate) summary_keys: BTreeMap<String, DiagnosticSummaryKey>,
     #[serde(skip)]
     pub(crate) event_log: diagnostics::EventLog,
     #[serde(skip)]
@@ -222,7 +300,7 @@ pub struct PluginDiagnostics {
 }
 
 impl PluginDiagnostics {
-    /// Journal every observation while retaining one bounded example per category.
+    /// Journal every observation while retaining the least source example per category.
     pub(crate) fn note(&mut self, category: &str, example: impl FnOnce() -> String) {
         match category {
             "record" => self.skipped_records += 1,
@@ -238,12 +316,63 @@ impl PluginDiagnostics {
             context.occurrence = 0;
         }
         self.event_log.append(&context, category, &example);
-        if !self.first_by_category.contains_key(category) {
-            let example = diagnostics::bounded_summary(example);
-            if self.first_example.is_none() {
-                self.first_example = Some(example.clone());
+        let key = DiagnosticSummaryKey::new(&context, category, &example);
+        self.remember_summary(category, key, diagnostics::bounded_summary(example));
+    }
+
+    /// Keep category and global examples under the same total order, without changing counts.
+    fn remember_summary(&mut self, category: &str, key: DiagnosticSummaryKey, example: String) {
+        self.remember_first(&key, &example);
+        let replace = self.first_by_category.get(category).is_none_or(|current| {
+            match self.summary_keys.get(category) {
+                Some(current_key) => &key < current_key,
+                None => key < DiagnosticSummaryKey::fallback(current),
             }
+        });
+        if replace {
             self.first_by_category.insert(category.to_owned(), example);
+            self.summary_keys.insert(category.to_owned(), key);
+        }
+    }
+
+    /// Select the global example, including authored summaries with no category entry.
+    fn remember_first(&mut self, key: &DiagnosticSummaryKey, example: &str) {
+        let replace =
+            self.first_example
+                .as_deref()
+                .is_none_or(|current| match &self.first_summary_key {
+                    Some(current_key) => key < current_key,
+                    None => key < &DiagnosticSummaryKey::fallback(current),
+                });
+        if replace {
+            self.first_example = Some(example.to_owned());
+            self.first_summary_key = Some(key.clone());
+        }
+    }
+
+    /// Merge one category's bounded example and provenance, leaving counts and journals alone.
+    pub(crate) fn merge_summary_category(&mut self, source: &Self, category: &str) {
+        if let Some(example) = source.first_by_category.get(category) {
+            let key = source
+                .summary_keys
+                .get(category)
+                .cloned()
+                .unwrap_or_else(|| DiagnosticSummaryKey::fallback(example));
+            self.remember_summary(category, key, diagnostics::bounded_summary(example.clone()));
+        }
+    }
+
+    /// Preserve ordering metadata whenever replay or test oracles copy bounded summaries.
+    pub(crate) fn merge_summaries(&mut self, source: &Self) {
+        if let Some(example) = &source.first_example {
+            let key = source
+                .first_summary_key
+                .clone()
+                .unwrap_or_else(|| DiagnosticSummaryKey::fallback(example));
+            self.remember_first(&key, &diagnostics::bounded_summary(example.clone()));
+        }
+        for category in source.first_by_category.keys() {
+            self.merge_summary_category(source, category);
         }
     }
 

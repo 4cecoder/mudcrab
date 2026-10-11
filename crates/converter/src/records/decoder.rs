@@ -1,5 +1,9 @@
 //! Ordered subrecord matching and generic values with typed FormID resolution.
 #[cfg(test)]
+#[path = "diagnostic_summary_tests.rs"]
+mod diagnostic_summary_tests;
+
+#[cfg(test)]
 mod addon_controls {
     use super::*;
 
@@ -1683,7 +1687,7 @@ fn alternate_textures(
     Ok((Value::Array(values), canonical))
 }
 
-/// Add only diagnostics newly discovered by a contextual replay, keeping existing examples.
+/// Add diagnostics newly discovered by contextual replay with the least source examples.
 fn merge_new_diagnostics(
     target: &mut PluginDiagnostics,
     baseline: &PluginDiagnostics,
@@ -1735,16 +1739,7 @@ fn merge_new_diagnostics(
             "compatibility" => target.compatibility_headers += count,
             _ => target.invalid_links += count,
         }
-        if !target.first_by_category.contains_key(category)
-            && let Some(example) = resolved.first_by_category.get(category)
-        {
-            if target.first_example.is_none() {
-                target.first_example = Some(example.clone());
-            }
-            target
-                .first_by_category
-                .insert(category.to_owned(), example.clone());
-        }
+        target.merge_summary_category(&resolved, category);
     }
 }
 
@@ -2118,15 +2113,10 @@ fn replay_deferred_field(
     (local, failure)
 }
 
-/// Add contextual observations while keeping source-order summary examples.
+/// Add contextual observations while retaining the least physical source examples.
 fn merge_replay_observations(replay: &mut PluginDiagnostics, local: PluginDiagnostics) {
     replay.event_log.merge_from(&local.event_log);
-    if replay.first_example.is_none() {
-        replay.first_example = local.first_example;
-    }
-    for (category, example) in local.first_by_category {
-        replay.first_by_category.entry(category).or_insert(example);
-    }
+    replay.merge_summaries(&local);
 }
 
 /// Grammar guards can change later descriptor admission or an EDID-based selector.
@@ -2663,12 +2653,7 @@ fn replay_deferred(
                 }
                 prefix.link += local.invalid_links;
                 replay.event_log.merge_from(&local.event_log);
-                for (category, example) in local.first_by_category {
-                    replay.first_by_category.entry(category).or_insert(example);
-                }
-                if replay.first_example.is_none() {
-                    replay.first_example = local.first_example;
-                }
+                replay.merge_summaries(&local);
                 prefix.write(replay);
                 return Err(format!(
                     "deferred winner {:08X}: {} {decoded_id:08X} mandatory {}: {error}",
@@ -2706,12 +2691,7 @@ fn replay_deferred(
             previous.push((original_counts, DiagnosticCounts::read(&local)));
         }
         replay.event_log.merge_from(&local.event_log);
-        if replay.first_example.is_none() {
-            replay.first_example = local.first_example;
-        }
-        for (category, example) in local.first_by_category {
-            replay.first_by_category.entry(category).or_insert(example);
-        }
+        replay.merge_summaries(&local);
     }
     omitted.sort_unstable();
     omitted.dedup();
@@ -3276,12 +3256,7 @@ pub(crate) fn validate_targets_with_prepared(
             let target = result.diagnostics.entry(plugin).or_default();
             target.event_log.merge_from(&diagnostics.event_log);
             target.invalid_links += diagnostics.invalid_links;
-            if target.first_example.is_none() {
-                target.first_example = diagnostics.first_example;
-            }
-            for (category, example) in diagnostics.first_by_category {
-                target.first_by_category.entry(category).or_insert(example);
-            }
+            target.merge_summaries(&diagnostics);
         }
     }
 }
@@ -3507,8 +3482,7 @@ mod tests {
     fn replay_probe_diagnostics(source: &PluginDiagnostics) -> PluginDiagnostics {
         let mut copied = PluginDiagnostics::default();
         DiagnosticCounts::read(source).write(&mut copied);
-        copied.first_example = source.first_example.clone();
-        copied.first_by_category = source.first_by_category.clone();
+        copied.merge_summaries(source);
         copied.event_log.merge_from(&source.event_log);
         copied
     }
@@ -4434,7 +4408,9 @@ mod tests {
             (0, 1, 2, 0, 0)
         );
         assert!(diagnostics.first_by_category["field"].contains("expected 4 bytes, got 1"));
-        assert!(diagnostics.first_by_category["link"].contains("02001888"));
+        // At the same source record, the lexical COED path precedes LINK even though
+        // deferred replay observes it later. Both events remain in the complete journal.
+        assert!(diagnostics.first_by_category["link"].contains("02001899"));
         let conn = replay_probe_database();
         super::super::diagnostics::write_tables(&conn, [(1, &diagnostics.event_log)]).unwrap();
         let events: Vec<(String, i64, Option<u32>, String)> = conn.prepare("SELECT field,occurrence,link_value,category FROM record_diagnostics WHERE source_form_id=6272 ORDER BY field").unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap().map(Result::unwrap).collect();
@@ -4514,8 +4490,7 @@ mod tests {
         oracle.event_log.merge_from(&baseline.event_log);
         oracle.skipped_fields = baseline.skipped_fields;
         oracle.invalid_links = baseline.invalid_links;
-        oracle.first_example = baseline.first_example.clone();
-        oracle.first_by_category = baseline.first_by_category.clone();
+        oracle.merge_summaries(&baseline);
         merge_new_diagnostics(&mut oracle, &baseline, replay);
         assert_eq!(
             (

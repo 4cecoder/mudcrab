@@ -313,6 +313,10 @@ mod database_work_dir_tests;
 #[path = "inhouse_review_tests.rs"]
 mod inhouse_review_tests;
 
+#[cfg(test)]
+#[path = "inhouse_determinism_tests.rs"]
+mod inhouse_determinism_tests;
+
 /// Stamp generated pack metadata after database/cache regeneration.
 pub(crate) fn write_reader_identity(staging: &Path, reader: RecordReader) -> Result<()> {
     let schemas = records::addons::RuntimeSchemas::from_addon_bytes(&[])
@@ -357,11 +361,12 @@ pub(crate) fn localized_string_paths(plugins: &[PathBuf]) -> BTreeSet<PathBuf> {
 #[derive(Default)]
 struct Warnings {
     summary: BTreeMap<String, (u64, String)>,
+    summary_keys: BTreeMap<String, records::DiagnosticSummaryKey>,
     logs: BTreeMap<String, records::diagnostics::EventLog>,
 }
 
 impl Warnings {
-    /// Journal each issue while retaining only one bounded summary example per plugin.
+    /// Journal each issue and retain the smallest bounded provenance example per plugin.
     fn skipped(
         &mut self,
         plugin: &str,
@@ -372,11 +377,17 @@ impl Warnings {
             .entry(plugin.to_owned())
             .or_default()
             .append(&context, "adapter", &message);
-        let entry = self
-            .summary
-            .entry(plugin.to_owned())
-            .or_insert_with(|| (0, records::diagnostics::bounded_summary(message)));
+        let key = records::DiagnosticSummaryKey::new(&context, "adapter", &message);
+        let entry = self.summary.entry(plugin.to_owned()).or_default();
         entry.0 += 1;
+        if self
+            .summary_keys
+            .get(plugin)
+            .is_none_or(|chosen| key < *chosen)
+        {
+            self.summary_keys.insert(plugin.to_owned(), key);
+            entry.1 = records::diagnostics::bounded_summary(message);
+        }
     }
 
     /// Emit deterministic plugin summaries after usable neighbors are exported.
@@ -652,7 +663,19 @@ fn convert_plugins_with_dump_impl(
     let projection_stage = records::profile::ProfileStage::start("typed_export_runtime_projection");
     let mut master = HashMap::with_capacity(decoded.records.len());
     let mut opaque_fields = HashMap::new();
-    for record in decoded.records.values_mut() {
+    // Sort compact keys, leaving record payloads in place and streaming one JSON line at a time.
+    // The same traversal fixes localized provenance rowids when no typed dump is requested.
+    let mut record_keys = decoded
+        .records
+        .values()
+        .map(|record| (record.record_type, record.form_id))
+        .collect::<Vec<_>>();
+    record_keys.sort_unstable();
+    for (_, id) in record_keys {
+        let record = decoded
+            .records
+            .get_mut(&id)
+            .expect("sorted winning record exists");
         let priority = record.load_order as usize;
         let plugin = &order.names[priority];
         let mut runtime_text_updates = decoded_text_updates(record);

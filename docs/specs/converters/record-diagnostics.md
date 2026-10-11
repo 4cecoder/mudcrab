@@ -6,6 +6,18 @@ details are scalar rows in the optional `record_diagnostics` SQL table. This
 table is tooling provenance and is refreshed in the same transaction as source
 records and override history.
 
+Bounded decoder and adapter examples are selected by a fixed provenance order
+within each plugin, rather than observation order. Known physical source offsets
+sort before missing offsets, followed by source FormID, canonical FormID, record
+signature, bounded field path, link occurrence, stage, category, action, link
+value and bounded reason. Field paths compare lexically; full-text digests break
+ties between equal bounded prefixes. Decoder `first_example` is the smallest
+category example under the same order. Replay merges retain that provenance;
+manually authored summaries without it use a deterministic bounded-text fallback.
+Counts and complete event identities are unchanged. Complete SQL diagnostics
+already publish in `(plugin_id, event_key)` order, independently of summary
+selection.
+
 Diagnostic events include the zero-based supplying `plugin_id`, physical
 `source_record_offset`, native `source_form_id`, resolved `form_id` when known,
 record signature, stage, field/link occurrence, category, reason and action.

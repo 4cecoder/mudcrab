@@ -248,6 +248,13 @@ as an override winner. An unusable candidate leaves its earlier usable
 predecessor. Short summaries remain bounded; every distinct recovery event is
 spooled to disk and published in the scalar `record_diagnostics` table as
 described in [the diagnostic contract](../../../../docs/specs/converters/record-diagnostics.md).
+`typed-records.jsonl` writes selected winning records in ascending record-type
+signature byte order, then ascending unsigned canonical FormID. The adapter
+sorts only these compact keys and streams each record before moving its field
+buffers into runtime projection; field, component and array order stay intact.
+The same traversal gives localized provenance rows a reproducible insertion
+order. This guarantees typed line ordering, without claiming byte-identical
+SQLite container files.
 TES4 headers remain separate.
 Failed deferred replay rejects a tentative override locally and restores an
 earlier usable complete candidate without crossing an admitted deletion or
