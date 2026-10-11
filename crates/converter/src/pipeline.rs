@@ -241,12 +241,14 @@ impl AssetPipeline {
         Self::run_async_with_cancel(config, progress_tx, Cancellation::new()).await
     }
 
+    /// Freeze configuration inputs before staging and honor cancellation at publication.
     pub async fn run_async_with_cancel(
         mut config: PipelineConfig,
         progress_tx: Sender<ProgressEvent>,
         cancellation: Cancellation,
     ) -> Result<PipelineReport, PipelineFailure> {
         config.validate()?;
+        config.freeze_schema_addons()?;
         reject_symlink_output(&config.output_dir)?;
         config.output_dir =
             resolve_asset_path(&config.output_dir).wrap_err("failed to resolve asset output")?;
@@ -394,6 +396,7 @@ impl AssetPipeline {
             retained_asset_configuration_hash: None,
             complete: false,
             configuration_hash: expected_configuration.clone(),
+            schema_addons: config.schemas()?.identities().to_vec(),
             asset_configuration_hashes: ["nif", "dds", "pex"]
                 .into_iter()
                 .map(|kind| {
@@ -626,11 +629,12 @@ impl AssetPipeline {
             if db_path.is_file() {
                 fs::remove_file(&db_path)?;
             }
-            let merged = EsmParser::convert_plugins_with_reader(
+            let merged = EsmParser::convert_plugins_with_reader_and_schemas(
                 &plugins,
                 &db_path,
                 config.record_reader,
                 &staging.join("vfs"),
+                Some(config.schemas()?.as_ref()),
             )?;
             validate_database(&Connection::open(&db_path)?)?;
             if config.record_reader == crate::config::RecordReader::Inhouse {
@@ -638,7 +642,11 @@ impl AssetPipeline {
             } else {
                 write_cell_cache(&merged, &staging.join("cell_cache.rkyv"))?;
             }
-            crate::esm::inhouse::write_reader_identity(staging, config.record_reader)?;
+            crate::esm::inhouse::write_reader_identity_with_schemas(
+                staging,
+                config.record_reader,
+                config.schemas()?.as_ref(),
+            )?;
             if config.record_reader == crate::config::RecordReader::Inhouse {
                 report
                     .artifacts

@@ -1,5 +1,5 @@
 //! Optional tooling provenance: header-only chains and lazy source-version decoding.
-use super::{DecodedRecord, PluginDiagnostics, Value, decoder, scanner};
+use super::{DecodedRecord, PluginDiagnostics, Value, addons::RuntimeSchemas, decoder, scanner};
 use crate::esm::{binary::PluginMetadata, load_order::LoadOrder};
 use color_eyre::{Result, eyre::ensure};
 use rusqlite::{Connection, OpenFlags, params};
@@ -90,15 +90,33 @@ pub(crate) fn reconcile_gmst(entries: &mut [HistoryEntry], ids: &HashMap<String,
 
 /// Persist all headers, including singletons, in a deterministic primary-key tree.
 /// The caller supplies its provenance transaction; database failures remain infrastructure errors.
+#[cfg(test)]
 pub(crate) fn write_tables(
     conn: &Connection,
     entries: &[HistoryEntry],
     order: &LoadOrder,
     paths: &[PathBuf],
 ) -> Result<()> {
+    let schemas = RuntimeSchemas::from_addon_bytes(&[]).map_err(color_eyre::eyre::Error::msg)?;
+    write_tables_with_schemas(conn, entries, order, paths, &schemas)
+}
+
+/// Atomically retain the exact ordered add-ons beside their producing history snapshot.
+/// Configuration is already validated before conversion; this persists reproducible bytes.
+pub(crate) fn write_tables_with_schemas(
+    conn: &Connection,
+    entries: &[HistoryEntry],
+    order: &LoadOrder,
+    paths: &[PathBuf],
+    schemas: &RuntimeSchemas,
+) -> Result<()> {
     // Complete conversion replaces this owned tooling snapshot atomically with provenance.
-    // Recreate only this table so a retained older optional-history schema is not reused.
-    conn.execute_batch("DROP TABLE IF EXISTS record_overrides;
+    // Recreate the owned tables so retained history and add-on bytes cannot become stale.
+    conn.execute_batch("DROP TABLE IF EXISTS inhouse_schema_addons;
+        CREATE TABLE inhouse_schema_addons(
+        ordinal INTEGER PRIMARY KEY, name TEXT NOT NULL, sha256 TEXT NOT NULL,
+        schema_json BLOB NOT NULL);
+        DROP TABLE IF EXISTS record_overrides;
         CREATE TABLE record_overrides(
         form_id INTEGER, chain_position INTEGER NOT NULL,
         plugin_id INTEGER NOT NULL, source_form_id INTEGER NOT NULL,
@@ -114,6 +132,22 @@ pub(crate) fn write_tables(
         PRIMARY KEY(plugin_id,source_record_offset)) WITHOUT ROWID;
         CREATE INDEX record_overrides_chain ON record_overrides(form_id,chain_position);
         CREATE INDEX record_overrides_source ON record_overrides(original_owner,full_local,plugin_id,source_record_offset);")?;
+    let mut addon_insert = conn.prepare(
+        "INSERT INTO inhouse_schema_addons(ordinal,name,sha256,schema_json) VALUES(?1,?2,?3,?4)",
+    )?;
+    for (ordinal, (identity, bytes)) in schemas
+        .identities()
+        .iter()
+        .zip(schemas.addon_bytes())
+        .enumerate()
+    {
+        addon_insert.execute(params![
+            ordinal as u64,
+            identity.name,
+            identity.sha256,
+            bytes
+        ])?;
+    }
     let source_paths = paths
         .iter()
         .map(|p| p.canonicalize())
@@ -185,7 +219,7 @@ pub(crate) fn write_tables(
                 ))
                 .transpose()?,
             is_header.then(|| source_paths[entry.plugin_index as usize].to_string_lossy()),
-            is_header.then(|| crate::cache::hash_bytes(super::SCHEMA_BYTES)),
+            is_header.then(|| schemas.schema_sha256()),
             identity.original_owner,
             identity.full_local,
             identity.state.as_str(),
@@ -266,8 +300,10 @@ fn decode_version(
     entry: &HistoryEntry,
     order: &LoadOrder,
     kinds: &HashMap<u32, [u8; 4]>,
+    runtime: (&RuntimeSchemas, &decoder::PreparedSchemas),
     diagnostics: &mut PluginDiagnostics,
 ) -> Result<DecodedRecord> {
+    let (schemas, prepared) = runtime;
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -339,8 +375,9 @@ fn decode_version(
         localized: order.metadata[entry.plugin_index as usize].flags & 0x80 != 0,
         winning_types: Some(kinds),
     };
-    let mut record = decoder::decode(scanned, super::schema(), &context, diagnostics)
-        .map_err(color_eyre::eyre::Error::msg)?;
+    let mut record =
+        decoder::decode_with_prepared(scanned, schemas.schema(), prepared, &context, diagnostics)
+            .map_err(color_eyre::eyre::Error::msg)?;
     record.form_id = entry.form_id.unwrap_or(record.form_id);
     ensure!(
         record.payload_complete && record.rejected_fields.is_empty(),
@@ -348,6 +385,74 @@ fn decode_version(
         record.rejected_fields
     );
     Ok(record)
+}
+
+/// Reopen saved add-on bytes without depending on files from the converter's invocation.
+/// Older packs have no add-on table and retain the embedded-schema compatibility check.
+pub(crate) fn stored_schemas(conn: &Connection) -> Result<RuntimeSchemas> {
+    let has_addons: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='inhouse_schema_addons')",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut bytes = Vec::new();
+    let mut identities = Vec::new();
+    let mut total_bytes = 0usize;
+    if has_addons {
+        let mut statement = conn.prepare(
+            "SELECT ordinal,name,sha256,schema_json FROM inhouse_schema_addons ORDER BY ordinal",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let ordinal = row.get::<_, i64>(0)?;
+            let name = row.get::<_, String>(1)?;
+            let sha256 = row.get::<_, String>(2)?;
+            let schema_json = row.get_ref(3)?.as_blob()?;
+            ensure!(
+                bytes.len() < super::addons::MAX_SCHEMA_ADDONS
+                    && schema_json.len() <= super::addons::MAX_SCHEMA_ADDON_BYTES,
+                "stored schema add-ons exceed their count or document-size limit"
+            );
+            total_bytes = total_bytes.saturating_add(schema_json.len());
+            ensure!(
+                total_bytes <= super::addons::MAX_SCHEMA_ADDON_TOTAL_BYTES,
+                "stored schema add-ons exceed their total-size limit"
+            );
+            ensure!(
+                usize::try_from(ordinal).ok() == Some(bytes.len()),
+                "stored schema add-on order is not contiguous"
+            );
+            ensure!(
+                crate::cache::hash_bytes(schema_json) == sha256,
+                "stored schema add-on {name} checksum mismatch"
+            );
+            bytes.push(schema_json.to_vec());
+            identities.push((name, sha256));
+        }
+    }
+    let references = bytes.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let schemas =
+        RuntimeSchemas::from_addon_bytes(&references).map_err(color_eyre::eyre::Error::msg)?;
+    ensure!(
+        schemas.identities().len() == identities.len()
+            && schemas
+                .identities()
+                .iter()
+                .zip(&identities)
+                .all(|(identity, (name, sha256))| identity.name == *name
+                    && identity.sha256 == *sha256),
+        "stored schema add-on identities differ from their saved definitions"
+    );
+    let mut statement = conn
+        .prepare("SELECT DISTINCT schema_sha256 FROM record_overrides WHERE record_type='TES4'")?;
+    let fingerprints = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        fingerprints.len() == 1 && fingerprints[0] == schemas.schema_sha256(),
+        "diagnostic schema differs from the producing schema"
+    );
+    Ok(schemas)
 }
 
 /// Load a requested chain read-only; one missing, changed or undecodable source remains local.
@@ -359,8 +464,10 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
     };
     let conn = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let (order, sources) = stored_order(&conn)?;
-    let schema_hash: String = conn.query_row("SELECT schema_sha256 FROM record_overrides WHERE record_type='TES4' ORDER BY plugin_id LIMIT 1", [], |r| r.get(0))?;
-    let schema_matches = schema_hash == crate::cache::hash_bytes(super::SCHEMA_BYTES);
+    // Schema/provenance failures leave the requested history visible, but forbid decoding
+    // with a different schema or an add-on set that only partly passed validation.
+    let schemas = stored_schemas(&conn).map_err(|error| format!("{error}"));
+    let prepared = schemas.as_ref().ok().map(decoder::prepare_runtime_schema);
     let mut kind_statement =
         conn.prepare("SELECT form_id,record_type FROM inhouse_source_records")?;
     let kinds = kind_statement
@@ -429,10 +536,10 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
             diagnostics: PluginDiagnostics::default(),
         };
         let decoded = (|| -> Result<DecodedRecord> {
-            ensure!(
-                schema_matches,
-                "diagnostic schema differs from the producing schema"
-            );
+            let schemas = schemas
+                .as_ref()
+                .map_err(|error| color_eyre::eyre::eyre!("{error}"))?;
+            let prepared = prepared.as_ref().expect("schema prepared after validation");
             let (name, path, checksum) = sources
                 .get(index as usize)
                 .ok_or_else(|| color_eyre::eyre::eyre!("absent stored source metadata"))?;
@@ -466,6 +573,7 @@ pub fn read_history(pack: &Path, data: Option<&Path>, form_id: u32) -> Result<Hi
                 &entry,
                 &order,
                 &kinds,
+                (schemas, prepared),
                 &mut version.diagnostics,
             )
         })();
@@ -566,4 +674,102 @@ pub fn display(report: &HistoryReport) -> String {
         ));
     }
     output
+}
+
+#[cfg(test)]
+mod schema_addon_controls {
+    use super::*;
+
+    const ADDON: &[u8] = br#"{"version":1,"name":"history_control","records":[{"signature":"ZHIS","source":"synthetic history fixture","fields":[{"signature":"ZNAM","name":"neighbor","kind":"u32"}]}]}"#;
+
+    /// Store the public provenance contract independently of the production history writer.
+    fn snapshot(schemas: &RuntimeSchemas) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE record_overrides(record_type TEXT,schema_sha256 TEXT);
+             CREATE TABLE inhouse_schema_addons(ordinal INTEGER PRIMARY KEY,name TEXT,sha256 TEXT,schema_json BLOB);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO record_overrides VALUES('TES4',?1)",
+            [schemas.schema_sha256()],
+        )
+        .unwrap();
+        for (ordinal, (identity, bytes)) in schemas
+            .identities()
+            .iter()
+            .zip(schemas.addon_bytes())
+            .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO inhouse_schema_addons VALUES(?1,?2,?3,?4)",
+                params![ordinal as u64, identity.name, identity.sha256, bytes],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// Exact retained documents restore new types without any original add-on file path.
+    #[test]
+    fn retained_documents_restore_schema_and_legacy_packs_keep_builtin_hash() {
+        let schemas = RuntimeSchemas::from_addon_bytes(&[ADDON]).unwrap();
+        let conn = snapshot(&schemas);
+        let reopened = stored_schemas(&conn).unwrap();
+        assert_eq!(reopened.identities(), schemas.identities());
+        assert_eq!(reopened.schema_sha256(), schemas.schema_sha256());
+        assert!(
+            reopened
+                .schema()
+                .records
+                .iter()
+                .any(|record| record.signature == "ZHIS")
+        );
+
+        let builtins = RuntimeSchemas::from_addon_bytes(&[]).unwrap();
+        let legacy = snapshot(&builtins);
+        legacy
+            .execute("DROP TABLE inhouse_schema_addons", [])
+            .unwrap();
+        assert_eq!(
+            stored_schemas(&legacy).unwrap().schema_sha256(),
+            crate::cache::hash_bytes(super::super::SCHEMA_BYTES)
+        );
+    }
+
+    /// Corrupt saved metadata never supplies a different or partially validated decoding schema.
+    #[test]
+    fn stored_metadata_corruption_rejects_order_names_hashes_and_fingerprints() {
+        let schemas = RuntimeSchemas::from_addon_bytes(&[ADDON]).unwrap();
+        for mutation in [
+            "UPDATE inhouse_schema_addons SET ordinal=-1",
+            "UPDATE inhouse_schema_addons SET name='other_name'",
+            "UPDATE inhouse_schema_addons SET sha256='wrong_hash'",
+            "UPDATE inhouse_schema_addons SET schema_json=x'7b7d'",
+            "UPDATE record_overrides SET schema_sha256='wrong_fingerprint'",
+            "INSERT INTO record_overrides VALUES('TES4','different_header_fingerprint')",
+        ] {
+            let conn = snapshot(&schemas);
+            conn.execute(mutation, []).unwrap();
+            assert!(stored_schemas(&conn).is_err(), "accepted {mutation}");
+        }
+    }
+
+    /// A subsequent no-add-on snapshot clears stale add-on rows in a reused database.
+    #[test]
+    fn builtin_history_write_clears_previous_addon_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
+        let order = LoadOrder::from_metadata(Vec::new(), Vec::new()).unwrap();
+        let schemas = RuntimeSchemas::from_addon_bytes(&[ADDON]).unwrap();
+        write_tables_with_schemas(&conn, &[], &order, &[], &schemas).unwrap();
+        let count = |conn: &Connection| {
+            conn.query_row("SELECT COUNT(*) FROM inhouse_schema_addons", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(count(&conn), 1);
+        write_tables(&conn, &[], &order, &[]).unwrap();
+        assert_eq!(count(&conn), 0);
+    }
 }

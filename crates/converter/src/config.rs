@@ -48,6 +48,12 @@ pub struct PipelineConfig {
     /// Defaults to legacy for older serialized configurations.
     #[serde(default)]
     pub record_reader: RecordReader,
+    /// Ordered schema JSON add-ons for the in-house reader.
+    #[serde(default)]
+    pub schema_addons: Vec<PathBuf>,
+    /// A run freezes schema bytes before creating or recovering output.
+    #[serde(skip)]
+    pub(crate) runtime_schemas: Option<std::sync::Arc<crate::records::addons::RuntimeSchemas>>,
     /// Explicit Creation list; absent uses Skyrim.ccc beside Data for player lists.
     #[serde(default)]
     pub skyrim_ccc_file: Option<PathBuf>,
@@ -89,6 +95,28 @@ fn default_texture_zstd_level() -> i32 {
 }
 
 impl PipelineConfig {
+    /// Read all configured add-ons once, rejecting the batch before output work begins.
+    pub(crate) fn freeze_schema_addons(&mut self) -> color_eyre::Result<()> {
+        self.runtime_schemas = Some(std::sync::Arc::new(
+            crate::records::addons::RuntimeSchemas::load(&self.schema_addons)
+                .map_err(color_eyre::eyre::Error::msg)?,
+        ));
+        Ok(())
+    }
+
+    /// Use the frozen run schema, or load a temporary snapshot for settings inspection.
+    pub(crate) fn schemas(
+        &self,
+    ) -> color_eyre::Result<std::sync::Arc<crate::records::addons::RuntimeSchemas>> {
+        if let Some(schemas) = &self.runtime_schemas {
+            return Ok(schemas.clone());
+        }
+        Ok(std::sync::Arc::new(
+            crate::records::addons::RuntimeSchemas::load(&self.schema_addons)
+                .map_err(color_eyre::eyre::Error::msg)?,
+        ))
+    }
+
     /// A configuration with the default settings for converting `data_dir` into `output_dir`.
     pub fn new(data_dir: impl Into<PathBuf>, output_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -98,6 +126,8 @@ impl PipelineConfig {
             cache_dir: None,
             plugins_file: None,
             record_reader: RecordReader::Legacy,
+            schema_addons: Vec::new(),
+            runtime_schemas: None,
             skyrim_ccc_file: None,
             skyrim_ini_file: None,
             lod_origins: BTreeMap::new(),
@@ -132,6 +162,10 @@ impl PipelineConfig {
 
     /// Checks that the directories and settings can be used for a run.
     pub(crate) fn validate(&self) -> color_eyre::Result<()> {
+        color_eyre::eyre::ensure!(
+            self.schema_addons.is_empty() || self.record_reader == RecordReader::Inhouse,
+            "schema add-ons require --record-reader inhouse"
+        );
         color_eyre::eyre::ensure!(
             self.data_dir.is_dir(),
             "Skyrim Data directory does not exist: {}",

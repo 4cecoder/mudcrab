@@ -291,6 +291,7 @@ mod tests {
     /// Keep source canonical bytes distinct from the typed value under test.
     fn field(value: Value) -> DecodedField {
         DecodedField {
+            opaque: false,
             signature: *b"DATA",
             name: "same_role".into(),
             value,

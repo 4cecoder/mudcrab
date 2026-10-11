@@ -1,4 +1,34 @@
 //! Ordered subrecord matching and generic values with typed FormID resolution.
+#[cfg(test)]
+mod addon_controls {
+    use super::*;
+
+    /// Extension localization uses its declared bank instead of the embedded default.
+    #[test]
+    fn extensions_retain_their_declared_localized_bank() {
+        let schemas = super::super::addons::RuntimeSchemas::from_addon_bytes(&[
+            br#"{"version":1,"name":"bank-test","records":[{"signature":"KYWD","extends":true,"fields":[{"signature":"XTXT","name":"addon_text","kind":"lstring","string_table":"dlstrings"},{"signature":"XONE","kind":"lstring","string_table":"dlstrings"},{"signature":"XTWO","kind":"lstring","string_table":"ilstrings"}]}]}"#,
+        ]).unwrap();
+        let prepared = prepare_runtime_schema(&schemas);
+        assert_eq!(
+            string_table_with_prepared(&prepared, b"KYWD", b"XTXT", "addon_text"),
+            "dlstrings"
+        );
+        assert_eq!(
+            string_table_with_prepared(&prepared, b"KYWD", b"EDID", "editor_id"),
+            "strings"
+        );
+        assert_eq!(
+            string_table_with_prepared(&prepared, b"KYWD", b"XONE", ""),
+            "dlstrings"
+        );
+        assert_eq!(
+            string_table_with_prepared(&prepared, b"KYWD", b"XTWO", ""),
+            "ilstrings"
+        );
+    }
+}
+
 use super::{
     DecodedField, DecodedRecord, PluginDiagnostics, ReadResult, Value,
     scanner::ScannedRecord,
@@ -36,6 +66,7 @@ struct RepeatRange {
 pub(crate) struct PreparedRecord {
     entries: Vec<Entry>,
     unordered: bool,
+    extensions: Vec<Entry>,
 }
 
 /// One prepared map shared by initial decoding, deferred replay and target validation.
@@ -84,10 +115,23 @@ pub(crate) fn prepare_schema(schema: &Schema) -> PreparedSchemas {
                 PreparedRecord {
                     entries,
                     unordered: record.allow_unordered,
+                    extensions: Vec::new(),
                 },
             )
         })
         .collect()
+}
+
+/// Prepare independent extension leaves without changing ordinary field positions.
+pub(crate) fn prepare_runtime_schema(schemas: &super::addons::RuntimeSchemas) -> PreparedSchemas {
+    let mut prepared = prepare_schema(schemas.schema());
+    for (signature, fields) in schemas.extensions() {
+        let record = prepared
+            .get_mut(signature)
+            .expect("validated extension owner");
+        flatten(fields, schemas.schema(), &mut record.extensions);
+    }
+    prepared
 }
 
 /// Prepare the build-validated embedded schema exactly once per process.
@@ -96,17 +140,36 @@ pub(crate) fn prepared() -> &'static PreparedSchemas {
     PREPARED.get_or_init(|| prepare_schema(super::schema()))
 }
 
-pub(crate) fn string_table(record_type: &[u8; 4], field_name: &str) -> &'static str {
-    prepared()
+/// Resolve a matched role's text bank from the same runtime schema as decoding.
+pub(crate) fn string_table_with_prepared(
+    prepared: &PreparedSchemas,
+    record_type: &[u8; 4],
+    signature: &[u8; 4],
+    field_name: &str,
+) -> &'static str {
+    match prepared
         .get(record_type)
         .and_then(|record| {
             record
                 .entries
                 .iter()
-                .find(|entry| entry.field.name == field_name)
+                .chain(&record.extensions)
+                .find(|entry| {
+                    entry.field.name == field_name
+                        && entry
+                            .field
+                            .signature
+                            .as_deref()
+                            .is_some_and(|tag| tag.as_bytes() == signature)
+                })
         })
         .and_then(|entry| entry.field.string_table.as_deref())
         .unwrap_or("strings")
+    {
+        "dlstrings" => "dlstrings",
+        "ilstrings" => "ilstrings",
+        _ => "strings",
+    }
 }
 
 /// Match a file-order occurrence without moving the cursor on an unknown tag.
@@ -289,16 +352,6 @@ fn remap(
     }
 }
 
-/// Decode only matched fields; retain source bytes separately for raw-record preservation.
-pub(crate) fn decode(
-    scanned: ScannedRecord,
-    schema: &Schema,
-    context: &Context<'_>,
-    diagnostics: &mut PluginDiagnostics,
-) -> Result<DecodedRecord, String> {
-    decode_with_prepared(scanned, schema, prepared(), context, diagnostics)
-}
-
 /// Use the same checked prepared entries for initial and catalogue-dependent decoding.
 pub(crate) fn decode_with_prepared(
     scanned: ScannedRecord,
@@ -359,6 +412,7 @@ pub(crate) fn decode_with_identity(
     let mut cursor = 0;
     let mut last = None;
     let mut fields = Vec::new();
+    let mut seen_extensions = std::collections::BTreeSet::new();
     let mut rejected_fields = Vec::new();
     let mut editor_id = String::new();
     // CIS leaves belong to the preceding CTDA, not the preceding surviving one.
@@ -428,6 +482,7 @@ pub(crate) fn decode_with_identity(
                         name: common.name,
                         value,
                         canonical_bytes,
+                        opaque: false,
                     }),
                     Err(error) => {
                         if !rejected_fields.contains(&signature) {
@@ -449,9 +504,68 @@ pub(crate) fn decode_with_identity(
                 name: String::from_utf8_lossy(&signature).into_owned(),
                 value: Value::Bytes(bytes.to_vec()),
                 canonical_bytes: bytes.to_vec(),
+                opaque: true,
             });
             continue;
         };
+        if let Some(entry) = record_schema.extensions.iter().find(|entry| {
+            entry
+                .field
+                .signature
+                .as_deref()
+                .is_some_and(|tag| tag.as_bytes() == signature)
+        }) {
+            let field_schema = &entry.field;
+            let decoded = if !field_schema.repeat && !seen_extensions.insert(signature) {
+                Err("duplicate singleton extension".to_owned())
+            } else {
+                value(
+                    field_schema,
+                    bytes,
+                    schema,
+                    context,
+                    diagnostics,
+                    &selection,
+                    0,
+                )
+            };
+            match decoded {
+                Ok((value, canonical_bytes)) => {
+                    if signature == *b"EDID"
+                        && let Value::String(name) = &value
+                    {
+                        editor_id.clone_from(name);
+                    }
+                    fields.push(DecodedField {
+                        signature,
+                        name: field_schema.name.clone(),
+                        value,
+                        canonical_bytes,
+                        opaque: false,
+                    });
+                }
+                Err(error) => {
+                    if field_schema.reject_record_on_error && scanned.flags & 0x20 == 0 {
+                        return Err(format!(
+                            "{} {id:08X} mandatory {}: {error}",
+                            String::from_utf8_lossy(&scanned.record_type),
+                            field_schema.name
+                        ));
+                    }
+                    if !rejected_fields.contains(&signature) {
+                        rejected_fields.push(signature);
+                    }
+                    diagnostics.note("field", || {
+                        format!(
+                            "{} {id:08X} {}: {error}",
+                            String::from_utf8_lossy(&scanned.record_type),
+                            String::from_utf8_lossy(&signature)
+                        )
+                    });
+                }
+            }
+            continue;
+        }
         let Some(index) = match_field(record_schema, &signature, cursor, last) else {
             if land_anchor {
                 rejected_land_layer = record_schema
@@ -466,17 +580,17 @@ pub(crate) fn decode_with_identity(
                     })
                     .and_then(|index| layer_repeat_range(record_schema, index));
             }
-            if signature == *b"CTDA" {
-                rejected_condition_strings = true;
-            }
-            if record_schema.entries.iter().any(|entry| {
+            let known = record_schema.entries.iter().any(|entry| {
                 entry
                     .field
                     .signature
                     .as_deref()
                     .is_some_and(|tag| tag.as_bytes() == signature)
-            }) && !rejected_fields.contains(&signature)
-            {
+            });
+            if known && signature == *b"CTDA" {
+                rejected_condition_strings = true;
+            }
+            if known && !rejected_fields.contains(&signature) {
                 rejected_fields.push(signature);
             }
             diagnostics.note("unexpected", || {
@@ -486,6 +600,15 @@ pub(crate) fn decode_with_identity(
                     String::from_utf8_lossy(&signature)
                 )
             });
+            if !known {
+                fields.push(DecodedField {
+                    signature,
+                    name: String::from_utf8_lossy(&signature).into_owned(),
+                    value: Value::Bytes(bytes.to_vec()),
+                    canonical_bytes: bytes.to_vec(),
+                    opaque: true,
+                });
+            }
             continue;
         };
         let field_schema = &record_schema.entries[index].field;
@@ -537,6 +660,7 @@ pub(crate) fn decode_with_identity(
                     name: field_schema.name.clone(),
                     value,
                     canonical_bytes,
+                    opaque: false,
                 });
             }
             Err(error) => {
@@ -1480,11 +1604,16 @@ pub(crate) fn validate_targets_with_prepared(
         };
         let link_kind = |id| kinds.get(&id).copied();
         for (position, field) in record.fields.iter_mut().enumerate() {
+            // Opaque occurrences have no authoritative descriptor and must remain exact bytes.
+            if field.opaque {
+                continue;
+            }
             let field_schema = record_schema
                 .and_then(|prepared| {
                     prepared
                         .entries
                         .iter()
+                        .chain(&prepared.extensions)
                         .find(|entry| {
                             entry.field.name == field.name
                                 && entry
@@ -2034,6 +2163,7 @@ mod tests {
         let record = PreparedRecord {
             entries,
             unordered: false,
+            extensions: Vec::new(),
         };
         assert_eq!(match_field(&record, b"BTXT", 2, Some(1)), Some(1));
         assert_eq!(match_field(&record, b"EDID", 2, Some(1)), None);
@@ -2086,6 +2216,7 @@ mod tests {
         let prepared = PreparedRecord {
             entries,
             unordered: false,
+            extensions: Vec::new(),
         };
         assert_eq!(match_field(&prepared, b"INDX", 2, Some(1)), Some(0));
         assert_eq!(match_field(&prepared, b"FNAM", 2, Some(1)), Some(2));
