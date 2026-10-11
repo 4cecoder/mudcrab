@@ -18,6 +18,8 @@ pub mod cell_cache;
 pub mod exporter;
 pub mod extractors;
 pub mod inhouse;
+mod inhouse_script_properties;
+mod inhouse_terrain_diagnostics;
 pub mod load_order;
 pub mod lodsettings;
 pub mod mmap_reader;

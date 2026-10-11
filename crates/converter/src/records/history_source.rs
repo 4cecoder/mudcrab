@@ -207,6 +207,8 @@ fn latest(
 /// authenticate edited SQL. Original-file checksums authenticate read bytes, not stored MAST,
 /// slot, group-bound, admission or winner metadata; this API does not independently reconstruct
 /// those contexts from arbitrary databases. Retain before/after bundle guards with the result.
+/// Stored MAST authority comes from ordered scalar rows in new packs, with legacy pack reading
+/// supported by the shared history loader; ordinal validation does not authenticate that authority.
 ///
 /// # Completion and errors
 /// Accept the result only after a returned summary reports full raw availability. SQL/metadata

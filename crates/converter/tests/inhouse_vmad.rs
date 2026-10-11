@@ -671,17 +671,33 @@ async fn malformed_script_fields_publish_neighbors_and_preserve_source_bytes() {
         );
     }
     for id in [0x01004300u32, 0x01004303] {
-        let properties: String = db
+        let json_columns: u32 = db
             .query_row(
-                "SELECT properties_json FROM scripts WHERE form_id=?1 AND script_name='NoneScript'",
+                "SELECT count(*) FROM pragma_table_info('scripts') WHERE name='properties_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            json_columns, 0,
+            "in-house script properties have no JSON list column"
+        );
+        let properties = db
+            .prepare("SELECT property_index,property_type,value_count FROM script_properties WHERE form_id=?1 AND script_name='NoneScript' ORDER BY property_index")
+            .unwrap()
+            .query_map([id], |row| Ok((row.get::<_, u32>(0)?,row.get::<_, u8>(1)?,row.get::<_, u32>(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(properties, [(0, 0, 0), (1, 3, 1)]);
+        let value: i32 = db
+            .query_row(
+                "SELECT integer_value FROM script_property_values WHERE form_id=?1 AND script_name='NoneScript' AND property_index=1 AND value_index=0",
                 [id],
                 |row| row.get(0),
             )
             .unwrap();
-        let properties: serde_json::Value = serde_json::from_str(&properties).unwrap();
-        assert_eq!(properties[0]["property_type"], 0);
-        assert_eq!(properties[0]["value"], "None");
-        assert_eq!(properties[1]["value"]["Int"], -7391);
+        assert_eq!(value, -7391);
     }
     let source: Vec<u8> = db
         .query_row(

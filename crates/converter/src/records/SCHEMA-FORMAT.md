@@ -164,8 +164,10 @@ pipeline and diagnostic exporter. All winning LAND identities and their native
 fields remain in the records/source tables, including unselected alternatives.
 
 `inhouse_terrain_layers` retains normalized, globally remapped original texture
-assignments for accepted LAND records, with their cell, load order and unresolved
-texture IDs. Source duplicate slots and authored NULL assignments are resolved
+assignments for accepted LAND records, with their cell and load order.
+`inhouse_unresolved_terrain_textures(form_id,texture_form_id)` retains distinct
+nonzero unresolved IDs as scalar child rows rather than a JSON list column.
+Source duplicate slots and authored NULL assignments are resolved
 before optional target clearing. `cell_cache_preserved.rkyv` uses these original
 assignments. The runtime cache replaces unusable texture keys with zero while
 retaining each selected assignment's quadrant, slot and blend weights; these
@@ -188,7 +190,10 @@ usable compressed deletion bodies retain identity-bearing fields. The runtime
 adapter checks required terrain and movement semantics on each candidate before
 committing it
 as an override winner. An unusable candidate leaves its earlier usable
-predecessor and records a bounded diagnostic. TES4 headers remain separate.
+predecessor. Short summaries remain bounded; every distinct recovery event is
+spooled to disk and published in the scalar `record_diagnostics` table as
+described in [the diagnostic contract](../../../../docs/specs/converters/record-diagnostics.md).
+TES4 headers remain separate.
 Failed deferred replay rejects a tentative override locally and restores an
 earlier usable complete candidate without crossing an admitted deletion or
 nondeferred replacement. A first definition can retain its safe fields while

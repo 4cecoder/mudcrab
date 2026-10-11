@@ -277,7 +277,7 @@ type CellMetadata = (Option<i32>, Option<i32>, Option<u32>);
 /// Synthetic records without a source load order have no formid_map entry.
 /// Export a legacy subset without replacing complete-load-order metadata.
 pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Result<()> {
-    export_records(conn, master, None, None, None, true)
+    export_records(conn, master, None, None, None, true, false)
 }
 
 /// Export a complete effective load order, replacing both grass projections.
@@ -288,7 +288,7 @@ pub fn export_to_db_with_load_order(
     master: &HashMap<u32, RawRecord>,
     order: &LoadOrder,
 ) -> Result<()> {
-    export_records(conn, master, Some(order), None, None, true)
+    export_records(conn, master, Some(order), None, None, true, false)
 }
 
 /// Export canonical decoded fields with Skyrim's texture slots and byte-wide XESP flags.
@@ -306,6 +306,7 @@ pub(crate) fn export_inhouse_to_db(
         Some(unresolved_fields),
         Some(terrain_offsets),
         true,
+        true,
     )
 }
 
@@ -316,7 +317,7 @@ pub(crate) fn export_inhouse_record_archive_to_db(
     master: &HashMap<u32, RawRecord>,
     order: &LoadOrder,
 ) -> Result<()> {
-    export_records(conn, master, Some(order), None, None, false)
+    export_records(conn, master, Some(order), None, None, false, true)
 }
 
 /// Keep unresolved text occurrences in the archive while nullable projections see no text.
@@ -377,9 +378,19 @@ fn export_records(
     unresolved_fields: Option<&HashMap<u32, BTreeSet<usize>>>,
     terrain_offsets: Option<&HashMap<u32, u64>>,
     runtime_views: bool,
+    scalar_scripts: bool,
 ) -> Result<()> {
     conn.set_prepared_statement_cache_capacity(64);
     let tx = conn.unchecked_transaction()?;
+    if scalar_scripts {
+        // In-house exports own the complete script snapshot; legacy partial APIs retain theirs.
+        super::inhouse_script_properties::replace_snapshot_tables(&tx)?;
+    }
+    // Partial public exports retain unrelated rows and follow the existing database's format.
+    let scalar_script_storage = scalar_scripts || tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='script_properties')",
+        [], |row| row.get::<_, bool>(0),
+    )?;
     if runtime_views {
         tx.prepare_cached("DELETE FROM movement_types")?
             .execute([])?;
@@ -489,6 +500,12 @@ fn export_records(
             let parsed = parse_vmad(vmad_bytes, &record.record_type);
             if let Ok((_, vmad)) = parsed {
                 for script in vmad.scripts {
+                    if scalar_script_storage {
+                        super::inhouse_script_properties::write_script(
+                            &tx, form_id, &script, vmad_bytes,
+                        )?;
+                        continue;
+                    }
                     let properties =
                         serde_json::to_string(&script.properties).map_err(|error| {
                             rusqlite::Error::ToSqlConversionFailure(Box::new(error))

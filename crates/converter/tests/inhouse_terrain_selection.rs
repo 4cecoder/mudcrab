@@ -386,14 +386,33 @@ async fn published_terrain_preserves_missing_texture_assignment_without_reviving
         .unwrap(),
         "LTEX"
     );
-    let (blob, unresolved): (Vec<u8>, String) = db
+    let blob: Vec<u8> = db
         .query_row(
-            "SELECT layer_data,unresolved_texture_ids FROM inhouse_terrain_layers WHERE form_id=?",
+            "SELECT layer_data FROM inhouse_terrain_layers WHERE form_id=?",
             [0x0100_08A1u32],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(unresolved, "[2116]");
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('inhouse_terrain_layers') WHERE name='unresolved_texture_ids'",
+            [],
+            |row| row.get::<_, u32>(0),
+        )
+        .unwrap(),
+        0,
+        "the published parent has no JSON list column"
+    );
+    let unresolved = db
+        .prepare(
+            "SELECT texture_form_id FROM inhouse_unresolved_terrain_textures WHERE form_id=? ORDER BY texture_form_id",
+        )
+        .unwrap()
+        .query_map([0x0100_08A1u32], |row| row.get::<_, u32>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(unresolved, vec![0x844]);
     assert_eq!(
         rkyv::from_bytes::<Vec<converter::shared::TerrainLayer>, rkyv::rancor::Error>(&blob)
             .unwrap(),

@@ -157,8 +157,12 @@ GMST history uses the reader's canonical EditorID aliases, including an already
 decoded EditorID when a later mandatory field rejects that version. Broken
 EditorID framing retains the raw numeric alias; history does not guess an ID.
 Each TES4 row uses a NULL canonical identity
-and status `header`, and stores original master-list JSON, source path and the
-authored schema hash. These small metadata rows allow replay to reconstruct
+and status `header`, and stores source path and the authored schema hash.
+`inhouse_plugin_masters(plugin_id,master_index,master_name)` stores original MAST
+order as scalar rows with contiguous zero-based indices; a header with no child
+rows has no masters. New snapshots have no `plugin_masters` JSON column.
+The history loader still accepts that column in retained packs when the child
+table is absent. These small metadata rows allow replay to reconstruct
 original full/light mapping without reading another missing or changed plugin.
 They are excluded from ordinary record-chain counts. Their deterministic positions
 in the NULL-identity group are header ordering, not a semantic record chain.
@@ -171,17 +175,22 @@ continue. The text view aligns authored field names and occurrences and marks
 differences. This is decoded source provenance, not a merge or patch format;
 partial decoding and unsupported semantic roles retain their existing limits.
 
-This optional additive tooling table does not change the runtime database
+These optional tooling tables do not change the runtime database
 contract, accepted version range or asset encodings. World and converter asset
 schema constants therefore remain unchanged. The existing committed history
-contribution uses in-house adapter 5; this integration uses adapter 7 for the
-preservation extension and required-header master-index compatibility. Older
+contribution uses in-house adapter 5; subsequent adapter identities cover the
+preservation extension and required-header master-index compatibility. The
+independent `diagnostics_version` in the reader identity covers complete scalar
+diagnostics and the normalization of stored tooling lists. Older
 in-house provenance output is invalidated through the existing reader/configuration
 identity. Runtime schema constants and reusable asset encodings remain unchanged,
-and older texture or mesh bytes are not relabeled. The existing global in-house
-configuration hash includes the adapter identity for asset cache entries too:
-normal conversion rejects older-adapter cache reuse despite unchanged encodings.
-Metadata-only rebuilds retain verified assets under their existing reuse rules.
+and older texture or mesh bytes are not relabeled. The broad configuration hash
+includes the reader identity for metadata provenance. Normal conversion can
+reuse compatible assets through separately recorded per-kind settings and source
+proofs; older in-house manifests with only a combined configuration proof may
+regenerate assets conservatively. The metadata-only path requires the current
+reader identity, so an older in-house pack without `diagnostics_version` is
+refused by that path rather than relabeled with the new tooling contract.
 Header rows bind the exact authored
 schema; a different schema is reported as undecodable rather than silently
 interpreting an old pack with new definitions. Deterministic sorted insertion
@@ -390,18 +399,38 @@ uses `lod_chunks` for indexing and external GLB files for payloads. See
 
 ---
 
-### 9. Compiled Scripts (`scripts`)
+### 9. Script attachments (`scripts`)
 
-Stores compiled Papyrus script bytecode and property bindings.
+In-house output stores attached Papyrus script names and canonical VMAD bytes.
+These are property bindings, not compiled PEX bytecode. Script status and
+authored order remain in VMAD. The last exact-name attachment for a record keeps
+the existing SQL overwrite behavior.
 
 ```sql
-CREATE TABLE IF NOT EXISTS scripts (
-    form_id INTEGER PRIMARY KEY,        -- Script FormID
-    script_name TEXT NOT NULL,          -- Script EDID name
-    bytecode BLOB NOT NULL,             -- Papyrus PEX binary bytecode
-    properties BLOB                     -- Script properties table
+CREATE TABLE scripts (
+    form_id INTEGER NOT NULL,
+    script_name TEXT NOT NULL,
+    vmad BLOB NOT NULL,
+    PRIMARY KEY (form_id, script_name)
 );
 ```
+
+`script_properties` has `(form_id,script_name,property_index)` as its primary key,
+with scalar property name, native `property_type`, status and `value_count`.
+`script_property_values` adds a zero-based `value_index` to that key and stores
+nullable `object_form_id`, `alias_id`, `string_value`, `integer_value`,
+`float_bits` and `boolean_value` columns. Scalar properties have one value row;
+arrays keep their authored element order. Native type zero and empty arrays
+have no value rows and remain distinguishable by their property headers. Float
+bits preserve all f32 representations without JSON or SQLite numeric coercion.
+
+These tables replace `scripts.properties_json` for in-house exports inside the
+existing record transaction. Complete exports refresh their owned script
+snapshot; record archives leave all three runtime script tables empty. The
+legacy reader's existing JSON projection remains separate. Runtime engine
+consumers continue using the canonical record/VMAD data. Public partial exports
+into a normalized database use scalar script rows without refreshing unrelated
+attachments; fresh legacy databases retain the legacy JSON projection.
 
 ---
 
