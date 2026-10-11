@@ -4862,8 +4862,8 @@ mod tests {
     /// diffuse images still fail locally and a subsequent placeholder snapshot remains usable.
     #[test]
     fn terrain_zero_texture_overlay_preserves_weights_and_nonzero_image_errors() {
-        let directory = tempfile::tempdir().unwrap().keep();
-        let path = directory.join("placeholder-catalogue.db");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("placeholder-catalogue.db");
         write_empty_catalogue(&path);
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection
