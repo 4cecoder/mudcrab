@@ -758,17 +758,18 @@ fn convert_plugins_with_dump_impl(
         for (index, text) in runtime_text_updates {
             raw.subrecords[index].1 = text;
         }
-        let runtime = filtered_record(&raw, opaque_fields.get(&raw.form_id));
-        let runtime = runtime.as_ref().unwrap_or(&raw);
-        let invalid = validate_inhouse_record(runtime)
-            .map_err(|error| error.to_string())
-            .and_then(|_| {
-                if raw.record_type == *b"LAND" {
-                    validate_inhouse_land(runtime).map_err(|error| error.to_string())
-                } else {
-                    Ok(())
-                }
-            });
+        let omitted = opaque_fields.get(&raw.form_id);
+        let invalid = with_filtered_record(&mut raw, omitted, |runtime| {
+            validate_inhouse_record(runtime)
+                .map_err(|error| error.to_string())
+                .and_then(|_| {
+                    if runtime.record_type == *b"LAND" {
+                        validate_inhouse_land(runtime).map_err(|error| error.to_string())
+                    } else {
+                        Ok(())
+                    }
+                })
+        });
         if let Err(error) = invalid {
             warnings.skipped(
                 plugin,
@@ -878,15 +879,8 @@ fn convert_plugins_with_dump_impl(
         )?
         .execute(params![id, offset])?;
     }
-    let mut source_ids = decoded.records.keys().copied().collect::<Vec<_>>();
-    source_ids.sort_unstable();
-    for id in source_ids {
-        let record = &decoded.records[&id];
-        tx.prepare_cached(
-            "INSERT INTO inhouse_source_records(form_id,source_form_id,load_order,record_type,flags,payload) VALUES (?1,?2,?3,?4,?5,?6)")?.execute(
-            params![id, record.source_form_id, record.load_order, String::from_utf8_lossy(&record.record_type), record.flags, record.raw_payload],
-        )?;
-    }
+    let source_count = decoded.records.len();
+    write_source_records(&tx, &mut decoded.records)?;
     records::history::write_tables_with_schemas(
         &tx,
         &decoded.history,
@@ -915,7 +909,7 @@ fn convert_plugins_with_dump_impl(
             ),
     )?;
     tx.commit()?;
-    provenance_stage.finish(decoded.records.len());
+    provenance_stage.finish(source_count);
     if let Some(staging) = db_path.parent() {
         let path = staging.join("inhouse-reader-diagnostics.json");
         if path.is_file() {
@@ -982,17 +976,87 @@ fn validate_candidate(record: &records::DecodedRecord) -> std::result::Result<()
     Ok(())
 }
 
-/// Exclude opaque occurrences from candidate runtime validation while retaining canonical SQL.
-fn filtered_record(record: &RawRecord, omitted: Option<&BTreeSet<usize>>) -> Option<RawRecord> {
-    let omitted = omitted?;
-    let mut filtered = record.clone();
-    let mut index = 0;
-    filtered.subrecords.retain(|_| {
-        let keep = !omitted.contains(&index);
-        index += 1;
-        keep
-    });
-    Some(filtered)
+/// Publish every accepted reader source, including later rejected runtime projections.
+/// History uses these rows for its winner catalogue; each payload can then be dropped.
+fn write_source_records(
+    conn: &Connection,
+    records: &mut HashMap<u32, records::DecodedRecord>,
+) -> Result<()> {
+    let mut source_ids = records.keys().copied().collect::<Vec<_>>();
+    source_ids.sort_unstable();
+    for id in source_ids {
+        let record = records.remove(&id).expect("sorted source record exists");
+        conn.prepare_cached(
+            "INSERT INTO inhouse_source_records(form_id,source_form_id,load_order,record_type,flags,payload) VALUES (?1,?2,?3,?4,?5,?6)")?.execute(
+            params![id, record.source_form_id, record.load_order, String::from_utf8_lossy(&record.record_type), record.flags, record.raw_payload],
+        )?;
+    }
+    Ok(())
+}
+
+/// One temporarily hidden occurrence retains its original position and exact owned buffers.
+struct OmittedSubrecord {
+    index: usize,
+    signature: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+/// Move only tuple ownership for validation; restoration also runs during unwinding.
+struct RuntimeFieldSelection<'a> {
+    record: &'a mut RawRecord,
+    omitted: Vec<OmittedSubrecord>,
+    original_len: usize,
+}
+
+impl<'a> RuntimeFieldSelection<'a> {
+    /// Preserve selected byte allocations while temporarily hiding opaque occurrences.
+    fn new(record: &'a mut RawRecord, omitted: &BTreeSet<usize>) -> Self {
+        let source = std::mem::take(&mut record.subrecords);
+        let original_len = source.len();
+        let mut hidden = Vec::new();
+        record.subrecords = Vec::with_capacity(original_len);
+        for (index, (signature, bytes)) in source.into_iter().enumerate() {
+            if omitted.contains(&index) {
+                hidden.push(OmittedSubrecord { index, signature, bytes });
+            } else {
+                record.subrecords.push((signature, bytes));
+            }
+        }
+        Self { record, omitted: hidden, original_len }
+    }
+}
+
+impl Drop for RuntimeFieldSelection<'_> {
+    /// Restore the canonical occurrence order without copying any signature or payload.
+    fn drop(&mut self) {
+        let mut selected = std::mem::take(&mut self.record.subrecords).into_iter();
+        let mut hidden = std::mem::take(&mut self.omitted).into_iter().peekable();
+        let mut restored = Vec::with_capacity(self.original_len);
+        for index in 0..self.original_len {
+            if hidden.peek().is_some_and(|field| field.index == index) {
+                let field = hidden.next().expect("selected hidden occurrence");
+                restored.push((field.signature, field.bytes));
+            } else {
+                restored.push(selected.next().expect("selected runtime occurrence"));
+            }
+        }
+        self.record.subrecords = restored;
+    }
+}
+
+/// Validate a runtime selection and restore canonical ownership before any result escapes.
+fn with_filtered_record<T>(
+    record: &mut RawRecord,
+    omitted: Option<&BTreeSet<usize>>,
+    validate: impl FnOnce(&RawRecord) -> T,
+) -> T {
+    let Some(omitted) = omitted.filter(|omitted| !omitted.is_empty()) else {
+        return validate(record);
+    };
+    let selection = RuntimeFieldSelection::new(record, omitted);
+    let result = validate(&*selection.record);
+    drop(selection);
+    result
 }
 
 /// Move canonical buffers only after selected typed serialization has completed.
@@ -1165,6 +1229,7 @@ mod runtime_move_tests {
     use super::*;
     use crate::records::{DecodedField, DecodedRecord};
 
+    /// Keep independent identity, payload and nested-value sentinels for ownership assertions.
     fn record() -> DecodedRecord {
         DecodedRecord {
             form_id: 0x0100_1234,
@@ -1215,6 +1280,214 @@ mod runtime_move_tests {
             raw_payload: b"source".to_vec(),
             supported: false,
         }
+    }
+
+    /// Hide invalid opaque links around valid repeated signatures and asymmetric payloads.
+    fn opaque_race() -> RawRecord {
+        RawRecord {
+            form_id: 0x0100_1234,
+            record_type: *b"RACE",
+            flags: 0x4000,
+            subrecords: vec![
+                (b"WKMV".to_vec(), vec![0x19, 0x73, 0xa5]),
+                (b"EDID".to_vec(), b"RetainedRace\0".to_vec()),
+                (b"RNMV".to_vec(), vec![0x27, 0x91]),
+                (b"WKMV".to_vec(), 0x0003_580du32.to_le_bytes().to_vec()),
+                (b"RNMV".to_vec(), 0u32.to_le_bytes().to_vec()),
+                (b"ZZZZ".to_vec(), vec![0x35, 0xb7, 0x59, 0xd1, 0x43]),
+            ],
+            cell_form_id: Some(91),
+            worldspace_form_id: Some(92),
+            load_order: 7,
+        }
+    }
+
+    /// Runtime selection borrows retained allocations and restores all canonical occurrences.
+    #[test]
+    fn runtime_selection_restores_exact_buffers_after_success_and_rejection() {
+        let mut raw = opaque_race();
+        let expected = raw.clone();
+        let canonical = crate::esm::extractors::serialize_subrecords(&raw.subrecords);
+        let pointers = raw.subrecords.iter()
+            .map(|(signature, bytes)| (signature.as_ptr(), bytes.as_ptr()))
+            .collect::<Vec<_>>();
+        assert!(validate_inhouse_record(&raw).is_err());
+        let omitted = BTreeSet::from([0usize, 2, 5, 99]);
+        let result = with_filtered_record(&mut raw, Some(&omitted), |runtime| {
+            assert_eq!(runtime.subrecords.len(), 3);
+            for (selected, original) in [1usize, 3, 4].into_iter().enumerate() {
+                assert_eq!(runtime.subrecords[selected], expected.subrecords[original]);
+                assert_eq!(runtime.subrecords[selected].0.as_ptr(), pointers[original].0);
+                assert_eq!(runtime.subrecords[selected].1.as_ptr(), pointers[original].1);
+            }
+            validate_inhouse_record(runtime)
+        });
+        result.unwrap();
+        assert_eq!(format!("{raw:?}"), format!("{expected:?}"));
+        assert_eq!(raw.subrecords, expected.subrecords);
+        assert_eq!(crate::esm::extractors::serialize_subrecords(&raw.subrecords), canonical);
+        for (index, (signature, bytes)) in raw.subrecords.iter().enumerate() {
+            assert_eq!((signature.as_ptr(), bytes.as_ptr()), pointers[index]);
+        }
+        let rejected = with_filtered_record(&mut raw, Some(&BTreeSet::from([5usize])),
+            validate_inhouse_record);
+        assert!(rejected.unwrap_err().to_string().contains("WKMV"));
+        assert_eq!(format!("{raw:?}"), format!("{expected:?}"));
+        assert_eq!(raw.subrecords, expected.subrecords);
+        assert_eq!(crate::esm::extractors::serialize_subrecords(&raw.subrecords), canonical);
+        for (index, (signature, bytes)) in raw.subrecords.iter().enumerate() {
+            assert_eq!((signature.as_ptr(), bytes.as_ptr()), pointers[index]);
+        }
+        let empty = BTreeSet::new();
+        let tuple_pointer = raw.subrecords.as_ptr();
+        with_filtered_record(&mut raw, Some(&empty), |runtime| {
+            assert_eq!(runtime.subrecords.as_ptr(), tuple_pointer);
+        });
+        assert_eq!(raw.subrecords.as_ptr(), tuple_pointer);
+    }
+
+    /// The ownership guard restores bytes if validation unwinds before returning a result.
+    #[test]
+    fn runtime_selection_restores_exact_buffers_during_unwind() {
+        let mut raw = opaque_race();
+        let expected = raw.clone();
+        let canonical = crate::esm::extractors::serialize_subrecords(&raw.subrecords);
+        let pointers = raw.subrecords.iter().map(|(_, bytes)| bytes.as_ptr()).collect::<Vec<_>>();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_filtered_record(&mut raw, Some(&BTreeSet::from([0usize, 2, 5])), |_| {
+                panic!("authored validation unwind");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(format!("{raw:?}"), format!("{expected:?}"));
+        assert_eq!(raw.subrecords, expected.subrecords);
+        assert_eq!(crate::esm::extractors::serialize_subrecords(&raw.subrecords), canonical);
+        for (index, (_, bytes)) in raw.subrecords.iter().enumerate() {
+            assert_eq!(bytes.as_ptr(), pointers[index]);
+        }
+    }
+
+    /// Source insertion drains payload ownership while publishing every retained reader row.
+    #[test]
+    fn source_sql_drains_payloads_without_changing_retained_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE inhouse_source_records(form_id INTEGER PRIMARY KEY, source_form_id INTEGER NOT NULL, load_order INTEGER NOT NULL, record_type TEXT NOT NULL, flags INTEGER NOT NULL, payload BLOB NOT NULL);").unwrap();
+        let mut later = record();
+        let earlier_id = later.form_id;
+        let mut earlier = later.clone();
+        later.form_id += 17;
+        later.source_form_id += 31;
+        later.load_order = 11;
+        later.raw_payload = vec![0x27, 0x91, 0x43];
+        earlier.raw_payload = vec![0x19, 0x73, 0xb5, 0x57];
+        let expected = [earlier.clone(), later.clone()];
+        let mut decoded = records::ReadResult {
+            records: HashMap::from([(later.form_id, later), (earlier.form_id, earlier)]),
+            ..Default::default()
+        };
+        write_source_records(&conn, &mut decoded.records).unwrap();
+        assert!(decoded.records.is_empty());
+        for original in expected {
+            let (source, priority, tag, flags, payload): (u32, u32, String, u32, Vec<u8>) = conn.query_row(
+                "SELECT source_form_id,load_order,record_type,flags,payload FROM inhouse_source_records WHERE form_id=?1",
+                [original.form_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).unwrap();
+            assert_eq!((source, priority, tag, flags, payload),
+                (original.source_form_id, original.load_order, "INFO".into(), original.flags, original.raw_payload));
+        }
+        let ids = conn.prepare("SELECT form_id FROM inhouse_source_records ORDER BY form_id").unwrap()
+            .query_map([], |row| row.get::<_, u32>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(ids, [earlier_id, earlier_id + 17]);
+    }
+
+    /// Frame own subrecords without using production encoding or schema helpers.
+    fn source_subrecord(tag: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
+        [tag.as_slice(), &u16::try_from(bytes.len()).unwrap().to_le_bytes(), bytes].concat()
+    }
+
+    /// Preserve independent header sentinels for exact source-offset/raw-history assertions.
+    fn source_frame(tag: &[u8; 4], id: u32, flags: u32, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = tag.to_vec();
+        bytes.extend(u32::try_from(payload.len()).unwrap().to_le_bytes());
+        bytes.extend(flags.to_le_bytes());
+        bytes.extend(id.to_le_bytes());
+        bytes.extend(0x1973_b557u32.to_le_bytes());
+        bytes.extend(44u16.to_le_bytes());
+        bytes.extend(0x2791u16.to_le_bytes());
+        bytes.extend(payload);
+        bytes
+    }
+
+    /// A synthetic localized WKMV reaches late rejection without changing source-row authority.
+    /// This private schema is a projection-policy witness, not a native RACE layout claim.
+    #[test]
+    fn post_projection_rejection_retains_source_row_typed_digest_and_raw_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("Data");
+        let output = directory.path().join("output");
+        fs::create_dir(&data).unwrap();
+        fs::create_dir(&output).unwrap();
+        let schema = records::schema_format::Schema::parse(br#"{
+            "version":1,"records":[
+                {"signature":"RACE","fields":[
+                    {"signature":"EDID","name":"editor_id","kind":"zstring"},
+                    {"signature":"WKMV","name":"synthetic_localized_link","kind":"lstring"}
+                ]},
+                {"signature":"STAT","fields":[
+                    {"signature":"EDID","name":"editor_id","kind":"zstring"}
+                ]}
+            ]}"#).unwrap();
+        let race_id = 0x1600u32;
+        let neighbor_id = 0x1700u32;
+        let race_payload = [source_subrecord(b"EDID", b"RetainedRejectedRace\0"),
+            source_subrecord(b"WKMV", &17u32.to_le_bytes())].concat();
+        let header = source_frame(b"TES4", 0, 0x80, &source_subrecord(b"HEDR", &[0; 12]));
+        let race_offset = header.len() as u64;
+        let race_frame = source_frame(b"RACE", race_id, 0, &race_payload);
+        let neighbor_payload = source_subrecord(b"EDID", b"UsableAfterRejectedRace\0");
+        let original = [header, race_frame.clone(), source_frame(b"STAT", neighbor_id, 0, &neighbor_payload)].concat();
+        let plugin = data.join("Synthetic.esm");
+        fs::write(&plugin, &original).unwrap();
+        let database = output.join("skyrim_world.db");
+        let master = convert_plugins_with_dump_impl(std::slice::from_ref(&plugin), &database, &data,
+            Some((&output, &[*b"RACE", *b"STAT"])), RecordBundleMode::Full, None, Some(&schema)).unwrap();
+        assert_eq!(master.len(), 1);
+        assert!(master.contains_key(&neighbor_id));
+        assert!(!master.contains_key(&race_id));
+        let conn = Connection::open(&database).unwrap();
+        let source: Vec<u8> = conn.query_row("SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+            [race_id], |row| row.get(0)).unwrap();
+        assert_eq!(source, race_payload);
+        let present: u32 = conn.query_row("SELECT count(*) FROM records WHERE form_id=?1", [race_id], |row| row.get(0)).unwrap();
+        assert_eq!(present, 0);
+        let rows: u32 = conn.query_row("SELECT count(*) FROM inhouse_source_records", [], |row| row.get(0)).unwrap();
+        assert_eq!(rows, 2);
+        let accepted: (String, u64) = conn.query_row("SELECT status,source_record_offset FROM record_overrides WHERE form_id=?1",
+            [race_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(accepted, ("accepted".into(), race_offset));
+        drop(conn);
+        let typed = fs::read_to_string(output.join("typed-records.jsonl")).unwrap();
+        let typed = typed.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|row| row["form_id"] == race_id).unwrap();
+        assert_eq!(typed["source_payload_sha256"], crate::cache::hash_bytes(&race_payload));
+        assert_eq!(typed["fields"][1]["value"], serde_json::json!({"LocalizedString":17}));
+        let database_pin = crate::cache::hash_file(&database).unwrap();
+        let mut seen = 0;
+        let summary = records::history_source::visit_source_history(&output, None,
+            records::history_source::SourceQuery::Physical { plugin_id: 0, source_record_offset: race_offset }, |version| {
+                assert_eq!(version.runtime_form_id, Some(race_id));
+                assert_eq!(version.status, "accepted");
+                assert!(version.accepted_source_winner);
+                assert!(!version.runtime_record_present);
+                let raw = version.raw.unwrap();
+                assert_eq!(raw.header.as_slice(), &race_frame[..24]);
+                assert_eq!(raw.stored_payload.as_deref(), Some(race_payload.as_slice()));
+                seen += 1;
+                Ok(())
+            }).unwrap();
+        assert_eq!(seen, 1);
+        assert!(summary.fully_raw_available);
+        assert_eq!(crate::cache::hash_file(&database).unwrap(), database_pin);
+        assert_eq!(fs::read(&plugin).unwrap(), original);
     }
 
     /// Releasing lookup capacity retains raw winners, physical rejection history and diagnostics.
