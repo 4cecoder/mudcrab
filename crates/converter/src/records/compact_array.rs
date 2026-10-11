@@ -559,7 +559,8 @@ mod tests {
     }
 
     /// Exercise the public records-only publisher with a malformed packed float between
-    /// usable records. Raw source survives; only the rejected typed field disappears.
+    /// usable records. Direct decoding drops VTXT; publication rejects the unusable LAND
+    /// while authenticated physical history retains its exact source payload.
     #[test]
     fn broken_compact_float_publishes_neighbors_and_retains_original_payload() {
         use super::super::read_plugins;
@@ -671,14 +672,15 @@ mod tests {
                 1
             );
         }
-        let raw: Vec<u8> = db
+        // RV-A rejects a LAND with authored VTXT failure; R5 retains skipped physical provenance.
+        let source_count: u32 = db
             .query_row(
-                "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+                "SELECT COUNT(*) FROM inhouse_source_records WHERE form_id=?1",
                 [land.form_id],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(raw, payload);
+        assert_eq!(source_count, 0);
         assert_eq!(
             db.query_row(
                 "SELECT COUNT(*) FROM records WHERE form_id=?1 AND record_type='LAND'",
@@ -686,28 +688,72 @@ mod tests {
                 |row| row.get::<_, u32>(0),
             )
             .unwrap(),
-            1,
+            0,
         );
-        assert!(output.join("cell_cache.rkyv").is_file());
-        assert!(output.join("cell_cache_preserved.rkyv").is_file());
+        let (status, reason): (String, String) = db
+            .query_row(
+                "SELECT status,reason FROM record_overrides WHERE form_id=?1",
+                [land.form_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "skipped");
+        assert!(reason.contains("rejected authored terrain field VTXT"));
+        assert_eq!(db.query_row(
+            "SELECT COUNT(*) FROM record_diagnostics WHERE source_form_id=?1 AND category='record' AND reason LIKE '%rejected authored terrain field VTXT%'",
+            [land.source_form_id], |row| row.get::<_, u32>(0),
+        ).unwrap(), 1);
+        let mut raw_versions = Vec::new();
+        let summary = super::super::history_source::visit_source_history(
+            &output,
+            None,
+            super::super::history_source::SourceQuery::Source {
+                original_owner: "arrayneighbors.esp".into(),
+                full_local: 0x821,
+            },
+            |version| {
+                raw_versions.push(version);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.versions, 1);
+        assert!(summary.fully_raw_available);
+        assert!(!summary.typed_runtime_decoding_attempted);
+        assert_eq!(raw_versions[0].status, "skipped");
+        assert!(!raw_versions[0].runtime_record_present);
+        assert!(!raw_versions[0].accepted_source_winner);
+        let raw = raw_versions[0].raw.as_ref().unwrap();
+        assert!(raw.frame_complete);
+        assert_eq!(raw.stored_payload.as_deref(), Some(payload.as_slice()));
+        for name in ["cell_cache.rkyv", "cell_cache_preserved.rkyv"] {
+            let path = output.join(name);
+            assert!(path.is_file());
+            let cache = rkyv::from_bytes::<shared::CellCache, rkyv::rancor::Error>(
+                &fs::read(path).unwrap(),
+            )
+            .unwrap();
+            assert!(cache.cells.is_empty(), "unusable LAND entered {name}");
+        }
         let typed: Vec<serde_json::Value> = fs::read_to_string(output.join("typed-records.jsonl"))
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(typed.len(), 3);
-        let typed_land = typed
+        assert_eq!(typed.len(), 2);
+        let mut typed_ids = typed
             .iter()
-            .find(|record| record["form_id"] == land.form_id)
-            .unwrap();
-        let fields = typed_land["fields"].as_array().unwrap();
+            .map(|record| record["form_id"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        typed_ids.sort_unstable();
+        assert_eq!(typed_ids, [0x810, 0x811]);
         assert!(
-            !fields
+            typed
                 .iter()
-                .any(|field| field["signature"] == serde_json::json!(*b"VTXT"))
+                .all(|record| record["record_type"] == serde_json::json!(*b"STAT"))
         );
         assert!(
-            !serde_json::to_string(typed_land)
+            !serde_json::to_string(land)
                 .unwrap()
                 .contains("CompactArray")
         );

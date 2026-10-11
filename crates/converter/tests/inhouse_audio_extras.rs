@@ -315,7 +315,12 @@ async fn corrupt_compressed_overrides_for_every_family_preserve_real_publication
     ));
     fixture.add("BadAudio.esp", &["Skyrim.esm", "Audio.esp"], &patch);
     let list = fixture.directory.path().join("plugins.txt");
-    fs::write(&list, "Skyrim.esm\nFiller.esm\n*Audio.esp\n*BadAudio.esp\n").unwrap();
+    // Player selection requires a checked filler to preserve the direct reader's asymmetric slots.
+    fs::write(
+        &list,
+        "Skyrim.esm\n*Filler.esm\n*Audio.esp\n*BadAudio.esp\n",
+    )
+    .unwrap();
     let output = fixture.directory.path().join("published-audio");
     let mut config = PipelineConfig::new(&fixture.data, &output);
     config.record_reader = RecordReader::Inhouse;

@@ -601,23 +601,42 @@ fn rv_a_runtime_invariant_actual_text_localization_and_cache_publication() {
             .collect::<Vec<_>>()
     );
     assert!(!preserved_land.layers.iter().any(|layer| layer.layer == 4));
-    for cache in [&runtime, &preserved] {
+    // R4 preserves every normalized overlay; only runtime applies six-layer capacity.
+    for (cache, expected_slots) in [
+        (&runtime, &[0_u16, 4, 5, 6, 7, 8][..]),
+        (&preserved, &[0_u16, 1, 2, 3, 4, 5, 6, 7, 8][..]),
+    ] {
         let heightless = cache
             .cells
             .iter()
             .find(|cell| cell.cell_id == 0x0200_0910)
             .unwrap();
         assert_eq!(heightless.heights, vec![0.0; 33 * 33]);
-        assert_eq!(heightless.layers.len(), 6);
+        assert_eq!(heightless.layers.len(), expected_slots.len());
         assert!(heightless.layers[0].is_base);
         assert_eq!(heightless.layers[0].texture_form_id, 0);
+        assert!(heightless.layers[0].weights.is_empty());
         assert_eq!(
             heightless.layers[1..]
                 .iter()
                 .map(|layer| layer.layer)
                 .collect::<Vec<_>>(),
-            [4, 5, 6, 7, 8]
+            expected_slots[1..]
         );
+        assert_eq!(heightless.layers[0].layer, 0);
+        assert!(heightless.layers.iter().all(|layer| layer.quadrant == 2));
+        for (&slot, layer) in expected_slots[1..].iter().zip(&heightless.layers[1..]) {
+            assert!(!layer.is_base);
+            assert_eq!(layer.texture_form_id, SELF_TEXTURE);
+            assert_eq!(
+                layer
+                    .weights
+                    .iter()
+                    .map(|weight| (weight.vertex, weight.opacity.to_bits()))
+                    .collect::<Vec<_>>(),
+                [(slot * 3, (f32::from(slot) / 16.0).to_bits())]
+            );
+        }
     }
     let typed = fs::read_to_string(output.join("typed-records.jsonl")).unwrap();
     let rows = typed

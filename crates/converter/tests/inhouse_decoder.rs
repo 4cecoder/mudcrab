@@ -482,7 +482,23 @@ fn ordered_matching_skips_unknown_and_out_of_order_fields() {
     fixture.add("Ordered.esp", &[], 0, record(b"STAT", 0x1800, 0, &payload));
     let (_, result) = fixture.read();
     let object = &result.records[&0x0100_1800];
-    assert_eq!(object.fields.len(), 2);
+    // R6 preserves unknown opaque occurrences without rewinding ordered known-field matching.
+    assert_eq!(object.fields.len(), 3);
+    assert_eq!(
+        object
+            .fields
+            .iter()
+            .map(|field| field.signature)
+            .collect::<Vec<_>>(),
+        [*b"EDID", *b"ZZZZ", *b"MODL"]
+    );
+    let opaque = field(object, b"ZZZZ");
+    assert_eq!(opaque.value, Value::Bytes(vec![91, 42, 73]));
+    assert_eq!(opaque.canonical_bytes, [91, 42, 73]);
+    assert!(opaque.opaque);
+    assert!(!field(object, b"EDID").opaque);
+    assert!(!field(object, b"MODL").opaque);
+    assert_eq!(object.rejected_fields, [*b"EDID", *b"OBND"]);
     assert_eq!(field(object, b"EDID").value, Value::String("First".into()));
     assert_eq!(
         field(object, b"MODL").value,

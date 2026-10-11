@@ -2,6 +2,7 @@
 
 use super::*;
 
+/// Complete reason evaluation retains one bounded compatibility summary and no failures.
 #[test]
 fn compatibility_observation_is_bounded_and_separate_from_failures() {
     let mut diagnostics = PluginDiagnostics::default();
@@ -12,12 +13,21 @@ fn compatibility_observation_is_bounded_and_separate_from_failures() {
             "original owner unresolved; supplier runtime projection".to_owned()
         });
     }
-    assert_eq!(allocations, 1);
+    // R5 evaluates every diagnostic reason while retaining one bounded summary.
+    assert_eq!(allocations, 64);
     assert_eq!(diagnostics.compatibility_headers, 64);
     assert_eq!(diagnostics.skipped_records, 0);
     assert_eq!(diagnostics.skipped_fields, 0);
     assert_eq!(diagnostics.invalid_links, 0);
     assert_eq!(diagnostics.first_by_category.len(), 1);
+    assert_eq!(
+        diagnostics.first_by_category["compatibility"],
+        "original owner unresolved; supplier runtime projection"
+    );
+    assert_eq!(
+        diagnostics.first_example.as_deref(),
+        Some("original owner unresolved; supplier runtime projection")
+    );
 }
 
 #[test]

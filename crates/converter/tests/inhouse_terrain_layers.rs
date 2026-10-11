@@ -317,11 +317,12 @@ fn assert_published_layers(output: &Path) {
         );
     }
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
-    let (cell, priority, blob, unresolved): (u32, u32, Vec<u8>, String) = db
+    // R5 normalizes unresolved texture membership into scalar child rows.
+    let (cell, priority, blob): (u32, u32, Vec<u8>) = db
         .query_row(
-            "SELECT cell_id,load_order,layer_data,unresolved_texture_ids FROM inhouse_terrain_layers WHERE form_id=?",
+            "SELECT cell_id,load_order,layer_data FROM inhouse_terrain_layers WHERE form_id=?",
             [LAND_GLOBAL_ID],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     assert_eq!((cell, priority), (CELL_ID, 2));
@@ -330,8 +331,15 @@ fn assert_published_layers(output: &Path) {
         expected_preserved_layers(),
         "SQL layer_data must retain every normalized active source layer"
     );
+    let unresolved = db
+        .prepare("SELECT texture_form_id FROM inhouse_unresolved_terrain_textures WHERE form_id=? ORDER BY texture_form_id")
+        .unwrap()
+        .query_map([LAND_GLOBAL_ID], |row| row.get::<_, u32>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
     assert_eq!(
-        serde_json::from_str::<Vec<u32>>(&unresolved).unwrap(),
+        unresolved,
         vec![0x844, 0x845, 0x846, 0x847],
         "unresolved inventory includes missing references in both retained and discarded runtime layers"
     );

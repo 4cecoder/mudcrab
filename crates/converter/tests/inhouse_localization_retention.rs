@@ -1113,6 +1113,7 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
             .map(|value| value.as_str().unwrap())
             .collect::<std::collections::BTreeSet<_>>();
         assert!(preserved.is_disjoint(&deferred_manifest));
+        // R6 creates add-on provenance even when empty; archive scope must classify it.
         assert!(preserved.contains("inhouse_schema_addons"));
         assert!(archive_tables["inhouse_schema_addons"].is_empty());
         assert_eq!(deferred_manifest, deferred.into_iter().collect());
@@ -1177,8 +1178,8 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
     }
 }
 
-#[test]
 /// A public export failure after scope creation leaves an explicit incomplete archive.
+#[test]
 fn failed_archive_does_not_publish_a_completed_scope_or_reader_identity() {
     use converter::esm::inhouse::RecordBundleMode;
     let temp = tempfile::tempdir().unwrap();
@@ -1186,11 +1187,51 @@ fn failed_archive_does_not_publish_a_completed_scope_or_reader_identity() {
     let data = retained.join("original-data");
     fs::create_dir(&data).unwrap();
     let generated = world();
+    // Missing masters now fail selection before scope creation; use a present,
+    // inverted regular-plugin dependency to exercise failure after scope creation.
+    let owner = native::plugin(&generated, &[], 0, &[]);
+    let dependent = native::plugin(&generated, &["Owner.esp"], 0, &[]);
+    fs::write(data.join("Owner.esp"), &owner).unwrap();
+    fs::write(data.join("Dependent.esp"), &dependent).unwrap();
+    let order = retained.join("original-order.txt");
+    let order_text = "*Dependent.esp\n*Owner.esp\n";
+    fs::write(&order, order_text).unwrap();
+    let output = retained.join("failed-archive-output");
+    let result = inhouse::export_record_bundle_typed_with_options(
+        &data,
+        &order,
+        &output,
+        &[*b"ACTI"],
+        None,
+        RecordBundleMode::RecordArchiveOnly,
+    );
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("must precede"), "{error:#}");
+    let scope: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("record-bundle-scope.json")).unwrap())
+            .unwrap();
+    assert_eq!(scope["status"], "INCOMPLETE");
+    assert_eq!(scope["runtime_ready"], false);
+    assert!(!output.join("record-reader.json").exists());
+    assert_eq!(fs::read(data.join("Owner.esp")).unwrap(), owner);
+    assert_eq!(fs::read(data.join("Dependent.esp")).unwrap(), dependent);
+    assert_eq!(fs::read_to_string(order).unwrap(), order_text);
+}
+
+/// Missing-master selection fails before the archive output or identity is created.
+#[test]
+fn missing_master_archive_preflight_creates_no_output() {
+    use converter::esm::inhouse::RecordBundleMode;
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("original-data");
+    fs::create_dir(&data).unwrap();
+    let generated = world();
     let patch = native::plugin(&generated, &["AbsentMaster.esm"], 0, &[]);
     fs::write(data.join("MissingDependency.esp"), &patch).unwrap();
-    let order = retained.join("original-order.txt");
-    fs::write(&order, "*MissingDependency.esp\n").unwrap();
-    let output = retained.join("failed-archive-output");
+    let order = temp.path().join("original-order.txt");
+    let order_text = "*MissingDependency.esp\n";
+    fs::write(&order, order_text).unwrap();
+    let output = temp.path().join("failed-archive-output");
     let result = inhouse::export_record_bundle_typed_with_options(
         &data,
         &order,
@@ -1203,15 +1244,8 @@ fn failed_archive_does_not_publish_a_completed_scope_or_reader_identity() {
         result.is_err(),
         "missing master must fail the public export"
     );
-    let scope: serde_json::Value =
-        serde_json::from_slice(&fs::read(output.join("record-bundle-scope.json")).unwrap())
-            .unwrap();
-    assert_eq!(scope["status"], "INCOMPLETE");
-    assert_eq!(scope["runtime_ready"], false);
+    assert!(!output.exists());
     assert!(!output.join("record-reader.json").exists());
     assert_eq!(fs::read(data.join("MissingDependency.esp")).unwrap(), patch);
-    assert_eq!(
-        fs::read_to_string(order).unwrap(),
-        "*MissingDependency.esp\n"
-    );
+    assert_eq!(fs::read_to_string(order).unwrap(), order_text);
 }
