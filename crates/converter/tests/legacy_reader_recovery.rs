@@ -513,7 +513,10 @@ fn vanilla_vmad_compatibility_preserves_scripts_and_complete_predecessors() {
     );
     for (id, format) in [(0x0200_1820u32, 1), (0x0200_1821, 2)] {
         let expected = compatibility_vmad(format, [0x0200_1931, 0x0100_1932, 0x0200_1931]);
-        assert_eq!(fields(&conn, id, b"VMAD"), [expected.clone()]);
+        assert_eq!(
+            fields(&conn, id, b"VMAD").as_slice(),
+            std::slice::from_ref(&expected)
+        );
         let stored: Vec<u8> = conn
             .query_row(
                 "SELECT vmad FROM scripts WHERE form_id=?1 AND script_name='Compatibility'",
