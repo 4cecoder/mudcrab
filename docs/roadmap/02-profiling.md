@@ -87,8 +87,10 @@ window scans.
   of the start offset (`setup_world`'s camera offset, Y 1200 by default; the cell centre supplies X
   and Z), on the first frame the world is ready. The report names the target in `jump_target`.
   `time_to_world_ready_after_jump_ms` and `frames_to_world_ready_after_jump` are measured from the
-  jump to the start of the next two-frame ready run (`jump_issued` says whether it happened). A
-  target cell with no terrain logs a warning and uses ground height 0. A coordinate outside ±512 is
+  jump to the start of the next two-frame ready run (`jump_issued` says whether it happened). A jump
+  into a cell whose window is already resident still latches only after those two ready frames, so it
+  reports a near-zero reload; that is correct and not a measurement bug. A target cell with no terrain
+  logs a warning and uses ground height 0. A coordinate outside ±512 is
   dropped with a warning when the arguments are parsed. The jump is ignored, with a warning, when
   `--auto-fly-speed`, `--streaming-fixture`, `--shots` or `--acceptance-screenshot` is also set,
   because the first two keep driving the camera, a shots run poses it for each shot and the
