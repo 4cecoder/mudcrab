@@ -647,7 +647,10 @@ pub(crate) fn ktx2_align_up(value: u64, alignment: u64) -> u64 {
 
 /// Byte size of the texel block a finished KTX2 file declares: `bytesPlane[0]`
 /// of its basic data format descriptor, the field the section 3.9.7
-/// alignment rule keys off. One byte when the file has no basic block: an
+/// alignment rule keys off. Only `bytesPlane[0]` is read, which is the
+/// whole block size for the single-plane formats this converter writes
+/// (BC*, RGBA8, R8, UASTC): a multi-plane format would need the sum of
+/// every plane's byte size. One byte when the file has no basic block: an
 /// uncompressed texel there is a single byte.
 pub(crate) fn ktx2_texel_block_bytes<Data: AsRef<[u8]>>(reader: &ktx2::Reader<Data>) -> u64 {
     reader
@@ -683,11 +686,15 @@ pub(crate) fn ktx2_metadata_end(header: &ktx2::Header) -> u64 {
 /// byte length in index order (base level first, section 3.9.7); the
 /// returned index entries stay in index order, with offsets pointing at
 /// the payloads where they now sit. Levels are packed at the exact
-/// alignment `alignment` bytes gives them: every level starts where the
+/// alignment `alignment` bytes gives them, starting from the end of
+/// `output` as the caller handed it over: every level starts where the
 /// previous level, in file order, ends rounded up to it, and the first
-/// level starts at the end of the metadata rounded up the same way — the
-/// layout section 3.9.7 and the KTX-Software validator expect, with no
-/// slack beyond that.
+/// starts at the end of `output` rounded up the same way, with no slack
+/// beyond that. What lies at that end is the caller's business: the
+/// combiners truncate a template at its first-data offset, already at the
+/// alignment, and `write_native_ktx2` hands over the metadata, whose end
+/// the rounding lifts to the alignment. That is the layout section 3.9.7
+/// and the KTX-Software validator expect.
 fn append_ktx2_levels_spec_order(
     output: &mut Vec<u8>,
     stored: &[(Vec<u8>, u64)],
@@ -2447,6 +2454,69 @@ mod tests {
         assert_eq!(offset, dds.data.len(), "trailing DDS bytes");
     }
 
+    /// With Zstandard on, KTX 2.0 section 3.10 puts no alignment on level
+    /// data at all, so the native writer must pack the levels contiguously:
+    /// the smallest level starts exactly where the metadata ends and every
+    /// next level exactly where the previous one ends, with no padding to
+    /// any boundary. The rule is hardcoded here, never read from the
+    /// alignment helper this test exists to check.
+    #[test]
+    fn zstandard_native_mips_pack_contiguously_with_no_padding() {
+        let mut dds = Dds::new_dxgi(NewDxgiParams {
+            height: 8,
+            width: 8,
+            depth: None,
+            format: DxgiFormat::BC3_UNorm,
+            mipmap_levels: Some(3),
+            array_layers: None,
+            caps2: None,
+            is_cubemap: false,
+            resource_dimension: D3D10ResourceDimension::Texture2D,
+            alpha_mode: AlphaMode::Straight,
+        })
+        .unwrap();
+        for (index, byte) in dds.data.iter_mut().enumerate() {
+            *byte = (index * 11 + 5) as u8;
+        }
+        let mut bytes = Vec::new();
+        dds.write(&mut bytes).unwrap();
+
+        let ktx = TextureConverter::convert(&bytes, TextureEncoding::DataLinear).unwrap();
+        let reader = ktx2::Reader::new(&ktx).unwrap();
+        let header = reader.header();
+        assert_eq!(
+            header.supercompression_scheme,
+            Some(ktx2::SupercompressionScheme::Zstandard)
+        );
+        assert_eq!(reader.levels().len(), 3);
+
+        // This file's metadata ends off every 8- and 16-byte boundary, so a
+        // writer that padded to one would put the first level elsewhere.
+        let metadata_end = ktx2_metadata_end(&header);
+        assert!(
+            !metadata_end.is_multiple_of(16) && !metadata_end.is_multiple_of(8),
+            "the metadata ends at {metadata_end} bytes, on a boundary padding \
+             would also land on: this test could not tell the two apart"
+        );
+
+        // File order: the smallest level (last index entry) first, each
+        // level exactly where the previous one ends, the base level ending
+        // the file.
+        let levels: Vec<_> = reader.levels().collect();
+        let mut expected = metadata_end;
+        for level in (0..levels.len()).rev() {
+            let data = levels[level].data;
+            let offset = (data.as_ptr() as usize - ktx.as_ptr() as usize) as u64;
+            assert_eq!(offset, expected, "level {level} must start at {expected}");
+            expected += data.len() as u64;
+        }
+        assert_eq!(
+            expected,
+            ktx.len() as u64,
+            "the base level must end the file"
+        );
+    }
+
     /// Without supercompression the native writer must still store the
     /// levels smallest-first, packed at exactly lcm(texel block size, 4):
     /// 16 bytes for BC3 blocks, with no slack beyond the alignment.
@@ -2523,7 +2593,7 @@ mod tests {
 
         let metadata_end = ktx2_metadata_end(&header);
         assert!(
-            metadata_end % 16 != 0 && metadata_end % 16 != 8,
+            !metadata_end.is_multiple_of(16) && !metadata_end.is_multiple_of(8),
             "the metadata ends at {metadata_end} bytes, which rounds up to the same \
              offset at 8- and 16-byte alignment: this test could not tell the two apart"
         );

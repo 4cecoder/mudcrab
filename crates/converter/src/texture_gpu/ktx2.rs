@@ -162,18 +162,59 @@ mod tests {
         for (level, expected) in reader.levels().zip(&levels) {
             assert_eq!(level.data, &expected[..]);
         }
-        // Both files store the level data smallest-first (KTX 2.0 section 3.7).
-        for bytes in [&raw, &packed] {
-            let offsets: Vec<u64> = (0..levels.len())
-                .map(|level| {
-                    let start = HEADER_LEN + level * LEVEL_INDEX_LEN;
-                    u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap())
-                })
-                .collect();
-            assert!(
-                offsets.windows(2).all(|pair| pair[0] > pair[1]),
-                "level data must be stored smallest-first: {offsets:?}"
+        // The key/value offset and length sit at header bytes 56 and 60, where
+        // `write_uastc` puts them, and the key/value data is the last metadata
+        // block, so its end is the file's metadata end. Read it out of the
+        // bytes, not from the alignment helper the writer uses.
+        let kvd_end = |file: &[u8]| {
+            u64::from(u32::from_le_bytes(file[56..60].try_into().unwrap()))
+                + u64::from(u32::from_le_bytes(file[60..64].try_into().unwrap()))
+        };
+
+        // Uncompressed, the levels are packed smallest-first (KTX 2.0 section
+        // 3.7) at the exact 16-byte alignment UASTC 4x4 blocks (bytesPlane[0]
+        // = 16) give them, with no slack: the smallest level starts at the end
+        // of the key/value data rounded up to 16, every next level at the end
+        // of the previous one rounded up the same way, and the base level ends
+        // the file.
+        let round_up_16 = |value: u64| value.div_ceil(16) * 16;
+        let mut expected = round_up_16(kvd_end(&raw));
+        for level in (0..levels.len()).rev() {
+            let start = HEADER_LEN + level * LEVEL_INDEX_LEN;
+            let entry = &raw[start..start + LEVEL_INDEX_LEN];
+            let offset = u64::from_le_bytes(entry[0..8].try_into().unwrap());
+            let byte_length = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+            assert_eq!(offset, expected, "raw level {level} offset");
+            assert_eq!(
+                byte_length,
+                levels[level].len() as u64,
+                "raw level {level} stored length"
             );
+            expected = round_up_16(expected + byte_length);
         }
+        assert_eq!(
+            expected,
+            raw.len() as u64,
+            "the base level must end the raw file"
+        );
+
+        // Supercompressed, section 3.10 puts no alignment on level data at
+        // all, so the levels are contiguous: the smallest starts exactly where
+        // the key/value data ends, with no padding, and every next level
+        // exactly where the previous one ends.
+        let mut expected = kvd_end(&packed);
+        for level in (0..levels.len()).rev() {
+            let start = HEADER_LEN + level * LEVEL_INDEX_LEN;
+            let entry = &packed[start..start + LEVEL_INDEX_LEN];
+            let offset = u64::from_le_bytes(entry[0..8].try_into().unwrap());
+            let byte_length = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+            assert_eq!(offset, expected, "packed level {level} offset");
+            expected += byte_length;
+        }
+        assert_eq!(
+            expected,
+            packed.len() as u64,
+            "the base level must end the packed file"
+        );
     }
 }
