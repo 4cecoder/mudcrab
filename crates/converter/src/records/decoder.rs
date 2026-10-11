@@ -1978,21 +1978,21 @@ fn validate_value_inner(
             let parent = bytes.to_vec();
             let mut values = values.iter_mut();
             for member in &field.members {
-                if let Ok(Some((member, range))) = member_span(member, bytes.len(), schema) {
-                    if let Some((_, value)) = values.next() {
-                        validate_value(
-                            value,
-                            &mut bytes[range],
-                            &member,
-                            schema,
-                            kinds,
-                            diagnostics,
-                            &super::deciders::Context {
-                                parent_payload: Some(&parent),
-                                ..*selection
-                            },
-                        );
-                    }
+                if let Ok(Some((member, range))) = member_span(member, bytes.len(), schema)
+                    && let Some((_, value)) = values.next()
+                {
+                    validate_value(
+                        value,
+                        &mut bytes[range],
+                        &member,
+                        schema,
+                        kinds,
+                        diagnostics,
+                        &super::deciders::Context {
+                            parent_payload: Some(&parent),
+                            ..*selection
+                        },
+                    );
                 }
             }
         }

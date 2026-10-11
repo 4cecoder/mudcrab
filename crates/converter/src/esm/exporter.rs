@@ -273,12 +273,31 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
 
 type CellMetadata = (Option<i32>, Option<i32>, Option<u32>);
 
+/// Select runtime projections and script storage independently of snapshot ownership.
+struct ExportOptions {
+    /// Emit runtime views as well as the canonical record archive.
+    runtime_views: bool,
+    /// Replace in-house script snapshots using their normalized scalar layout.
+    scalar_scripts: bool,
+}
+
 /// Export selected records without changing existing provenance. Grass records
 /// outside this subset are preserved; movement projections are rebuilt from it.
 /// Synthetic records without a source load order have no formid_map entry.
 /// Export a legacy subset without replacing complete-load-order metadata.
 pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Result<()> {
-    export_records(conn, master, None, None, None, None, true, false)
+    export_records(
+        conn,
+        master,
+        None,
+        None,
+        None,
+        None,
+        ExportOptions {
+            runtime_views: true,
+            scalar_scripts: false,
+        },
+    )
 }
 
 /// Replace the complete canonical/runtime snapshot for an effective load order.
@@ -290,7 +309,18 @@ pub fn export_to_db_with_load_order(
     master: &HashMap<u32, RawRecord>,
     order: &LoadOrder,
 ) -> Result<()> {
-    export_records(conn, master, Some(order), None, None, None, true, false)
+    export_records(
+        conn,
+        master,
+        Some(order),
+        None,
+        None,
+        None,
+        ExportOptions {
+            runtime_views: true,
+            scalar_scripts: false,
+        },
+    )
 }
 
 /// Replace plugin metadata and the complete legacy snapshot in one transaction.
@@ -307,8 +337,10 @@ pub(super) fn export_plugins_to_db(
         Some(plugin_paths),
         None,
         None,
-        true,
-        false,
+        ExportOptions {
+            runtime_views: true,
+            scalar_scripts: false,
+        },
     )
 }
 
@@ -328,8 +360,10 @@ pub(crate) fn export_inhouse_to_db(
         Some(plugin_paths),
         Some(unresolved_fields),
         Some(terrain_offsets),
-        true,
-        true,
+        ExportOptions {
+            runtime_views: true,
+            scalar_scripts: true,
+        },
     )
 }
 
@@ -348,8 +382,10 @@ pub(crate) fn export_inhouse_record_archive_to_db(
         Some(plugin_paths),
         None,
         None,
-        false,
-        true,
+        ExportOptions {
+            runtime_views: false,
+            scalar_scripts: true,
+        },
     )
 }
 
@@ -459,9 +495,12 @@ fn export_records(
     plugin_paths: Option<&[PathBuf]>,
     unresolved_fields: Option<&HashMap<u32, BTreeSet<usize>>>,
     terrain_offsets: Option<&HashMap<u32, u64>>,
-    runtime_views: bool,
-    scalar_scripts: bool,
+    options: ExportOptions,
 ) -> Result<()> {
+    let ExportOptions {
+        runtime_views,
+        scalar_scripts,
+    } = options;
     conn.set_prepared_statement_cache_capacity(64);
     let tx = conn.unchecked_transaction()?;
     if order.is_some() {
