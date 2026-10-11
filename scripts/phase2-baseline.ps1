@@ -228,56 +228,68 @@ function Format-FieldValue($Value) {
     return "$Value"
 }
 
-# What the converted data set a window loaded actually is, as the conversion's own manifest describes
-# it: the `configuration_hash` and `schema_version` of the `conversion-manifest.json` in the asset
-# directory the run was pointed at. The directory path identifies nothing by itself — a warm
-# re-conversion, or an added mod, leaves the path and the schema unchanged — so the manifest fields
-# are what a comparison checks. A data set that could not be read that way (the window was started
-# without `--assets`, the manifest file is missing, or it does not parse) is `null` with the reason
-# returned beside it, never a guessed identity.
+# What the converted data set a window loaded actually is. The directory path identifies nothing by
+# itself — a warm re-conversion, or an added mod, leaves the path and the schema unchanged — so the
+# window also records two things that do change with the data: the size and last-write time of the
+# world database (`skyrim_world.db`) and the size of the cell cache (`cell_cache.rkyv`), which a
+# re-conversion or a different plugin set rewrites, and the conversion manifest's own
+# `configuration_hash` and `schema_version`, which say what settings the converter ran with. A copy of
+# the same data set to another folder keeps the sizes but not the last-write time, and is refused too:
+# a refusal is the safe direction, and `-CompareTo` names the baseline to rerun against. A data set
+# that could not be read (the window was started without `--assets`, a file is missing, or the
+# manifest does not parse) is `null` with the reason returned beside it, never a guessed identity.
+# Read once per data set: the manifest of a full conversion is tens of MiB of JSON, and every window
+# of a campaign asks about the same one.
+$script:assetsIdentityCache = @{}
+
 function Get-AssetsIdentity([string]$ResolvedAssets) {
+    $none = { param($Reason) [ordered]@{
+        world_database_bytes = $null; world_database_modified_utc = $null; cell_cache_bytes = $null
+        configuration_hash = $null; schema_version = $null; unavailable = $Reason
+    } }
     if (-not $ResolvedAssets) {
+        return & $none "this window was started without -Assets, so it loaded no converted data set"
+    }
+    if ($script:assetsIdentityCache.ContainsKey($ResolvedAssets)) { return $script:assetsIdentityCache[$ResolvedAssets] }
+    $identity = & {
+        $database = Join-Path $ResolvedAssets "skyrim_world.db"
+        $cellCache = Join-Path $ResolvedAssets "cell_cache.rkyv"
+        $manifestPath = Join-Path $ResolvedAssets "conversion-manifest.json"
+        foreach ($required in @($database, $cellCache, $manifestPath)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                return & $none "the data set at $ResolvedAssets has no $(Split-Path -Leaf $required)"
+            }
+        }
+        try {
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -AsHashtable
+        } catch {
+            return & $none "conversion-manifest.json could not be read ($($_.Exception.Message))"
+        }
+        if ($manifest -isnot [System.Collections.IDictionary]) {
+            return & $none "conversion-manifest.json is not a JSON object"
+        }
+        $databaseInfo = Get-Item -LiteralPath $database
+        $configurationHash = if ($manifest.Contains("configuration_hash")) { $manifest.configuration_hash } else { $null }
+        $schemaVersion = if ($manifest.Contains("schema_version")) { $manifest.schema_version } else { $null }
+        # An empty hash is what a manifest written before the producer recorded one carries: it names
+        # no settings either, so it is recorded as unread rather than as an identity.
+        $unavailable = $null
+        if ([string]::IsNullOrEmpty([string]$configurationHash)) {
+            $unavailable = "conversion-manifest.json records no configuration_hash for the data set"
+        } elseif ($null -eq $schemaVersion) {
+            $unavailable = "conversion-manifest.json records no schema_version for the data set"
+        }
         return [ordered]@{
-            configuration_hash = $null; schema_version = $null
-            unavailable = "this window was started without -Assets, so it loaded no converted data set"
+            world_database_bytes = $databaseInfo.Length
+            world_database_modified_utc = $databaseInfo.LastWriteTimeUtc.ToString("o")
+            cell_cache_bytes = (Get-Item -LiteralPath $cellCache).Length
+            configuration_hash = $configurationHash
+            schema_version = $schemaVersion
+            unavailable = $unavailable
         }
     }
-    $manifestPath = Join-Path $ResolvedAssets "conversion-manifest.json"
-    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
-        return [ordered]@{
-            configuration_hash = $null; schema_version = $null
-            unavailable = "the data set at $ResolvedAssets carries no conversion-manifest.json"
-        }
-    }
-    try {
-        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -AsHashtable
-    } catch {
-        return [ordered]@{
-            configuration_hash = $null; schema_version = $null
-            unavailable = "conversion-manifest.json could not be read ($($_.Exception.Message))"
-        }
-    }
-    if ($manifest -isnot [System.Collections.IDictionary]) {
-        return [ordered]@{
-            configuration_hash = $null; schema_version = $null
-            unavailable = "conversion-manifest.json is not a JSON object"
-        }
-    }
-    $configurationHash = if ($manifest.Contains("configuration_hash")) { $manifest.configuration_hash } else { $null }
-    $schemaVersion = if ($manifest.Contains("schema_version")) { $manifest.schema_version } else { $null }
-    # An empty hash is what a manifest written before the producer recorded one carries: it names no
-    # data set either, so it is recorded as unread rather than as an identity.
-    $unavailable = $null
-    if ([string]::IsNullOrEmpty([string]$configurationHash)) {
-        $unavailable = "conversion-manifest.json records no configuration_hash for the data set"
-    } elseif ($null -eq $schemaVersion) {
-        $unavailable = "conversion-manifest.json records no schema_version for the data set"
-    }
-    return [ordered]@{
-        configuration_hash = $configurationHash
-        schema_version = $schemaVersion
-        unavailable = $unavailable
-    }
+    $script:assetsIdentityCache[$ResolvedAssets] = $identity
+    return $identity
 }
 
 # The inputs a window's scenario was started with, taken from the engine arguments that produced it
@@ -301,6 +313,9 @@ function Get-ScenarioInputs($Arguments, $Report, [int]$DurationSeconds) {
         synthetic_instances = if ($null -eq $syntheticInstances) { $null } else { [int]$syntheticInstances }
         assets = Get-ArgumentValue $Arguments "--assets"
         assets_identity = [ordered]@{
+            world_database_bytes = $assetsIdentity.world_database_bytes
+            world_database_modified_utc = $assetsIdentity.world_database_modified_utc
+            cell_cache_bytes = $assetsIdentity.cell_cache_bytes
             configuration_hash = $assetsIdentity.configuration_hash
             schema_version = $assetsIdentity.schema_version
         }
@@ -895,7 +910,7 @@ if ($previous) {
         "## Comparison against $comparePath",
         "",
         "- Compared with commit $($previous.commit), generated $($previous.generated_at); this run is commit $($identity.commit).",
-        "- The two runs were checked to share the machine (the hardware label, backend, adapter and driver), resolution, build profile, schemas, graphics settings and scenario inputs — the data set's `configuration_hash` and manifest `schema_version` among them; the commit is the field allowed to differ.",
+        "- The two runs were checked to share the machine (the hardware label, backend, adapter and driver), resolution, build profile, schemas, graphics settings and scenario inputs — the data set's identity (its world database and cell cache files, and the conversion manifest's settings) among them; the commit is the field allowed to differ.",
         "",
         "| Window | Metric | Baseline | Current | Change % | Status |",
         "|---|---|---:|---:|---:|---|"

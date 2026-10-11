@@ -123,8 +123,8 @@ function Get-RegressionComparison([string]$Metric, [double]$Old, [double]$New) {
 }
 
 # Where a scenario's camera ran, as the string a stored baseline records for it: `<worldspace>
-# <gridX>,<gridY>` for a world scenario, taken from the arguments the engine was actually started
-# with, and `synthetic` for a scenario started in no world place (the fixture scenes and the
+# <gridX>,<gridY>` for a world scenario, taken from the scenario's own engine arguments (the
+# benchmark flags added at launch say nothing about the place), and `synthetic` for a scenario started in no world place (the fixture scenes and the
 # synthetic benchmark).
 #
 # A scene's size is a property of the place's data, not of the scenario's name: `dense` moved from

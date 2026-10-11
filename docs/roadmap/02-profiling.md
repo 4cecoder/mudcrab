@@ -288,8 +288,9 @@ the run could not measure it.
 
 - **`scene`** — what the frame drew. `entity_count` is Bevy's own entity-count diagnostic;
   `mesh_entities`, `terrain_patches` and `water_surfaces` are the engine's scene inventory, sampled
-  every 60th frame (a scene inventory that was never sampled is `null`, so a synthetic run's real
-  zero terrain patches and a missing sample are told apart). `pipeline_statistics_supported` is the
+  every 60th frame and kept only from a frame inside the measured window (a count never sampled
+  there is `null`, never the warm-up's number, so a synthetic run's real zero terrain patches and a
+  missing sample are told apart). `pipeline_statistics_supported` is the
   device's answer, and on a device that has pipeline statistics (Vulkan; DX12 offers none) the
   section lists per pass `vertex_shader_invocations` and `clipper_primitives_out`, each a
   distribution over the measured frames, with `measured_frames` giving the frames those numbers rest
@@ -378,11 +379,12 @@ cannot drift apart).
   still), the `synthetic_instances` it rendered, and the resolved full path of the `assets` set it
   loaded. The window comparison checks every one of them, so a rerun at another flight speed,
   another instance count or against another asset set is refused rather than scored against a
-  different workload. The data set's identity is among them: `assets_identity` holds the
-  `configuration_hash` and `schema_version` recorded in that directory's `conversion-manifest.json`
-  (`null`, with the reason in `assets_identity_unavailable`, when the window loaded no data set or
-  the manifest could not be read), so two runs whose `assets` path is the same but whose conversion
-  or mod set is not are refused too. Format 3 added those fields and the `measured_frames` below; a
+  different workload. The data set's identity is among them: `assets_identity` holds the size and
+  last-write time of `skyrim_world.db`, the size of `cell_cache.rkyv` (a re-conversion or another
+  plugin set rewrites both) and the `configuration_hash` and `schema_version` of the
+  `conversion-manifest.json` (the converter's settings). They are `null`, with the reason in
+  `assets_identity_unavailable`, when the window loaded no data set or a file could not be read, so
+  two runs whose `assets` path is the same but whose data is not are refused too. Format 3 added those fields and the `measured_frames` below; a
   format-2 file does not carry them and cannot be compared with a run of this script — nor can a
   format-3 file written before `assets_identity` existed, which the window comparison refuses as a
   missing input.
@@ -420,12 +422,13 @@ cannot drift apart).
   fingerprint's renderer backend, adapter and driver — resolution, build
   profile, graphics settings, world-database and cell-cache schemas, or any window's scenario
   inputs (flight speed, synthetic instance count and the data set included). The data set is checked
-  twice: as the resolved `assets` path, and as its own identity — `assets_identity` records the
-  `configuration_hash` and `schema_version` of the `conversion-manifest.json` in that directory,
-  `null` with the reason in `assets_identity_unavailable` when it could not be read that way — so a
+  twice: as the resolved `assets` path, and as its own identity (`assets_identity`, above), so a
   re-conversion or an added mod at the same path is refused rather than scored as the same workload.
-  A `baseline.json` written before its windows carried `assets_identity` is refused by that check
-  rather than compared against; record the field once with `-UpdateBaseline`. A different **commit**
+  The identity is a file identity, not a content hash: copying the same data set to another folder
+  keeps the sizes but changes the last-write time, so the copy is refused too, which is the safe
+  direction; rerun the baseline there to compare. A `baseline.json` written before its windows
+  carried `assets_identity` is refused by that check rather than compared against; rerun the
+  baseline once to write a new one. A different **commit**
   is expected and allowed — comparing a branch against the baseline
   it was measured from is the point of the command. `-Out` defaults to `target/phase2-baseline`, so
   a rerun compares with the previous baseline by default; each window's report bundle stays under
