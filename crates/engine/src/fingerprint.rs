@@ -395,7 +395,10 @@ mod tests {
             .split_once("version")
             .map_or(declaration, |(_, rest)| rest)
             .trim_start();
-        let after_key = after_key.strip_prefix('=').unwrap_or(after_key).trim_start();
+        let after_key = after_key
+            .strip_prefix('=')
+            .unwrap_or(after_key)
+            .trim_start();
         after_key
             .strip_prefix('"')
             .and_then(|quoted| quoted.split('"').next())
@@ -413,8 +416,7 @@ mod tests {
     fn the_fingerprint_bevy_version_matches_the_workspace_manifest() {
         let requirement = workspace_bevy_requirement();
         assert!(
-            requirement == BEVY_VERSION
-                || requirement.starts_with(&format!("{BEVY_VERSION}.")),
+            requirement == BEVY_VERSION || requirement.starts_with(&format!("{BEVY_VERSION}.")),
             "the workspace requires bevy `{requirement}` but the fingerprint records \
              `{BEVY_VERSION}`: move BEVY_VERSION when Bevy is bumped"
         );

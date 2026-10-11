@@ -739,14 +739,26 @@ fn sample_scene_inventory(
     }
     let started = Instant::now();
     let mut counts = BTreeMap::new();
-    counts.insert("scene/mesh_entities".to_owned(), meshes.iter().count() as f64);
-    counts.insert("scene/terrain_patches".to_owned(), terrain.iter().count() as f64);
+    counts.insert(
+        "scene/mesh_entities".to_owned(),
+        meshes.iter().count() as f64,
+    );
+    counts.insert(
+        "scene/terrain_patches".to_owned(),
+        terrain.iter().count() as f64,
+    );
     counts.insert(
         "scene/visible_terrain_patches".to_owned(),
         terrain.iter().filter(|visible| visible.get()).count() as f64,
     );
-    counts.insert("scene/water_surfaces".to_owned(), water.iter().count() as f64);
-    counts.insert("scene/bounded_instances".to_owned(), bounds.iter().count() as f64);
+    counts.insert(
+        "scene/water_surfaces".to_owned(),
+        water.iter().count() as f64,
+    );
+    counts.insert(
+        "scene/bounded_instances".to_owned(),
+        bounds.iter().count() as f64,
+    );
     counts.insert("assets/meshes".to_owned(), mesh_assets.len() as f64);
     counts.insert("assets/images".to_owned(), images.len() as f64);
     profiler.stage_scene_inventory(counts);
@@ -1748,10 +1760,7 @@ mod tests {
         // The inventory runs in `Update` and the benchmark samples in `Last`, so the counts are
         // staged first and the sample of the same frame is what decides them. A warm-up frame's
         // inventory is dropped.
-        profiler.stage_scene_inventory(BTreeMap::from([(
-            "scene/mesh_entities".to_owned(),
-            3.0,
-        )]));
+        profiler.stage_scene_inventory(BTreeMap::from([("scene/mesh_entities".to_owned(), 3.0)]));
         profiler.sample_frame(&diagnostics, None, false, true);
         let scene = profiler.scene_report(Some(11), Some(&renderer(true, true)));
         assert_eq!(scene.mesh_entities, None, "a warm-up count is not measured");
