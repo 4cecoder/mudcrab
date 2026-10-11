@@ -206,6 +206,9 @@ pub struct ConversionManifest {
     pub inputs_by_kind: BTreeMap<String, u64>,
     #[serde(default)]
     pub failures: BTreeMap<String, String>,
+    /// Non-runtime inputs deliberately excluded, with an auditable reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub excluded_inputs: BTreeMap<String, String>,
     /// Texture references a published mesh omits because the game data does not
     /// contain that texture, keyed by the published `.glb` and holding the
     /// resolved texture paths it dropped. Kept out of `failures`: nothing failed
@@ -316,10 +319,12 @@ pub fn configuration_hash(config: &crate::config::PipelineConfig) -> Result<Stri
 }
 
 /// Recreate the historical combined proof for a recorded producer schema.
-/// Legacy proofs predate projection versions and omit the reader identity; this
-/// calculation remains byte-identical. New publication uses `configuration_hash`.
+/// Legacy proofs predate projection versions and omit the reader identity; the
+/// non-MO2 calculation remains byte-identical. New publication uses `configuration_hash`.
 /// Matching this known hash is the conservative fallback when per-kind settings
 /// are absent; an arbitrary historical hash cannot establish those settings.
+/// MO2 instance/profile paths also bind source selection; winning input bytes
+/// remain independently hashed per source.
 pub fn configuration_hash_for_schema(
     config: &crate::config::PipelineConfig,
     schema: u32,
@@ -379,6 +384,18 @@ fn configuration_hash_with_identity(
     // Actual DDS roles remain in per-source proofs rather than this broad identity.
     if let Some(identity) = identity {
         relevant["record_reader"] = identity.clone();
+    }
+    if let Some(selection) = &config.mo2 {
+        let instance = mo2::Instance::open(&selection.instance_path)?;
+        let profile = instance.profile_dir(&selection.profile)?;
+
+        relevant["mo2"] = serde_json::json!({
+            "instance": instance.instance_path,
+            "profile": profile,
+            "mods": instance.mods_dir,
+            "overwrite": instance.overwrite_dir,
+            "data": std::fs::canonicalize(&config.data_dir)?,
+        });
     }
     if schema >= 16 {
         relevant["texture_zstd_level"] = serde_json::json!(config.texture_zstd_level);

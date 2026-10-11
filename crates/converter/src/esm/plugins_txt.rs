@@ -10,8 +10,11 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use shared::plugin_selection::decode_windows_1252;
 pub use shared::plugin_selection::{OFFICIAL_MASTERS, read_skyrim_ccc};
+use shared::plugin_selection::{
+    PluginEntry, Warnings, decode_windows_1252, normalize_plugin_name, parse_plugin_entries,
+    select_plugin_names,
+};
 
 /// Recognize plugin filenames directly inside Data, excluding path components.
 fn plugin_name(name: &str) -> bool {
@@ -32,31 +35,6 @@ fn lines(contents: &str) -> impl Iterator<Item = &str> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with(['#', ';']))
-}
-
-/// Count repeated diagnostics and emit one line for each distinct problem.
-#[derive(Default)]
-struct Warnings(BTreeMap<String, usize>);
-
-impl Warnings {
-    /// Accumulate repeated occurrences without producing unbounded log output.
-    fn add(&mut self, message: String) {
-        *self
-            .0
-            .entry(message.replace(['\r', '\n'], " "))
-            .or_default() += 1;
-    }
-
-    /// Forward warnings through the pipeline notice channel or public reader.
-    fn finish(self, notices: &mut Vec<String>) {
-        for (message, count) in self.0 {
-            notices.push(if count == 1 {
-                message
-            } else {
-                format!("{message} ({count} occurrences)")
-            });
-        }
-    }
 }
 
 /// Read only explicit General sTestFile1 through sTestFile10 settings.
@@ -109,9 +87,7 @@ fn usable_plugins(paths: Vec<PathBuf>, warnings: &mut Warnings) -> Vec<PathBuf> 
         .enumerate()
         .map(|(i, path)| {
             (
-                load_order::normalize_plugin_name(
-                    &path.file_name().unwrap_or_default().to_string_lossy(),
-                ),
+                normalize_plugin_name(&path.file_name().unwrap_or_default().to_string_lossy()),
                 i,
             )
         })
@@ -146,7 +122,7 @@ fn usable_plugins(paths: Vec<PathBuf>, warnings: &mut Warnings) -> Vec<PathBuf> 
                 continue;
             };
             for master in &header.masters {
-                let cause = match indices.get(&load_order::normalize_plugin_name(master)) {
+                let cause = match indices.get(&normalize_plugin_name(master)) {
                     Some(&dependency) => missing[dependency].clone(),
                     None => Some(master.clone()),
                 };
@@ -180,6 +156,14 @@ fn usable_plugins(paths: Vec<PathBuf>, warnings: &mut Warnings) -> Vec<PathBuf> 
         .collect()
 }
 
+/// Apply the same header and missing-master closure recovery to a mod-manager selection.
+pub(crate) fn recover_with_notices(paths: Vec<PathBuf>, notices: &mut Vec<String>) -> Vec<PathBuf> {
+    let mut warnings = Warnings::default();
+    let paths = usable_plugins(paths, &mut warnings);
+    warnings.finish(notices);
+    paths
+}
+
 /// Select plugins using explicit CCC/INI inputs, collecting bounded diagnostics.
 pub(crate) fn read_with_notices(
     path: &Path,
@@ -204,7 +188,7 @@ pub(crate) fn read_with_notices(
         if entry.path().is_file() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if plugin_name(&name) {
-                installed.insert(load_order::normalize_plugin_name(&name), entry.path());
+                installed.insert(normalize_plugin_name(&name), entry.path());
             }
         }
     }
@@ -223,60 +207,14 @@ pub(crate) fn read_with_notices(
     let test_files = ini
         .map(|path| ini_plugins(path, &mut warnings))
         .unwrap_or_default();
-    let test_names: HashSet<_> = test_files
-        .iter()
-        .map(|name| load_order::normalize_plugin_name(name))
-        .collect();
-    let mut listed = Vec::new();
-    let mut last = HashMap::new();
-    for line in lines(&text) {
-        let checked = line.starts_with('*');
-        let name = line.strip_prefix('*').unwrap_or(line).trim();
-        if !plugin_name(name) {
-            continue;
-        }
-        let key = load_order::normalize_plugin_name(name);
-        if last.insert(key.clone(), listed.len()).is_some() {
-            warnings.add(format!(
-                "duplicate plugins.txt entry {key}; keeping the last position and checkbox"
-            ));
-        }
-        listed.push((name.to_owned(), key, checked));
-    }
-    let mut selected = Vec::new();
-    let mut seen = HashSet::new();
-    let mut add = |name: &str, warnings: &mut Warnings| {
-        let key = load_order::normalize_plugin_name(name);
-        if let Some(path) = installed.get(&key) {
-            if seen.insert(key) {
-                selected.push(path.clone());
-            }
-        } else {
-            warnings.add(format!("plugin {key} is not installed; skipping"));
-        }
-    };
-    for name in OFFICIAL_MASTERS {
-        add(name, &mut warnings);
-    }
-    for name in &creations {
-        add(name, &mut warnings);
-    }
-    for (index, (name, key, checked)) in listed.iter().enumerate() {
-        if last[key] != index {
-            continue;
-        }
-        if *checked || test_names.contains(key) {
-            add(name, &mut warnings);
-        } else if !installed.contains_key(key) {
-            warnings.add(format!("plugin {key} is not installed; skipping"));
-        }
-    }
+    let mut listed = parse_plugin_entries(&text, false, &mut warnings);
+    let listed_names: HashSet<_> = listed.iter().map(|entry| entry.key.clone()).collect();
     let mut unlisted: Vec<_> = test_files
         .iter()
-        .filter(|name| !last.contains_key(&load_order::normalize_plugin_name(name)))
+        .filter(|name| !listed_names.contains(&normalize_plugin_name(name)))
         .collect();
     unlisted.sort_by_key(|name| {
-        let key = load_order::normalize_plugin_name(name);
+        let key = normalize_plugin_name(name);
         let modified = installed
             .get(&key)
             .and_then(|path| std::fs::metadata(path).ok())
@@ -285,8 +223,25 @@ pub(crate) fn read_with_notices(
         (modified, key)
     });
     for name in unlisted {
-        add(name, &mut warnings);
+        listed.push(PluginEntry {
+            name: name.clone(),
+            key: normalize_plugin_name(name),
+            checked: true,
+        });
     }
+    let installed_names = installed.keys().cloned().collect();
+    let names = select_plugin_names(
+        &listed,
+        &installed_names,
+        &creations,
+        &test_files,
+        None,
+        &mut warnings,
+    );
+    let selected = names
+        .into_iter()
+        .map(|name| installed[&name].clone())
+        .collect();
     let selected = usable_plugins(selected, &mut warnings);
     warnings.finish(notices);
     ensure!(

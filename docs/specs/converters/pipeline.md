@@ -14,7 +14,7 @@ usable winner. Legacy decoding recovers at checked record boundaries or the end
 of the current bounded group, and never searches corrupt payload bytes for a
 replacement header. Malformed optional native links are cleared or their
 occurrences omitted; malformed required links omit only their record candidate.
-Invalid TES4/MAST metadata and load-order authority remain conversion errors.
+With an explicit player list or MO2 profile, unusable TES4/MAST headers and their dependency closures warn and skip while usable neighbors continue; an empty usable selection fails clearly. Unusable selection authority, final invalid order and cycles remain conversion errors. Automatic discovery retains its strict missing-master/header policy.
 Real deletions still apply. LAND with rejected authored heights
 or incomplete framing is skipped; genuinely heightless texture/color records
 retain the existing default-height cache behavior.
@@ -78,7 +78,7 @@ normal cache eligibility: a later normal conversion checks the original producer
 and current settings, source dependencies and resolved texture encoding.
 Unknown source producer identities are rejected by the retained-asset route.
 Plugin filename keys use Unicode lowercase after native Windows-1252 decoding,
-including accented case pairs. Record signatures and GMST EditorIDs retain their
+including accented case pairs. The same shared function supplies player and MO2 selection, the merged MO2 Data index, master and identity lookup, and archive attachment keys. Record signatures and GMST EditorIDs retain their
 separate ASCII conventions. Filename spelling remains available in source proof;
 neither Unicode normalization nor general Unicode case folding is implemented.
 Complete load-order database exports replace canonical/runtime rows, identity
@@ -165,6 +165,8 @@ runtime selection are unchanged; normal conversion and metadata rebuild
 regenerate both caches and the layer table.
 
 Explicit player selection is available through `--plugins-file FILE`. Optional `--skyrim-ccc-file FILE` overrides the game-folder Creation list, and `--skyrim-ini-file FILE` supplies General test-file settings without reading ambient profiles. These options also exist as `PipelineConfig.plugins_file`, `skyrim_ccc_file` and `skyrim_ini_file`. Selection rules and recoverable missing-master behavior are documented in [the database specification](db-schema.md). Automatic discovery remains the default.
+
+MO2 profiles use the same official/Creation activation, Windows-1252 decoding, last-duplicate selection and missing-master recovery. `--mo2-instance` and `--mo2-profile` retain the profile's file overlay and `loadorder.txt` order after implicitly active plugins. An active plugin omitted from `loadorder.txt` appends after ordered plugins, in `plugins.txt` order, with a warning. Missing Data entries and missing/disabled-master closures warn and skip while usable neighbors publish. `Skyrim.ccc` comes from the game folder beside physical Data; unreadable or missing CCC warns and continues. MO2 selection and `--plugins-file` are mutually exclusive. In-house localized fields use the effective winning loose English string banks from the MO2 Data overlay before archive banks; malformed winning banks remain unresolved with counted diagnostics, without reverting to a losing bank. Metadata rebuild via `--reuse-assets` requires authenticated physical Data and recorded plugin order; it rejects MO2 profile selection before source/output work. Use normal conversion for an MO2 profile.
 
 ---
 
@@ -314,6 +316,19 @@ enabled (the default), each blob must also match its recorded SHA-256. A failed
 source or blob integrity check causes that archive to be extracted again;
 unaffected archives remain candidates. `--invalidate-cache` explicitly discards
 both converted-asset and archive candidates.
+
+### Failed-asset repair
+
+`converter repair-failed <Data> <output> [--apply]` retries only the published manifest's
+failed inputs using the original conversion configuration, including reader,
+schema add-ons, encoding and MO2 source/profile options. Without `--apply`, the
+repair remains in a separate directory for inspection. Applying a repair holds
+the output locks, verifies existing outputs, updates the manifest and database,
+and publishes transactionally with recovery of the last good output after an
+interrupted swap. Missing winning sources remain failures; known authoring resources and geometryless overlay templates are recorded as excluded.
+Repaired outputs retain per-kind asset settings and source/integrity proofs.
+Archive extraction candidates stay independent of converted-asset eligibility;
+old failed entries cannot override current repaired or excluded decisions.
 
 ### Checking a converted output
 

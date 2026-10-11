@@ -66,11 +66,16 @@ struct SourceMetadata<'a> {
 impl AssetPipeline {
     /// Publishes only to a new, disjoint directory. The source package and its
     /// retained GLB/KTX2/Luau bytes are never modified or relabeled in place.
+    /// MO2 source selection is unsupported by this package-matched Data route.
     pub async fn rebuild_metadata_async(
         mut config: PipelineConfig,
         source_assets: &Path,
         progress_tx: Sender<ProgressEvent>,
     ) -> Result<PipelineReport> {
+        ensure!(
+            config.mo2.is_none(),
+            "metadata rebuild does not support MO2 selection; use normal conversion"
+        );
         config.validate()?;
         config.freeze_schema_addons()?;
         ensure!(
@@ -876,6 +881,41 @@ mod tests {
 mod metadata_schema_controls {
     use super::*;
     use crate::{cache::asset_configuration_hash_for_schema, config::RecordReader};
+
+    /// Unsupported MO2 metadata is rejected before configuration reads or output work.
+    #[tokio::test]
+    async fn mo2_metadata_rebuild_is_rejected_before_source_and_output_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let sentinel = source.join("sentinel");
+        fs::write(&sentinel, b"untouched source package").unwrap();
+        let data = directory.path().join("absent-Data");
+        let output = directory.path().join("output");
+        let instance = directory.path().join("absent-instance");
+        let mut config = PipelineConfig::new(&data, &output);
+        config.mo2 = Some(mo2::Selection {
+            instance_path: instance.clone(),
+            profile: "Absent".into(),
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let error = AssetPipeline::rebuild_metadata_async(config, &source, tx)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("metadata rebuild does not support MO2 selection"),
+            "wrong source boundary: {error}"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched source package");
+        assert_eq!(fs::read_dir(&source).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert!(!data.exists());
+        assert!(!output.exists());
+        assert!(!instance.exists());
+        assert!(rx.try_recv().is_err());
+    }
 
     const ORIGINAL: &[u8] = br#"{"version":1,"name":"original_source","records":[{"signature":"ZMEX","source":"synthetic metadata fixture","fields":[{"signature":"SCAL","name":"value","kind":"u32"}]}]}"#;
     const REQUESTED: &[u8] = br#"{"version":1,"name":"requested_output","records":[{"signature":"ZMEX","source":"synthetic metadata fixture","fields":[{"signature":"SCAL","name":"value","kind":"i32"}]}]}"#;

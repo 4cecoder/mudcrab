@@ -43,8 +43,11 @@ pub struct PipelineConfig {
     /// alongside the output directory; the runtime pack no longer contains it.
     #[serde(skip)]
     pub cache_dir: Option<PathBuf>,
-    /// Explicit player plugin selection; absent uses automatic discovery.
+    /// Explicit player selection; absent uses MO2 when configured, else automatic discovery.
     pub plugins_file: Option<PathBuf>,
+    /// Resolve this MO2 profile over physical Data; incompatible with plugins_file.
+    #[serde(default)]
+    pub mo2: Option<mo2::Selection>,
     /// Defaults to legacy for older serialized configurations.
     #[serde(default)]
     pub record_reader: RecordReader,
@@ -125,6 +128,7 @@ impl PipelineConfig {
             resume_staging: None,
             cache_dir: None,
             plugins_file: None,
+            mo2: None,
             record_reader: RecordReader::Legacy,
             schema_addons: Vec::new(),
             runtime_schemas: None,
@@ -196,6 +200,21 @@ impl PipelineConfig {
         // on publish, staging is deleted after it, and the cache is pruned, so
         // none of them may be, hold, or sit inside the game data.
         let data = std::fs::canonicalize(&self.data_dir)?;
+        let mut sources = vec![data.clone()];
+        if let Some(selection) = &self.mo2 {
+            color_eyre::eyre::ensure!(
+                self.plugins_file.is_none(),
+                "MO2 selection cannot be combined with plugins_file"
+            );
+            let instance = mo2::Instance::open(&selection.instance_path)?;
+            instance.profile_dir(&selection.profile)?;
+            sources.extend(
+                instance
+                    .source_roots()
+                    .iter()
+                    .map(|path| path.to_path_buf()),
+            );
+        }
         let mut written = vec![
             ("output directory", self.output_dir.clone()),
             ("ingestion cache directory", self.ingestion_cache_dir()),
@@ -205,12 +224,14 @@ impl PipelineConfig {
         }
         for (role, path) in written {
             let resolved = resolve_path(&path)?;
-            color_eyre::eyre::ensure!(
-                !(resolved.starts_with(&data) || data.starts_with(&resolved)),
-                "the {role} {} overlaps the Skyrim Data directory {}; choose a folder outside it that does not contain it",
-                path.display(),
-                self.data_dir.display()
-            );
+            for source in &sources {
+                color_eyre::eyre::ensure!(
+                    !(resolved.starts_with(source) || source.starts_with(&resolved)),
+                    "the {role} {} overlaps the Skyrim Data directory or MO2 source {}; choose a folder outside it that does not contain it",
+                    path.display(),
+                    source.display()
+                );
+            }
         }
         check_output_dir(&self.output_dir)?;
         if let Some(staging) = &self.resume_staging {
@@ -350,10 +371,14 @@ fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
     loop {
         match std::fs::canonicalize(existing) {
             Ok(resolved) => {
-                return Ok(missing
-                    .iter()
-                    .rev()
-                    .fold(resolved, |resolved, part| resolved.join(part)));
+                return Ok(missing.iter().rev().fold(resolved, |mut resolved, part| {
+                    if *part == std::ffi::OsStr::new("..") {
+                        resolved.pop();
+                    } else if *part != std::ffi::OsStr::new(".") {
+                        resolved.push(part);
+                    }
+                    resolved
+                }));
             }
             Err(error) => match (existing.parent(), existing.file_name()) {
                 (Some(parent), Some(name)) => {
@@ -426,6 +451,9 @@ mod tests {
         let config: PipelineConfig = serde_json::from_value(legacy.clone()).unwrap();
         assert!(config.skyrim_ccc_file.is_none());
         assert!(config.skyrim_ini_file.is_none());
+        assert!(config.mo2.is_none());
+        assert_eq!(config.record_reader, RecordReader::Legacy);
+        assert!(config.schema_addons.is_empty());
         assert!(config.lod_origins.is_empty());
         assert!(!config.no_lod);
         assert_eq!(config.texture_encoder, TextureEncoder::Cpu);
@@ -435,6 +463,29 @@ mod tests {
         legacy["lod_origins"] = serde_json::json!({"GeneratedWorld": [-4, 12]});
         let explicit: PipelineConfig = serde_json::from_value(legacy).unwrap();
         assert_eq!(explicit.lod_origins["GeneratedWorld"], [-4, 12]);
+    }
+
+    /// Mixed source selection is rejected before opening an MO2 instance or starting output work.
+    #[test]
+    fn mo2_and_player_selection_are_rejected_before_instance_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("Data");
+        std::fs::create_dir(&data).unwrap();
+        let output = directory.path().join("pack");
+        let mut config = PipelineConfig::new(data, &output);
+        config.plugins_file = Some(directory.path().join("plugins.txt"));
+        config.mo2 = Some(mo2::Selection {
+            instance_path: directory.path().join("absent-instance"),
+            profile: "Absent".into(),
+        });
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("MO2 selection cannot be combined with plugins_file")
+        );
+        assert!(!output.exists());
     }
 
     #[test]

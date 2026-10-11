@@ -33,6 +33,43 @@ fn asset_settings_are_independent_of_reader_metadata() {
     }
 }
 
+/// MO2 source selection binds metadata without widening per-kind asset settings.
+#[test]
+fn mo2_profile_and_reader_bind_metadata_without_changing_asset_settings() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("Data");
+    let instance = root.path().join("MO2");
+    fs::create_dir_all(&data).unwrap();
+    for path in ["mods", "overwrite", "profiles/Default", "profiles/Second"] {
+        fs::create_dir_all(instance.join(path)).unwrap();
+    }
+    fs::write(
+        instance.join("ModOrganizer.ini"),
+        "[General]\ngameName=Skyrim Special Edition\n",
+    )
+    .unwrap();
+    let original = PipelineConfig::new(&data, root.path().join("output"));
+    let mut mo2_config = original.clone();
+    mo2_config.mo2 = Some(mo2::Selection {
+        instance_path: instance,
+        profile: "Default".into(),
+    });
+    let mut other_profile = mo2_config.clone();
+    other_profile.mo2.as_mut().unwrap().profile = "Second".into();
+    let mut other_reader = mo2_config.clone();
+    other_reader.record_reader = RecordReader::Inhouse;
+    let hash = configuration_hash(&mo2_config).unwrap();
+    for config in [&original, &other_profile, &other_reader] {
+        assert_ne!(hash, configuration_hash(config).unwrap());
+        for kind in ["nif", "dds", "pex"] {
+            assert_eq!(
+                asset_configuration_hash_for_schema(&mo2_config, 26, kind).unwrap(),
+                asset_configuration_hash_for_schema(config, 26, kind).unwrap(),
+            );
+        }
+    }
+}
+
 /// New legacy projections have distinct metadata proof without changing asset settings.
 #[test]
 fn legacy_projection_identity_separates_current_and_historical_full_hashes() {

@@ -29,7 +29,6 @@ pub mod types;
 pub use plugins_txt::{
     OFFICIAL_MASTERS, read_plugins_txt, read_plugins_txt_with_options, read_skyrim_ccc,
 };
-
 #[cfg(test)]
 mod plugin_table_tests;
 
@@ -99,22 +98,47 @@ impl EsmParser {
         strings_root: &Path,
         schemas: Option<&crate::records::addons::RuntimeSchemas>,
     ) -> Result<HashMap<u32, RawRecord>> {
+        Self::convert_plugins_with_reader_and_schemas_with_string_sources(
+            plugin_paths,
+            db_path,
+            reader,
+            inhouse::StringSources::PluginLooseFirst(strings_root),
+            schemas,
+        )
+    }
+
+    /// Select authoritative loose string inputs independently of the plugin's physical parent.
+    pub(crate) fn convert_plugins_with_reader_and_schemas_with_string_sources(
+        plugin_paths: &[PathBuf],
+        db_path: &Path,
+        reader: crate::config::RecordReader,
+        string_sources: inhouse::StringSources<'_>,
+        schemas: Option<&crate::records::addons::RuntimeSchemas>,
+    ) -> Result<HashMap<u32, RawRecord>> {
         match reader {
             crate::config::RecordReader::Legacy => {
                 Self::convert_plugins_with_records(plugin_paths, db_path)
             }
-            crate::config::RecordReader::Inhouse => {
-                if let Some(schemas) = schemas {
-                    inhouse::convert_plugins_with_schemas(
-                        plugin_paths,
-                        db_path,
-                        strings_root,
-                        schemas,
-                    )
-                } else {
-                    inhouse::convert_plugins(plugin_paths, db_path, strings_root)
+            crate::config::RecordReader::Inhouse => match string_sources {
+                inhouse::StringSources::PluginLooseFirst(strings_root) => {
+                    if let Some(schemas) = schemas {
+                        inhouse::convert_plugins_with_schemas(
+                            plugin_paths,
+                            db_path,
+                            strings_root,
+                            schemas,
+                        )
+                    } else {
+                        inhouse::convert_plugins(plugin_paths, db_path, strings_root)
+                    }
                 }
-            }
+                source => inhouse::convert_plugins_with_string_sources(
+                    plugin_paths,
+                    db_path,
+                    source,
+                    schemas,
+                ),
+            },
         }
     }
     /// Parses .esm files and exports world data to skyrim_world.db

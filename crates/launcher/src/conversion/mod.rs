@@ -162,9 +162,11 @@ pub struct RunHandle {
 pub struct ConversionLogicPlugin;
 
 impl Plugin for ConversionLogicPlugin {
+    /// Registers conversion and source-selection resources and orders the conversion logic systems.
     fn build(&self, app: &mut App) {
         app.init_resource::<ConversionStatus>()
             .init_resource::<GamePathConfig>()
+            .init_resource::<crate::mo2_settings::SourceSettings>()
             .init_resource::<CurrentConversion>()
             .init_resource::<PendingInputs>()
             .init_resource::<PendingEffects>()
@@ -302,13 +304,21 @@ pub fn actuate_effects(
     mut effects: ResMut<PendingEffects>,
     mut status: ResMut<ConversionStatus>,
     mut handle: ResMut<RunHandle>,
+    source: Res<crate::mo2_settings::SourceSettings>,
 ) {
     for effect in effects.drain() {
         match effect {
             Effect::None => {}
-            Effect::Begin(config) => {
+            Effect::Begin(mut config) => {
                 let (tx, rx) = crossbeam_channel::unbounded();
-                handle.cancellation = Some(runner::spawn(*config, tx));
+                match source.apply(&mut config) {
+                    Ok(()) => handle.cancellation = Some(runner::spawn(*config, tx)),
+                    Err(reason) => {
+                        let _ = tx.send(RunMessage::Failed(state::FailureReport::before_start(
+                            reason,
+                        )));
+                    }
+                }
                 commands.insert_resource(RunChannel { receiver: rx });
                 status.begin_run();
             }
@@ -530,6 +540,36 @@ pub(crate) mod tests {
         app.add_plugins(MinimalPlugins);
         app.add_plugins(ConversionLogicPlugin);
         app
+    }
+
+    /// An invalid MO2 source reports a before-start failure through the boxed Begin effect.
+    #[test]
+    fn invalid_mo2_source_fails_before_spawning_conversion() {
+        let mut app = test_app();
+        app.add_systems(Update, actuate_effects.after(LauncherSet::Logic));
+        app.world_mut()
+            .resource_mut::<crate::mo2_settings::SourceSettings>()
+            .use_mo2 = true;
+        let (data, output) = folders();
+        app.world_mut()
+            .resource_mut::<PendingInputs>()
+            .push(Input::Start { data, output });
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world().resource::<CurrentConversion>().0,
+            ConversionState::Stopped {
+                staging: None,
+                cancelled: false,
+            }
+        );
+        assert!(app.world().resource::<RunHandle>().cancellation.is_none());
+        assert!(
+            app.world()
+                .resource::<ConversionStatus>()
+                .notice_text()
+                .contains("Choose a valid MO2 instance and profile")
+        );
     }
 
     /// The folders the tests run with, and a Start press that puts the window in `Running`.

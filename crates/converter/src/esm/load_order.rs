@@ -7,11 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Shared case-insensitive key for plugin basenames, including Windows-1252 case pairs.
-/// Keep this separate from ASCII record signatures and EditorID conventions.
-pub(crate) fn normalize_plugin_name(name: &str) -> String {
-    name.to_lowercase()
-}
+pub(crate) use shared::plugin_selection::normalize_plugin_name;
 
 /// Whether Skyrim loads this plugin with the masters: ESM-flagged, or an `.esm`/`.esl` file.
 /// The ESL flag alone (an ESL-flagged `.esp`) narrows the slot but keeps regular priority.

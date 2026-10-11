@@ -30,6 +30,28 @@ pub const ADAPTER_VERSION: u32 = 11;
 /// This identity does not change the independent converted-asset producer/settings proofs.
 pub const LEGACY_PROJECTION_VERSION: u32 = 3;
 
+/// Explicit loose-text precedence while keeping original plugin paths and provenance.
+#[derive(Clone, Copy)]
+pub(crate) enum StringSources<'a> {
+    /// Ordinary Data inputs search each plugin's loose directory before the archive VFS.
+    PluginLooseFirst(&'a Path),
+    /// MO2 inputs read only the effective loose winner, then the effective archive VFS.
+    EffectiveData {
+        archive_root: &'a Path,
+        loose_files: &'a BTreeMap<String, PathBuf>,
+    },
+}
+
+impl<'a> StringSources<'a> {
+    /// Archive extraction already resolves load-order precedence in this directory.
+    fn archive_root(self) -> &'a Path {
+        match self {
+            Self::PluginLooseFirst(root) => root,
+            Self::EffectiveData { archive_root, .. } => archive_root,
+        }
+    }
+}
+
 /// Explicit diagnostic export scope; existing publication APIs always select Full.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordBundleMode {
@@ -539,6 +561,25 @@ pub(crate) fn convert_plugins_with_schemas(
     )
 }
 
+/// Share authoritative loose sources between localized candidate admission and publication.
+pub(crate) fn convert_plugins_with_string_sources(
+    plugin_paths: &[PathBuf],
+    db_path: &Path,
+    string_sources: StringSources<'_>,
+    schemas: Option<&records::addons::RuntimeSchemas>,
+) -> Result<HashMap<u32, RawRecord>> {
+    convert_plugins_with_text_sources_impl(
+        plugin_paths,
+        db_path,
+        string_sources,
+        None,
+        RecordBundleMode::Full,
+        schemas,
+        #[cfg(test)]
+        None,
+    )
+}
+
 /// Diagnostic export shares the exact decoder, winner and text lookup paths with publication.
 fn convert_plugins_with_dump(
     plugin_paths: &[PathBuf],
@@ -581,6 +622,28 @@ fn convert_plugins_with_dump_impl(
     schemas: Option<&records::addons::RuntimeSchemas>,
     #[cfg(test)] test_schema: Option<&records::schema_format::Schema>,
 ) -> Result<HashMap<u32, RawRecord>> {
+    convert_plugins_with_text_sources_impl(
+        plugin_paths,
+        db_path,
+        StringSources::PluginLooseFirst(strings_root),
+        dump,
+        mode,
+        schemas,
+        #[cfg(test)]
+        test_schema,
+    )
+}
+
+/// One explicit text-source policy applies to both winner validation and final projection.
+fn convert_plugins_with_text_sources_impl(
+    plugin_paths: &[PathBuf],
+    db_path: &Path,
+    string_sources: StringSources<'_>,
+    dump: Option<(&Path, &[[u8; 4]])>,
+    mode: RecordBundleMode,
+    schemas: Option<&records::addons::RuntimeSchemas>,
+    #[cfg(test)] test_schema: Option<&records::schema_format::Schema>,
+) -> Result<HashMap<u32, RawRecord>> {
     let builtin;
     let schemas = match schemas {
         Some(schemas) => schemas,
@@ -597,7 +660,13 @@ fn convert_plugins_with_dump_impl(
     let prepared = records::prepare_runtime_schema(schemas);
     let mut tables = HashMap::new();
     let validate = |record: &records::DecodedRecord| {
-        validate_candidate(record, &prepared, plugin_paths, strings_root, &mut tables)
+        validate_candidate_with_string_sources(
+            record,
+            &prepared,
+            plugin_paths,
+            string_sources,
+            &mut tables,
+        )
     };
     let mut preserved_layers = HashMap::new();
     let preserve = |accepted: &records::ReadResult| {
@@ -697,7 +766,7 @@ fn convert_plugins_with_dump_impl(
                     &mut tables,
                     priority,
                     &plugin_paths[priority],
-                    strings_root,
+                    string_sources,
                     bank,
                 );
                 if !table.reported {
@@ -949,13 +1018,31 @@ fn release_reader_metadata(decoded: &mut records::ReadResult) {
     drop(std::mem::take(&mut decoded.overrides));
 }
 
-/// Validate the same runtime text and opaque selection before merge replaces a predecessor.
-/// Localization failures retain the established empty-text policy and remain record-local.
+/// Existing publication regressions retain the ordinary loose-directory lookup policy.
+#[cfg(test)]
 fn validate_candidate(
     record: &records::DecodedRecord,
     prepared: &records::PreparedSchemas,
     plugin_paths: &[PathBuf],
     strings_root: &Path,
+    tables: &mut HashMap<(usize, String), RuntimeTextTable>,
+) -> std::result::Result<(), String> {
+    validate_candidate_with_string_sources(
+        record,
+        prepared,
+        plugin_paths,
+        StringSources::PluginLooseFirst(strings_root),
+        tables,
+    )
+}
+
+/// Validate the same runtime text and opaque selection before merge replaces a predecessor.
+/// Localization failures retain the established empty-text policy and remain record-local.
+fn validate_candidate_with_string_sources(
+    record: &records::DecodedRecord,
+    prepared: &records::PreparedSchemas,
+    plugin_paths: &[PathBuf],
+    string_sources: StringSources<'_>,
     tables: &mut HashMap<(usize, String), RuntimeTextTable>,
 ) -> std::result::Result<(), String> {
     if !matches!(&record.record_type, b"LAND" | b"MOVT" | b"GMST" | b"RACE") {
@@ -989,7 +1076,7 @@ fn validate_candidate(
                 tables,
                 priority,
                 &plugin_paths[priority],
-                strings_root,
+                string_sources,
                 bank,
             );
             raw.subrecords[index].1 =
@@ -1133,18 +1220,18 @@ struct RuntimeTextTable {
     reported: bool,
 }
 
-/// Load the same loose/VFS text snapshot once; an unreadable bank remains unresolved.
+/// Load the same authoritative loose/VFS snapshot once; an unreadable bank remains unresolved.
 fn runtime_text_table<'a>(
     tables: &'a mut HashMap<(usize, String), RuntimeTextTable>,
     priority: usize,
     plugin: &Path,
-    strings_root: &Path,
+    string_sources: StringSources<'_>,
     bank: &str,
 ) -> &'a mut RuntimeTextTable {
     tables
         .entry((priority, bank.to_owned()))
         .or_insert_with(|| {
-            let (values, error) = match read_plugin_strings(plugin, strings_root, bank) {
+            let (values, error) = match read_plugin_strings(plugin, string_sources, bank) {
                 Ok(values) => (values, None),
                 Err(error) => (HashMap::new(), Some(error.to_string())),
             };
@@ -1214,22 +1301,39 @@ fn runtime_string(text: &str) -> Vec<u8> {
     bytes
 }
 
-/// Find a plugin's loose STRINGS override first, then the effective staged archive VFS.
+/// Resolve the authoritative loose bank before the effective archive VFS.
+/// A broken winning loose source remains unresolved instead of falling back to losing text.
 fn read_plugin_strings(
     plugin: &Path,
-    strings_root: &Path,
+    string_sources: StringSources<'_>,
     bank: &str,
 ) -> Result<HashMap<u32, String>> {
     let file_name = format!(
         "{}_english.{bank}",
         plugin.file_stem().unwrap_or_default().to_string_lossy()
     );
-    for root in [plugin.parent().unwrap_or(Path::new(".")), strings_root] {
-        if let Some(folder) = child_case_insensitive(root, "strings")
-            && let Some(path) = child_case_insensitive(&folder, &file_name)
-        {
-            return parse_text_table(&fs::read(path)?, bank != "strings");
+    match string_sources {
+        StringSources::PluginLooseFirst(_) => {
+            if let Some(folder) =
+                child_case_insensitive(plugin.parent().unwrap_or(Path::new(".")), "strings")
+                && let Some(path) = child_case_insensitive(&folder, &file_name)
+            {
+                return parse_text_table(&fs::read(path)?, bank != "strings");
+            }
         }
+        StringSources::EffectiveData { loose_files, .. } => {
+            // MO2 indexes direct Strings banks with the same plugin-derived Unicode key.
+            // A single key retains layer precedence; scanning equivalent keys could select a loser.
+            let key = super::load_order::normalize_plugin_name(&format!("strings/{file_name}"));
+            if let Some(path) = loose_files.get(&key) {
+                return parse_text_table(&fs::read(path)?, bank != "strings");
+            }
+        }
+    }
+    if let Some(folder) = child_case_insensitive(string_sources.archive_root(), "strings")
+        && let Some(path) = child_case_insensitive(&folder, &file_name)
+    {
+        return parse_text_table(&fs::read(path)?, bank != "strings");
     }
     Ok(HashMap::new())
 }
