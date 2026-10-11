@@ -274,7 +274,9 @@ fn settings_for_source_reader(
             || (reader == crate::config::RecordReader::Legacy
                 && (identity == &serde_json::json!({"mode": "legacy"})
                     || identity
-                        == &serde_json::json!({"mode": "legacy", "projection_version": 1}))
+                        == &serde_json::json!({"mode": "legacy", "projection_version": 1})
+                    || identity
+                        == &serde_json::json!({"mode": "legacy", "projection_version": 2}))
                 && schemas.identities().is_empty()),
         "unsupported source reader producer identity; use normal conversion to regenerate assets before metadata-only migration"
     );
@@ -930,6 +932,7 @@ mod metadata_schema_controls {
         for identity in [
             serde_json::json!({"mode": "legacy"}),
             serde_json::json!({"mode": "legacy", "projection_version": 1}),
+            serde_json::json!({"mode": "legacy", "projection_version": 2}),
             crate::esm::inhouse::reader_identity(RecordReader::Legacy),
         ] {
             let settings = settings_for_source_reader(
@@ -942,7 +945,7 @@ mod metadata_schema_controls {
         }
         for identity in [
             serde_json::json!({"mode": "legacy", "projection_version": 0}),
-            serde_json::json!({"mode": "legacy", "projection_version": 3}),
+            serde_json::json!({"mode": "legacy", "projection_version": 4}),
             serde_json::json!({"mode": "legacy", "unproven": true}),
         ] {
             assert!(

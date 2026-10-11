@@ -446,9 +446,9 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         b"SNAM" | b"PFIG" if record_type == b"TREE" => Fixed(SINGLE),
         b"TNAM" | b"GNAM" | b"MNAM" if record_type == b"LTEX" => Fixed(SINGLE),
         b"XCWT" if record_type == b"CELL" => Fixed(SINGLE),
-        b"NAM2" | b"NAM3" | b"WNAM" | b"CNAM" | b"RNAM" | b"TNAM" if record_type == b"WRLD" => {
-            Fixed(SINGLE)
-        }
+        // RNAM is a compound large-reference payload and TNAM is a texture path;
+        // preserve those bytes under the existing unsupported-layout policy.
+        b"NAM2" | b"NAM3" | b"WNAM" | b"CNAM" if record_type == b"WRLD" => Fixed(SINGLE),
         b"RNAM" | b"CNAM" | b"INAM" if record_type == b"NPC_" => Fixed(SINGLE),
         b"WKMV" | b"RNMV" if record_type == b"RACE" => Fixed(SINGLE),
         b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL" => Fixed(SINGLE),
@@ -492,8 +492,9 @@ fn remap_record_form_ids(
 ) -> Result<()> {
     // Native record identities retain the documented legacy compatibility outside
     // these kinds, including shipped GMST IDs beyond the master table. All known
-    // native links use strict ownership/width checks; optional layouts clear invalid
-    // IDs or drop malformed occurrences instead of replacing an entire candidate.
+    // fixed optional links use strict ownership/width checks, while VMAD follows
+    // record-kind compatibility. Optional layouts clear invalid IDs or drop malformed
+    // occurrences instead of replacing an entire candidate.
     let strict = matches!(
         &record.record_type,
         b"GRAS" | b"LTEX" | b"TXST" | b"LAND" | b"CELL" | b"WRLD"
@@ -590,7 +591,9 @@ fn remap_record_form_ids(
             continue;
         }
         if tag.as_slice() == b"VMAD" {
-            records::record_type::vmad::remap_primary_form_ids(data, &remap_link)
+            // Primary script objects retain the record kind's established legacy
+            // ownership compatibility. Malformed framing still rejects the candidate.
+            records::record_type::vmad::remap_primary_form_ids(data, &remap)
                 .wrap_err("VMAD references")?;
             continue;
         }

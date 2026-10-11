@@ -998,6 +998,10 @@ fn reusable_manifest(
                         == crate::cache::legacy_projection_v1_configuration_hash(
                             &settings, producer,
                         )?;
+                    matched |= recorded
+                        == crate::cache::legacy_projection_v2_configuration_hash(
+                            &settings, producer,
+                        )?;
                 }
             }
             matched

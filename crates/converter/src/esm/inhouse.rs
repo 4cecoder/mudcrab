@@ -26,9 +26,9 @@ use std::{
 /// Decoder/adapter behavior version for output changes outside the authored schema.
 pub const ADAPTER_VERSION: u32 = 10;
 
-/// Legacy metadata projection contract: corrected slots, faction links and local recovery.
+/// Legacy metadata projection contract: preserve WRLD payloads and record-aware VMAD links.
 /// This identity does not change the independent converted-asset producer/settings proofs.
-pub const LEGACY_PROJECTION_VERSION: u32 = 2;
+pub const LEGACY_PROJECTION_VERSION: u32 = 3;
 
 /// Explicit diagnostic export scope; existing publication APIs always select Full.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

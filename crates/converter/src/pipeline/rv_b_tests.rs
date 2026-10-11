@@ -277,10 +277,16 @@ async fn reader_switch_reuses_archives_and_assets_but_rebuilds_database_and_cell
     assert!(fixture.output.join("cell_cache_preserved.rkyv").is_file());
 }
 
-/// Both known full legacy proofs retain assets; arbitrary metadata hashes cannot replace them.
+/// Known full legacy proofs retain assets; arbitrary metadata hashes cannot replace them.
 #[tokio::test]
 async fn known_legacy_full_hashes_reuse_assets_without_kind_keys() {
-    for contract in ["historical", "current", "unproven"] {
+    for contract in [
+        "historical",
+        "projection-1",
+        "projection-2",
+        "current",
+        "unproven",
+    ] {
         let fixture = Fixture::new(true);
         append_broken_stat_neighbors(&fixture.data);
         let config = fixture.config(RecordReader::Legacy);
@@ -293,16 +299,32 @@ async fn known_legacy_full_hashes_reuse_assets_without_kind_keys() {
             "historical" => {
                 configuration_hash_for_schema(&config, CONVERTER_SCHEMA_VERSION).unwrap()
             }
+            "projection-1" => crate::cache::legacy_projection_v1_configuration_hash(
+                &config,
+                CONVERTER_SCHEMA_VERSION,
+            )
+            .unwrap(),
+            "projection-2" => crate::cache::legacy_projection_v2_configuration_hash(
+                &config,
+                CONVERTER_SCHEMA_VERSION,
+            )
+            .unwrap(),
             "current" => configuration_hash(&config).unwrap(),
             _ => "unproven-settings".into(),
         };
         original
             .save(&fixture.output.join("conversion-manifest.json"))
             .unwrap();
-        if contract == "historical" {
+        let source_reader = match contract {
+            "historical" => Some(serde_json::json!({"mode": "legacy"})),
+            "projection-1" => Some(serde_json::json!({"mode": "legacy", "projection_version": 1})),
+            "projection-2" => Some(serde_json::json!({"mode": "legacy", "projection_version": 2})),
+            _ => None,
+        };
+        if let Some(source_reader) = source_reader {
             fs::write(
                 fixture.output.join("record-reader.json"),
-                br#"{"mode":"legacy"}"#,
+                serde_json::to_vec(&source_reader).unwrap(),
             )
             .unwrap();
         }
@@ -571,77 +593,94 @@ async fn repeated_metadata_migrations_preserve_recorded_asset_producer() {
     );
 }
 
-/// Old mode-only producer proof survives reader changes and multiple retained publications.
+/// Mode-only and previous versioned proofs survive multiple retained publications unchanged.
 #[tokio::test]
 async fn historical_legacy_reader_identity_survives_repeated_metadata_migrations() {
-    let fixture = Fixture::new(true);
-    let legacy = fixture.config(RecordReader::Legacy);
-    publish(legacy.clone()).await;
-    let expected = asset_bytes(&fixture.output);
-    let mut original = manifest(&fixture.output);
-    original.configuration_hash =
-        configuration_hash_for_schema(&legacy, CONVERTER_SCHEMA_VERSION).unwrap();
-    original.asset_configuration_hashes.clear();
-    original
-        .save(&fixture.output.join("conversion-manifest.json"))
+    for projection_version in [None, Some(1), Some(2)] {
+        let fixture = Fixture::new(true);
+        let legacy = fixture.config(RecordReader::Legacy);
+        publish(legacy.clone()).await;
+        let expected = asset_bytes(&fixture.output);
+        let mut original = manifest(&fixture.output);
+        original.configuration_hash = match projection_version {
+            None => configuration_hash_for_schema(&legacy, CONVERTER_SCHEMA_VERSION).unwrap(),
+            Some(1) => crate::cache::legacy_projection_v1_configuration_hash(
+                &legacy,
+                CONVERTER_SCHEMA_VERSION,
+            )
+            .unwrap(),
+            Some(2) => crate::cache::legacy_projection_v2_configuration_hash(
+                &legacy,
+                CONVERTER_SCHEMA_VERSION,
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        };
+        original.asset_configuration_hashes.clear();
+        original
+            .save(&fixture.output.join("conversion-manifest.json"))
+            .unwrap();
+        let original_reader = match projection_version {
+            Some(version) => serde_json::json!({"mode": "legacy", "projection_version": version}),
+            None => serde_json::json!({"mode": "legacy"}),
+        };
+        fs::write(
+            fixture.output.join("record-reader.json"),
+            serde_json::to_vec(&original_reader).unwrap(),
+        )
         .unwrap();
-    let original_reader = serde_json::json!({"mode": "legacy"});
-    fs::write(
-        fixture.output.join("record-reader.json"),
-        serde_json::to_vec(&original_reader).unwrap(),
-    )
-    .unwrap();
-    let source_hash = hash_file(&fixture.output.join("conversion-manifest.json")).unwrap();
+        let source_hash = hash_file(&fixture.output.join("conversion-manifest.json")).unwrap();
 
-    let first_output = fixture.sibling_output("old-legacy-to-inhouse");
-    let second_output = fixture.sibling_output("old-legacy-to-versioned-legacy");
-    let mut first_config = fixture.config(RecordReader::Inhouse);
-    first_config.output_dir = first_output.clone();
-    publish_metadata(first_config, &fixture.output).await;
-    let mut second_config = legacy;
-    second_config.output_dir = second_output.clone();
-    publish_metadata(second_config.clone(), &first_output).await;
-    for output in [&first_output, &second_output] {
-        let retained = manifest(output);
+        let first_output = fixture.sibling_output("old-legacy-to-inhouse");
+        let second_output = fixture.sibling_output("old-legacy-to-versioned-legacy");
+        let mut first_config = fixture.config(RecordReader::Inhouse);
+        first_config.output_dir = first_output.clone();
+        publish_metadata(first_config, &fixture.output).await;
+        let mut second_config = legacy;
+        second_config.output_dir = second_output.clone();
+        publish_metadata(second_config.clone(), &first_output).await;
+        for output in [&first_output, &second_output] {
+            let retained = manifest(output);
+            assert_eq!(
+                retained.retained_mesh_schema_version,
+                Some(CONVERTER_SCHEMA_VERSION)
+            );
+            assert_eq!(
+                retained.retained_asset_configuration_hash.as_deref(),
+                Some(original.configuration_hash.as_str())
+            );
+            assert!(retained.asset_configuration_hashes.is_empty());
+            let provenance = json_artifact(output, "metadata-rebuild.json");
+            assert_eq!(provenance["retained_asset_record_reader"], original_reader);
+            assert_eq!(
+                provenance["retained_asset_configuration_hash"],
+                original.configuration_hash
+            );
+            assert_asset_bytes(output, &expected);
+        }
         assert_eq!(
-            retained.retained_mesh_schema_version,
-            Some(CONVERTER_SCHEMA_VERSION)
+            hash_file(&fixture.output.join("conversion-manifest.json")).unwrap(),
+            source_hash
         );
         assert_eq!(
-            retained.retained_asset_configuration_hash.as_deref(),
-            Some(original.configuration_hash.as_str())
+            json_artifact(&second_output, "record-reader.json"),
+            serde_json::json!({"mode": "legacy", "projection_version": crate::esm::inhouse::LEGACY_PROJECTION_VERSION})
         );
-        assert!(retained.asset_configuration_hashes.is_empty());
-        let provenance = json_artifact(output, "metadata-rebuild.json");
-        assert_eq!(provenance["retained_asset_record_reader"], original_reader);
-        assert_eq!(
-            provenance["retained_asset_configuration_hash"],
+        assert_ne!(
+            manifest(&second_output).configuration_hash,
             original.configuration_hash
         );
-        assert_asset_bytes(output, &expected);
+        let report = publish(second_config).await;
+        assert_eq!(
+            report.converted, 1,
+            "metadata retention did not copy the archive cache"
+        );
+        assert_eq!(
+            report.cache_hits, 5,
+            "original current-producer asset settings remain proven"
+        );
+        assert_asset_bytes(&second_output, &expected);
     }
-    assert_eq!(
-        hash_file(&fixture.output.join("conversion-manifest.json")).unwrap(),
-        source_hash
-    );
-    assert_eq!(
-        json_artifact(&second_output, "record-reader.json"),
-        serde_json::json!({"mode": "legacy", "projection_version": crate::esm::inhouse::LEGACY_PROJECTION_VERSION})
-    );
-    assert_ne!(
-        manifest(&second_output).configuration_hash,
-        original.configuration_hash
-    );
-    let report = publish(second_config).await;
-    assert_eq!(
-        report.converted, 1,
-        "metadata retention did not copy the archive cache"
-    );
-    assert_eq!(
-        report.cache_hits, 5,
-        "original current-producer asset settings remain proven"
-    );
-    assert_asset_bytes(&second_output, &expected);
 }
 
 /// Explicit historical byte retention does not upgrade old meshes or textures into normal hits.

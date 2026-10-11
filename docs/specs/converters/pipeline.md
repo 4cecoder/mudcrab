@@ -19,10 +19,12 @@ Real deletions still apply. LAND with rejected authored heights
 or incomplete framing is skipped; genuinely heightless texture/color records
 retain the existing default-height cache behavior.
 
-`record-reader.json` stamps the selected frontend. Legacy `projection_version=2`
-adds corrected faction links, strict native-link ownership and local recovery to
-version 1's corrected TX06/TX07 and ARMO world-model projections, independently
-of asset producer 26. In-house adapter version 10 identifies corrected schema
+`record-reader.json` stamps the selected frontend. Legacy `projection_version=3`
+preserves WRLD RNAM payloads and TNAM strings and restores record-aware VMAD
+ownership compatibility. Version 2 added corrected faction links, strict native
+link ownership and local recovery to version 1's corrected TX06/TX07 and ARMO
+world-model projections. These metadata contracts are independent of asset
+producer 26. In-house adapter version 10 identifies corrected schema
 layouts, GMST winner admission, union localization and filename namespaces.
 In-house identity includes the
 authored schema SHA-256, adapter version and English localization choice, and
@@ -52,8 +54,9 @@ remain available in provenance. The reader identity records both encoding contra
 Metadata rebuild uses the selected reader while validating retained assets under
 their original recorded reader configuration. Older unstamped packs and the exact
 `{"mode":"legacy"}` stamp retain the historical unversioned legacy contract;
-they are not identified as a versioned projection. Exact version-1 legacy stamps
-and full hashes remain recognized as that earlier retained-asset contract.
+they are not identified as a versioned projection. Exact version-1 and version-2
+legacy stamps and full hashes remain recognized as their original retained-asset
+contracts and are not upgraded to the current projection.
 New full configuration hashes
 include the versioned legacy identity, while `configuration_hash_for_schema`
 preserves historical legacy hash reproduction. Metadata retention validates each

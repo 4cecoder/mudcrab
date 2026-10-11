@@ -45,6 +45,18 @@ fn legacy_projection_identity_separates_current_and_historical_full_hashes() {
     );
     assert_ne!(configuration_hash(&legacy).unwrap(), historical);
     assert_eq!(
+        legacy_projection_v1_configuration_hash(&legacy, 26).unwrap(),
+        "81deb6e0dccb63cc67289e38d9eeba2b6a312db62e09db8dbd35fa834ec022b2"
+    );
+    assert_eq!(
+        legacy_projection_v2_configuration_hash(&legacy, 26).unwrap(),
+        "52045b4ce9519e636d5948e24185871df559dfe1f40b1edbe6195b844d71d59f"
+    );
+    assert_eq!(
+        configuration_hash(&legacy).unwrap(),
+        "4482b6966e40954faa2655b13e909ba75a107d58ebbf6478b977dcf45c92b912"
+    );
+    assert_eq!(
         configuration_hash_for_schema(&legacy, 15).unwrap(),
         "9a58fda00b27d0f2a8e46afb9334ea869602556393a35bffd7fcb39582a08a4f"
     );
@@ -71,21 +83,31 @@ fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
     let config = PipelineConfig::new("synthetic-data", "synthetic-output");
     let old_identity = serde_json::json!({"mode": "legacy"});
     let current_identity = crate::esm::inhouse::reader_identity(RecordReader::Legacy);
-    let previous_identity = serde_json::json!({"mode": "legacy", "projection_version": 1});
+    let v1_identity = serde_json::json!({"mode": "legacy", "projection_version": 1});
+    let v2_identity = serde_json::json!({"mode": "legacy", "projection_version": 2});
     let historical = configuration_hash_for_schema(&config, 26).unwrap();
     let current = configuration_hash(&config).unwrap();
-    let previous = legacy_projection_v1_configuration_hash(&config, 26).unwrap();
-    assert_ne!(previous, current);
-    assert_ne!(previous, historical);
-    for (identity, matching, other) in [
-        (&old_identity, historical.as_str(), current.as_str()),
-        (&current_identity, current.as_str(), historical.as_str()),
-        (&previous_identity, previous.as_str(), current.as_str()),
-    ] {
+    let v1 = legacy_projection_v1_configuration_hash(&config, 26).unwrap();
+    let v2 = legacy_projection_v2_configuration_hash(&config, 26).unwrap();
+    let contracts = [
+        (&old_identity, historical.as_str()),
+        (&v1_identity, v1.as_str()),
+        (&v2_identity, v2.as_str()),
+        (&current_identity, current.as_str()),
+    ];
+    for (identity, matching) in contracts {
         assert!(
             retained_configuration_matches_for_reader(&config, 26, matching, identity).unwrap()
         );
-        assert!(!retained_configuration_matches_for_reader(&config, 26, other, identity).unwrap());
+        for (other_identity, other_hash) in contracts {
+            if identity != other_identity {
+                assert_ne!(matching, other_hash);
+                assert!(
+                    !retained_configuration_matches_for_reader(&config, 26, other_hash, identity)
+                        .unwrap()
+                );
+            }
+        }
         let mut changed = config.clone();
         changed.script_abi_version += 1;
         assert!(
@@ -101,15 +123,17 @@ fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
         )
         .unwrap()
     );
-    assert!(
-        !retained_configuration_matches_for_reader(
-            &config,
-            15,
-            "b23881a864cdcfe1609779a9a27fefab2de629b50ec339101d4e0ad592e7e435",
-            &current_identity,
-        )
-        .unwrap()
-    );
+    for identity in [&v1_identity, &v2_identity, &current_identity] {
+        assert!(
+            !retained_configuration_matches_for_reader(
+                &config,
+                15,
+                "b23881a864cdcfe1609779a9a27fefab2de629b50ec339101d4e0ad592e7e435",
+                identity,
+            )
+            .unwrap()
+        );
+    }
 }
 
 /// Changes to texture encoding settings do not discard unrelated mesh/script proof.
