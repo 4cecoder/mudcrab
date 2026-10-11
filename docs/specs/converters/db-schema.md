@@ -2,14 +2,14 @@
 
 This specification details the canonical DDL schema, tables, indices, and column constraints for `skyrim_world.db`, as implemented in [`crates/converter/src/esm/exporter.rs`](../../../crates/converter/src/esm/exporter.rs).
 
-The optional in-house frontend keeps the runtime column contract while
-using TXST slot interpretation: diffuse TX00, normal TX01, mask TX02, glow
+Both record frontends use the same runtime column contract and TXST slot
+interpretation: diffuse TX00, normal TX01, mask TX02, glow
 TX03, height TX04, environment TX05, detail TX06, and specular TX07. The existing
 `detail_path` column carries TX06 multilayer data; TX03 is the source's
 glow/detail-map slot and TX07 its backlight-mask/specular slot. These role names
 retain the runtime approximation and do not imply complete shader support.
-In-house ARMO model projection uses MOD2 with MOD4 as the female world-model
-fallback; legacy retains its existing MOD3 fallback.
+ARMO model projection uses MOD2 with MOD4 as the female world-model fallback
+for both frontends. MOD3 is an ARMA model slot, not an ARMO world-model path.
 
 ---
 
@@ -23,9 +23,9 @@ The database stamps its version in `schema_info`; the current version is **9**
 the combined producer exports grass and LOD tables. Schema 6 adds LOD origins, chunk metadata,
 its spatial index, and a build identity. Schema 9 combines the corrected texture-set slot
 projection: `mask_path` comes from TX02, `glow_path` from TX03, `height_path`
-from TX04 and `environment_path` from TX05. TX00, TX01, TX06 and TX07 retain
-their existing diffuse, normal, specular and detail column projections in legacy mode.
-The in-house terminal-slot interpretation is documented above. Schema 9 also
+from TX04 and `environment_path` from TX05. TX00 and TX01 provide diffuse and
+normal paths. Both frontends project TX06 into `detail_path` and TX07 into
+`specular_path`, as documented above. Schema 9 also
 projects only XESP byte 4 into `enable_parent_flags`. Separate candidate fixes
 used producer 25/world 8 for different contracts; combined output uses 26/9.
 The engine, `world-inspect` and launcher accept world schemas **3 through 9**, using
@@ -40,6 +40,16 @@ archive ingestion remain reusable with matching source/dependency,
 configuration and output-byte proof; producers 12-23 still rebuild GLBs.
 Metadata-only rebuilds preserve the original retained producer/configuration
 and texture bytes. Run normal conversion to repair those retained encodings.
+
+The legacy TX06/TX07 alignment changes the SQL role assignment while retaining
+the current texture-byte encoding: multilayer/detail and specular/backlight are
+both color uses in `TextureEncoding::from_semantics`. Exchanging those roles
+leaves the selected encoding unchanged, including normal/data precedence for
+textures with several uses. ARMO model-path alignment also changes the SQL
+projection; mesh conversion discovers NIF inputs independently of that column.
+These projection changes require rebuilding metadata. Any subsequent change to
+converted mesh or texture bytes must invalidate the affected asset cache key;
+metadata retention preserves the producer identity of the retained bytes.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐

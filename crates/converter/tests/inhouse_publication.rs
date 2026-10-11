@@ -517,12 +517,18 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
     );
 }
 
-/// A reader change invalidates the shared cache proof while legacy hashes retain compatibility.
+/// Reader metadata changes while current texture settings proof stays reusable.
 #[test]
 fn reader_identity_separates_configuration_proofs() {
     let mut config = PipelineConfig::new("Data", "output");
     let legacy = converter::cache::configuration_hash(&config).unwrap();
     assert_eq!(config.record_reader, RecordReader::Legacy);
+    let texture_settings = converter::cache::asset_configuration_hash_for_schema(
+        &config,
+        converter::cache::CONVERTER_SCHEMA_VERSION,
+        "dds",
+    )
+    .unwrap();
     config.record_reader = RecordReader::Inhouse;
     assert_ne!(
         legacy,
@@ -538,17 +544,25 @@ fn reader_identity_separates_configuration_proofs() {
     fs::write(&path, b"synthetic staged asset").unwrap();
     let staged = converter::cache::StagedOutput {
         schema_version: converter::cache::CONVERTER_SCHEMA_VERSION,
-        configuration_hash: legacy.clone(),
+        configuration_hash: texture_settings.clone(),
         source_hash: "source".into(),
         output_size: 22,
         output_hash: converter::cache::hash_file(&path).unwrap(),
     };
-    assert!(staged.is_current(&path, "source", &legacy));
-    assert!(!staged.is_current(
-        &path,
-        "source",
-        &converter::cache::configuration_hash(&config).unwrap()
-    ));
+    let current_texture_settings = converter::cache::asset_configuration_hash_for_schema(
+        &config,
+        converter::cache::CONVERTER_SCHEMA_VERSION,
+        "dds",
+    )
+    .unwrap();
+    assert_eq!(texture_settings, current_texture_settings);
+    assert!(staged.is_current(&path, "source", &texture_settings));
+    assert!(staged.is_current(&path, "source", &current_texture_settings));
+    let legacy_full_journal = converter::cache::StagedOutput {
+        configuration_hash: legacy,
+        ..staged
+    };
+    assert!(!legacy_full_journal.is_current(&path, "source", &current_texture_settings));
 }
 
 /// Malformed later candidates must not erase usable movement or terrain winners.

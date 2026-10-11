@@ -1,4 +1,5 @@
 //! Authored schema-driven Skyrim records, independent of the legacy field decoder.
+pub mod compact_array;
 pub mod deciders;
 mod decoder;
 pub mod history;
@@ -10,10 +11,13 @@ pub mod source_identity;
 pub(crate) mod typed_export;
 pub mod vmad;
 
+#[cfg(test)]
+pub(crate) mod review_recovery_tests;
+
 use crate::esm::{load_order::LoadOrder, records::RawRecord};
 use color_eyre::Result;
 use schema_format::Schema;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -24,7 +28,9 @@ use std::{
 pub const SCHEMA_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/records-schema.json"));
 
 /// Numeric values keep their binary widths in the schema; floats retain raw f32 precision.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+/// Arrays may use ordinary or compact storage. Tooling should use `array_element` or
+/// `materialized_array` to inspect either representation; serialized tags remain unchanged.
+#[derive(Clone, Debug)]
 pub enum Value {
     Unsigned(u64),
     Signed(i64),
@@ -37,6 +43,90 @@ pub enum Value {
     Deferred(Vec<u8>),
     Struct(Vec<(String, Value)>),
     Array(Vec<Value>),
+    /// Internal immutable fixed layout; serialization remains the legacy Array variant.
+    CompactArray(compact_array::CompactArray),
+}
+
+impl Value {
+    /// Inspect one array element without materializing the entire compact array.
+    /// Ordinary arrays clone only the selected element; compact arrays decode it on demand.
+    pub fn array_element(&self, index: usize) -> Option<Value> {
+        match self {
+            Self::Array(values) => values.get(index).cloned(),
+            Self::CompactArray(values) => values.get(index),
+            _ => None,
+        }
+    }
+
+    /// Obtain owned array elements for explicit inspection.
+    /// This allocates in proportion to the element count; streaming export does not use it.
+    pub fn materialized_array(&self) -> Option<Vec<Value>> {
+        match self {
+            Self::Array(values) => Some(values.clone()),
+            Self::CompactArray(values) => Some(values.materialize()),
+            _ => None,
+        }
+    }
+}
+
+impl PartialEq for Value {
+    /// Compare the legacy logical value independent of compact storage and padding.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unsigned(a), Self::Unsigned(b)) => a == b,
+            (Self::Signed(a), Self::Signed(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::LocalizedString(a), Self::LocalizedString(b)) => a == b,
+            (Self::FormId(a), Self::FormId(b)) => a == b,
+            (Self::Bytes(a), Self::Bytes(b)) | (Self::Deferred(a), Self::Deferred(b)) => a == b,
+            (Self::Struct(a), Self::Struct(b)) => a == b,
+            (Self::Array(a), Self::Array(b)) => a == b,
+            (Self::CompactArray(a), Self::CompactArray(b)) => a == b,
+            (Self::CompactArray(a), Self::Array(b)) | (Self::Array(b), Self::CompactArray(a)) => {
+                a.len() == b.len()
+                    && b.iter()
+                        .enumerate()
+                        .all(|(index, value)| a.get(index).as_ref() == Some(value))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Serialize for Value {
+    /// Keep the derived enum's external tags, indices and ordinary f32 policy unchanged.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Unsigned(value) => {
+                serializer.serialize_newtype_variant("Value", 0, "Unsigned", value)
+            }
+            Self::Signed(value) => {
+                serializer.serialize_newtype_variant("Value", 1, "Signed", value)
+            }
+            Self::Float(value) => serializer.serialize_newtype_variant("Value", 2, "Float", value),
+            Self::String(value) => {
+                serializer.serialize_newtype_variant("Value", 3, "String", value)
+            }
+            Self::LocalizedString(value) => {
+                serializer.serialize_newtype_variant("Value", 4, "LocalizedString", value)
+            }
+            Self::FormId(value) => {
+                serializer.serialize_newtype_variant("Value", 5, "FormId", value)
+            }
+            Self::Bytes(value) => serializer.serialize_newtype_variant("Value", 6, "Bytes", value),
+            Self::Deferred(value) => {
+                serializer.serialize_newtype_variant("Value", 7, "Deferred", value)
+            }
+            Self::Struct(value) => {
+                serializer.serialize_newtype_variant("Value", 8, "Struct", value)
+            }
+            Self::Array(value) => serializer.serialize_newtype_variant("Value", 9, "Array", value),
+            Self::CompactArray(value) => {
+                serializer.serialize_newtype_variant("Value", 9, "Array", &value.elements(false))
+            }
+        }
+    }
 }
 
 /// One matched subrecord and the validated bytes used by runtime projections.
@@ -185,6 +275,38 @@ pub(crate) fn read_plugins_with_validation(
 pub(crate) fn read_plugins_with_validation_and_observer(
     plugin_paths: &[PathBuf],
     order: &LoadOrder,
+    validate: impl FnMut(&DecodedRecord) -> std::result::Result<(), String>,
+    observe: impl FnMut(&ReadResult),
+) -> Result<ReadResult> {
+    read_plugins_with_prepared(
+        plugin_paths,
+        order,
+        schema(),
+        decoder::prepared(),
+        validate,
+        observe,
+    )
+}
+
+/// Exercise the real reader with an independently checked schema in internal regressions only.
+#[cfg(test)]
+pub(crate) fn read_plugins_with_validation_and_observer_with_schema(
+    plugin_paths: &[PathBuf],
+    order: &LoadOrder,
+    schema: &Schema,
+    validate: impl FnMut(&DecodedRecord) -> std::result::Result<(), String>,
+    observe: impl FnMut(&ReadResult),
+) -> Result<ReadResult> {
+    let prepared = decoder::prepare_schema(schema);
+    read_plugins_with_prepared(plugin_paths, order, schema, &prepared, validate, observe)
+}
+
+/// Share winner selection across embedded publication and the private schema regression path.
+fn read_plugins_with_prepared(
+    plugin_paths: &[PathBuf],
+    order: &LoadOrder,
+    schema: &Schema,
+    prepared: &decoder::PreparedSchemas,
     mut validate: impl FnMut(&DecodedRecord) -> std::result::Result<(), String>,
     mut observe: impl FnMut(&ReadResult),
 ) -> Result<ReadResult> {
@@ -192,8 +314,9 @@ pub(crate) fn read_plugins_with_validation_and_observer(
         plugin_paths.len() == order.names.len(),
         "plugin/order length mismatch"
     );
-    let schema = schema();
     let mut result = ReadResult::default();
+    // Retain payloads only while an admitted winner still needs catalogue replay.
+    let mut deferred_predecessors: HashMap<u32, Vec<DecodedRecord>> = HashMap::new();
     let mut gmst_ids: HashMap<String, u32> = HashMap::new();
     let mut gmst_aliases: HashMap<u32, u32> = HashMap::new();
     let scan_stage = profile::ProfileStage::start("scan_decode_merge");
@@ -223,6 +346,7 @@ pub(crate) fn read_plugins_with_validation_and_observer(
             let mut record = match decoder::decode_with_identity(
                 scanned,
                 schema,
+                prepared,
                 &context,
                 diagnostics,
                 &mut identity,
@@ -273,7 +397,8 @@ pub(crate) fn read_plugins_with_validation_and_observer(
             }
             // A torn override cannot show what its missing tail held, so it never
             // replaces a complete earlier version; a first definition keeps its prefix.
-            if !record.payload_complete
+            if record.flags & 0x20 == 0
+                && !record.payload_complete
                 && result
                     .records
                     .get(&record.form_id)
@@ -404,8 +529,18 @@ pub(crate) fn read_plugins_with_validation_and_observer(
             }
             if record.flags & 0x20 != 0 {
                 result.records.remove(&record.form_id);
+                deferred_predecessors.remove(&record.form_id);
             } else {
-                result.records.insert(record.form_id, record);
+                let id = record.form_id;
+                let tentative = decoder::record_contains_deferred(&record);
+                let previous = result.records.insert(id, record);
+                if tentative {
+                    if let Some(previous) = previous {
+                        deferred_predecessors.entry(id).or_default().push(previous);
+                    }
+                } else {
+                    deferred_predecessors.remove(&id);
+                }
             }
         })?;
         result.history.extend(history.into_inner());
@@ -414,13 +549,20 @@ pub(crate) fn read_plugins_with_validation_and_observer(
     scan_stage.finish(result.records.len());
     let deferred_stage = profile::ProfileStage::start("resolve_deferred");
     history::reconcile_gmst(&mut result.history, &gmst_ids);
-    decoder::resolve_deferred(&mut result, schema, order);
+    decoder::resolve_deferred(
+        &mut result,
+        schema,
+        prepared,
+        order,
+        &mut deferred_predecessors,
+        &mut validate,
+    );
     deferred_stage.finish(result.records.len());
     let preservation_stage = profile::ProfileStage::start("preservation_observer");
     observe(&result);
     preservation_stage.finish(result.records.len());
     let targets_stage = profile::ProfileStage::start("validate_targets");
-    decoder::validate_targets(&mut result, schema, order);
+    decoder::validate_targets_with_prepared(&mut result, schema, prepared, order);
     targets_stage.finish(result.records.len());
     for (name, diagnostics) in &result.diagnostics {
         if let Some(example) = ["record", "field", "link", "unexpected"]

@@ -63,8 +63,8 @@ fn texture_set_physical_slots_reach_the_correct_database_columns() {
         ("glow_path", 3),
         ("height_path", 4),
         ("environment_path", 5),
-        ("specular_path", 6),
-        ("detail_path", 7),
+        ("specular_path", 7),
+        ("detail_path", 6),
     ] {
         let stored: String = connection
             .query_row(
@@ -145,6 +145,9 @@ fn legacy_pack(data: &Path, output: &Path, schema: u32) -> ConversionManifest {
     let config = PipelineConfig::new(data, output);
     let mut legacy = manifest(output);
     legacy.schema_version = schema;
+    if schema != CONVERTER_SCHEMA_VERSION {
+        legacy.asset_configuration_hashes.clear();
+    }
     legacy.configuration_hash = configuration_hash_for_schema(&config, schema).unwrap();
     for (slot, old_encoding) in [
         (2, TextureEncoding::ColorSrgb),
@@ -251,20 +254,25 @@ async fn texture_semantic_migration_preserves_only_known_compatible_published_me
     }
 }
 
-/// A matching old producer cannot erase a real change to conversion settings.
+/// Changed encoder settings rebuild old assets while verified archive entries remain hits.
 #[tokio::test]
 async fn texture_semantic_migration_still_requires_matching_configuration() {
     let directory = tempfile::tempdir().unwrap();
     let data = directory.path().join("Data");
     let output = directory.path().join("modern");
     convert_texture_set_semantics(&data, &output).await;
-    legacy_pack(&data, &output, 24);
+    let legacy = legacy_pack(&data, &output, 24);
+    let archive_files: u64 = legacy
+        .archives
+        .values()
+        .map(|entry| entry.files.len() as u64)
+        .sum();
     let mut changed = PipelineConfig::new(&data, &output);
     changed.no_lod = true;
     changed.texture_zstd_level = 0;
     let report = run_pipeline(changed).await;
-    assert_eq!(report.cache_hits, 0);
-    assert!(report.converted > 0);
+    assert_eq!(report.cache_hits, archive_files);
+    assert_eq!(report.converted, legacy.entries.len() as u64);
 }
 
 /// Metadata retains honest producer-24 texture provenance until normal conversion.

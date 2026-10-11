@@ -180,6 +180,9 @@ fn scan_bytes_observed(
         let inflated = if flags & 0x0004_0000 != 0 {
             match inflate(payload) {
                 Ok(bytes) => bytes,
+                // A bounded native deletion is authoritative even without a decodable body.
+                // Keep usable bytes above so a GMST tombstone can still name its alias.
+                Err(_) if flags & 0x20 != 0 => Vec::new(),
                 Err(error) => {
                     observed.failure = Some(error.clone());
                     observe(observed);

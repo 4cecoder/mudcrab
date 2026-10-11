@@ -82,11 +82,10 @@ fn member<'a>(value: &'a Value, name: &str) -> &'a Value {
 }
 
 /// Access one decoded array element while preserving its order.
-fn item(value: &Value, index: usize) -> &Value {
-    let Value::Array(items) = value else {
-        panic!("expected array: {value:?}")
-    };
-    &items[index]
+fn item(value: &Value, index: usize) -> Value {
+    value
+        .array_element(index)
+        .unwrap_or_else(|| panic!("expected array element {index}: {value:?}"))
 }
 
 /// A catalogued STAT is an invalid WRLD discriminator; source coordinates keep their role.
@@ -147,13 +146,13 @@ fn world_families_decode_complete_asymmetric_values() {
     let geometry = field(&result.records[&world::FIRST_ID], b"NVNM");
     assert_eq!(member(geometry, "vertices_count"), &Value::Unsigned(3));
     assert_eq!(
-        member(item(member(geometry, "vertices"), 1), "z"),
+        member(&item(member(geometry, "vertices"), 1), "z"),
         &Value::Float(-13.5)
     );
     let triangle = item(member(geometry, "triangles"), 0);
-    assert_eq!(member(triangle, "edge_2_0"), &Value::Signed(-3));
-    assert_eq!(member(triangle, "flags"), &Value::Unsigned(0x0645));
-    assert_eq!(member(triangle, "cover_flags"), &Value::Unsigned(0xA753));
+    assert_eq!(member(&triangle, "edge_2_0"), &Value::Signed(-3));
+    assert_eq!(member(&triangle, "flags"), &Value::Unsigned(0x0645));
+    assert_eq!(member(&triangle, "cover_flags"), &Value::Unsigned(0xA753));
     assert_eq!(
         member(
             member(member(geometry, "pathing_cell"), "coordinates"),
@@ -169,7 +168,7 @@ fn world_families_decode_complete_asymmetric_values() {
         &Value::Signed(17)
     );
     assert_eq!(
-        member(item(member(geometry, "edge_links"), 0), "navmesh"),
+        member(&item(member(geometry, "edge_links"), 0), "navmesh"),
         &Value::FormId(world::FIRST_ID)
     );
     assert_eq!(
@@ -178,7 +177,7 @@ fn world_families_decode_complete_asymmetric_values() {
     );
     assert_eq!(
         item(member(member(geometry, "grid"), "cell_0"), 1),
-        &Value::Signed(-3)
+        Value::Signed(-3)
     );
     let navi = &result.records[&(world::FIRST_ID + 1)];
     let infos: Vec<_> = navi
@@ -206,7 +205,7 @@ fn world_families_decode_complete_asymmetric_values() {
         &Value::Array(vec![])
     );
     assert_eq!(
-        member(item(member(paths, "road_markers"), 1), "index"),
+        member(&item(member(paths, "road_markers"), 1), "index"),
         &Value::Unsigned(29)
     );
     let region = &result.records[&(world::FIRST_ID + 2)];
@@ -222,11 +221,11 @@ fn world_families_decode_complete_asymmetric_values() {
         &Value::Bytes(vec![0xC1, 0x39])
     );
     assert_eq!(
-        member(item(field(region, b"RDOT"), 0), "angle_z"),
+        member(&item(field(region, b"RDOT"), 0), "angle_z"),
         &Value::Unsigned(59)
     );
     assert_eq!(
-        member(item(field(region, b"RDOT"), 0), "unknown_48"),
+        member(&item(field(region, b"RDOT"), 0), "unknown_48"),
         &Value::Bytes(vec![0xC1, 0x39, 0x87, 0xB3])
     );
     assert_eq!(
@@ -243,7 +242,7 @@ fn world_families_decode_complete_asymmetric_values() {
         .collect();
     assert_eq!(placements.len(), 2);
     assert_eq!(
-        member(item(&placements[1].value, 0), "scale"),
+        member(&item(&placements[1].value, 0), "scale"),
         &Value::Float(0.625)
     );
     assert_eq!(result.diagnostics["skyrim.esm"].skipped_fields, 0);
@@ -276,17 +275,17 @@ fn navigation_links_use_full_and_light_slots_and_clear_wrong_target_kinds() {
     assert_cleared_worldspace_keeps_coordinates(nav, b"NVNM");
     let geometry = field(nav, b"NVNM");
     assert_eq!(
-        member(item(member(geometry, "edge_links"), 0), "navmesh"),
+        member(&item(member(geometry, "edge_links"), 0), "navmesh"),
         &Value::FormId(0xFE00_1842)
     );
     assert_eq!(
-        member(item(member(geometry, "door_triangles"), 0), "door"),
+        member(&item(member(geometry, "door_triangles"), 0), "door"),
         &Value::FormId(0)
     );
     assert_cleared_worldspace_keeps_coordinates(&result.records[&0xFE00_1843], b"NVMI");
     let info = field(&result.records[&0xFE00_1843], b"NVMI");
     assert_eq!(
-        member(item(member(info, "door_links"), 0), "door"),
+        member(&item(member(info, "door_links"), 0), "door"),
         &Value::FormId(0)
     );
     assert_eq!(
@@ -296,7 +295,7 @@ fn navigation_links_use_full_and_light_slots_and_clear_wrong_target_kinds() {
     assert_cleared_worldspace_keeps_coordinates(&result.records[&0x0200_2743], b"NVNM");
     let full = field(&result.records[&0x0200_2743], b"NVNM");
     assert_eq!(
-        member(item(member(full, "edge_links"), 0), "navmesh"),
+        member(&item(member(full, "edge_links"), 0), "navmesh"),
         &Value::FormId(0x0200_2743)
     );
     assert!(result.diagnostics["navigation.esl"].invalid_links >= 3);
@@ -464,7 +463,7 @@ async fn broken_world_mod_publishes_prior_winners_neighbors_and_link_recovery() 
     assert_cleared_worldspace_keeps_coordinates(&result.records[&0x0100_2901], b"NVMI");
     let recovered_info = field(&result.records[&0x0100_2901], b"NVMI");
     assert_eq!(
-        member(item(member(recovered_info, "door_links"), 0), "door"),
+        member(&item(member(recovered_info, "door_links"), 0), "door"),
         &Value::FormId(0)
     );
     assert_eq!(

@@ -121,8 +121,12 @@ are optional unless a decoder-specific constraint requires them. A repeated
 group restarts its child cursor when a new occurrence begins; a repeated leaf
 accepts another occurrence at its current position. Keep duplicate values and
 their occurrence order. TES4 master groups associate each MAST with its DATA;
-LAND layer groups associate ATXT with its VTXT. Grouping prevents repeated
-shared signatures from being treated as a global last-value map.
+LAND layer groups associate each physical ATXT with its VTXT. If value decoding
+or ordered matching rejects that anchor, its dependent weights are omitted
+rather than transferred to an earlier surviving ATXT. A BTXT closes overlay
+ownership, including when that BTXT is rejected; a later valid ATXT starts a
+new layer. Unknown subrecords do not end that protection. Grouping prevents
+repeated shared signatures from being treated as a global last-value map.
 
 Typed decoding is separate from source preservation. `records.data` retains its
 existing rkyv encoding and contains validated canonical subrecord bytes for
@@ -145,6 +149,11 @@ Ordinary inline strings and English localization banks decode as Windows-1252;
 valid UTF-8 byte sequences do not override that native encoding. VMAD names and
 values retain their separately specified UTF-8 decoder. Canonical runtime text
 is UTF-8, with original encoded bytes preserved in the source payload or bank.
+Before winner admission, LAND, MOVT, GMST and RACE validation uses the same
+decoded inline-string normalization as final publication for every String
+field. This changes only a temporary validation projection; source fields,
+identities and history remain intact. Localized keys are resolved later through
+their existing string-bank path; these validators do not depend on that text.
 
 Multiple live LAND identities can share one parent cell. Both the database's
 cell-keyed terrain projection and cache select the record with the highest
@@ -172,16 +181,28 @@ ordered matching are distinct from fields that the source omitted; unknown
 signatures remain unexpected rather than rejected known fields. The public typed reader retains these facts for
 consumers rather than guessing missing values.
 
-An incomplete override never replaces a complete earlier version of the same
-record; a first definition keeps its readable prefix. The runtime adapter checks
-required terrain and movement semantics on each candidate before committing it
-as an override winner. An unusable candidate
-leaves its earlier usable predecessor and records a bounded diagnostic. TES4
-headers remain separate, and header-only deletions still apply. Genuine
-texture/color-only LAND without VHGT uses the shared cache's established zero
-heights; an incomplete LAND payload or rejected authored VHGT cannot take that
-fallback. The decoder's source metadata supports this decision without using
-the original payload as an alternative runtime projection.
+An incomplete non-deleted override never replaces a complete earlier version
+of the same record; a first definition keeps its readable prefix. A safely
+framed deletion still applies when its compressed body cannot be decoded;
+usable compressed deletion bodies retain identity-bearing fields. The runtime
+adapter checks required terrain and movement semantics on each candidate before
+committing it
+as an override winner. An unusable candidate leaves its earlier usable
+predecessor and records a bounded diagnostic. TES4 headers remain separate.
+Failed deferred replay rejects a tentative override locally and restores an
+earlier usable complete candidate without crossing an admitted deletion or
+nondeferred replacement. A first definition can retain its safe fields while
+omitting each whole field that remains deferred; its accepted history occurrence
+records that omission. If the remaining candidate is unusable, it is skipped
+too. Rejected physical versions are marked skipped with their own reason.
+Target-dependent replay uses the resulting winner catalogue before preservation
+and target clearing; unresolved deferred bytes never enter canonical runtime
+fields. Genuine texture/color-only LAND without VHGT uses the shared cache's zero
+heights; an incomplete LAND payload or rejected authored VHGT, BTXT, ATXT or
+VTXT makes the whole LAND candidate unusable. Generic decoding can retain safe
+fields, while the runtime adapter omits a malformed first-definition LAND.
+The decoder's source metadata supports these decisions without using the
+original payload as an alternative runtime projection.
 
 ## Decider hooks
 

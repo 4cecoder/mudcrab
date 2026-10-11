@@ -5,7 +5,11 @@ use super::{
     schema_format::{FieldSchema, Schema},
 };
 use crate::esm::load_order::LoadOrder;
-use std::{borrow::Cow, collections::HashMap, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    sync::OnceLock,
+};
 
 /// Per-file interpretation supplied by the shared load-order authority.
 pub(crate) struct Context<'a> {
@@ -29,10 +33,13 @@ struct RepeatRange {
 }
 
 /// Prepared schemas avoid re-expanding reusable definitions for every record.
-struct PreparedRecord {
+pub(crate) struct PreparedRecord {
     entries: Vec<Entry>,
     unordered: bool,
 }
+
+/// One prepared map shared by initial decoding, deferred replay and target validation.
+pub(crate) type PreparedSchemas = HashMap<[u8; 4], PreparedRecord>;
 
 /// Flatten only subrecord groups; byte structs and arrays stay typed and nested.
 fn flatten(fields: &[FieldSchema], schema: &Schema, output: &mut Vec<Entry>) {
@@ -60,31 +67,33 @@ fn flatten(fields: &[FieldSchema], schema: &Schema, output: &mut Vec<Entry>) {
     }
 }
 
+/// Prepare matched entries from a checked schema without changing the embedded singleton.
+pub(crate) fn prepare_schema(schema: &Schema) -> PreparedSchemas {
+    schema
+        .records
+        .iter()
+        .map(|record| {
+            let mut entries = Vec::new();
+            flatten(&record.fields, schema, &mut entries);
+            (
+                record
+                    .signature
+                    .as_bytes()
+                    .try_into()
+                    .expect("checked signature"),
+                PreparedRecord {
+                    entries,
+                    unordered: record.allow_unordered,
+                },
+            )
+        })
+        .collect()
+}
+
 /// Prepare the build-validated embedded schema exactly once per process.
-fn prepared() -> &'static HashMap<[u8; 4], PreparedRecord> {
-    static PREPARED: OnceLock<HashMap<[u8; 4], PreparedRecord>> = OnceLock::new();
-    PREPARED.get_or_init(|| {
-        let schema = super::schema();
-        schema
-            .records
-            .iter()
-            .map(|record| {
-                let mut entries = Vec::new();
-                flatten(&record.fields, schema, &mut entries);
-                (
-                    record
-                        .signature
-                        .as_bytes()
-                        .try_into()
-                        .expect("checked signature"),
-                    PreparedRecord {
-                        entries,
-                        unordered: record.allow_unordered,
-                    },
-                )
-            })
-            .collect()
-    })
+pub(crate) fn prepared() -> &'static PreparedSchemas {
+    static PREPARED: OnceLock<PreparedSchemas> = OnceLock::new();
+    PREPARED.get_or_init(|| prepare_schema(super::schema()))
 }
 
 pub(crate) fn string_table(record_type: &[u8; 4], field_name: &str) -> &'static str {
@@ -146,6 +155,15 @@ fn match_field(
         return (0..record.entries.len()).find(|&index| matches(index));
     }
     None
+}
+
+/// LAND's ATXT belongs inside its repeated layer group, rather than starting it.
+fn layer_repeat_range(record: &PreparedRecord, index: usize) -> Option<(usize, usize)> {
+    record.entries[index]
+        .repeat_ranges
+        .iter()
+        .find(|range| index >= range.start && index < range.end)
+        .map(|range| (range.start, range.end))
 }
 
 /// Framed prefix and whether its remaining payload was safe to scan.
@@ -278,13 +296,25 @@ pub(crate) fn decode(
     context: &Context<'_>,
     diagnostics: &mut PluginDiagnostics,
 ) -> Result<DecodedRecord, String> {
-    decode_with_identity(scanned, schema, context, diagnostics, &mut |_| {})
+    decode_with_prepared(scanned, schema, prepared(), context, diagnostics)
+}
+
+/// Use the same checked prepared entries for initial and catalogue-dependent decoding.
+pub(crate) fn decode_with_prepared(
+    scanned: ScannedRecord,
+    schema: &Schema,
+    prepared: &PreparedSchemas,
+    context: &Context<'_>,
+    diagnostics: &mut PluginDiagnostics,
+) -> Result<DecodedRecord, String> {
+    decode_with_identity(scanned, schema, prepared, context, diagnostics, &mut |_| {})
 }
 
 /// Observe only a successfully decoded GMST EDID, even if a later field rejects the record.
 pub(crate) fn decode_with_identity(
     scanned: ScannedRecord,
     schema: &Schema,
+    prepared: &PreparedSchemas,
     context: &Context<'_>,
     diagnostics: &mut PluginDiagnostics,
     identity: &mut impl FnMut(&str),
@@ -325,7 +355,7 @@ pub(crate) fn decode_with_identity(
         .map(|id| remap(id, context, true, diagnostics))
         .transpose()?
         .filter(|&id| id != 0);
-    let record_schema = prepared().get(&scanned.record_type);
+    let record_schema = prepared.get(&scanned.record_type);
     let mut cursor = 0;
     let mut last = None;
     let mut fields = Vec::new();
@@ -335,12 +365,27 @@ pub(crate) fn decode_with_identity(
     let mut rejected_condition_strings = false;
     // Response members must not move beneath an earlier surviving TRDT.
     let mut rejected_info_response: Option<(usize, usize)> = None;
+    // Weights belong to their physical layer anchor, including an anchor that was rejected.
+    let mut rejected_land_layer: Option<(usize, usize)> = None;
     let framed = subrecords(&scanned.payload, diagnostics, scanned.source_form_id);
     let link_kind = |source_id| {
         let id = remap(source_id, context, true, &mut PluginDiagnostics::default()).ok()?;
         context.winning_types?.get(&id).copied()
     };
     for (position, &(signature, bytes)) in framed.fields.iter().enumerate() {
+        let land_anchor =
+            scanned.record_type == *b"LAND" && matches!(&signature, b"BTXT" | b"ATXT");
+        if land_anchor {
+            rejected_land_layer = None;
+        } else if signature == *b"VTXT" && rejected_land_layer.is_some() {
+            if !rejected_fields.contains(&signature) {
+                rejected_fields.push(signature);
+            }
+            diagnostics.note("field", || {
+                format!("LAND {id:08X} VTXT: weights belong to a rejected physical layer anchor")
+            });
+            continue;
+        }
         let condition_string = matches!(&signature, b"CIS1" | b"CIS2");
         if condition_string && rejected_condition_strings {
             if !rejected_fields.contains(&signature) {
@@ -408,6 +453,19 @@ pub(crate) fn decode_with_identity(
             continue;
         };
         let Some(index) = match_field(record_schema, &signature, cursor, last) else {
+            if land_anchor {
+                rejected_land_layer = record_schema
+                    .entries
+                    .iter()
+                    .position(|entry| {
+                        entry
+                            .field
+                            .signature
+                            .as_deref()
+                            .is_some_and(|tag| tag.as_bytes() == signature)
+                    })
+                    .and_then(|index| layer_repeat_range(record_schema, index));
+            }
             if signature == *b"CTDA" {
                 rejected_condition_strings = true;
             }
@@ -433,6 +491,12 @@ pub(crate) fn decode_with_identity(
         let field_schema = &record_schema.entries[index].field;
         cursor = index + usize::from(!field_schema.repeat);
         last = Some(index);
+        if let Some((start, end)) = rejected_land_layer
+            && (index < start || index >= end)
+        {
+            // Only a real matched group boundary or a new physical anchor ends ownership.
+            rejected_land_layer = None;
+        }
         if let Some((start, end)) = rejected_info_response {
             if index > start && index < end {
                 if !rejected_fields.contains(&signature) {
@@ -476,6 +540,9 @@ pub(crate) fn decode_with_identity(
                 });
             }
             Err(error) => {
+                if land_anchor {
+                    rejected_land_layer = layer_repeat_range(record_schema, index);
+                }
                 if signature == *b"CTDA" {
                     rejected_condition_strings = true;
                 }
@@ -853,6 +920,18 @@ fn array(
             ..Default::default()
         }
     };
+    if field.decider.is_none()
+        && let Some(compact) = super::compact_array::try_decode(
+            &element,
+            &bytes[offset..],
+            count,
+            stride,
+            schema,
+            depth,
+        )?
+    {
+        return Ok((Value::CompactArray(compact), bytes.to_vec()));
+    }
     let mut canonical = bytes.to_vec();
     let mut values = Vec::with_capacity(count);
     for index in 0..count {
@@ -992,78 +1071,314 @@ fn merge_new_diagnostics(
 #[path = "master_index_compatibility_diagnostic_tests.rs"]
 mod master_index_compatibility_diagnostic_tests;
 
-/// Resolve catalogue-dependent unions without recounting already diagnosed source issues.
-pub(crate) fn resolve_deferred(result: &mut ReadResult, schema: &Schema, order: &LoadOrder) {
-    fn deferred(value: &Value) -> bool {
-        match value {
-            Value::Deferred(_) => true,
-            Value::Struct(values) => values.iter().any(|(_, value)| deferred(value)),
-            Value::Array(values) => values.iter().any(deferred),
-            _ => false,
-        }
+/// Catalogue replay must never expose unresolved members in a canonical field.
+pub(crate) fn value_contains_deferred(value: &Value) -> bool {
+    match value {
+        Value::Deferred(_) => true,
+        Value::Struct(members) => members
+            .iter()
+            .any(|(_, value)| value_contains_deferred(value)),
+        Value::Array(values) => values.iter().any(value_contains_deferred),
+        _ => false,
     }
-    let kinds: HashMap<_, _> = result
-        .records
+}
+
+/// Retain recovery state only for winners with an unresolved canonical member.
+pub(crate) fn record_contains_deferred(record: &DecodedRecord) -> bool {
+    record
+        .fields
         .iter()
-        .map(|(&id, record)| (id, record.record_type))
-        .collect();
-    for record in result
-        .records
-        .values_mut()
-        .filter(|record| record.fields.iter().any(|field| deferred(&field.value)))
-    {
-        let priority = record.load_order as usize;
-        let context = Context {
-            order,
-            plugin_index: priority,
-            localized: order.metadata[priority].flags & 0x80 != 0,
-            winning_types: Some(&kinds),
-        };
-        let scanned = || ScannedRecord {
-            record_type: record.record_type,
-            flags: record.flags,
-            source_form_id: record.source_form_id,
-            version_control: record.version_control,
-            form_version: record.form_version,
-            header_unknown: record.header_unknown,
-            cell_form_id: None,
-            worldspace_form_id: None,
-            source_topic_form_id: record.source_topic_form_id,
-            topic_group_offset: record.topic_group_offset,
-            source_record_offset: record.source_record_offset,
-            payload: record.raw_payload.clone(),
-        };
-        let diagnostics = result
-            .diagnostics
-            .entry(order.names[priority].clone())
-            .or_default();
-        // Compare the same source under its initial and accepted-winner contexts.
-        // Replaying into scratch counters preserves genuine new COED link errors
-        // while avoiding duplicate malformed-field and unexpected-tag warnings.
-        let baseline_context = Context {
-            winning_types: None,
-            ..context
-        };
-        let mut baseline = PluginDiagnostics::default();
-        if let Err(error) = decode(scanned(), schema, &baseline_context, &mut baseline) {
-            diagnostics.note("record", || {
-                format!("deferred baseline {:08X}: {error}", record.form_id)
-            });
-            continue;
-        }
-        let mut replay = PluginDiagnostics::default();
-        let resolution = decode(scanned(), schema, &context, &mut replay);
-        merge_new_diagnostics(diagnostics, &baseline, replay);
-        match resolution {
-            Ok(resolved) => {
-                record.fields = resolved.fields;
-                record.rejected_fields = resolved.rejected_fields;
-            }
-            Err(error) => diagnostics.note("record", || {
-                format!("deferred winner {:08X}: {error}", record.form_id)
-            }),
+        .any(|field| value_contains_deferred(&field.value))
+}
+
+/// Only tentative winners retain their original fields while resolved fields are published.
+struct DeferredSource {
+    fields: Vec<DecodedField>,
+    rejected_fields: Vec<[u8; 4]>,
+}
+
+impl DeferredSource {
+    /// Move first-pass fields without duplicating retained winner payloads.
+    fn take(record: &mut DecodedRecord) -> Self {
+        Self {
+            fields: std::mem::take(&mut record.fields),
+            rejected_fields: std::mem::take(&mut record.rejected_fields),
         }
     }
+}
+
+/// Change the exact physical occurrence while retaining its native source metadata.
+fn set_deferred_history(
+    result: &mut ReadResult,
+    record: &DecodedRecord,
+    accepted: bool,
+    reason: String,
+) {
+    if let Some(entry) = result.history.iter_mut().find(|entry| {
+        entry.plugin_index == record.load_order
+            && entry.source_record_offset == record.source_record_offset
+    }) {
+        entry.accepted = accepted;
+        entry.reason = Some(reason);
+    }
+}
+
+/// Diagnose local candidate failure and revoke that occurrence's earlier admission.
+fn reject_deferred_candidate(
+    result: &mut ReadResult,
+    record: &DecodedRecord,
+    order: &LoadOrder,
+    reason: String,
+) {
+    set_deferred_history(result, record, false, reason.clone());
+    result
+        .diagnostics
+        .entry(order.names[record.load_order as usize].clone())
+        .or_default()
+        .note("record", || {
+            format!(
+                "{} {:08X}: {reason}",
+                String::from_utf8_lossy(&record.record_type),
+                record.form_id
+            )
+        });
+}
+
+/// Finalize tentative winners against a stable catalogue, preserving only selective fallback chains.
+pub(crate) fn resolve_deferred(
+    result: &mut ReadResult,
+    schema: &Schema,
+    prepared: &PreparedSchemas,
+    order: &LoadOrder,
+    predecessors: &mut HashMap<u32, Vec<DecodedRecord>>,
+    validate: &mut impl FnMut(&DecodedRecord) -> Result<(), String>,
+) {
+    let mut pending = BTreeMap::new();
+    for (&id, record) in &mut result.records {
+        if record_contains_deferred(record) {
+            pending.insert(id, DeferredSource::take(record));
+        }
+    }
+    let affected: Vec<_> = pending.keys().copied().collect();
+    let candidate_count = pending.len()
+        + affected
+            .iter()
+            .filter_map(|id| predecessors.get(id))
+            .map(Vec::len)
+            .sum::<usize>();
+    let mut replay_diagnostics = HashMap::new();
+    let mut changed_chains: HashMap<u32, Vec<super::RecordSource>> = HashMap::new();
+    // Every failure consumes a candidate or finishes its safe prefix. One extra
+    // round permits all remaining candidates to replay after the last fallback.
+    for _ in 0..=candidate_count {
+        if pending.is_empty() {
+            break;
+        }
+        let kinds: HashMap<_, _> = result
+            .records
+            .iter()
+            .map(|(&id, record)| (id, record.record_type))
+            .collect();
+        let ids: Vec<_> = pending.keys().copied().collect();
+        let mut recovered = false;
+        for id in ids {
+            let Some(mut record) = result.records.remove(&id) else {
+                pending.remove(&id);
+                continue;
+            };
+            let priority = record.load_order as usize;
+            let context = Context {
+                order,
+                plugin_index: priority,
+                localized: order.metadata[priority].flags & 0x80 != 0,
+                winning_types: Some(&kinds),
+            };
+            let scanned = || ScannedRecord {
+                record_type: record.record_type,
+                flags: record.flags,
+                source_form_id: record.source_form_id,
+                version_control: record.version_control,
+                form_version: record.form_version,
+                header_unknown: record.header_unknown,
+                cell_form_id: None,
+                worldspace_form_id: None,
+                source_topic_form_id: record.source_topic_form_id,
+                topic_group_offset: record.topic_group_offset,
+                source_record_offset: record.source_record_offset,
+                payload: record.raw_payload.clone(),
+            };
+            let baseline_context = Context {
+                winning_types: None,
+                ..context
+            };
+            let mut baseline = PluginDiagnostics::default();
+            let mut replay = PluginDiagnostics::default();
+            let failure = match decode_with_prepared(
+                scanned(),
+                schema,
+                prepared,
+                &baseline_context,
+                &mut baseline,
+            ) {
+                Err(error) => Some(format!("deferred baseline {id:08X}: {error}")),
+                Ok(_) => {
+                    match decode_with_prepared(scanned(), schema, prepared, &context, &mut replay) {
+                        Err(error) => Some(format!("deferred winner {id:08X}: {error}")),
+                        Ok(resolved) if record_contains_deferred(&resolved) => Some(format!(
+                            "deferred winner {id:08X}: retained unresolved values"
+                        )),
+                        Ok(resolved) => {
+                            record.fields = resolved.fields;
+                            record.rejected_fields = resolved.rejected_fields;
+                            validate(&record).err().map(|error| {
+                                format!("deferred resolved candidate {id:08X} unusable: {error}")
+                            })
+                        }
+                    }
+                }
+            };
+            let Some(reason) = failure else {
+                replay_diagnostics.insert(id, (baseline, replay));
+                result.records.insert(id, record);
+                continue;
+            };
+            merge_new_diagnostics(
+                result
+                    .diagnostics
+                    .entry(order.names[priority].clone())
+                    .or_default(),
+                &baseline,
+                replay,
+            );
+            replay_diagnostics.remove(&id);
+            changed_chains.entry(id).or_default();
+            let source = pending.remove(&id).expect("selected deferred source");
+            if let Some(mut previous) = predecessors.get_mut(&id).and_then(|chain| chain.pop()) {
+                reject_deferred_candidate(result, &record, order, reason);
+                loop {
+                    let failure = if !previous.payload_complete {
+                        Some("deferred recovery predecessor has incomplete payload".to_owned())
+                    } else if record_contains_deferred(&previous) {
+                        None
+                    } else {
+                        validate(&previous)
+                            .err()
+                            .map(|error| format!("deferred recovery predecessor unusable: {error}"))
+                    };
+                    if let Some(reason) = failure {
+                        reject_deferred_candidate(result, &previous, order, reason);
+                        if let Some(earlier) =
+                            predecessors.get_mut(&id).and_then(|chain| chain.pop())
+                        {
+                            previous = earlier;
+                            continue;
+                        }
+                    } else {
+                        if record_contains_deferred(&previous) {
+                            pending.insert(id, DeferredSource::take(&mut previous));
+                        }
+                        result.records.insert(id, previous);
+                    }
+                    break;
+                }
+            } else {
+                record.fields = source.fields;
+                record.rejected_fields = source.rejected_fields;
+                let mut omitted = Vec::new();
+                record.fields.retain(|field| {
+                    if value_contains_deferred(&field.value) {
+                        omitted.push(field.signature);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for signature in &omitted {
+                    if !record.rejected_fields.contains(signature) {
+                        record.rejected_fields.push(*signature);
+                    }
+                    result
+                        .diagnostics
+                        .entry(order.names[priority].clone())
+                        .or_default()
+                        .note("field", || {
+                            format!(
+                                "{} {id:08X} {}: omitted after {reason}",
+                                String::from_utf8_lossy(&record.record_type),
+                                String::from_utf8_lossy(signature)
+                            )
+                        });
+                }
+                let fields = omitted
+                    .iter()
+                    .map(|signature| String::from_utf8_lossy(signature))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let reason = format!("deferred recovery omitted {fields}: {reason}");
+                if let Err(error) = validate(&record) {
+                    reject_deferred_candidate(
+                        result,
+                        &record,
+                        order,
+                        format!("{reason}; recovered prefix unusable: {error}"),
+                    );
+                } else {
+                    set_deferred_history(result, &record, true, reason);
+                    result.records.insert(id, record);
+                }
+            }
+            recovered = true;
+            // A changed kind can affect a previously successful dependent. Restart
+            // before rejecting any other candidate against the superseded catalogue.
+            break;
+        }
+        if !recovered {
+            pending.clear();
+            break;
+        }
+    }
+    debug_assert!(
+        pending.is_empty(),
+        "finite deferred candidate population exhausted"
+    );
+    for (id, (baseline, replay)) in replay_diagnostics {
+        if let Some(record) = result.records.get(&id) {
+            merge_new_diagnostics(
+                result
+                    .diagnostics
+                    .entry(order.names[record.load_order as usize].clone())
+                    .or_default(),
+                &baseline,
+                replay,
+            );
+        }
+    }
+    // Metadata follows final admission; full physical history keeps every rejected version.
+    for entry in &result.history {
+        if entry.accepted
+            && let Some(id) = entry.form_id
+            && let Some(chain) = changed_chains.get_mut(&id)
+        {
+            chain.push(super::RecordSource {
+                plugin_index: entry.plugin_index,
+                source_form_id: entry.source_form_id,
+                deleted: entry.flags & 0x20 != 0,
+            });
+        }
+    }
+    for (id, chain) in changed_chains {
+        if chain.len() > 1 || chain.iter().any(|source| source.deleted) {
+            result.overrides.insert(id, chain);
+        } else {
+            result.overrides.remove(&id);
+        }
+    }
+    debug_assert!(
+        result
+            .records
+            .values()
+            .all(|record| !record_contains_deferred(record))
+    );
 }
 
 /// Resolve named definitions with occurrence overrides; plain fields are already complete.
@@ -1088,15 +1403,26 @@ fn contains_target_link(value: &Value) -> bool {
     }
 }
 
-/// Validate declared target kinds after all winners exist; dangling optional links are nulled.
+/// Keep direct validator probes on the embedded prepared schema.
+#[cfg(test)]
 pub(crate) fn validate_targets(result: &mut ReadResult, schema: &Schema, order: &LoadOrder) {
+    validate_targets_with_prepared(result, schema, prepared(), order);
+}
+
+/// Validate declared target kinds after all winners exist; dangling optional links are nulled.
+pub(crate) fn validate_targets_with_prepared(
+    result: &mut ReadResult,
+    schema: &Schema,
+    prepared: &PreparedSchemas,
+    order: &LoadOrder,
+) {
     let kinds: HashMap<u32, [u8; 4]> = result
         .records
         .iter()
         .map(|(&id, record)| (id, record.record_type))
         .collect();
     for record in result.records.values_mut() {
-        let record_schema = prepared().get(&record.record_type);
+        let record_schema = prepared.get(&record.record_type);
         let plugin = order.names.get(record.load_order as usize).cloned();
         let mut diagnostics = PluginDiagnostics::default();
         if let Some(topic) = record.topic_form_id {
@@ -1258,7 +1584,8 @@ fn validate_value(
         | Value::String(_)
         | Value::LocalizedString(_)
         | Value::Bytes(_)
-        | Value::Deferred(_) => return,
+        | Value::Deferred(_)
+        | Value::CompactArray(_) => return,
         _ => {}
     }
     let Ok(field) = validation_schema(schema, field) else {
@@ -1424,6 +1751,243 @@ mod target_validation_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Count prefixes and mixed structs retain every canonical byte; an optional policy
+    /// marker forces the unchanged materialized path for an asymmetric decoder oracle.
+    #[test]
+    fn compact_arrays_match_materialized_counts_padding_and_field_local_errors() {
+        let schema = Schema::parse(br#"{"version":1,"records":[]}"#).unwrap();
+        let order = LoadOrder::read(&[]).unwrap();
+        let context = Context {
+            order: &order,
+            plugin_index: 0,
+            localized: false,
+            winning_types: None,
+        };
+        let selection = super::super::deciders::Context {
+            record_type: *b"TEST",
+            form_version: 44,
+            editor_id: "",
+            preceding_subrecords: &[],
+            parent_payload: None,
+            link_record_type: None,
+        };
+        let mut diagnostics = PluginDiagnostics::default();
+        let mut field = FieldSchema {
+            kind: "array".into(),
+            count: Some(serde_json::json!({"kind":"prefix_u32","stride":8})),
+            members: vec![
+                FieldSchema {
+                    name: "weight".into(),
+                    kind: "f32".into(),
+                    offset: 4,
+                    ..Default::default()
+                },
+                FieldSchema {
+                    name: "index".into(),
+                    kind: "u16".into(),
+                    ..Default::default()
+                },
+                FieldSchema {
+                    name: "padding".into(),
+                    kind: "bytes".into(),
+                    offset: 2,
+                    size: Some(2),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut bytes = 2_u32.to_le_bytes().to_vec();
+        bytes.extend([1, 128, 99, 255]);
+        bytes.extend((-0.0_f32).to_le_bytes());
+        bytes.extend([7, 0, 66, 77]);
+        bytes.extend(f32::from_bits(1).to_le_bytes());
+        let (compact, canonical) = array(
+            &field,
+            &bytes,
+            &schema,
+            &context,
+            &mut diagnostics,
+            &selection,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(&compact, Value::CompactArray(_)));
+        assert_eq!(canonical, bytes);
+        field.decider = Some("size".into());
+        let (old, old_canonical) = array(
+            &field,
+            &bytes,
+            &schema,
+            &context,
+            &mut diagnostics,
+            &selection,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(&old, Value::Array(_)));
+        assert_eq!(compact, old);
+        assert_eq!(canonical, old_canonical);
+        assert_eq!(
+            serde_json::to_vec(&compact).unwrap(),
+            serde_json::to_vec(&old).unwrap()
+        );
+        field.decider = None;
+        // An invalid second element must reject the field, never publish a prefix array.
+        let mut bad = bytes.clone();
+        bad[16..20].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert_eq!(
+            array(
+                &field,
+                &bad,
+                &schema,
+                &context,
+                &mut diagnostics,
+                &selection,
+                1
+            )
+            .unwrap_err(),
+            "non-finite float"
+        );
+        assert!(
+            array(
+                &field,
+                &bytes,
+                &schema,
+                &context,
+                &mut diagnostics,
+                &selection,
+                1
+            )
+            .is_ok()
+        );
+        // Framing/extent failures still use the preexisting path and diagnostic boundary.
+        assert_eq!(
+            array(
+                &field,
+                &bytes[..19],
+                &schema,
+                &context,
+                &mut diagnostics,
+                &selection,
+                1
+            )
+            .unwrap_err(),
+            "array extent/count mismatch"
+        );
+        assert_eq!(diagnostics.invalid_links, 0);
+        assert!(!contains_target_link(&compact));
+        let mut after = canonical.clone();
+        let mut compact = compact;
+        validate_value(
+            &mut compact,
+            &mut after,
+            &field,
+            &schema,
+            &HashMap::new(),
+            &mut diagnostics,
+            &selection,
+        );
+        assert_eq!(after, canonical);
+    }
+
+    /// Preserve fixed, remaining-byte and empty-array counts across both storage paths.
+    #[test]
+    fn compact_fixed_remaining_and_empty_arrays_preserve_count_authority() {
+        let schema = Schema::parse(br#"{"version":1,"records":[]}"#).unwrap();
+        let order = LoadOrder::read(&[]).unwrap();
+        let context = Context {
+            order: &order,
+            plugin_index: 0,
+            localized: false,
+            winning_types: None,
+        };
+        let selection = super::super::deciders::Context {
+            record_type: *b"TEST",
+            form_version: 44,
+            editor_id: "",
+            preceding_subrecords: &[],
+            parent_payload: None,
+            link_record_type: None,
+        };
+        let mut diagnostics = PluginDiagnostics::default();
+        let mut field = FieldSchema {
+            kind: "array".into(),
+            size: Some(1),
+            members: vec![FieldSchema {
+                kind: "i8".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for rule in [
+            serde_json::json!({"kind":"remaining"}),
+            serde_json::json!({"kind":"fixed","value":3}),
+        ] {
+            field.count = Some(rule);
+            let (actual, bytes) = array(
+                &field,
+                &[128, 0, 127],
+                &schema,
+                &context,
+                &mut diagnostics,
+                &selection,
+                1,
+            )
+            .unwrap();
+            assert_eq!(
+                actual,
+                Value::Array(vec![
+                    Value::Signed(-128),
+                    Value::Signed(0),
+                    Value::Signed(127)
+                ])
+            );
+            assert_eq!(bytes, [128, 0, 127]);
+        }
+        field.count = Some(serde_json::json!({"kind":"fixed","value":0}));
+        let (empty, _) = array(
+            &field,
+            &[],
+            &schema,
+            &context,
+            &mut diagnostics,
+            &selection,
+            1,
+        )
+        .unwrap();
+        assert!(matches!(empty, Value::Array(values) if values.is_empty()));
+        field.count = Some(serde_json::json!({"kind":"fixed","value":1_000_001}));
+        assert_eq!(
+            array(
+                &field,
+                &[],
+                &schema,
+                &context,
+                &mut diagnostics,
+                &selection,
+                1
+            )
+            .unwrap_err(),
+            "array exceeds one million elements"
+        );
+        field.count = None;
+        field.size = Some(0);
+        assert_eq!(
+            array(
+                &field,
+                &[],
+                &schema,
+                &context,
+                &mut diagnostics,
+                &selection,
+                1
+            )
+            .unwrap_err(),
+            "zero array stride"
+        );
+    }
 
     /// Unknown and out-of-order fields cannot rewind a nonrepeating schema cursor.
     #[test]

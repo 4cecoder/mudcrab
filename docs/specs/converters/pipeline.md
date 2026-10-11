@@ -16,12 +16,13 @@ retain the existing default-height cache behavior.
 
 `record-reader.json` stamps the selected frontend. In-house identity includes the
 authored schema SHA-256, adapter version and English localization choice, and
-`inhouse-reader-diagnostics.json` records bounded decoder and adapter issues. Generated
-database, terrain cache and LOD artifacts are rebuilt when resuming staging.
-In-house mode includes this identity in the configuration proof, because the
-corrected TXST slots affect texture roles. The current shared configuration key
-also invalidates mesh reuse conservatively; legacy configuration hashes remain
-compatible with existing packs. Resume commands preserve the reader choice.
+`inhouse-reader-diagnostics.json` records bounded decoder and adapter issues.
+The manifest's `configuration_hash` keeps the full reader identity for metadata
+provenance. Database, terrain cache and LOD artifacts are rebuilt on every
+conversion, including resumed staging. Resume commands preserve the reader choice.
+Converted assets use separate producer, settings and source proofs, described
+below; a full reader identity change alone does not discard those candidates or
+the archive extraction manifest.
 
 Localized fields in in-house mode use their declared English STRINGS, DLSTRINGS
 or ILSTRINGS bank from the effective archive VFS, with loose files taking
@@ -38,10 +39,16 @@ ASCII codes retain their original width and termination. Original source bytes
 remain available in provenance. The reader identity records both encoding contracts.
 Metadata rebuild uses the selected reader while validating retained assets under
 their original recorded reader configuration (unstamped older packs are legacy).
-Provenance records the retained reader separately, including across repeated
-metadata rebuilds. Retained models/textures keep their source bytes and may carry
-older TXST role encodings; normal conversion regenerates them under the selected
-reader. Unknown source producer identities are rejected.
+Provenance preserves that reader, producer schema and combined settings hash
+across repeated metadata rebuilds, together with any per-kind asset settings
+proofs. Retained models/textures keep their verified bytes and may carry older
+TXST role encodings. Explicit retention does not upgrade their producer or grant
+normal cache eligibility: a later normal conversion checks the original producer
+and current settings, source dependencies and resolved texture encoding.
+Unknown source producer identities are rejected by the retained-asset route.
+This route copies no archive extraction cache and clears its manifest entries;
+the next normal run extracts those archives once before recording new reusable
+source/integrity proofs.
 
 The explicit retained-asset route accepts the exact schema-15/16 producer
 configuration variant that records fixed Zstd level 6. Protected schema-15
@@ -73,6 +80,20 @@ deferred tables and stamps `runtime_ready=false`, as does `record-reader.json`.
 This option does not produce a runnable pack or claim whole runtime SQL
 equivalence. The default diagnostic export and normal converter still build all
 runtime views. No diagnostic mode converts meshes, textures, scripts or LOD.
+
+Fixed link-free scalar arrays use compact decoded storage with a shared element
+layout. Serialization still emits the existing tagged `Array`, `Struct` and
+`Bytes` values in source order, with unchanged numeric values and canonical field
+bytes. Layouts containing links, strings, selectors or deferred fields keep the
+ordinary representation. Rust consumers can use `Value::array_element` or
+`Value::materialized_array` for either representation; exhaustive enum matches
+must handle `Value::CompactArray`. The streaming typed writer avoids materializing
+the array. Serialized data and runtime archive layouts do not gain a new variant.
+
+Export buffers are released after their last consumers. Accepted raw records,
+physical source history and unresolved localized bytes remain available through
+their publication steps. Runtime projections clone only the retained subrecords,
+avoiding a redundant full-record clone before omitted fields are filtered.
 
 Set `MUDCRAB_RECORDS_PROFILE=1` before starting the process to emit stage timing
 observations on stderr. Each observation names the stage, elapsed wall seconds
@@ -200,6 +221,47 @@ The converter pipeline is orchestrated asynchronously using **`tokio`** task con
 - **Non-blocking Concurrency:** Heavy I/O decompression and file transformations execute concurrently using `tokio::spawn` and `tokio::task::spawn_blocking` for CPU-bound transcode tasks (`dds` ➔ `ktx2` and `nif` ➔ `glb`).
 - **Async Progress Reporting:** Sends `ProgressEvent` updates across a `tokio::sync::mpsc::Sender` to the launcher UI or CLI without thread blocking.
 - **Unified Interface:** Exposes `AssetPipeline::run_async(config, progress_tx).await` as the single high-leverage entry point for modernizing game assets, and `run_async_with_cancel(config, progress_tx, cancellation)` for a caller that can stop it (the command-line converter's Ctrl+C handler).
+
+### Reuse proofs
+
+Current manifests record `asset_configuration_hashes` for each source kind,
+independently of the full reader identity. Each hash contains only the settings
+that affect that kind's bytes:
+
+| Kind | Settings proof | Source proof |
+| :--- | :--- | :--- |
+| NIF -> GLB | Mesh producer contract | NIF and available skeleton bytes, plus scoped material-repair revision and source-texture presence |
+| DDS -> KTX2 | Texture producer, fallback quality, UASTC level, Zstd level and CPU/GPU encoder quality | DDS bytes, resolved `TextureEncoding` from the freshly rebuilt database and accepted GLBs, plus the applicable GPU encoding label |
+| PEX -> Luau | Script ABI | PEX bytes; known producer eligibility is checked separately |
+
+Worker counts, GPU batch size and `--no-lod` do not affect these settings proofs.
+A reader/schema edit that leaves the actual asset dependencies and encoding
+unchanged therefore permits reuse. A role edit that changes one DDS's resolved
+encoding changes that DDS's source proof and rebuilds it. Reuse still requires
+the published output to exist with its recorded size and SHA-256.
+Staging journal entries carry the same per-kind settings proof and also require
+the current producer contract and matching source/output bytes; older journal
+entries carrying a full configuration hash do not acquire a new proof implicitly.
+
+Normal producer eligibility remains independent of explicit metadata retention.
+The only cross-producer mesh allowance is producer 24 -> 26; a future producer
+does not inherit that allowance. Older textures regenerate, and scripts require
+both a supported producer and matching ABI settings. A retained producer remains
+the producer of its original bytes after any number of metadata rebuilds.
+
+Older manifests without per-kind settings hashes must match an exact known
+combined configuration hash for their original producer and a known reader
+identity. An opaque historical in-house hash whose schema/adapter identity is
+unavailable cannot establish asset settings, so its converted assets may rebuild
+once. Archive candidates survive this conservative rejection.
+
+Archive extraction reuse is independent of output producer, reader identity and
+encoder settings. The archive source SHA-256 must match, and every recorded
+content-addressed blob must exist with the recorded size. With cache verification
+enabled (the default), each blob must also match its recorded SHA-256. A failed
+source or blob integrity check causes that archive to be extracted again;
+unaffected archives remain candidates. `--invalidate-cache` explicitly discards
+both converted-asset and archive candidates.
 
 ### Checking a converted output
 
