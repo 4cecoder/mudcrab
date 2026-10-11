@@ -24,7 +24,7 @@ use std::{
 };
 
 /// Decoder/adapter behavior version for output changes outside the authored schema.
-pub const ADAPTER_VERSION: u32 = 8;
+pub const ADAPTER_VERSION: u32 = 9;
 
 /// Explicit diagnostic export scope; existing publication APIs always select Full.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -360,7 +360,7 @@ pub(crate) fn terrain_source_offsets(db_path: &Path) -> Result<HashMap<u32, u64>
     Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
 }
 
-/// Read normalized native layer geometry and globally remapped source keys for accepted LAND.
+/// Read every normalized native layer and remapped source key, including excess runtime layers.
 pub(crate) fn terrain_preserved_layers(
     db_path: &Path,
 ) -> Result<HashMap<u32, Vec<shared::TerrainLayer>>> {
@@ -380,7 +380,8 @@ pub(crate) fn terrain_preserved_layers(
     Ok(output)
 }
 
-/// Keep every layer and blend weight; unresolved texture keys become explicit runtime placeholders.
+/// Clear unresolved texture keys without dropping their layers or blend weights.
+/// The runtime cache writer applies its capacity after receiving this complete projection.
 pub(crate) fn terrain_runtime_layers(
     db_path: &Path,
     preserved: &HashMap<u32, Vec<shared::TerrainLayer>>,
@@ -416,7 +417,7 @@ pub(crate) fn write_terrain_caches(
         &runtime,
         &output.join("cell_cache.rkyv"),
     )?;
-    crate::esm::cell_cache::write_cell_cache_with_preserved_layers(
+    crate::esm::cell_cache::write_preserved_cell_cache_with_source_layers(
         records,
         &offsets,
         &preserved,
