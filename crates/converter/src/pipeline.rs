@@ -14,14 +14,14 @@ use crate::{
         lodsettings::{LodSettings, sidecar_path},
         read_plugins_txt,
     },
-    integration::{IntegrationReport, finalize_world_database},
+    integration::{IntegrationReport, finalize_world_database_with_sources},
     lod::{
         albedo::TerrainTextures,
         terrain::{
             compile_world_terrain, exterior_terrain_cells, publish_chunks, read_cached_heights,
         },
     },
-    mesh::{MeshConverter, nif_source_hash},
+    mesh::MeshConverter,
     progress::{AssetOutcome, ProgressEvent, ProgressStage},
     script::ScriptConverter,
     texture::{TextureConverter, TextureEncoding, TextureSemantic, publish_ktx2_file},
@@ -266,6 +266,11 @@ impl AssetPipeline {
             };
             color_eyre::Report::from(error).wrap_err(message)
         })?;
+        // Hold the runtime lock before repair-journal recovery can write the pack,
+        // and the distinct repair lock before directory recovery or publication.
+        // Both guards remain alive through cache cleanup; publication reuses output_lock.
+        let ownership = crate::repair::OutputOwnership::acquire(&config.output_dir)?;
+        config.output_dir = ownership.output().to_path_buf();
         recover_interrupted_publication(&config.output_dir)?;
         let started = Instant::now();
         send(
@@ -386,6 +391,11 @@ impl AssetPipeline {
         Ok(report)
     }
 
+    /// Converts resolved inputs into staging, reusing valid cached outputs and reporting progress.
+    ///
+    /// Rebuilds MO2 input selection on resume and records conversion results in the staging manifest.
+    /// Preserves usable outputs through texture repair, alias publication, pruning, and artifact
+    /// verification, and returns the report for pack publication.
     async fn run_into(
         config: &PipelineConfig,
         staging: &Path,
@@ -418,12 +428,63 @@ impl AssetPipeline {
             configuration_hash: expected_configuration.clone(),
             inputs_by_kind: Default::default(),
             failures: Default::default(),
+            excluded_inputs: Default::default(),
             pruned_texture_references: Default::default(),
             archives: Default::default(),
             entries: Default::default(),
         };
-        let files = discover(&config.data_dir)?;
-        let plugins = plugin_paths(config, &files, &mut report.notices)?;
+        let mut resolved_files = BTreeMap::new();
+        let mut mo2_plugins = None;
+        if let Some(selection) = &config.mo2 {
+            let instance = mo2::Instance::open(&selection.instance_path)?;
+            let data = config.data_dir.clone();
+            let profile = selection.profile.clone();
+            let stop = cancellation.clone();
+            let resolved = spawn_blocking(move || {
+                instance.resolve_with_cancel(&data, &profile, &|| stop.is_cancelled())
+            })
+            .await
+            .wrap_err("MO2 resolver worker panicked")?;
+            interrupt(cancellation)?;
+            let resolved = resolved?;
+            // Rebuild archive-derived inputs on resume; loose assets are read directly from
+            // their winning source paths. Remove legacy copied inputs from older runs too.
+            for root in [staging.join(".mo2-input")] {
+                if root.exists() {
+                    fs::remove_dir_all(&root)?;
+                }
+            }
+            mo2_plugins = Some(
+                resolved
+                    .plugins
+                    .iter()
+                    .map(|name| resolved.files[name].clone())
+                    .collect::<Vec<_>>(),
+            );
+            resolved_files = resolved.files;
+        }
+        let files = if config.mo2.is_some() {
+            resolved_files.values().cloned().collect()
+        } else {
+            discover(&config.data_dir)?
+        };
+        let archive_keys: BTreeMap<_, _> = resolved_files
+            .iter()
+            .filter(|(_, source)| extension(source, &["bsa", "ba2"]))
+            .map(|(relative, source)| (source.clone(), relative.clone()))
+            .collect();
+        let plugins = match mo2_plugins {
+            Some(plugins) => {
+                crate::esm::load_order::LoadOrder::read(&plugins).wrap_err_with(|| {
+                    format!(
+                        "MO2 profile {}: invalid plugin/master order",
+                        config.mo2.as_ref().unwrap().profile
+                    )
+                })?;
+                plugins
+            }
+            None => plugin_paths(config, &files, &mut report.notices)?,
+        };
         // Notices go out on the progress channel, like the pruned-texture warnings, so the CLI
         // prints them without splicing into its status line and the launcher shows them in its
         // notice pane. They stay in `report.notices` for the summary and the JSON report.
@@ -448,6 +509,7 @@ impl AssetPipeline {
         let mut enabled_archives: Vec<_> = archives
             .into_iter()
             .filter(|archive| !extension(archive, &["ba2"]) || config.enable_ba2)
+            .filter(|archive| config.mo2.is_none() || mo2_archive_is_active(archive, &plugins))
             .collect();
         sort_archives_by_load_order(&mut enabled_archives, &plugins);
         if !enabled_archives.is_empty() {
@@ -487,12 +549,14 @@ impl AssetPipeline {
             let vfs_for_worker = vfs_dir.clone();
             let previous_cache_root = config.ingestion_cache_dir().join(".ingestion-cache");
             let cache_root = staging.join(".ingestion-cache");
-            let archive_key = archive
-                .strip_prefix(&config.data_dir)
-                .unwrap_or(archive)
-                .to_string_lossy()
-                .replace('\\', "/")
-                .to_ascii_lowercase();
+            let archive_key = archive_keys.get(archive).cloned().unwrap_or_else(|| {
+                archive
+                    .strip_prefix(&config.data_dir)
+                    .unwrap_or(archive)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_ascii_lowercase()
+            });
             let previous_entry = previous.archives.get(&archive_key).cloned();
             let verify_cache = config.verify_cache;
 
@@ -609,7 +673,9 @@ impl AssetPipeline {
             }
         }
 
-        overlay_loose_assets(&config.data_dir, &staging.join("vfs"), &files)?;
+        if config.mo2.is_none() {
+            overlay_loose_assets(&config.data_dir, &staging.join("vfs"), &files)?;
+        }
         interrupt(cancellation)?;
 
         if !plugins.is_empty() {
@@ -637,7 +703,69 @@ impl AssetPipeline {
             ]);
         }
 
-        let vfs_files = discover(&staging.join("vfs"))?;
+        let vfs_root = staging.join("vfs");
+        let mut vfs_files: BTreeMap<PathBuf, PathBuf> = discover(&vfs_root)?
+            .into_iter()
+            .map(|path| (path.clone(), path))
+            .collect();
+        let mut loose_keys = BTreeSet::new();
+        for (relative, source) in &resolved_files {
+            if crate::asset_path::is_authoring_resource(relative) {
+                manifest.excluded_inputs.insert(
+                    relative.clone(),
+                    "BodySlide/Outfit Studio authoring resource, not runtime data".into(),
+                );
+                continue;
+            }
+            let (kind, ext) = if extension(source, &["dds"]) {
+                (AssetKind::Texture, "dds")
+            } else if extension(source, &["nif"]) {
+                (AssetKind::Mesh, "nif")
+            } else if extension(source, &["pex"]) {
+                (AssetKind::Script, "pex")
+            } else {
+                continue;
+            };
+            let canonical = canonical_asset_path(relative, kind, ext)?;
+            ensure!(
+                loose_keys.insert(canonical.clone()),
+                "loose assets contain normalized path collision for {canonical}"
+            );
+            vfs_files.insert(vfs_root.join(canonical), source.clone());
+        }
+        vfs_files.retain(|path, _| {
+            let relative = path
+                .strip_prefix(&vfs_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if crate::asset_path::is_authoring_resource(&relative) {
+                manifest.excluded_inputs.insert(
+                    relative,
+                    "BodySlide/Outfit Studio authoring resource, not runtime data".into(),
+                );
+                false
+            } else {
+                true
+            }
+        });
+        let source_paths = vfs_files;
+        let vfs_files: Vec<_> = source_paths.keys().cloned().collect();
+        if config.mo2.is_some() {
+            prune_removed_mo2_outputs(staging, &vfs_files)?;
+            if plugins.is_empty() {
+                for name in [
+                    "skyrim_world.db",
+                    "cell_cache.rkyv",
+                    "integration-report.json",
+                ] {
+                    let path = staging.join(name);
+                    if path.is_file() {
+                        fs::remove_file(path)?;
+                    }
+                }
+            }
+        }
         // Canonical source texture keys, used to tell a failed publication from absent game data
         // and to detect a pruned texture whose source is back in the installed data.
         let source_textures = texture_source_keys(staging, &vfs_files);
@@ -659,6 +787,7 @@ impl AssetPipeline {
             batch
                 .convert_kind(
                     &vfs_files,
+                    &source_paths,
                     "nif",
                     ProgressStage::Meshes,
                     None,
@@ -676,7 +805,7 @@ impl AssetPipeline {
             .map(|path| path.to_string_lossy().replace('\\', "/"))
             .collect();
         invalidate_staged_mesh_outputs(staging, &accepted_meshes)?;
-        let texture_semantics = collect_texture_semantics(staging)?;
+        let texture_semantics = collect_texture_semantics(staging, &source_textures)?;
         {
             let mut batch = ConversionBatch {
                 config,
@@ -693,12 +822,17 @@ impl AssetPipeline {
             batch
                 .convert_kind(
                     &vfs_files,
+                    &source_paths,
                     "dds",
                     ProgressStage::Textures,
                     Some(&texture_semantics),
                     &BTreeSet::new(),
                 )
                 .await?;
+            // Repair after the canonical DDS target publishes, retaining sampler aliases in
+            // the URI so the alias publisher below creates the correct per-image variant.
+            let mut repaired =
+                MeshConverter::repair_volcanic_grass_normals(staging, &source_textures)?;
             let aliases = publish_texture_aliases(staging)?;
             batch.report.artifacts.extend(aliases);
             // A reused mesh that still holds its published bytes keeps the prune record of the
@@ -738,14 +872,27 @@ impl AssetPipeline {
             }
             // A missing artifact whose DDS source exists under `staging/vfs` is a failed
             // publication, not absent game data: the prune leaves those references alone.
-            let pruned =
+            let mut pruned =
                 MeshConverter::prune_dangling_texture_uris_with_sources(staging, &source_textures)?;
+            pruned.append(&mut repaired);
             let pruned_uris: u64 = pruned
                 .iter()
                 .map(|file| file.removed_uris.len() as u64)
                 .sum();
             let mut pruned_completed = 0;
             for file in &pruned {
+                for (original, target) in &file.repaired_uris {
+                    send_notice(
+                        progress_tx,
+                        ProgressStage::Textures,
+                        Some(PathBuf::from(&file.glb)),
+                        &format!(
+                            "repaired texture {original} -> {target} referenced by {}",
+                            file.glb
+                        ),
+                    )
+                    .await;
+                }
                 for uri in &file.removed_uris {
                     pruned_completed += 1;
                     // The warning goes out as a notice on the progress channel rather than to
@@ -789,18 +936,18 @@ impl AssetPipeline {
                     batch.record_pruned_texture_reference(glb, reference);
                 }
             }
-            // The prune rewrote the GLB after its cache entry was recorded, so refresh every
+            // Repair or pruning rewrote the GLB after its cache entry was recorded, so refresh every
             // entry that publishes it from the rewritten bytes. Otherwise the next run fails the
             // entry's size and hash check and converts the mesh again.
             //
             // The staging journal is deliberately left alone. A journal record carries no prune
             // references, so certifying the pruned bytes would let a resumed run reuse the mesh
             // with nothing left for the prune pass to find, and the published manifest would lose
-            // the record. The mesh's journal record still holds its pre-prune hash, which the
-            // pruned file no longer matches, so a resume converts it again and prunes it again.
+            // the record. The mesh's journal record still holds its original conversion hash,
+            // which repaired or pruned bytes no longer match, so a resume rewrites it again.
             let pruned_outputs: BTreeSet<String> = pruned
                 .iter()
-                .filter(|file| !file.removed_uris.is_empty())
+                .filter(|file| !file.removed_uris.is_empty() || !file.repaired_uris.is_empty())
                 .map(|file| file.glb.clone())
                 .collect();
             for entry in batch.manifest.entries.values_mut() {
@@ -825,12 +972,16 @@ impl AssetPipeline {
             batch
                 .convert_kind(
                     &vfs_files,
+                    &source_paths,
                     "pex",
                     ProgressStage::Scripts,
                     None,
                     &BTreeSet::new(),
                 )
                 .await?;
+        }
+        if config.mo2.is_some() && !config.no_lod && !plugins.is_empty() {
+            stage_mo2_lod_inputs(&staging.join("vfs"), &resolved_files)?;
         }
         let lod_started = Instant::now();
         compile_lod_chunks_with_cancel(
@@ -845,7 +996,22 @@ impl AssetPipeline {
         .await?;
         report.lod_elapsed_ms = lod_started.elapsed().as_millis();
         interrupt(cancellation)?;
-        if let Some(integration) = finalize_world_database(staging)? {
+        let integration_sources = source_paths
+            .iter()
+            .map(|(path, source)| {
+                (
+                    path.strip_prefix(staging.join("vfs"))
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .to_ascii_lowercase(),
+                    source.clone(),
+                )
+            })
+            .collect();
+        if let Some(integration) =
+            finalize_world_database_with_sources(staging, &integration_sources)?
+        {
             if !integration.passed {
                 report.warnings.push(format!(
                     "asset integration failed: {} missing models, {} invalid models, {} missing textures, terrain/cache cells {}/{}",
@@ -952,9 +1118,11 @@ impl ConversionBatch<'_> {
     /// Converts every file of one kind (`dds`, `nif` or `pex`) on the worker pool, reusing cached
     /// and staged outputs, and records each result in the manifest, the journal and the report.
     /// Textures the GPU encoder takes are batched to it instead of being encoded on a worker.
+    /// Scoped mesh repair hashes use source-texture presence from the full VFS snapshot.
     async fn convert_kind(
         &mut self,
         files: &[PathBuf],
+        source_paths: &BTreeMap<PathBuf, PathBuf>,
         source_ext: &str,
         stage: ProgressStage,
         texture_semantics: Option<&BTreeMap<String, BTreeSet<TextureSemantic>>>,
@@ -1001,6 +1169,7 @@ impl ConversionBatch<'_> {
             } else {
                 None
             };
+            let source = source_paths.get(&source).unwrap_or(&source).clone();
             let source_bytes = fs::metadata(&source).map_or(0, |metadata| metadata.len());
             bytes_total += source_bytes;
             source_sizes.insert(source_key.clone(), source_bytes);
@@ -1029,6 +1198,16 @@ impl ConversionBatch<'_> {
         let staging_root = self.staging.to_path_buf();
         let output_dir = self.config.output_dir.clone();
         let source_kind = source_ext.to_owned();
+        let mesh_sources = source_paths
+            .iter()
+            .map(|(path, source)| {
+                Ok((
+                    path.strip_prefix(&staging_vfs)?.to_path_buf(),
+                    source.clone(),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let source_textures = texture_source_keys(self.staging, files);
         let etc1s_quality = self.config.texture_fallback_quality;
         let uastc_level = self.config.texture_uastc_level;
         let zstd_level = self.config.texture_zstd_level;
@@ -1173,18 +1352,15 @@ impl ConversionBatch<'_> {
                         {
                             return;
                         }
-                        // A mesh whose pruned texture source is back must be converted again:
-                        // the mesh cache does not hash texture dependencies, so a reused GLB
-                        // would never regain the reference.
+                        // Retry a mesh whose pruned source or scoped fallback is back. General
+                        // mesh hashes omit texture bytes, and the volcanic presence bits alone
+                        // cannot detect a failed fallback DDS repaired in place.
                         let forced =
                             force_reconvert.contains(target_rel.to_string_lossy().as_ref());
                         let target = staging_root.join(&target_rel);
 
-                        let source_hash = if source_kind == "nif" {
-                            nif_source_hash(&source)
-                        } else {
-                            hash_file(&source)
-                        };
+                        // Dependencies come from the merged winners below, not physical neighbors.
+                        let source_hash = hash_file(&source);
                         let mut hash = match source_hash {
                             Ok(h) => h,
                             Err(err) => {
@@ -1218,6 +1394,46 @@ impl ConversionBatch<'_> {
                             {
                                 hash.push_str(label);
                             }
+                        }
+
+                        let skeleton = if source_kind == "nif" {
+                            crate::mesh::resolve_skeleton(&relative, &mesh_sources)
+                        } else {
+                            None
+                        };
+                        if source_kind == "nif"
+                            && let Some(dependency) = &skeleton
+                        {
+                            match hash_file(dependency) {
+                                Ok(dep_hash) => {
+                                    hash.push(':');
+                                    hash.push_str(&dep_hash);
+                                }
+                                Err(err) => {
+                                    let (err, fatal) = match remove_invalid_staged_output(&target) {
+                                        Ok(()) => (err, false),
+                                        Err(remove_error) => (remove_error, true),
+                                    };
+                                    let _ = outcome_tx.send((
+                                        index,
+                                        key,
+                                        hash,
+                                        target_rel,
+                                        relative.clone(),
+                                        Err(err),
+                                        target,
+                                        fatal,
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+
+                        if source_kind == "nif"
+                            && let Some(suffix) =
+                                crate::mesh::volcanic_normal_cache_suffix(&key, &source_textures)
+                        {
+                            hash.push_str(&suffix);
                         }
 
                         // Check cache
@@ -1355,9 +1571,11 @@ impl ConversionBatch<'_> {
                                             )
                                             .map(|_| ())
                                         }
-                                        "nif" => {
-                                            MeshConverter::convert_nif_to_glb(&source, &target)
-                                        }
+                                        "nif" => MeshConverter::convert_nif_to_glb_with_skeleton(
+                                            &source,
+                                            &target,
+                                            skeleton.as_deref(),
+                                        ),
                                         "pex" => {
                                             ScriptConverter::convert_pex_to_luau(&source, &target)
                                         }
@@ -1598,42 +1816,65 @@ impl ConversionBatch<'_> {
     }
 }
 
-fn collect_texture_semantics(
+/// Collects texture usage from staged GLBs and the world database, including scoped replacement normals.
+pub(crate) fn collect_texture_semantics(
     staging: &Path,
+    source_textures: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, BTreeSet<TextureSemantic>>> {
+    use rayon::prelude::*;
     let mut semantics = BTreeMap::<String, BTreeSet<TextureSemantic>>::new();
-    for entry in WalkDir::new(staging)
-        .follow_links(false)
+    let glbs: Vec<_> = discover(staging)?
         .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-    {
-        let glb = entry.path();
-        if !extension(glb, &["glb"]) {
-            continue;
-        }
-        for dependency in MeshConverter::glb_texture_dependencies(glb)? {
-            let resolved = resolve_asset_uri(staging, glb, &dependency.uri)?;
-            let relative = resolved.strip_prefix(staging)?;
-            let key = canonical_asset_path(&relative.to_string_lossy(), AssetKind::Texture, "ktx2")
-                .and_then(|key| source_texture_key(&key))
-                .wrap_err_with(|| {
-                    format!(
-                        "invalid texture dependency {:?} resolved from {}",
-                        dependency.uri,
-                        glb.display()
+        .filter(|path| extension(path, &["glb"]))
+        .collect();
+    let dependencies = glbs
+        .par_iter()
+        .map(|glb| -> Result<Vec<_>> {
+            MeshConverter::glb_texture_dependencies(glb)?
+                .into_iter()
+                .map(|dependency| {
+                    let resolved = resolve_asset_uri(staging, glb, &dependency.uri)?;
+                    let relative = resolved.strip_prefix(staging)?;
+                    let key = canonical_asset_path(
+                        &relative.to_string_lossy(),
+                        AssetKind::Texture,
+                        "ktx2",
                     )
-                })?;
-            semantics
-                .entry(key)
-                .or_default()
-                .insert(dependency.semantic);
+                    .and_then(|key| source_texture_key(&key))
+                    .wrap_err_with(|| {
+                        format!(
+                            "invalid texture dependency {:?} resolved from {}",
+                            dependency.uri,
+                            glb.display()
+                        )
+                    })?;
+                    let replacement = if dependency.semantic == TextureSemantic::Normal {
+                        let model = glb
+                            .strip_prefix(staging)
+                            .ok()
+                            .map(|path| path.to_string_lossy().replace('\\', "/"));
+                        model.and_then(|model| {
+                            crate::mesh::volcanic_normal_replacement(&model, &key, source_textures)
+                        })
+                    } else {
+                        None
+                    };
+                    Ok((key, dependency.semantic, replacement))
+                })
+                .collect()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (key, semantic, replacement) in dependencies.into_iter().flatten() {
+        semantics.entry(key).or_default().insert(semantic);
+        if let Some(replacement) = replacement {
+            semantics.entry(replacement).or_default().insert(semantic);
         }
     }
 
     let database = staging.join("skyrim_world.db");
     if database.is_file() {
-        let connection = Connection::open(&database)?;
+        let connection =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let columns = [
             ("diffuse_path", TextureSemantic::BaseColor),
             ("normal_path", TextureSemantic::Normal),
@@ -1711,9 +1952,9 @@ fn texture_reference_source_key(reference: &str) -> Option<String> {
     canonical_asset_path(&source, AssetKind::Texture, "dds").ok()
 }
 
-/// Target outputs of meshes that must be converted again: one of their pruned references has
-/// its source back under `staging/vfs`. The mesh cache does not hash texture dependencies, so a
-/// reused GLB would never regain the restored reference.
+/// Meshes whose pruned reference has its source back, or whose scoped volcanic fallback source
+/// is present. Retry the latter even when source presence is unchanged: its first DDS conversion
+/// may have failed, leaving the authored reference pruned behind the mesh cache.
 fn restored_mesh_outputs(
     previous: &ConversionManifest,
     source_textures: &BTreeSet<String>,
@@ -1721,22 +1962,31 @@ fn restored_mesh_outputs(
     previous
         .pruned_texture_references
         .iter()
-        .filter(|(_, references)| {
+        .filter(|(glb, references)| {
             references.iter().any(|reference| {
                 texture_reference_source_key(reference)
                     .is_some_and(|key| source_textures.contains(&key))
+                    || crate::mesh::volcanic_normal_replacement(glb, reference, source_textures)
+                        .and_then(|replacement| texture_reference_source_key(&replacement))
+                        .is_some_and(|key| source_textures.contains(&key))
             })
         })
         .map(|(glb, _)| glb.clone())
         .collect()
 }
 
-fn source_texture_key(runtime_key: &str) -> Result<String> {
+/// Resolves a runtime texture or alias to its source KTX2 key, rejecting invalid paths.
+pub(crate) fn source_texture_key(runtime_key: &str) -> Result<String> {
     crate::asset_path::runtime_texture_source(runtime_key)
         .ok_or_else(|| color_eyre::eyre::eyre!("invalid runtime texture path: {runtime_key}"))
 }
 
-fn publish_texture_aliases(staging: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) use publish_texture_aliases as publish_srgb_texture_aliases;
+
+/// Links or copies existing source textures to aliases referenced by staged GLBs.
+///
+/// Returns the published paths relative to staging; references without a source file are skipped.
+pub(crate) fn publish_texture_aliases(staging: &Path) -> Result<Vec<PathBuf>> {
     let mut aliases = BTreeSet::new();
     for entry in WalkDir::new(staging)
         .follow_links(false)
@@ -1859,7 +2109,7 @@ pub(crate) fn validate_artifacts(
 
 /// Checks one generated artifact. `lua` is the compiler for Luau scripts, created on first use so
 /// a caller that never meets a script never builds one.
-fn validate_artifact(
+pub(crate) fn validate_artifact(
     staging: &Path,
     relative: &Path,
     texture_semantics: &BTreeMap<String, BTreeSet<TextureSemantic>>,
@@ -1955,7 +2205,7 @@ pub(crate) fn overlay_loose_assets(data: &Path, vfs: &Path, files: &[PathBuf]) -
 }
 
 /// Select explicit plugins or direct Data children, warning about nested-only discovery.
-fn plugin_paths(
+pub(crate) fn plugin_paths(
     config: &PipelineConfig,
     files: &[PathBuf],
     notices: &mut Vec<String>,
@@ -2009,6 +2259,93 @@ fn plugin_paths(
     crate::esm::load_order::order_discovered_plugins(plugins)
 }
 
+/// Materializes winning loose LOD inputs for the compiler's filesystem-based VFS reads.
+fn stage_mo2_lod_inputs(vfs: &Path, sources: &BTreeMap<String, PathBuf>) -> Result<()> {
+    for (relative, source) in sources {
+        if crate::asset_path::is_authoring_resource(relative) {
+            continue;
+        }
+        let relative = if extension(source, &["dds"]) {
+            PathBuf::from(canonical_asset_path(relative, AssetKind::Texture, "dds")?)
+        } else if relative.starts_with("lodsettings/") && extension(source, &["lod"]) {
+            crate::archive::safe_relative_path(relative)?
+        } else {
+            continue;
+        };
+        let destination = vfs.join(relative);
+        fs::create_dir_all(destination.parent().unwrap())?;
+        link_or_copy(source, &destination)?;
+    }
+    Ok(())
+}
+
+/// Removes staged mesh, texture, and script outputs absent from the current MO2 source selection.
+///
+/// Retains current resume work while preventing removed outputs from contributing stale references.
+fn prune_removed_mo2_outputs(staging: &Path, sources: &[PathBuf]) -> Result<()> {
+    let mut current = BTreeSet::new();
+    for source in sources {
+        let (kind, output) = if extension(source, &["nif"]) {
+            (AssetKind::Mesh, "glb")
+        } else if extension(source, &["dds"]) {
+            (AssetKind::Texture, "ktx2")
+        } else if extension(source, &["pex"]) {
+            (AssetKind::Script, "luau")
+        } else {
+            continue;
+        };
+        current.insert(canonical_asset_path(
+            &source.strip_prefix(staging.join("vfs"))?.to_string_lossy(),
+            kind,
+            output,
+        )?);
+    }
+    for folder in ["meshes", "textures", "scripts"] {
+        let directory = staging.join(folder);
+        if !directory.is_dir() {
+            continue;
+        }
+        for path in discover(&directory)? {
+            if !extension(&path, &["glb", "ktx2", "luau"]) {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(staging)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let key = if extension(&path, &["ktx2"]) {
+                source_texture_key(&relative)?
+            } else {
+                relative
+            };
+            if !current.contains(&key) {
+                fs::remove_file(path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks whether an archive stem matches an active plugin, including suffixed companion archives.
+pub(crate) fn mo2_archive_is_active(archive: &Path, plugins: &[PathBuf]) -> bool {
+    let stem = archive
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    plugins
+        .iter()
+        .filter_map(|path| path.file_stem())
+        .any(|plugin| {
+            let plugin = plugin.to_string_lossy().to_ascii_lowercase();
+            stem == plugin
+                || stem
+                    .strip_prefix(&plugin)
+                    .is_some_and(|suffix| suffix.starts_with(" - "))
+        })
+}
+
+/// Sorts archives by plugin load order, then lowercase stem, placing unmatched archives last.
 pub(crate) fn sort_archives_by_load_order(archives: &mut [PathBuf], plugins: &[PathBuf]) {
     archives.sort_by_cached_key(|archive| {
         (
@@ -4008,6 +4345,92 @@ mod tests {
     }
 
     #[test]
+    fn conversion_ownership_recovers_repairs_and_reuses_publication_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("assets");
+        let staging = directory.path().join("staging");
+        let repair_backup = directory.path().join("repair-backup");
+        write_test_runtime_pack(&output, "previous");
+        write_test_runtime_pack(&staging, "next");
+        fs::create_dir(&repair_backup).unwrap();
+        fs::write(output.join("sentinel"), b"interrupted repair").unwrap();
+        fs::write(repair_backup.join("sentinel"), b"last good").unwrap();
+        let journal = output.with_file_name("assets.repair-journal.json");
+        fs::write(
+            &journal,
+            serde_json::to_vec(&serde_json::json!({
+                "backup": repair_backup,
+                "paths": [["sentinel", true]],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let output_lock = AssetLock::acquire_exclusive(&output).unwrap();
+        let ownership = crate::repair::OutputOwnership::acquire(&output).unwrap();
+        recover_interrupted_publication(ownership.output()).unwrap();
+        assert_eq!(fs::read(output.join("sentinel")).unwrap(), b"last good");
+        assert!(!journal.exists());
+        assert!(crate::repair::OutputOwnership::acquire(&output).is_err());
+        assert!(AssetLock::acquire_shared(&output).is_err());
+        publish_directory_locked(&staging, ownership.output(), true, &output_lock).unwrap();
+        assert_eq!(published_manifest(&output).configuration_hash, "next");
+        assert!(crate::repair::OutputOwnership::acquire(&output).is_err());
+        drop(ownership);
+        drop(output_lock);
+        assert!(crate::repair::OutputOwnership::acquire(&output).is_ok());
+        assert!(AssetLock::acquire_exclusive(&output).is_ok());
+    }
+
+    #[test]
+    fn mo2_output_pruning_handles_missing_folders_and_keeps_current_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        prune_removed_mo2_outputs(staging, &[]).unwrap();
+
+        fs::create_dir_all(staging.join("meshes")).unwrap();
+        fs::write(staging.join("meshes/current.glb"), b"current").unwrap();
+        fs::write(staging.join("meshes/stale.glb"), b"stale").unwrap();
+        fs::write(staging.join("meshes/unrelated.txt"), b"unrelated").unwrap();
+        let sources = vec![staging.join("vfs/meshes/current.nif")];
+        prune_removed_mo2_outputs(staging, &sources).unwrap();
+        assert!(staging.join("meshes/current.glb").is_file());
+        assert!(!staging.join("meshes/stale.glb").exists());
+        assert!(staging.join("meshes/unrelated.txt").is_file());
+        assert!(!staging.join("textures").exists());
+        assert!(!staging.join("scripts").exists());
+    }
+
+    #[test]
+    fn mo2_lod_inputs_override_archive_textures_and_sidecars() {
+        let directory = tempfile::tempdir().unwrap();
+        let vfs = directory.path().join("vfs");
+        fs::create_dir_all(vfs.join("textures/landscape")).unwrap();
+        fs::create_dir_all(vfs.join("lodsettings")).unwrap();
+        fs::write(vfs.join("textures/landscape/grass.dds"), b"archive").unwrap();
+        fs::write(vfs.join("lodsettings/tamriel.lod"), b"archive").unwrap();
+        let texture = directory.path().join("winner.dds");
+        let sidecar = directory.path().join("winner.lod");
+        fs::write(&texture, b"winning texture").unwrap();
+        fs::write(&sidecar, b"winning sidecar").unwrap();
+        let sources = BTreeMap::from([
+            ("textures/landscape/grass.dds".into(), texture.clone()),
+            ("lodsettings/tamriel.lod".into(), sidecar.clone()),
+        ]);
+        stage_mo2_lod_inputs(&vfs, &sources).unwrap();
+        assert_eq!(
+            fs::read(vfs.join("textures/landscape/grass.dds")).unwrap(),
+            b"winning texture"
+        );
+        assert_eq!(
+            fs::read(vfs.join("lodsettings/tamriel.lod")).unwrap(),
+            b"winning sidecar"
+        );
+        assert_eq!(fs::read(texture).unwrap(), b"winning texture");
+        assert_eq!(fs::read(sidecar).unwrap(), b"winning sidecar");
+    }
+
+    #[test]
     fn publication_refuses_to_swap_assets_held_by_a_runtime_reader() {
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("modern_assets");
@@ -4175,6 +4598,27 @@ mod tests {
             "the override wrote through the link into the previous output"
         );
         assert_eq!(fs::read(&previous_blob).unwrap(), b"archive bytes");
+    }
+
+    #[test]
+    fn mo2_archives_require_exact_stem_or_spaced_dash_suffix() {
+        let plugins = vec![PathBuf::from("Example.esp")];
+        for name in [
+            "EXAMPLE.bsa",
+            "Example - Textures.bsa",
+            "Example - Meshes.ba2",
+        ] {
+            assert!(mo2_archive_is_active(Path::new(name), &plugins), "{name}");
+        }
+        for name in [
+            "Example Other.bsa",
+            "Example-Other.bsa",
+            "Example_Other.bsa",
+            "Example -Other.bsa",
+            "Example2.bsa",
+        ] {
+            assert!(!mo2_archive_is_active(Path::new(name), &plugins), "{name}");
+        }
     }
 
     #[test]
@@ -4626,6 +5070,146 @@ mod tests {
         report.warnings.clear();
         report.skipped = 1;
         assert!(!conversion_is_complete(&report));
+    }
+
+    /// Both volcanic models recover failed fallback publication and follow loose mod changes.
+    #[tokio::test]
+    async fn volcanic_normal_pipeline_publishes_target_and_tracks_mod_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("meshes/landscape/grass")).unwrap();
+        fs::create_dir_all(data.join("textures/dlc02/landscape/grass")).unwrap();
+        fs::create_dir_all(data.join("textures/landscape/grass")).unwrap();
+        let positions = [[-2.0, -1.0, 0.0], [3.0, -1.0, 0.0], [0.0, 4.0, 0.0]];
+        let normals = [[0.0, 0.0, 1.0]; 3];
+        let uvs = [[0.0, 1.0], [1.0, 1.0], [0.0, 0.0]];
+        let indices = [[0, 1, 2]];
+        for model in [
+            "dlc02volcanicashgrass01",
+            "dlc02volcanicashgrass02",
+            "control",
+        ] {
+            let shape = dummy_content::nif::StaticShape {
+                name: model,
+                positions: &positions,
+                normals: &normals,
+                uvs: &uvs,
+                indices: &indices,
+                diffuse: "textures/present.dds",
+                normal_texture: if model == "control" {
+                    ""
+                } else {
+                    "textures/landscape/grass/volcanicashgrass02_n.dds"
+                },
+            };
+            let mut nif = dummy_content::nif::static_shape(&shape).unwrap();
+            // This generated four-block fixture ends with a nine-slot texture set and the
+            // 100-byte lighting shader directly before it. Enable its authored specular flag.
+            let texture_set_size = 4 + 9 * 4 + shape.diffuse.len() + shape.normal_texture.len();
+            let shader = nif.len() - texture_set_size - 100;
+            assert_eq!(&nif[shader + 16..shader + 20], &0u32.to_le_bytes());
+            nif[shader + 16..shader + 20].copy_from_slice(&1u32.to_le_bytes());
+            fs::write(
+                data.join(format!("meshes/landscape/grass/{model}.nif")),
+                nif,
+            )
+            .unwrap();
+        }
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc7Unorm, 8, 8),
+            &mut dummy_content::rng::Rng::new(71),
+        )
+        .unwrap();
+        fs::write(data.join("textures/present.dds"), &dds).unwrap();
+        fs::write(
+            data.join("textures/dlc02/landscape/grass/volcanicashgrass02_n.dds"),
+            &dds,
+        )
+        .unwrap();
+        let override_dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc7Unorm, 8, 8),
+            &mut dummy_content::rng::Rng::new(93),
+        )
+        .unwrap();
+        assert_ne!(dds, override_dds);
+        let target_source = data.join("textures/dlc02/landscape/grass/volcanicashgrass02_n.dds");
+        fs::write(&target_source, b"invalid DDS, still present in the VFS").unwrap();
+        let failed = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(
+            !failed.complete,
+            "invalid target texture cannot complete publication"
+        );
+        for model in ["dlc02volcanicashgrass01", "dlc02volcanicashgrass02"] {
+            let glb = output.join(format!("meshes/landscape/grass/{model}.glb"));
+            assert_eq!(MeshConverter::glb_texture_uris(&glb).unwrap().len(), 1);
+        }
+        // Repair the DDS bytes without changing either source-presence bit or any NIF bytes.
+        fs::write(&target_source, &dds).unwrap();
+        let mut control_bytes = None;
+        for (run, original) in [false, true, false, false].into_iter().enumerate() {
+            let source = data.join("textures/landscape/grass/volcanicashgrass02_n.dds");
+            if original {
+                fs::write(&source, &override_dds).unwrap();
+            } else if source.exists() {
+                fs::remove_file(&source).unwrap();
+            }
+            let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
+            assert!(report.complete, "{:?}", report.warnings);
+            let control = fs::read(output.join("meshes/landscape/grass/control.glb")).unwrap();
+            if let Some(previous) = &control_bytes {
+                assert_eq!(&control, previous);
+                assert!(
+                    report.cache_hits >= 2,
+                    "unchanged control and diffuse must be reused"
+                );
+            } else {
+                control_bytes = Some(control);
+            }
+            if run == 3 {
+                assert_eq!(
+                    report.converted, 0,
+                    "unchanged repaired meshes must remain cache hits"
+                );
+            }
+            for model in ["dlc02volcanicashgrass01", "dlc02volcanicashgrass02"] {
+                let glb = output.join(format!("meshes/landscape/grass/{model}.glb"));
+                let uris = MeshConverter::glb_texture_uris(&glb).unwrap();
+                let expected = if original {
+                    "../../../textures/landscape/grass/volcanicashgrass02_n.opensky-wrap0.ktx2"
+                } else {
+                    "../../../textures/dlc02/landscape/grass/volcanicashgrass02_n.opensky-wrap0.ktx2"
+                };
+                assert!(
+                    uris.iter().any(|uri| uri == expected),
+                    "expected {expected}, got {uris:?}"
+                );
+                assert!(
+                    resolve_asset_uri(&output, &glb, expected)
+                        .unwrap()
+                        .is_file()
+                );
+                if original {
+                    assert_ne!(
+                        fs::read(resolve_asset_uri(&output, &glb, expected).unwrap()).unwrap(),
+                        fs::read(
+                            output.join("textures/dlc02/landscape/grass/volcanicashgrass02_n.ktx2")
+                        )
+                        .unwrap()
+                    );
+                }
+                let bytes = fs::read(&glb).unwrap();
+                let length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+                let json: serde_json::Value =
+                    serde_json::from_slice(&bytes[20..20 + length]).unwrap();
+                assert_eq!(
+                    json["materials"][0]["normalTexture"]["index"],
+                    json["materials"][0]["extensions"]["KHR_materials_specular"]["specularTexture"]
+                        ["index"]
+                );
+                assert!(json["materials"][0]["normalTexture"]["index"].is_number());
+            }
+        }
     }
 
     #[tokio::test]
@@ -6117,7 +6701,7 @@ mod tests {
         {
             BTreeMap::new()
         } else {
-            collect_texture_semantics(&output).unwrap_or_else(|error| {
+            collect_texture_semantics(&output, &BTreeSet::new()).unwrap_or_else(|error| {
                 eprintln!("texture semantics unavailable, validating without them: {error:#}");
                 BTreeMap::new()
             })
