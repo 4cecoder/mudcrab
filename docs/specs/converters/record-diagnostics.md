@@ -42,9 +42,11 @@ Changes to this optional table do not advance runtime database, cell-cache or
 asset producer versions. Existing packs without the table remain usable by
 runtime consumers. A normal in-house export supplies the new tables and metadata
 identity. Its broad configuration hash changes; current per-kind asset settings
-and source proofs remain unchanged. Older in-house manifests with only a combined
-proof may regenerate assets conservatively, and metadata-only migration refuses
-an older in-house reader identity rather than relabeling its tooling contract.
+and source proofs remain unchanged. Adapter-11 metadata explicitly recognizes
+the exact adapter-10 combined proof for unchanged asset settings and independently
+eligible producers. Metadata-only migration retains its complete original
+reader/schema identity rather than relabeling those bytes. Other older in-house
+identities remain unsupported by this explicit compatibility pair.
 
 New main-database snapshots also store existing lists as scalar child rows.
 `inhouse_plugin_masters(plugin_id, master_index, master_name)` preserves the

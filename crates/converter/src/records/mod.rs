@@ -327,7 +327,7 @@ pub(crate) fn decode_text(bytes: &[u8]) -> String {
     decoder::decode_string(bytes)
 }
 
-pub(crate) use decoder::{prepare_runtime_schema, string_table_with_prepared};
+pub(crate) use decoder::{PreparedSchemas, prepare_runtime_schema, string_table_with_prepared};
 
 /// Scan in load order using the converter's single slot/master authority.
 pub fn read_plugins(plugin_paths: &[PathBuf], order: &LoadOrder) -> Result<ReadResult> {

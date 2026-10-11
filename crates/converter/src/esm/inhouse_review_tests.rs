@@ -362,11 +362,23 @@ fn invariant_fixture(speed_count: usize) -> Fixture {
 fn rv_a_runtime_invariant_actual_target_nulling_preserves_candidate_validation() {
     let fixture = invariant_fixture(10);
     let order = LoadOrder::read(&fixture.paths).unwrap();
+    let schemas = records::addons::RuntimeSchemas::from_addon_bytes(&[]).unwrap();
+    let prepared = records::prepare_runtime_schema(&schemas);
+    let mut tables = HashMap::new();
+    let mut validate = |record: &records::DecodedRecord| {
+        validate_candidate(
+            record,
+            &prepared,
+            &fixture.paths,
+            &fixture.data,
+            &mut tables,
+        )
+    };
     let mut before = HashMap::new();
     let result = records::read_plugins_with_validation_and_observer(
         &fixture.paths,
         &order,
-        validate_candidate,
+        &mut validate,
         |accepted: &ReadResult| before.clone_from(&accepted.records),
     )
     .unwrap();
@@ -382,8 +394,8 @@ fn rv_a_runtime_invariant_actual_target_nulling_preserves_candidate_validation()
     ] {
         let original = &before[&id];
         let nulled = &result.records[&id];
-        validate_candidate(original).unwrap();
-        validate_candidate(nulled).unwrap();
+        validate(original).unwrap();
+        validate(nulled).unwrap();
         assert_eq!(original.load_order, 2);
         assert_eq!(nulled.load_order, 2);
         assert_eq!(original.raw_payload, nulled.raw_payload);

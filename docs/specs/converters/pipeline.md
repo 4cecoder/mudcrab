@@ -24,8 +24,11 @@ preserves WRLD RNAM payloads and TNAM strings and restores record-aware VMAD
 ownership compatibility. Version 2 added corrected faction links, strict native
 link ownership and local recovery to version 1's corrected TX06/TX07 and ARMO
 world-model projections. These metadata contracts are independent of asset
-producer 26. In-house adapter version 10 identifies corrected schema
-layouts, GMST winner admission, union localization and filename namespaces.
+producer 26. In-house adapter version 11 adds projection-aware winner admission
+to version 10's corrected schema layouts, GMST winner admission, union localization
+and filename namespaces. Required runtime projection checks resolve localized
+fields before admission, so an unusable later candidate preserves its usable
+predecessor without crossing an admitted deletion.
 In-house identity includes the
 authored schema SHA-256, adapter version and English localization choice, and
 `inhouse-reader-diagnostics.json` records bounded decoder and adapter issues.
@@ -57,6 +60,11 @@ their original recorded reader configuration. Older unstamped packs and the exac
 they are not identified as a versioned projection. Exact version-1 and version-2
 legacy stamps and full hashes remain recognized as their original retained-asset
 contracts and are not upgraded to the current projection.
+Adapter-11 metadata also recognizes the exact adapter-10 retained-asset contract
+with matching original schema/add-on bytes, reader fields and combined settings
+hash. Its original reader and asset producer remain recorded across repeated
+metadata rebuilds. This explicit compatibility pair does not authorize arbitrary
+older in-house identities or automatically extend to future adapters.
 New full configuration hashes
 include the versioned legacy identity, while `configuration_hash_for_schema`
 preserves historical legacy hash reproduction. Metadata retention validates each

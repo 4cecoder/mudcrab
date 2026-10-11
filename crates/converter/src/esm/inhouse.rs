@@ -24,7 +24,7 @@ use std::{
 };
 
 /// Decoder/adapter behavior version for output changes outside the authored schema.
-pub const ADAPTER_VERSION: u32 = 10;
+pub const ADAPTER_VERSION: u32 = 11;
 
 /// Legacy metadata projection contract: preserve WRLD payloads and record-aware VMAD links.
 /// This identity does not change the independent converted-asset producer/settings proofs.
@@ -583,6 +583,11 @@ fn convert_plugins_with_dump_impl(
     let order = LoadOrder::read(plugin_paths)?;
     order_stage.finish(plugin_paths.len());
     let mut warnings = Warnings::default();
+    let prepared = records::prepare_runtime_schema(schemas);
+    let mut tables = HashMap::new();
+    let validate = |record: &records::DecodedRecord| {
+        validate_candidate(record, &prepared, plugin_paths, strings_root, &mut tables)
+    };
     let mut preserved_layers = HashMap::new();
     let preserve = |accepted: &records::ReadResult| {
         for record in accepted
@@ -613,7 +618,7 @@ fn convert_plugins_with_dump_impl(
             plugin_paths,
             &order,
             schema,
-            validate_candidate,
+            validate,
             preserve,
         )?
     } else {
@@ -621,7 +626,7 @@ fn convert_plugins_with_dump_impl(
             plugin_paths,
             &order,
             schemas,
-            validate_candidate,
+            validate,
             preserve,
         )?
     };
@@ -630,7 +635,7 @@ fn convert_plugins_with_dump_impl(
         plugin_paths,
         &order,
         schemas,
-        validate_candidate,
+        validate,
         preserve,
     )?;
     // Winner validation and the observer have finished; physical history and
@@ -638,7 +643,6 @@ fn convert_plugins_with_dump_impl(
     release_reader_metadata(&mut decoded);
     let mut localized_fields = Vec::new();
     let mut unresolved_fields = HashMap::new();
-    let mut tables: HashMap<(usize, String), HashMap<u32, String>> = HashMap::new();
     let mut typed_output = dump
         .map(|(output, _)| {
             fs::File::create(output.join("typed-records.jsonl"))
@@ -647,7 +651,6 @@ fn convert_plugins_with_dump_impl(
         .transpose()?;
     let projection_stage = records::profile::ProfileStage::start("typed_export_runtime_projection");
     let mut master = HashMap::with_capacity(decoded.records.len());
-    let prepared = records::prepare_runtime_schema(schemas);
     let mut opaque_fields = HashMap::new();
     for record in decoded.records.values_mut() {
         let priority = record.load_order as usize;
@@ -666,37 +669,31 @@ fn convert_plugins_with_dump_impl(
                 unresolved.insert(index);
             }
             if let Value::LocalizedString(id) = &field.value {
-                let bank = match field.localized_bank.as_deref() {
-                    Some("dlstrings") => "dlstrings",
-                    Some("ilstrings") => "ilstrings",
-                    Some("strings") => "strings",
-                    _ => records::string_table_with_prepared(
-                        &prepared,
-                        &record.record_type,
-                        &field.signature,
-                        &field.name,
-                    ),
-                };
-                let table = tables
-                    .entry((priority, bank.to_owned()))
-                    .or_insert_with(|| {
-                        read_plugin_strings(&plugin_paths[priority], strings_root, bank)
-                            .unwrap_or_else(|error| {
-                                warnings.skipped(
-                                    plugin,
-                                    records::diagnostics::EventContext {
-                                        stage: "localization_bank",
-                                        field: Some(bank.to_owned()),
-                                        action: Some("unresolved"),
-                                        ..Default::default()
-                                    },
-                                    format!("localized table: {error}"),
-                                );
-                                HashMap::new()
-                            })
-                    });
+                let bank = localized_bank(&prepared, record.record_type, field);
+                let table = runtime_text_table(
+                    &mut tables,
+                    priority,
+                    &plugin_paths[priority],
+                    strings_root,
+                    bank,
+                );
+                if !table.reported {
+                    if let Some(error) = &table.error {
+                        warnings.skipped(
+                            plugin,
+                            records::diagnostics::EventContext {
+                                stage: "localization_bank",
+                                field: Some(bank.to_owned()),
+                                action: Some("unresolved"),
+                                ..Default::default()
+                            },
+                            format!("localized table: {error}"),
+                        );
+                    }
+                    table.reported = true;
+                }
                 // Zero is a null key even if a malformed table gives it text.
-                let resolved = if *id == 0 { None } else { table.get(id) };
+                let resolved = localized_text(*id, &table.values);
                 let status = if *id == 0 {
                     "null_id"
                 } else if resolved.is_some() {
@@ -716,7 +713,7 @@ fn convert_plugins_with_dump_impl(
                     string_table: bank,
                     string_id: *id,
                     load_order: record.load_order,
-                    resolved_text: resolved.cloned(),
+                    resolved_text: resolved.map(str::to_owned),
                     status,
                 });
                 // Keep the occurrence and key; unresolved text is never invented.
@@ -759,17 +756,10 @@ fn convert_plugins_with_dump_impl(
             raw.subrecords[index].1 = text;
         }
         let omitted = opaque_fields.get(&raw.form_id);
-        let invalid = with_filtered_record(&mut raw, omitted, |runtime| {
-            validate_inhouse_record(runtime)
-                .map_err(|error| error.to_string())
-                .and_then(|_| {
-                    if runtime.record_type == *b"LAND" {
-                        validate_inhouse_land(runtime).map_err(|error| error.to_string())
-                    } else {
-                        Ok(())
-                    }
-                })
-        });
+        // Admission already validated these shared text/opaque transformations.
+        // This defensive guard is exceptional under the current validators; future
+        // catalogue-dependent projection rules need their own admission/recovery policy.
+        let invalid = with_filtered_record(&mut raw, omitted, validate_runtime_record);
         if let Err(error) = invalid {
             warnings.skipped(
                 plugin,
@@ -936,8 +926,15 @@ fn release_reader_metadata(decoded: &mut records::ReadResult) {
     drop(std::mem::take(&mut decoded.overrides));
 }
 
-/// Validate required runtime semantics before merge so a bad override leaves its predecessor.
-fn validate_candidate(record: &records::DecodedRecord) -> std::result::Result<(), String> {
+/// Validate the same runtime text and opaque selection before merge replaces a predecessor.
+/// Localization failures retain the established empty-text policy and remain record-local.
+fn validate_candidate(
+    record: &records::DecodedRecord,
+    prepared: &records::PreparedSchemas,
+    plugin_paths: &[PathBuf],
+    strings_root: &Path,
+    tables: &mut HashMap<(usize, String), RuntimeTextTable>,
+) -> std::result::Result<(), String> {
     if !matches!(&record.record_type, b"LAND" | b"MOVT" | b"GMST" | b"RACE") {
         return Ok(());
     }
@@ -961,6 +958,21 @@ fn validate_candidate(record: &records::DecodedRecord) -> std::result::Result<()
     for (index, text) in decoded_text_updates(record) {
         raw.subrecords[index].1 = text;
     }
+    for (index, field) in record.fields.iter().enumerate() {
+        if let Value::LocalizedString(id) = &field.value {
+            let priority = record.load_order as usize;
+            let bank = localized_bank(prepared, record.record_type, field);
+            let table = runtime_text_table(
+                tables,
+                priority,
+                &plugin_paths[priority],
+                strings_root,
+                bank,
+            );
+            raw.subrecords[index].1 =
+                runtime_string(localized_text(*id, &table.values).unwrap_or(""));
+        }
+    }
     if record.supported {
         let mut index = 0;
         raw.subrecords.retain(|_| {
@@ -969,14 +981,19 @@ fn validate_candidate(record: &records::DecodedRecord) -> std::result::Result<()
             keep
         });
     }
-    validate_inhouse_record(&raw).map_err(|error| error.to_string())?;
+    validate_runtime_record(&raw)
+}
+
+/// Keep candidate admission and the final defensive check on one validator contract.
+fn validate_runtime_record(record: &RawRecord) -> std::result::Result<(), String> {
+    validate_inhouse_record(record).map_err(|error| error.to_string())?;
     if record.record_type == *b"LAND" {
-        validate_inhouse_land(&raw).map_err(|error| error.to_string())?;
+        validate_inhouse_land(record).map_err(|error| error.to_string())?;
     }
     Ok(())
 }
 
-/// Publish every accepted reader source, including later rejected runtime projections.
+/// Publish every accepted reader source, including any exceptional final projection rejection.
 /// History uses these rows for its winner catalogue; each payload can then be dropped.
 fn write_source_records(
     conn: &Connection,
@@ -1085,8 +1102,67 @@ fn take_canonical_record(record: &mut records::DecodedRecord) -> RawRecord {
     }
 }
 
+/// One lazily loaded string bank shared by candidate admission and final publication.
+/// Deferred warning publication avoids reporting banks from discarded candidates twice.
+struct RuntimeTextTable {
+    values: HashMap<u32, String>,
+    error: Option<String>,
+    reported: bool,
+}
+
+/// Load the same loose/VFS text snapshot once; an unreadable bank remains unresolved.
+fn runtime_text_table<'a>(
+    tables: &'a mut HashMap<(usize, String), RuntimeTextTable>,
+    priority: usize,
+    plugin: &Path,
+    strings_root: &Path,
+    bank: &str,
+) -> &'a mut RuntimeTextTable {
+    tables
+        .entry((priority, bank.to_owned()))
+        .or_insert_with(|| {
+            let (values, error) = match read_plugin_strings(plugin, strings_root, bank) {
+                Ok(values) => (values, None),
+                Err(error) => (HashMap::new(), Some(error.to_string())),
+            };
+            RuntimeTextTable {
+                values,
+                error,
+                reported: false,
+            }
+        })
+}
+
+/// Share authoritative localized-bank selection across admission and publication.
+fn localized_bank(
+    prepared: &records::PreparedSchemas,
+    record_type: [u8; 4],
+    field: &records::DecodedField,
+) -> &'static str {
+    match field.localized_bank.as_deref() {
+        Some("dlstrings") => "dlstrings",
+        Some("ilstrings") => "ilstrings",
+        Some("strings") => "strings",
+        _ => records::string_table_with_prepared(
+            prepared,
+            &record_type,
+            &field.signature,
+            &field.name,
+        ),
+    }
+}
+
+/// A zero localized key stays null even when an invalid table gives it a value.
+fn localized_text(id: u32, table: &HashMap<u32, String>) -> Option<&str> {
+    if id == 0 {
+        None
+    } else {
+        table.get(&id).map(String::as_str)
+    }
+}
+
 /// Use the same decoded inline text in candidate validation and final publication.
-/// Field indices follow both raw projections; localized keys are resolved separately.
+/// Field indices follow both raw projections; localized keys use the shared bank lookup.
 fn decoded_text_updates(record: &records::DecodedRecord) -> Vec<(usize, Vec<u8>)> {
     record
         .fields
@@ -1468,10 +1544,311 @@ mod runtime_move_tests {
         bytes
     }
 
-    /// A synthetic localized WKMV reaches late rejection without changing source-row authority.
+    /// Exercise projection policy with a private non-native localized WKMV descriptor.
+    /// Current public add-ons cannot replace RACE.WKMV's built-in FormID descriptor.
+    fn projection_admission_fallback_case(deletion_barrier: bool, extra_rejection: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("Data");
+        let output = directory.path().join("output");
+        let strings = data.join("Strings");
+        fs::create_dir(&data).unwrap();
+        fs::create_dir(&output).unwrap();
+        fs::create_dir(&strings).unwrap();
+        let schema = records::schema_format::Schema::parse(
+            br#"{
+            "version":1,"records":[
+                {"signature":"RACE","fields":[
+                    {"signature":"EDID","name":"editor_id","kind":"zstring"},
+                    {"signature":"WKMV","name":"synthetic_localized_link","kind":"lstring"}
+                ]},
+                {"signature":"STAT","fields":[
+                    {"signature":"EDID","name":"editor_id","kind":"zstring"}
+                ]}
+            ]}"#,
+        )
+        .unwrap();
+        let header = |master: bool, localized: bool| {
+            let mut payload = source_subrecord(b"HEDR", &[0; 12]);
+            if master {
+                payload.extend(source_subrecord(b"MAST", b"Base.esm\0"));
+                payload.extend(source_subrecord(b"DATA", &[0; 8]));
+            }
+            source_frame(b"TES4", 0, if localized { 0x80 } else { 0 }, &payload)
+        };
+        let source_id = 0x1600u32;
+        let runtime_id = 0x0100_1600u32;
+        let prior_payload = [
+            source_subrecord(b"EDID", b"UsableLocalizedPredecessor\0"),
+            source_subrecord(b"WKMV", &8u32.to_le_bytes()),
+        ]
+        .concat();
+        let rejected_payload = [
+            source_subrecord(b"EDID", b"RejectedLocalizedOverride\0"),
+            source_subrecord(b"WKMV", &17u32.to_le_bytes()),
+        ]
+        .concat();
+        let prior_header = header(false, true);
+        let prior_offset = prior_header.len() as u64;
+        let prior_frame = source_frame(b"RACE", source_id, 0, &prior_payload);
+        let rejected_header = header(true, true);
+        let rejected_offset = rejected_header.len() as u64;
+        let rejected_frame = source_frame(b"RACE", source_id, 0, &rejected_payload);
+        let mut originals = vec![
+            (data.join("Bootstrap.esm"), header(false, false)),
+            (
+                data.join("Base.esm"),
+                [prior_header, prior_frame.clone()].concat(),
+            ),
+        ];
+        if deletion_barrier {
+            originals.push((
+                data.join("Delete.esp"),
+                [
+                    header(true, false),
+                    source_frame(b"RACE", source_id, 0x20, &[]),
+                ]
+                .concat(),
+            ));
+        }
+        let intermediate = extra_rejection.then(|| {
+            let payload = [
+                source_subrecord(b"EDID", b"AnotherRejectedLocalizedOverride\0"),
+                source_subrecord(b"WKMV", &31u32.to_le_bytes()),
+            ]
+            .concat();
+            let header = header(true, true);
+            let offset = header.len() as u64;
+            let frame = source_frame(b"RACE", source_id, 0, &payload);
+            let priority = originals.len() as u32;
+            originals.push((
+                data.join("Intermediate.esp"),
+                [header, frame.clone()].concat(),
+            ));
+            (priority, offset, frame, payload)
+        });
+        let rejected_priority = originals.len() as u32;
+        let neighbor_id = (rejected_priority << 24) | 0x1700;
+        originals.push((
+            data.join("Override.esp"),
+            [
+                rejected_header,
+                rejected_frame.clone(),
+                source_frame(
+                    b"STAT",
+                    0x0100_1700,
+                    0,
+                    &source_subrecord(b"EDID", b"UsableAfterRejectedOverride\0"),
+                ),
+            ]
+            .concat(),
+        ));
+        for (path, bytes) in &originals {
+            fs::write(path, bytes).unwrap();
+        }
+        // Independent STRINGS framing makes the earlier key exactly four runtime bytes.
+        // The later key is absent and projects to one NUL rather than a valid link width.
+        let table = [
+            1u32.to_le_bytes().as_slice(),
+            4u32.to_le_bytes().as_slice(),
+            8u32.to_le_bytes().as_slice(),
+            0u32.to_le_bytes().as_slice(),
+            b"Q7z\0",
+        ]
+        .concat();
+        let table_path = strings.join("Base_english.strings");
+        fs::write(&table_path, &table).unwrap();
+        let paths = originals
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let database = output.join("skyrim_world.db");
+        let master = convert_plugins_with_dump_impl(
+            &paths,
+            &database,
+            &data,
+            Some((&output, &[*b"RACE", *b"STAT"])),
+            RecordBundleMode::Full,
+            None,
+            Some(&schema),
+        )
+        .unwrap();
+        assert!(master.contains_key(&neighbor_id));
+        assert_eq!(master.len(), if deletion_barrier { 1 } else { 2 });
+        assert_eq!(master.contains_key(&runtime_id), !deletion_barrier);
+        let conn = Connection::open(&database).unwrap();
+        let source_rows: u32 = conn
+            .query_row(
+                "SELECT count(*) FROM inhouse_source_records WHERE form_id=?1",
+                [runtime_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_rows, u32::from(!deletion_barrier));
+        if !deletion_barrier {
+            let race = &master[&runtime_id];
+            assert_eq!(race.load_order, 1);
+            assert_eq!(
+                race.subrecords
+                    .iter()
+                    .find(|(tag, _)| tag == b"WKMV")
+                    .map(|(_, bytes)| bytes.as_slice()),
+                Some(b"Q7z\0".as_slice())
+            );
+            let source: (u32, u32, Vec<u8>) = conn
+                .query_row(
+                    "SELECT source_form_id,load_order,payload FROM inhouse_source_records WHERE form_id=?1",
+                    [runtime_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(source, (source_id, 1, prior_payload.clone()));
+            let localized: (u32, u32, String) = conn
+                .query_row(
+                    "SELECT string_id,load_order,resolved_text FROM inhouse_localized_fields WHERE form_id=?1",
+                    [runtime_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(localized, (8, 1, "Q7z".into()));
+        }
+        let versions = conn
+            .prepare("SELECT plugin_id,status,reason FROM record_overrides WHERE form_id=?1 ORDER BY plugin_id")
+            .unwrap()
+            .query_map([runtime_id], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let expected_versions = 2 + usize::from(deletion_barrier) + usize::from(extra_rejection);
+        assert_eq!(versions.len(), expected_versions);
+        assert_eq!(versions[0], (1, "accepted".into(), None));
+        if deletion_barrier {
+            assert_eq!(versions[1], (2, "accepted".into(), None));
+        }
+        if let Some((priority, _, _, _)) = &intermediate {
+            let row = versions
+                .iter()
+                .find(|(plugin, _, _)| plugin == priority)
+                .unwrap();
+            assert_eq!(row.1, "skipped");
+            assert!(row.2.as_deref().unwrap().contains("RACE WKMV length"));
+        }
+        let rejected = versions.last().unwrap();
+        assert_eq!(rejected.0, rejected_priority);
+        assert_eq!(rejected.1, "skipped");
+        let reason = rejected.2.as_deref().unwrap();
+        assert!(reason.contains("unusable runtime candidate"));
+        assert!(reason.contains("RACE WKMV length"));
+        drop(conn);
+        let typed = fs::read_to_string(output.join("typed-records.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(typed.len(), if deletion_barrier { 1 } else { 2 });
+        if !deletion_barrier {
+            let row = typed
+                .iter()
+                .find(|row| row["form_id"] == runtime_id)
+                .unwrap();
+            assert_eq!(row["load_order"], 1);
+            assert_eq!(
+                row["source_payload_sha256"],
+                crate::cache::hash_bytes(&prior_payload)
+            );
+            assert_eq!(
+                row["fields"][1]["value"],
+                serde_json::json!({"LocalizedString":8})
+            );
+        }
+        let pin = crate::cache::hash_file(&database).unwrap();
+        let mut visited = 0;
+        let summary = records::history_source::visit_source_history(
+            &output,
+            None,
+            records::history_source::SourceQuery::Source {
+                original_owner: "Base.esm".into(),
+                full_local: source_id,
+            },
+            |version| {
+                assert_eq!(version.runtime_form_id, Some(runtime_id));
+                let raw = version.raw.unwrap();
+                if version.plugin_id == 1 {
+                    assert_eq!(version.status, "accepted");
+                    assert_eq!(version.source_record_offset, prior_offset);
+                    assert_eq!(version.accepted_source_winner, !deletion_barrier);
+                    assert_eq!(version.runtime_record_present, !deletion_barrier);
+                    assert_eq!(
+                        version.runtime_fallback_before_latest_source,
+                        !deletion_barrier
+                    );
+                    assert_eq!(raw.header.as_slice(), &prior_frame[..24]);
+                    assert_eq!(
+                        raw.stored_payload.as_deref(),
+                        Some(prior_payload.as_slice())
+                    );
+                } else if version.plugin_id == rejected_priority {
+                    assert_eq!(version.status, "skipped");
+                    assert_eq!(version.source_record_offset, rejected_offset);
+                    assert!(!version.accepted_source_winner);
+                    assert!(!version.runtime_record_present);
+                    assert_eq!(raw.header.as_slice(), &rejected_frame[..24]);
+                    assert_eq!(
+                        raw.stored_payload.as_deref(),
+                        Some(rejected_payload.as_slice())
+                    );
+                } else if let Some((priority, offset, frame, payload)) = &intermediate
+                    && version.plugin_id == *priority
+                {
+                    assert_eq!(version.status, "skipped");
+                    assert_eq!(version.source_record_offset, *offset);
+                    assert!(!version.accepted_source_winner);
+                    assert!(!version.runtime_record_present);
+                    assert_eq!(raw.header.as_slice(), &frame[..24]);
+                    assert_eq!(raw.stored_payload.as_deref(), Some(payload.as_slice()));
+                } else {
+                    assert!(deletion_barrier);
+                    assert_eq!(version.flags & 0x20, 0x20);
+                    assert!(!version.accepted_source_winner);
+                    assert!(!version.runtime_record_present);
+                }
+                visited += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(visited, expected_versions);
+        assert!(summary.fully_raw_available);
+        assert_eq!(crate::cache::hash_file(&database).unwrap(), pin);
+        for (path, bytes) in originals {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(fs::read(table_path).unwrap(), table);
+    }
+
+    /// A projection-unusable override keeps the exact prior source, typed value and neighbor.
+    #[test]
+    fn projection_admission_restores_predecessor_source_typed_history_and_neighbor() {
+        projection_admission_fallback_case(false, false);
+    }
+
+    /// A valid deletion prevents projection recovery from resurrecting an earlier definition.
+    #[test]
+    fn projection_admission_respects_deletion_barrier_and_keeps_neighbor() {
+        projection_admission_fallback_case(true, false);
+    }
+
+    /// Consecutive projection rejections keep the same usable source and every raw version.
+    #[test]
+    fn projection_admission_skips_multiple_rejected_overrides_without_losing_predecessor() {
+        projection_admission_fallback_case(false, true);
+    }
+
+    /// A projection-unusable first definition has no winner rows but retains exact raw history.
     /// This private schema is a projection-policy witness, not a native RACE layout claim.
     #[test]
-    fn post_projection_rejection_retains_source_row_typed_digest_and_raw_history() {
+    fn projection_rejection_omits_winner_rows_but_keeps_raw_history_and_neighbor() {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("Data");
         let output = directory.path().join("output");
@@ -1524,14 +1901,14 @@ mod runtime_move_tests {
         assert!(master.contains_key(&neighbor_id));
         assert!(!master.contains_key(&race_id));
         let conn = Connection::open(&database).unwrap();
-        let source: Vec<u8> = conn
+        let source_rows: u32 = conn
             .query_row(
-                "SELECT payload FROM inhouse_source_records WHERE form_id=?1",
+                "SELECT count(*) FROM inhouse_source_records WHERE form_id=?1",
                 [race_id],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(source, race_payload);
+        assert_eq!(source_rows, 0);
         let present: u32 = conn
             .query_row(
                 "SELECT count(*) FROM records WHERE form_id=?1",
@@ -1545,7 +1922,7 @@ mod runtime_move_tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(rows, 2);
+        assert_eq!(rows, 1);
         let accepted: (String, u64) = conn
             .query_row(
                 "SELECT status,source_record_offset FROM record_overrides WHERE form_id=?1",
@@ -1553,21 +1930,18 @@ mod runtime_move_tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(accepted, ("accepted".into(), race_offset));
+        assert_eq!(accepted, ("skipped".into(), race_offset));
         drop(conn);
         let typed = fs::read_to_string(output.join("typed-records.jsonl")).unwrap();
         let typed = typed
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|row| row["form_id"] == race_id)
-            .unwrap();
+            .collect::<Vec<_>>();
+        assert_eq!(typed.len(), 1);
+        assert_eq!(typed[0]["form_id"], neighbor_id);
         assert_eq!(
-            typed["source_payload_sha256"],
-            crate::cache::hash_bytes(&race_payload)
-        );
-        assert_eq!(
-            typed["fields"][1]["value"],
-            serde_json::json!({"LocalizedString":17})
+            typed[0]["source_payload_sha256"],
+            crate::cache::hash_bytes(&neighbor_payload)
         );
         let database_pin = crate::cache::hash_file(&database).unwrap();
         let mut seen = 0;
@@ -1580,12 +1954,23 @@ mod runtime_move_tests {
             },
             |version| {
                 assert_eq!(version.runtime_form_id, Some(race_id));
-                assert_eq!(version.status, "accepted");
-                assert!(version.accepted_source_winner);
+                assert_eq!(version.status, "skipped");
+                assert!(!version.accepted_source_winner);
                 assert!(!version.runtime_record_present);
+                assert!(
+                    version
+                        .rejection_reason
+                        .as_deref()
+                        .unwrap()
+                        .contains("RACE WKMV length")
+                );
                 let raw = version.raw.unwrap();
                 assert_eq!(raw.header.as_slice(), &race_frame[..24]);
                 assert_eq!(raw.stored_payload.as_deref(), Some(race_payload.as_slice()));
+                assert_eq!(
+                    raw.stored_payload_sha256,
+                    Some(crate::cache::hash_bytes(&race_payload))
+                );
                 seen += 1;
                 Ok(())
             },

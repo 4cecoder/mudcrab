@@ -993,6 +993,15 @@ fn reusable_manifest(
                 settings.record_reader = reader;
                 matched |= recorded == current_configuration_hash_for_schema(&settings, producer)?;
                 matched |= recorded == configuration_hash_for_schema(&settings, producer)?;
+                if reader == crate::config::RecordReader::Inhouse
+                    && let Some(identity) = crate::cache::inhouse_adapter10_reader_identity(
+                        settings.schemas()?.as_ref(),
+                    )
+                {
+                    matched |= crate::cache::retained_configuration_matches_for_reader(
+                        &settings, producer, recorded, &identity,
+                    )?;
+                }
                 if reader == crate::config::RecordReader::Legacy {
                     matched |= recorded
                         == crate::cache::legacy_projection_v1_configuration_hash(
@@ -3453,6 +3462,92 @@ mod tests {
     }
 
     use super::*;
+
+    /// A known adapter-10 combined settings proof preserves eligible producer-26 candidates.
+    #[test]
+    fn adapter10_combined_asset_proof_reuses_eligible_candidates_without_relabeling() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = PipelineConfig::new(
+            directory.path().join("Data"),
+            directory.path().join("output"),
+        );
+        config.record_reader = crate::config::RecordReader::Inhouse;
+        let mut identity = crate::esm::inhouse::reader_identity(config.record_reader);
+        identity["adapter_version"] = serde_json::json!(10);
+        let historical = serde_json::json!({
+            "schema": CONVERTER_SCHEMA_VERSION,
+            "texture_etc1s_quality": config.texture_fallback_quality,
+            "texture_uastc_level": config.texture_uastc_level,
+            "texture_zstd_level": config.texture_zstd_level,
+            "texture_encoder": {"mode": "cpu"},
+            "script_abi_version": config.script_abi_version,
+            "record_reader": identity,
+        });
+        let recorded = hash_bytes(&serde_json::to_vec(&historical).unwrap());
+        let manifest = ConversionManifest {
+            schema_version: CONVERTER_SCHEMA_VERSION,
+            configuration_hash: recorded.clone(),
+            entries: [
+                (
+                    "meshes/prior.nif".into(),
+                    CacheEntry {
+                        source_hash: "native-mesh-proof".into(),
+                        output: "meshes/prior.glb".into(),
+                        output_hash: "mesh-byte-proof".into(),
+                        output_size: 137,
+                    },
+                ),
+                (
+                    "textures/prior.dds".into(),
+                    CacheEntry {
+                        source_hash: "native-texture-proof".into(),
+                        output: "textures/prior.ktx2".into(),
+                        output_hash: "texture-byte-proof".into(),
+                        output_size: 251,
+                    },
+                ),
+                (
+                    "scripts/prior.pex".into(),
+                    CacheEntry {
+                        source_hash: "native-script-proof".into(),
+                        output: "scripts/prior.luau".into(),
+                        output_hash: "script-byte-proof".into(),
+                        output_size: 389,
+                    },
+                ),
+            ]
+            .into(),
+            complete: true,
+            ..Default::default()
+        };
+        let reused = reusable_manifest(&config, manifest.clone()).unwrap();
+        assert_eq!(
+            reused.entries, manifest.entries,
+            "metadata-only adapter identity must preserve eligible asset candidates"
+        );
+        assert_eq!(reused.schema_version, CONVERTER_SCHEMA_VERSION);
+        assert_eq!(reused.configuration_hash, recorded);
+        assert_eq!(reused.retained_mesh_schema_version, None);
+        assert_eq!(reused.retained_asset_configuration_hash, None);
+        let mut changed = config.clone();
+        changed.texture_fallback_quality = 191;
+        assert!(
+            reusable_manifest(&changed, manifest.clone())
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let mut unsupported = manifest;
+        let mut historical = historical;
+        historical["record_reader"]["adapter_version"] = serde_json::json!(8);
+        unsupported.configuration_hash = hash_bytes(&serde_json::to_vec(&historical).unwrap());
+        assert!(
+            reusable_manifest(&config, unsupported)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
 
     #[test]
     fn a_dotted_output_name_keeps_its_whole_name_in_the_staging_folder() {

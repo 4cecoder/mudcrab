@@ -1106,6 +1106,116 @@ async fn rebuild_config(mut config: PipelineConfig, source: &Path) {
     assert!(report.complete, "{:?}", report.warnings);
 }
 
+/// Repeated adapter-10 migrations retain original source documents and verified script bytes.
+/// The synthetic package uses a historical metadata stamp; no older converter binary is invoked.
+#[tokio::test]
+async fn adapter10_metadata_rebuild_preserves_original_assets_and_saved_addons_across_generations()
+{
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("Data");
+    generate_minimal_mod(&data);
+    let addon = temp.path().join("original.json");
+    let original_bytes = addon_bytes();
+    fs::write(&addon, &original_bytes).unwrap();
+    let source = temp.path().join("adapter10-source");
+    let original_config = mod_config(&data, &source, &[&addon]);
+    publish_config(original_config.clone()).await;
+    let mut identity = json_artifact(&source, "record-reader.json");
+    identity["adapter_version"] = json!(10);
+    let historical_settings = json!({
+        "schema": converter::cache::CONVERTER_SCHEMA_VERSION,
+        "texture_etc1s_quality": original_config.texture_fallback_quality,
+        "texture_uastc_level": original_config.texture_uastc_level,
+        "texture_zstd_level": original_config.texture_zstd_level,
+        "texture_encoder": {"mode": "cpu"},
+        "script_abi_version": original_config.script_abi_version,
+        "record_reader": identity,
+    });
+    let historical_hash =
+        converter::cache::hash_bytes(&serde_json::to_vec(&historical_settings).unwrap());
+    let mut original_manifest = json_artifact(&source, "conversion-manifest.json");
+    original_manifest["configuration_hash"] = json!(historical_hash);
+    fs::write(
+        source.join("record-reader.json"),
+        serde_json::to_vec(&identity).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        source.join("conversion-manifest.json"),
+        serde_json::to_vec(&original_manifest).unwrap(),
+    )
+    .unwrap();
+    let source_database_hash =
+        converter::cache::hash_file(&source.join("skyrim_world.db")).unwrap();
+    let runtime_path = "scripts/papyrus_runtime.luau";
+    let original_runtime = fs::read(source.join(runtime_path)).unwrap();
+    let original_runtime_hash = converter::cache::hash_bytes(&original_runtime);
+    let original_documents = json!([original_bytes]);
+    fs::write(
+        &addon,
+        b"changed invalid invocation file must not replace saved source bytes",
+    )
+    .unwrap();
+
+    let first = temp.path().join("adapter11-first");
+    rebuild_config(mod_config(&data, &first, &[]), &source).await;
+    let second = temp.path().join("adapter11-second");
+    rebuild_config(mod_config(&data, &second, &[]), &first).await;
+    for output in [&first, &second] {
+        let reader = json_artifact(output, "record-reader.json");
+        assert_eq!(reader["adapter_version"], 11);
+        let manifest = json_artifact(output, "conversion-manifest.json");
+        let provenance = json_artifact(output, "metadata-rebuild.json");
+        assert_ne!(
+            manifest["configuration_hash"],
+            original_manifest["configuration_hash"]
+        );
+        assert_eq!(
+            manifest["schema_version"],
+            original_manifest["schema_version"]
+        );
+        assert_eq!(
+            manifest["retained_mesh_schema_version"],
+            original_manifest["schema_version"]
+        );
+        assert_eq!(
+            manifest["retained_asset_configuration_hash"],
+            original_manifest["configuration_hash"]
+        );
+        assert_eq!(
+            manifest["asset_configuration_hashes"],
+            original_manifest["asset_configuration_hashes"]
+        );
+        assert_eq!(provenance["retained_asset_record_reader"], identity);
+        assert_eq!(provenance["retained_asset_schema_json"], original_documents);
+        assert_eq!(
+            provenance["retained_asset_hashes"][runtime_path],
+            original_runtime_hash
+        );
+        assert_eq!(
+            fs::read(output.join(runtime_path)).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            canonical_fields(output, 0x0300_1820),
+            custom_fields("CustomBefore", 0x1801u32.to_le_bytes().to_vec())
+        );
+    }
+    assert_eq!(
+        json_artifact(&source, "conversion-manifest.json"),
+        original_manifest
+    );
+    assert_eq!(json_artifact(&source, "record-reader.json"), identity);
+    assert_eq!(
+        converter::cache::hash_file(&source.join("skyrim_world.db")).unwrap(),
+        source_database_hash
+    );
+    assert_eq!(
+        fs::read(source.join(runtime_path)).unwrap(),
+        original_runtime
+    );
+}
+
 /// Repeated rebuilds use requested schemas while retaining exact original add-on asset provenance.
 #[tokio::test]
 async fn metadata_rebuilds_replay_saved_addons_and_preserve_original_asset_producer() {

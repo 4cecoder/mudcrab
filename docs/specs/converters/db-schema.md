@@ -193,10 +193,13 @@ identity. Runtime schema constants and reusable asset encodings remain unchanged
 and older texture or mesh bytes are not relabeled. The broad configuration hash
 includes the reader identity for metadata provenance. Normal conversion can
 reuse compatible assets through separately recorded per-kind settings and source
-proofs; older in-house manifests with only a combined configuration proof may
-regenerate assets conservatively. The metadata-only path requires the current
-reader identity, so an older in-house pack without `diagnostics_version` is
-refused by that path rather than relabeled with the new tooling contract.
+proofs. Adapter-11 metadata recognizes the exact adapter-10 combined settings
+proof for independently eligible asset producers, without changing retained
+bytes or their recorded producer. The metadata-only path accepts the current
+reader identity and that explicit adapter-10 retention contract with matching
+schema/add-on bytes and complete reader fields. Older in-house packs without
+`diagnostics_version` remain refused rather than relabeled with the new tooling
+contract; unknown adapter versions cannot authorize retained settings.
 Header rows bind the exact authored
 schema; a different schema is reported as undecodable rather than silently
 interpreting an old pack with new definitions. Deterministic sorted insertion
