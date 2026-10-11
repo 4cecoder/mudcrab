@@ -395,3 +395,205 @@ fn unusable_movement_override_does_not_claim_a_deletion_alias() {
     assert_eq!(speed.to_bits(), 200.0f32.to_bits());
     assert_eq!(fields(&conn, 0x0003_580D, b"SPED"), [speeds]);
 }
+
+/// Encode asymmetric primary object properties without any record-specific fragments.
+fn compatibility_vmad(object_format: u16, references: [u32; 3]) -> Vec<u8> {
+    let mut bytes = [
+        5u16.to_le_bytes(),
+        object_format.to_le_bytes(),
+        1u16.to_le_bytes(),
+    ]
+    .concat();
+    let string = |bytes: &mut Vec<u8>, text: &[u8]| {
+        bytes.extend_from_slice(&(text.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(text);
+    };
+    let object = |bytes: &mut Vec<u8>, reference: u32| {
+        if object_format == 1 {
+            bytes.extend_from_slice(&reference.to_le_bytes());
+            bytes.extend_from_slice(&(-1i16).to_le_bytes());
+            bytes.extend_from_slice(&0xA7B8u16.to_le_bytes());
+        } else {
+            bytes.extend_from_slice(&0xA7B8u16.to_le_bytes());
+            bytes.extend_from_slice(&(-1i16).to_le_bytes());
+            bytes.extend_from_slice(&reference.to_le_bytes());
+        }
+    };
+    string(&mut bytes, b"Compatibility");
+    bytes.push(0);
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    string(&mut bytes, b"Single");
+    bytes.extend_from_slice(&[1, 1]);
+    object(&mut bytes, references[0]);
+    string(&mut bytes, b"Array");
+    bytes.extend_from_slice(&[11, 1]);
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    object(&mut bytes, references[1]);
+    object(&mut bytes, references[2]);
+    bytes
+}
+
+/// Legacy VMAD links retain admitted compatibility identities while torn overrides recover locally.
+#[test]
+fn vanilla_vmad_compatibility_preserves_scripts_and_complete_predecessors() {
+    let dir = tempfile::tempdir().unwrap();
+    let base_vmad = compatibility_vmad(2, [0x1932; 3]);
+    let mut torn = base_vmad.clone();
+    torn.pop();
+    let paths = vec![
+        plugin(dir.path(), "Filler.esm", &[], 1, Vec::new()),
+        plugin(
+            dir.path(),
+            "Base.esm",
+            &[],
+            1,
+            [
+                record(b"ACTI", 0x1932, 0, sub(b"EDID", b"BaseTarget\0")),
+                record(b"ACTI", 0x820, 0, sub(b"VMAD", &base_vmad)),
+            ]
+            .concat(),
+        ),
+        plugin(
+            dir.path(),
+            "Patch.esp",
+            &["Base.esm"],
+            0,
+            [
+                record(
+                    b"ACTI",
+                    0x0300_1931,
+                    0,
+                    sub(b"EDID", b"CompatibilityTarget\0"),
+                ),
+                record(
+                    b"ACTI",
+                    0x0100_1820,
+                    0,
+                    sub(
+                        b"VMAD",
+                        &compatibility_vmad(1, [0x0300_1931, 0x1932, 0x0300_1931]),
+                    ),
+                ),
+                record(
+                    b"ACTI",
+                    0x0100_1821,
+                    0,
+                    sub(
+                        b"VMAD",
+                        &compatibility_vmad(2, [0x0300_1931, 0x1932, 0x0300_1931]),
+                    ),
+                ),
+                record(b"ACTI", 0x820, 0, sub(b"VMAD", &torn)),
+                record(b"STAT", 0x0100_1822, 0, sub(b"EDID", b"Neighbor\0")),
+            ]
+            .concat(),
+        ),
+    ];
+    let source_bytes: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let db = dir.path().join("world.db");
+    EsmParser::convert_plugins(&paths, &db).unwrap();
+    let conn = Connection::open(db).unwrap();
+    assert_eq!(
+        ids(&conn),
+        [
+            0x0100_0820,
+            0x0100_1932,
+            0x0200_1820,
+            0x0200_1821,
+            0x0200_1822,
+            0x0200_1931
+        ]
+    );
+    assert_eq!(
+        fields(&conn, 0x0100_0820, b"VMAD"),
+        [compatibility_vmad(2, [0x0100_1932; 3])]
+    );
+    for (id, format) in [(0x0200_1820u32, 1), (0x0200_1821, 2)] {
+        let expected = compatibility_vmad(format, [0x0200_1931, 0x0100_1932, 0x0200_1931]);
+        assert_eq!(fields(&conn, id, b"VMAD"), [expected.clone()]);
+        let stored: Vec<u8> = conn
+            .query_row(
+                "SELECT vmad FROM scripts WHERE form_id=?1 AND script_name='Compatibility'",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, expected);
+    }
+    let script_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM scripts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(script_count, 3);
+    for (path, before) in paths.iter().zip(source_bytes) {
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+}
+
+/// Preserve non-scalar WRLD payloads, including a four-byte texture string, beside real links.
+#[test]
+fn vanilla_wrld_large_reference_and_texture_payloads_survive_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let large_references = [
+        (-3i16).to_le_bytes().to_vec(),
+        7i16.to_le_bytes().to_vec(),
+        2u32.to_le_bytes().to_vec(),
+        0x0000_0911u32.to_le_bytes().to_vec(),
+        2i16.to_le_bytes().to_vec(),
+        (-5i16).to_le_bytes().to_vec(),
+        0x0100_0912u32.to_le_bytes().to_vec(),
+        (-9i16).to_le_bytes().to_vec(),
+        11i16.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    let long_texture = b"Textures\\Terrain\\World.dds\0".to_vec();
+    let paths = vec![
+        plugin(dir.path(), "Filler.esm", &[], 1, Vec::new()),
+        plugin(dir.path(), "Base.esm", &[], 1, Vec::new()),
+        plugin(
+            dir.path(),
+            "Patch.esp",
+            &["Base.esm"],
+            0,
+            record(
+                b"WRLD",
+                0x0100_0800,
+                0,
+                [
+                    sub(b"RNAM", &large_references),
+                    sub(b"TNAM", &long_texture),
+                    sub(b"TNAM", b"lod\0"),
+                    sub(b"NAM2", &0x0000_0920u32.to_le_bytes()),
+                    sub(b"CNAM", &0x0100_0921u32.to_le_bytes()),
+                ]
+                .concat(),
+            ),
+        ),
+    ];
+    let source_bytes: Vec<_> = paths
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let db = dir.path().join("world.db");
+    EsmParser::convert_plugins(&paths, &db).unwrap();
+    let conn = Connection::open(db).unwrap();
+    assert_eq!(ids(&conn), [0x0200_0800]);
+    assert_eq!(fields(&conn, 0x0200_0800, b"RNAM"), [large_references]);
+    assert_eq!(
+        fields(&conn, 0x0200_0800, b"TNAM"),
+        [long_texture, b"lod\0".to_vec()]
+    );
+    assert_eq!(
+        fields(&conn, 0x0200_0800, b"NAM2"),
+        [0x0100_0920u32.to_le_bytes().to_vec()]
+    );
+    assert_eq!(
+        fields(&conn, 0x0200_0800, b"CNAM"),
+        [0x0200_0921u32.to_le_bytes().to_vec()]
+    );
+    for (path, before) in paths.iter().zip(source_bytes) {
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+}
