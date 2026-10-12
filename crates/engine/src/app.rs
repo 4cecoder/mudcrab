@@ -1,4 +1,5 @@
 use crate::{
+    color_pipeline::SkyrimCinematicPostPlugin,
     config::{EngineConfig, MAX_IO_THREADS},
     console::{ConsolePlugin, console_closed},
     metrics::AcceptanceMetricsPlugin,
@@ -207,6 +208,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
             crate::mesh_residency_audit::MeshResidencyAuditPlugin,
             SkyPlugin,
+            SkyrimCinematicPostPlugin,
             ConsolePlugin,
             crate::nif_material::NifMaterialPlugin,
         ))
