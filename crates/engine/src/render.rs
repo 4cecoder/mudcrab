@@ -13,7 +13,10 @@ use bevy::{
     },
     core_pipeline::{mip_generation::experimental::depth::ViewDepthPyramid, prepass::DepthPrepass},
     image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor},
-    pbr::{ExtendedMaterial, MaterialExtension},
+    pbr::{
+        ExtendedMaterial, ExtractedDirectionalLight, LightEntity, MaterialExtension, ShadowView,
+        prepare_lights,
+    },
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
@@ -138,10 +141,44 @@ impl Plugin for VercidiumRendererPlugin {
         let bridge = RendererProofBridge::default();
         app.insert_resource(bridge.clone());
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app.insert_resource(bridge).add_systems(
-                Render,
-                sample_renderer_path.after(RenderSystems::PrepareResourcesCollectPhaseBuffers),
-            );
+            render_app
+                .insert_resource(bridge)
+                .add_systems(
+                    Render,
+                    sample_renderer_path.after(RenderSystems::PrepareResourcesCollectPhaseBuffers),
+                )
+                .add_systems(
+                    Render,
+                    give_shadow_views_their_light_layers
+                        .in_set(RenderSystems::CreateViews)
+                        .after(prepare_lights),
+                );
+        }
+    }
+}
+
+/// A shadow view Bevy created without render layers.
+type UnlayeredShadowView = (With<ShadowView>, Without<RenderLayers>);
+
+/// Gives each directional shadow cascade the render layers of the light that owns it.
+///
+/// Bevy 0.19 builds a cascade's shadow view without a `RenderLayers` component, and
+/// `queue_shadows` tests every caster's layers against that view's, defaulting to layer 0 when it
+/// has none. The CPU side (`check_dir_light_mesh_visibility`) does use the light's layers, so a
+/// caster on [`PLACED_OBJECT_LAYER`] is collected for the cascade and then dropped before it is
+/// queued: none of the placed objects - buildings, trees, rocks - would cast a shadow. Copying the
+/// light's layers onto its views makes the queue test agree with the collection test.
+fn give_shadow_views_their_light_layers(
+    mut commands: Commands,
+    views: Query<(Entity, &LightEntity), UnlayeredShadowView>,
+    lights: Query<&ExtractedDirectionalLight>,
+) {
+    for (view, owner) in &views {
+        let LightEntity::Directional { light_entity, .. } = owner else {
+            continue;
+        };
+        if let Ok(light) = lights.get(*light_entity) {
+            commands.entity(view).insert(light.render_layers.clone());
         }
     }
 }
