@@ -17,7 +17,7 @@ use bevy::{
     window::{ExitCondition, WindowPlugin},
 };
 use engine::{
-    color_pipeline::SceneColorPipeline,
+    color_pipeline::{SceneColorPipeline, SkyrimCinematicPostPlugin},
     profiling::ProfilingState,
     render::{
         TerrainExtension, TerrainMaterial, VercidiumRendererPlugin, WaterExtension, WaterMaterial,
@@ -109,7 +109,11 @@ fn main() {
         .add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(
             Duration::from_millis(16),
         ))
-        .add_plugins((VercidiumRendererPlugin, SkyPlugin))
+        .add_plugins((
+            VercidiumRendererPlugin,
+            SkyPlugin,
+            SkyrimCinematicPostPlugin,
+        ))
         .add_systems(PostStartup, setup)
         .add_systems(Update, capture)
         .run();
