@@ -73,6 +73,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         None
     };
+    let asset_plugin = asset_plugin(&mut config)?;
     let reads_asset_tree = config.streaming_fixture
         || !(config.benchmark_only
             || config.material_fixture
@@ -127,20 +128,19 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         && !config.streaming_fixture)
         .then(|| MovementTuning::from_world_database(&config.assets_dir.join("skyrim_world.db")))
         .transpose()?;
-    let asset_path = config.assets_dir.to_string_lossy().into_owned();
     let benchmark_active =
         config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some();
     configure_benchmark_priority(benchmark_active)?;
-    let window = (!config.headless || shots_active).then(|| Window {
+    let window = (!config.headless || shots_active || config.hidden_window).then(|| Window {
         title: config.window_title(),
+        visible: !config.hidden_window,
         // A shots file's frame is the size its reference screenshots were taken at, so the window,
         // and every PNG taken of it, is exactly that many pixels.
         resolution: match &shots {
             Some(run) => run.file.window_resolution(),
             None => (1600, 900).into(),
         },
-        // A timing or shots run opens on screen, in the middle, so whoever is at the machine can
-        // see what is running and not disturb it.
+        // Visible timing and shots runs open in the middle of the primary screen.
         position: if benchmark_active || shots_active {
             WindowPosition::Centered(MonitorSelection::Primary)
         } else {
@@ -161,7 +161,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     if let Some(asset_lock) = asset_lock {
         app.insert_resource(AssetDirectoryReadLock { _guard: asset_lock });
     }
-    if benchmark_active || shots_active {
+    if benchmark_active || shots_active || config.hidden_window {
         // Acceptance runs are commonly left unfocused while the campaign driver
         // advances through its scenarios. Bevy's game default throttles an
         // unfocused window to 60 Hz, which makes a 16.67 ms P95 gate measure the
@@ -179,10 +179,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 .build()
                 .disable::<bevy::render::RenderPlugin>()
                 .add_before::<bevy::render::RenderPlugin>(RendererInitPlugin::default())
-                .set(AssetPlugin {
-                    file_path: asset_path,
-                    ..default()
-                })
+                .set(asset_plugin)
                 .set(world_gltf_plugin())
                 .set(WindowPlugin {
                     primary_window: window,
@@ -205,13 +202,18 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
         .add_plugins((
             VercidiumRendererPlugin,
+            crate::visibility_optimization::VisibilityOptimizationPlugin,
+            crate::terrain_upload::TerrainUploadPlugin,
+            crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
+            crate::mesh_residency_audit::MeshResidencyAuditPlugin,
             SkyPlugin,
             ConsolePlugin,
             crate::nif_material::NifMaterialPlugin,
         ))
         // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
         // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
-        .add_plugins(crate::lights::LightsPlugin);
+        .add_plugins(crate::lights::LightsPlugin)
+        .add_systems(PostUpdate, keep_windows_hidden);
     add_camera_and_capture_systems(&mut app);
     if let Some((database, catalog, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
@@ -261,7 +263,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             output = %run.output_dir.display(),
             "rendering camera poses"
         );
-        app.add_plugins(ShotsPlugin { run });
+        app.add_plugins((
+            crate::capture_frame::CaptureFramePlugin,
+            ShotsPlugin { run },
+        ));
     }
     let exit = app.run();
     drop(app);
@@ -283,6 +288,18 @@ fn finished(exit: &AppExit) -> Result<()> {
     }
 }
 
+/// Reset accidental visibility changes before Bevy applies Window changes in Last.
+/// The primary window starts hidden, so screenshot rendering needs no visible flash.
+fn keep_windows_hidden(config: Res<EngineConfig>, mut windows: Query<&mut Window>) {
+    if config.hidden_window {
+        for mut window in &mut windows {
+            if window.visible {
+                window.visible = false;
+            }
+        }
+    }
+}
+
 /// Bevy's per-frame render-asset byte budget, seeded from the run's option.
 ///
 /// Textures and meshes over the budget wait for a later frame instead of being
@@ -295,6 +312,20 @@ fn upload_budget(config: &EngineConfig) -> RenderAssetBytesPerFrame {
     RenderAssetBytesPerFrame {
         max_bytes: config.max_upload_bytes_per_frame(),
     }
+}
+
+/// Direct database reads and Bevy's file reader must use the same absolute root.
+fn asset_plugin(config: &mut EngineConfig) -> Result<AssetPlugin> {
+    config.assets_dir = std::path::absolute(&config.assets_dir).wrap_err_with(|| {
+        format!(
+            "cannot resolve asset directory {}",
+            config.assets_dir.display()
+        )
+    })?;
+    Ok(AssetPlugin {
+        file_path: config.assets_dir.to_string_lossy().into_owned(),
+        ..default()
+    })
 }
 
 /// Matches LAND's sampler for shared repeating images before either loader caches them.
@@ -310,10 +341,15 @@ fn world_gltf_plugin() -> bevy::gltf::GltfPlugin {
 /// shot's worldspace and grid square are where streaming starts, so the first view does not wait
 /// for cells around a start the file never looks at.
 fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
-    let Some(path) = config.shots.clone() else {
+    let Some(path) = config
+        .shots
+        .clone()
+        .or_else(|| config.matched_route.clone())
+    else {
         return Ok(None);
     };
-    let other_mode = config.benchmark_only
+    let other_mode = (config.shots.is_some() && config.matched_route.is_some())
+        || config.benchmark_only
         || config.benchmark_frames.is_some()
         || config.benchmark_duration_secs.is_some()
         || config.acceptance_screenshot.is_some()
@@ -333,7 +369,12 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         // The logger is not installed yet, so a `warn!` here would never be seen.
         eprintln!("warning: --shots photographs the window, so --headless is ignored");
     }
-    let file = ShotsFile::load(&path)?;
+    let (file, checkpoints) = if config.matched_route.is_some() {
+        let (file, checkpoints) = crate::matched_route::MatchedRoute::load(&path)?.expand()?;
+        (file, Some(checkpoints))
+    } else {
+        (ShotsFile::load(&path)?, None)
+    };
     if let Some((worldspace_id, grid)) = file.start() {
         if let Some(worldspace_id) = worldspace_id {
             config.worldspace_id = worldspace_id;
@@ -344,7 +385,9 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         .shots_out
         .clone()
         .unwrap_or_else(|| default_output_dir(&path));
-    Ok(Some(ShotsRun::new(file, output_dir, config.worldspace_id)))
+    let mut run = ShotsRun::new(file, output_dir, config.worldspace_id);
+    run.route_checkpoints = checkpoints;
+    Ok(Some(run))
 }
 
 fn validate_fixture_selection(config: &EngineConfig) -> Result<()> {
@@ -460,9 +503,10 @@ fn check_existing_io_pool(requested: usize, threads: usize, existing: Option<usi
              first, or use 0 to keep the existing pool"
         );
     }
-    warn!(
-        threads,
-        existing, "the asset IO pool already exists with a different thread count; keeping it"
+    // `run` checks the pool before installing LogPlugin, so report directly to stderr.
+    eprintln!(
+        "warning: the asset IO pool already exists with {existing} threads; \
+         automatic sizing selected {threads}; keeping the existing pool"
     );
     Ok(())
 }
@@ -1975,9 +2019,13 @@ fn setup_world(
     commands.insert_resource(DirectionalLightShadowMap {
         size: SUN_SHADOW_MAP_SIZE,
     });
+    // The sun and ambient are the clear weather's own (`WTHR` 0x81A, day), at the relative level
+    // Skyrim's sunlight scale gives them (`crate::lights::AMBIENT_ILLUMINANCE`).
+    let weather_lighting = crate::sky::WeatherLighting::default();
     commands.spawn((
         DirectionalLight {
-            illuminance: 12_000.0,
+            color: weather_lighting.sunlight,
+            illuminance: crate::lights::SUN_ILLUMINANCE,
             shadow_maps_enabled: true,
             ..default()
         },
@@ -1986,7 +2034,7 @@ fn setup_world(
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.48, 0.55, 0.7),
+        color: weather_lighting.mean_ambient(),
         // The one definition of the ambient this world path applies: the converted lights are
         // scaled against it (`crate::lights`).
         brightness: crate::lights::AMBIENT_ILLUMINANCE,
@@ -2091,7 +2139,11 @@ fn fly_camera(
 ) {
     // Interactive player paths own the camera; automated camera paths keep legacy controls. A
     // shots run poses the camera itself, and a key press must not move a pose.
-    if config.physics_fixture || config.interactive_world_physics() || config.shots.is_some() {
+    if config.physics_fixture
+        || config.interactive_world_physics()
+        || config.shots.is_some()
+        || config.matched_route.is_some()
+    {
         return;
     }
     let started = std::time::Instant::now();
@@ -2238,6 +2290,99 @@ mod tests {
     use bevy::window::{PrimaryWindow, Window};
     use bevy::world_serialization::WorldSerializationPlugin;
     use std::time::Duration;
+
+    /// A capture window remains hidden if an update system tries to show it.
+    #[test]
+    fn hidden_capture_suppresses_visibility_changes_before_window_sync() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            hidden_window: true,
+            ..default()
+        })
+        .add_systems(PostUpdate, keep_windows_hidden);
+        let entity = app
+            .world_mut()
+            .spawn(Window {
+                visible: true,
+                ..default()
+            })
+            .id();
+        app.update();
+        assert!(!app.world().get::<Window>(entity).unwrap().visible);
+        app.world_mut().resource_mut::<EngineConfig>().hidden_window = false;
+        app.world_mut().get_mut::<Window>(entity).unwrap().visible = true;
+        app.update();
+        assert!(app.world().get::<Window>(entity).unwrap().visible);
+    }
+
+    #[test]
+    fn relative_asset_root_is_shared_by_database_and_streamed_files() {
+        use bevy::asset::io::{AssetReader, Reader, file::FileAssetReader};
+
+        // Keep the process CWD and environment intact so this can run alongside other tests.
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(&cwd).unwrap();
+        let mut config = EngineConfig {
+            assets_dir: directory.path().strip_prefix(&cwd).unwrap().to_owned(),
+            ..default()
+        };
+        let plugin = asset_plugin(&mut config).unwrap();
+        assert!(config.assets_dir.is_absolute());
+        assert_eq!(config.assets_dir, directory.path());
+
+        let database_path = config.assets_dir.join("skyrim_world.db");
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE fixture (value TEXT); INSERT INTO fixture VALUES ('same root');",
+            )
+            .unwrap();
+        fs::create_dir(config.assets_dir.join("meshes")).unwrap();
+        fs::write(config.assets_dir.join("meshes/model.glb"), b"model").unwrap();
+        fs::create_dir(config.assets_dir.join("textures")).unwrap();
+        fs::write(config.assets_dir.join("textures/image.png"), b"image").unwrap();
+
+        let reader = FileAssetReader::new(plugin.file_path);
+        assert_eq!(reader.root_path(), &config.assets_dir);
+        bevy::tasks::block_on(async {
+            for (path, expected) in [
+                ("meshes/model.glb", b"model".as_slice()),
+                ("textures/image.png", b"image".as_slice()),
+            ] {
+                let mut file = reader.read(Path::new(path)).await.unwrap();
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes, expected);
+            }
+        });
+        let database =
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let value: String = database
+            .query_row("SELECT value FROM fixture", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "same root");
+    }
+
+    #[test]
+    fn asset_root_resolution_allows_missing_directories_and_preserves_absolute_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let absolute = directory.path().join("not-created");
+        let mut config = EngineConfig {
+            assets_dir: absolute.clone(),
+            ..default()
+        };
+        let plugin = asset_plugin(&mut config).unwrap();
+        assert_eq!(config.assets_dir, absolute);
+        assert_eq!(PathBuf::from(plugin.file_path), absolute);
+        assert!(!absolute.exists());
+
+        config.assets_dir = EngineConfig::default().assets_dir;
+        asset_plugin(&mut config).unwrap();
+        assert_eq!(
+            config.assets_dir,
+            std::env::current_dir().unwrap().join("modern_assets")
+        );
+    }
 
     #[test]
     fn an_existing_io_pool_of_another_size_is_an_error_only_for_an_explicit_request() {
