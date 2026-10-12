@@ -1986,9 +1986,13 @@ fn setup_world(
     commands.insert_resource(DirectionalLightShadowMap {
         size: SUN_SHADOW_MAP_SIZE,
     });
+    // The sun and ambient are the clear weather's own (`WTHR` 0x81A, day), at the relative level
+    // Skyrim's sunlight scale gives them (`crate::lights::AMBIENT_ILLUMINANCE`).
+    let weather_lighting = crate::sky::WeatherLighting::default();
     commands.spawn((
         DirectionalLight {
-            illuminance: 12_000.0,
+            color: weather_lighting.sunlight,
+            illuminance: crate::lights::SUN_ILLUMINANCE,
             shadow_maps_enabled: true,
             ..default()
         },
@@ -1997,7 +2001,7 @@ fn setup_world(
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.48, 0.55, 0.7),
+        color: weather_lighting.mean_ambient(),
         // The one definition of the ambient this world path applies: the converted lights are
         // scaled against it (`crate::lights`).
         brightness: crate::lights::AMBIENT_ILLUMINANCE,

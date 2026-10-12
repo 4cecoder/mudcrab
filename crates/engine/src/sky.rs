@@ -130,6 +130,72 @@ pub fn dome_mask(elevation_degrees: f32) -> DomeMaskRow {
     last
 }
 
+/// What one weather lights the world with at one time of day: the sun's colour and the six-axis
+/// ambient cube of the weather's `DALC` record.
+///
+/// Weather colours are 8-bit sRGB values. Bevy has one ambient colour per view rather than an
+/// ambient cube, so [`WeatherLighting::mean_ambient`] folds the cube to its linear mean.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub struct WeatherLighting {
+    /// `NAM0`'s Sunlight colour.
+    pub sunlight: Color,
+    /// `DALC`'s six faces in stored order: +X, -X, +Y, -Y, +Z, -Z (the converter schema's
+    /// `positive_x` ... `negative_z`).
+    ///
+    /// The labels name the stored slot, not the direction a face lights. The recovered ambient
+    /// arithmetic (`docs/research/skyrim-environment-preparation-20261009.md`, "Six-face ambient
+    /// matrix") is `ambient(N) = (Xminus - Xplus)/2 * N.x + (Yminus - Yplus)/2 * N.y +
+    /// (Zminus - Zplus)/2 * N.z + mean`, so a stored positive face lights the opposite normal: the
+    /// bright sixth face, "Z-", is what an upward normal reads. The record agrees - at sunset the
+    /// sixth carries the sunset tint (146,132,131) while the fifth stays a neutral grey (80,83,90).
+    pub ambient_cube: [Color; 6],
+}
+
+impl WeatherLighting {
+    /// `SkyrimClear` (`WTHR` 0x0000081A, as left by Update.esm), day column: `NAM0` Sunlight
+    /// 190,181,171 and `DALC` row 2 of 4 (sunrise, day, sunset, night).
+    pub const SKYRIM_CLEAR_DAY: Self = Self {
+        sunlight: Color::srgb_u8(190, 181, 171),
+        ambient_cube: [
+            Color::srgb_u8(108, 146, 164),
+            Color::srgb_u8(94, 134, 142),
+            Color::srgb_u8(101, 145, 154),
+            Color::srgb_u8(100, 135, 155),
+            Color::srgb_u8(77, 129, 136),
+            Color::srgb_u8(191, 214, 221),
+        ],
+    };
+
+    /// The ambient a surface with this normal reads, in linear light, with the normal in engine
+    /// coordinates (`Creation(x, y, z) -> engine(x, z, -y)`).
+    ///
+    /// This is the recovered affine form with the unresolved global term `G` taken as zero; see
+    /// [`WeatherLighting::ambient_cube`]. The native arithmetic runs on 8-bit values without an
+    /// sRGB decode; the faces are decoded here because the engine composes in linear light.
+    pub fn ambient_toward(&self, normal: Vec3) -> LinearRgba {
+        let [x_plus, x_minus, y_plus, y_minus, z_plus, z_minus] =
+            self.ambient_cube.map(|face| face.to_linear());
+        let mean = (x_plus + x_minus + y_plus + y_minus + z_plus + z_minus) * (1.0 / 6.0);
+        let dx = (x_minus - x_plus) * 0.5;
+        let dy = (y_minus - y_plus) * 0.5;
+        let dz = (z_minus - z_plus) * 0.5;
+        // Creation (x, y, z) is engine (x, z, -y): the engine's up axis reads Creation's Z.
+        mean + dx * normal.x + dz * normal.y - dy * normal.z
+    }
+
+    /// The ambient colour Bevy's single ambient takes: what a normal-less surface reads, which is
+    /// the mean of the six faces. Bevy has one ambient colour per view, not a cube.
+    pub fn mean_ambient(&self) -> Color {
+        Color::LinearRgba(self.ambient_toward(Vec3::ZERO))
+    }
+}
+
+impl Default for WeatherLighting {
+    fn default() -> Self {
+        Self::SKYRIM_CLEAR_DAY
+    }
+}
+
 /// The colours one weather gives the sky at one time of day.
 #[derive(Resource, Debug, Clone, Copy, PartialEq)]
 pub struct SkyPalette {
@@ -882,6 +948,36 @@ mod tests {
         assert_eq!(
             materials.get(&handle).unwrap().sky,
             SkyUniform::new(&dimmer)
+        );
+    }
+
+    /// `SkyrimClear`'s day ambient, read from the record: its mean in linear light, about
+    /// (0.186, 0.324, 0.377), and its sky-facing face the brightest of the six.
+    #[test]
+    fn clear_day_ambient_is_the_mean_of_the_records_six_faces() {
+        let lighting = WeatherLighting::SKYRIM_CLEAR_DAY;
+        let mean = lighting.mean_ambient().to_linear();
+        for (channel, expected) in [(mean.red, 0.186), (mean.green, 0.324), (mean.blue, 0.377)] {
+            assert!(
+                (channel - expected).abs() < 0.005,
+                "mean ambient channel {channel}, expected about {expected}"
+            );
+        }
+        let up = lighting.ambient_toward(Vec3::Y);
+        let down = lighting.ambient_toward(Vec3::NEG_Y);
+        assert!(
+            up.green > down.green * 1.5,
+            "an upward normal reads the sky-facing face: up {up:?}, down {down:?}"
+        );
+    }
+
+    /// The sunlight is the record's warm white, not pure white: it is what tints sunlit surfaces.
+    #[test]
+    fn clear_day_sunlight_is_the_records_warm_white() {
+        let sun = WeatherLighting::default().sunlight.to_srgba();
+        assert_eq!(
+            [sun.red, sun.green, sun.blue].map(|c| (c * 255.0).round() as u8),
+            [190, 181, 171]
         );
     }
 
