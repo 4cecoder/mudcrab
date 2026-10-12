@@ -1,15 +1,11 @@
-// Post-tonemap cinematic grade: the brightness, contrast and tint of the weather's
-// image space (IMGS CNAM/TNAM). Vanilla's ISHDRTonemapBlendCinematic applies these
-// on display-range values after its tone curve: tint toward the tinted luminance,
-// then brightness/contrast around the adapted luminance (here the fixed
-// CINEMATIC_PIVOT until auto-exposure metering feeds it).
-//
-// Bevy's intermediate target at this point still holds linear values (the sRGB
-// write conversion happens at the output), so the shader converts to display
-// range, grades there, and converts back. Grading in linear range crushes most
-// shadow values to black with these record values. Saturation is not here:
-// Bevy applies it inside the tonemapping pass (post_saturation), immediately
-// before this pass, as vanilla applies it first.
+// Experimental clear-day grade using reported IMGS CNAM/TNAM values.
+// Bevy post_saturation runs first in linear RGB. This pass converts linear
+// post-tonemap RGB to sRGB, mixes toward tinted luminance, applies brightness
+// and contrast around an artistic pivot, then converts back to linear RGB.
+// The sRGB domain preserves the approved appearance; retail shader slot mapping,
+// adapted pivot, tone curve and final transfer remain unverified.
+// Negative input and out-of-gamut results are clipped. Alpha passes unchanged;
+// retail bloom-feed and alpha grading are not reproduced here.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 

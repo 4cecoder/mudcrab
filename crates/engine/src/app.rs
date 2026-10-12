@@ -11,7 +11,7 @@ use crate::{
         WaterReflectionTexture, terrain_layer_sampler,
     },
     renderer_init::RendererInitPlugin,
-    shots::{ShotsFile, ShotsPlugin, ShotsRun, default_output_dir},
+    shots::{ShotOutputImage, ShotsFile, ShotsPlugin, ShotsRun, default_output_dir},
     sky::{FogCamera, SkyCamera, SkyPlugin},
     streaming::{
         AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, StreamingWorld,
@@ -135,8 +135,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let window = (!config.headless || shots_active || config.hidden_window).then(|| Window {
         title: config.window_title(),
         visible: !config.hidden_window,
-        // A shots file's frame is the size its reference screenshots were taken at, so the window,
-        // and every PNG taken of it, is exactly that many pixels.
+        // Start the window at the reference size; shots use an independent exact-size image target.
         resolution: match &shots {
             Some(run) => run.file.window_resolution(),
             None => (1600, 900).into(),
@@ -171,7 +170,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         app.insert_resource(WinitSettings::continuous());
     }
     let render_asset_budget = upload_budget(&config);
-    app.insert_resource(config)
+    app.insert_resource(config.color_grade)
+        .insert_resource(config)
         .insert_resource(origin)
         .insert_resource(render_asset_budget)
         .init_resource::<StreamingMetrics>()
@@ -369,7 +369,7 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
     );
     if config.headless {
         // The logger is not installed yet, so a `warn!` here would never be seen.
-        eprintln!("warning: --shots photographs the window, so --headless is ignored");
+        eprintln!("warning: --shots requires the render loop, so --headless is ignored");
     }
     let (file, checkpoints) = if config.matched_route.is_some() {
         let (file, checkpoints) = crate::matched_route::MatchedRoute::load(&path)?.expand()?;
@@ -389,6 +389,7 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         .unwrap_or_else(|| default_output_dir(&path));
     let mut run = ShotsRun::new(file, output_dir, config.worldspace_id);
     run.route_checkpoints = checkpoints;
+    run.settle_timeout_seconds = config.shots_settle_timeout;
     Ok(Some(run))
 }
 
@@ -1979,6 +1980,7 @@ fn camera_offset(config: &EngineConfig) -> Vec3 {
 
 fn setup_world(
     mut commands: Commands,
+    shot_output: Option<Res<ShotOutputImage>>,
     config: Res<EngineConfig>,
     ground_height: Option<Res<InitialCameraGroundHeight>>,
     tuning: Option<Res<MovementTuning>>,
@@ -1999,7 +2001,7 @@ fn setup_world(
     } else {
         Transform::from_translation(camera_position).looking_at(target, Vec3::Y)
     };
-    commands.spawn((
+    let mut camera = commands.spawn((
         Camera3d::default(),
         crate::color_pipeline::SceneColorPipeline::default(),
         Projection::Perspective(PerspectiveProjection { far, ..default() }),
@@ -2014,6 +2016,12 @@ fn setup_world(
         OcclusionCulling,
         RenderLayers::from_layers(MAIN_VIEW_LAYERS),
     ));
+    if let Some(output) = shot_output {
+        camera.insert((
+            bevy::camera::RenderTarget::Image(output.0.clone().into()),
+            bevy::camera::ShadowLodOrigin,
+        ));
+    }
     // The sun's shadows. `shadow_maps_enabled` was never the missing piece - the cascades were:
     // without a configuration of its own the sun gets Bevy's, which reaches 150 metres of a world
     // whose unit is 1.43 cm, and a shadow map spent on that patch is a world lit flat
@@ -3414,6 +3422,25 @@ mod tests {
                 "the streaming camera must render layer {layer}"
             );
         }
+    }
+
+    #[test]
+    fn shots_camera_uses_capture_image_and_drives_shadow_lod() {
+        let mut app = App::new();
+        let output = Handle::<Image>::default();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(ShotOutputImage(output.clone()))
+            .add_systems(Startup, setup_world);
+        app.update();
+        let mut query = app.world_mut().query_filtered::<(
+            &bevy::camera::RenderTarget,
+            Has<bevy::camera::ShadowLodOrigin>,
+        ), With<StreamingCamera>>();
+        let (target, shadow_origin) = query.single(app.world()).unwrap();
+        assert!(
+            matches!(target, bevy::camera::RenderTarget::Image(image) if image.handle == output)
+        );
+        assert!(shadow_origin);
     }
 
     #[test]

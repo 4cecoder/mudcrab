@@ -1,4 +1,4 @@
-use crate::{skyrim_ini::SkyrimIni, world::components::CELL_SIZE};
+use crate::{color_pipeline::SceneGradeMode, skyrim_ini::SkyrimIni, world::components::CELL_SIZE};
 use bevy::prelude::Resource;
 use shared::lod::LodTier;
 use std::{fmt, path::PathBuf};
@@ -90,6 +90,8 @@ pub struct EngineConfig {
     pub headless: bool,
     /// Keep a renderable window hidden for automated screenshot capture.
     pub hidden_window: bool,
+    /// Select the cinematic A/B experiment without changing scene lighting.
+    pub color_grade: SceneGradeMode,
     pub benchmark_only: bool,
     pub benchmark_frames: Option<u32>,
     pub benchmark_duration_secs: Option<f64>,
@@ -124,6 +126,8 @@ pub struct EngineConfig {
     /// `--shots-out <dir>`: where the PNGs and `shots.log` go. `None` is
     /// [`crate::shots::default_output_dir`], a `<file stem>-shots/` folder beside the shots file.
     pub shots_out: Option<PathBuf>,
+    /// Maximum settling time per shot, in seconds.
+    pub shots_settle_timeout: f32,
     pub diagnostic_asset_fallbacks: bool,
     pub material_fixture: bool,
     pub terrain_water_fixture: bool,
@@ -166,6 +170,7 @@ impl Default for EngineConfig {
             max_upload_mib_per_frame: 16,
             headless: false,
             hidden_window: false,
+            color_grade: SceneGradeMode::Full,
             benchmark_only: false,
             benchmark_frames: None,
             benchmark_duration_secs: None,
@@ -190,6 +195,7 @@ impl Default for EngineConfig {
             shots: None,
             matched_route: None,
             shots_out: None,
+            shots_settle_timeout: crate::shots::SETTLE_TIMEOUT_SECONDS,
             diagnostic_asset_fallbacks: false,
             material_fixture: false,
             terrain_water_fixture: false,
@@ -250,7 +256,9 @@ Benchmark and profiling:
   --acceptance-screenshot <file>        write a screenshot when the run ends
   --screenshot-camera-offset <x,y,z>    camera offset for the acceptance screenshot
   --matched-route <file>                execute exact route steps with transition and settled checkpoints
+  --color-grade <off|saturation|full>    select color grading for matched shots (default: full)
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
+  --shots-settle-timeout <seconds>      maximum settling time per shot (default: 30, maximum: 600)
   --shots-out <dir>                     where the shots' PNGs and shots.log go (default: beside the shots file)
   --profile-output <dir>                profile bundle directory (default: no bundle)
   --profile-scenario <name>             scenario name recorded in the profile (default: adhoc)
@@ -705,8 +713,33 @@ impl EngineConfig {
                         args.next(),
                     )?);
                 }
+                "--color-grade" => {
+                    let raw = take_raw("--color-grade", "off, saturation or full", args.next())?;
+                    config.color_grade = SceneGradeMode::parse(&raw).ok_or_else(|| {
+                        ConfigError::invalid_value(
+                            "--color-grade",
+                            Some(raw),
+                            "off, saturation or full",
+                        )
+                    })?;
+                }
                 "--shots" => {
                     config.shots = Some(take_value("--shots", "a shots file path", args.next())?);
+                }
+                "--shots-settle-timeout" => {
+                    const EXPECTED: &str = "a positive number of seconds up to 600";
+                    let raw = take_raw("--shots-settle-timeout", EXPECTED, args.next())?;
+                    config.shots_settle_timeout = raw
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|value| value.is_finite() && *value > 0.0 && *value <= 600.0)
+                        .ok_or_else(|| {
+                            ConfigError::invalid_value(
+                                "--shots-settle-timeout",
+                                Some(raw),
+                                EXPECTED,
+                            )
+                        })?;
                 }
                 "--shots-out" => {
                     config.shots_out = Some(take_value(
@@ -1029,6 +1062,28 @@ mod tests {
         assert!(line.ends_with(&format!("(default: {default})")), "{line}");
     }
 
+    #[test]
+    fn parses_color_grade_and_rejects_unknown_modes() {
+        for (value, wanted) in [
+            ("off", SceneGradeMode::Off),
+            ("saturation", SceneGradeMode::Saturation),
+            ("FULL", SceneGradeMode::Full),
+        ] {
+            assert_eq!(run_config(&["--color-grade", value]).color_grade, wanted);
+        }
+        assert_eq!(EngineConfig::default().color_grade, SceneGradeMode::Full);
+        assert!(
+            parse_error(&["--color-grade", "bad"])
+                .to_string()
+                .contains("off, saturation or full")
+        );
+        assert!(
+            parse_error(&["--color-grade"])
+                .to_string()
+                .contains("--color-grade")
+        );
+    }
+
     /// Hidden capture selects rendering without enabling interactive mouse ownership.
     #[test]
     fn parses_hidden_window_capture_mode() {
@@ -1225,6 +1280,22 @@ mod tests {
                 .window_title()
                 .contains("matched-route")
         );
+    }
+
+    #[test]
+    fn shots_settle_timeout_is_finite_positive_and_bounded() {
+        assert_eq!(run_config(&[]).shots_settle_timeout, 30.0);
+        assert_eq!(
+            run_config(&["--shots-settle-timeout", "120"]).shots_settle_timeout,
+            120.0
+        );
+        for value in ["0", "-1", "NaN", "inf", "601"] {
+            assert!(
+                parse_error(&["--shots-settle-timeout", value])
+                    .to_string()
+                    .contains("--shots-settle-timeout")
+            );
+        }
     }
 
     /// A shots path left out does not swallow the next option, and it is an error rather than a
