@@ -68,3 +68,26 @@ claim references, retained artifact hashes and current workspace anchors. This
 checks papertrail coherence; it does not validate native semantics or visual
 matching. Source drift must be reported or checked against the named historical
 checkpoint; refreshing an index does not refresh evidence interpretations.
+
+## Third-party source publication
+
+The 35 whole-file third-party snapshots formerly under N003's `sources-*`
+directories have been removed. The [source publication manifest](source-publication.json)
+records each former path, pinned upstream URL, commit, SHA-256 and byte count.
+Inspect those upstream revisions to follow source citations; do not restore
+copies into this repository. The existing fetch receipts, research findings and
+claim attribution remain preserved.
+
+Historical `copy`, `snapshot_path` and `local_path` fields, corpus receipts,
+line anchors and viewer references describe the research checkpoint before
+publication cleanup. They are provenance records, not promises of bundled
+source files. Their hashes have not been rewritten to disguise removal.
+The source publication manifest maps those former paths to external sources.
+
+`python3 scripts/check-distance-fog-spec.py` remains the standalone analytical
+check for this documentation branch. The render-map and research-notes checkers
+still require the documented implementation/private checkpoint evidence; the
+latter may also report removed local source anchors. Those failures remain
+visible and do not establish native semantics or retail parity. A full historical
+validation requires separately obtained, hash-matched evidence outside this
+published snapshot.
