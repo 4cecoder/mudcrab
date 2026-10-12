@@ -1735,6 +1735,72 @@ mod tests {
     }
 
     #[test]
+    fn v174_exported_enable_parent_ignores_xesp_padding() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut master = HashMap::new();
+        let mut expected = Vec::new();
+        let parent = 0x1234_5678u32;
+        let mut id = 0x1000;
+        for record_type in [*b"REFR", *b"ACHR", *b"ACRE", *b"PGRE", *b"PMIS"] {
+            for flags in [0u8, 1, 2, 3, 0x80, 0xFF] {
+                for padding in [[0; 3], [0x0D, 0xBF, 0x38]] {
+                    let mut record = reference(id, 0x100, 0x900, [0.0; 3], [0.0; 3]);
+                    record.record_type = record_type;
+                    let mut xesp = parent.to_le_bytes().to_vec();
+                    xesp.push(flags);
+                    xesp.extend_from_slice(&padding);
+                    record.subrecords.push((b"XESP".to_vec(), xesp));
+                    master.insert(id, record);
+                    expected.push((id, Some(parent), Some(u32::from(flags))));
+                    id += 1;
+                }
+            }
+        }
+        // Missing and incomplete enable-parent subrecords have no projection.
+        master.insert(id, reference(id, 0x100, 0x900, [0.0; 3], [0.0; 3]));
+        expected.push((id, None, None));
+        id += 1;
+        for length in 0..8 {
+            let mut record = reference(id, 0x100, 0x900, [0.0; 3], [0.0; 3]);
+            record
+                .subrecords
+                .push((b"XESP".to_vec(), vec![0xFF; length]));
+            master.insert(id, record);
+            expected.push((id, None, None));
+            id += 1;
+        }
+
+        export_to_db(&conn, &master).unwrap();
+
+        for (id, parent, flags) in expected {
+            let actual: (Option<u32>, Option<u32>, Vec<u8>) = conn
+                .query_row(
+                    "SELECT enable_parent_id, enable_parent_flags, data FROM \"references\" WHERE id=?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!((actual.0, actual.1), (parent, flags), "reference {id:08X}");
+            let raw =
+                rkyv::from_bytes::<crate::esm::types::ArchivedRecordData, rkyv::rancor::Error>(
+                    &actual.2,
+                )
+                .unwrap();
+            let stored = raw.subrecords.iter().find(|sub| &sub.tag == b"XESP");
+            let original = master[&id]
+                .subrecords
+                .iter()
+                .find(|(tag, _)| tag == b"XESP");
+            assert_eq!(
+                stored.map(|sub| &sub.data),
+                original.map(|(_, data)| data),
+                "raw XESP for reference {id:08X}"
+            );
+        }
+    }
+
+    #[test]
     fn stores_a_reference_radius_override_from_xrds() {
         let conn = Connection::open_in_memory().unwrap();
         create_tables(&conn).unwrap();
