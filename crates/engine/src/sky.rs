@@ -11,9 +11,9 @@
 //! alpha-blended with no depth write, which also keeps it out of the depth prepass. The camera's
 //! clear colour is the weather's Fog Far colour, which fills the dome's transparent band.
 //!
-//! The same Fog Far colour is the colour of the distance fog every world camera carries, fitted
-//! to the weather's `FNAM` fog distances, so terrain fades into the band the dome leaves open at
-//! the horizon.
+//! The distance fog every world camera carries is fitted to the weather's `FNAM` fog
+//! distances and its Fog Near-to-Far colour lerp, converging on the Fog Far colour, so terrain
+//! fades into the band the dome leaves open at the horizon.
 
 use crate::world::database::CellKey;
 use bevy::{
@@ -202,6 +202,8 @@ pub struct SkyPalette {
     pub upper: Color,
     pub lower: Color,
     pub horizon: Color,
+    /// `NAM0`'s Fog Near colour: the colour vanilla's fog starts from at the camera.
+    pub fog_near: Color,
     pub fog_far: Color,
     /// Linear scale on the dome and clear colour, for calibrating the sky against lit surfaces.
     pub brightness: f32,
@@ -215,6 +217,7 @@ impl SkyPalette {
         upper: Color::srgb_u8(21, 77, 117),
         lower: Color::srgb_u8(60, 135, 183),
         horizon: Color::srgb_u8(125, 163, 183),
+        fog_near: Color::srgb_u8(35, 98, 124),
         fog_far: Color::srgb_u8(116, 168, 203),
         brightness: 1.0,
     };
@@ -224,6 +227,21 @@ impl SkyPalette {
     pub fn dome_colour(&self, elevation_degrees: f32) -> Srgba {
         let mask = dome_mask(elevation_degrees);
         mix_row(self, mask)
+    }
+
+    /// The fog colour vanilla uses at this fog amount: Fog Near lerped to Fog Far by the
+    /// amount, mixed over the sRGB-encoded colours as vanilla mixes its 8-bit values.
+    pub fn fog_colour(&self, amount: f32) -> Srgba {
+        let near = self.fog_near.to_srgba();
+        let far = self.fog_far.to_srgba();
+        let amount = amount.clamp(0.0, 1.0);
+        let lerp = |a: f32, b: f32| a + (b - a) * amount;
+        Srgba::new(
+            lerp(near.red, far.red),
+            lerp(near.green, far.green),
+            lerp(near.blue, far.blue),
+            1.0,
+        )
     }
 
     /// The colour the camera clears to: Fog Far outside, black inside an interior cell.
@@ -284,7 +302,8 @@ impl CameraSpace {
 /// `t = clamp((d - near) / (far - near), 0, 1)`, and its fog colour is the Near-to-Far colour
 /// lerp taken at that amount. The amount caps at `max` instead of reaching 1, and it follows a
 /// power of the distance rather than an exponential, so the engine fits Bevy's
-/// [`FogFalloff::Exponential`] to the curve as well as one number allows.
+/// [`FogFalloff::Atmospheric`] to the curve: one extinction density for the fade, and one
+/// inscattering density per channel for the near-to-far colour lerp.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VanillaFog {
     pub near: f32,
@@ -332,23 +351,37 @@ pub const SKYRIM_CLEAR_FOG: VanillaFog = VanillaFog {
 /// loaded.
 pub const FOG_DENSITY: f32 = 6.2e-5;
 
-/// The distance fog for one weather: vanilla's fitted density in the Fog Far colour.
+/// Inscattering density of the engine's distance fog, per channel in inverse world units:
+/// the least-squares fit of `max * FogFar * (1 - exp(-b * d))` to vanilla's added light,
+/// `amount * lerp(Fog Near, Fog Far, amount)`, over 0 to 120_000 units. Vanilla darkens its
+/// near fog colour by lerping toward Fog Far as the amount grows, so one density per channel
+/// carries most of that lerp into Bevy's single-colour atmospheric fog: the red channel,
+/// which vanilla keeps darkest longest, gets the thinnest density. Per-channel RMSE against
+/// vanilla's added light drops from 0.038/0.056/0.081 (one Fog Far colour at `FOG_DENSITY`)
+/// to 0.009/0.018/0.026.
+pub const FOG_INSCATTERING: Vec3 = Vec3::new(2.07e-5, 2.90e-5, 3.00e-5);
+
+/// The distance fog for one weather: vanilla's fitted extinction and per-channel
+/// inscattering, converging on the Fog Far colour.
 pub fn fog_for(palette: &SkyPalette) -> DistanceFog {
     // The fog colour is the clear colour - the Fog Far colour the dome's transparent band lets
-    // through - carrying vanilla's maximum fog strength as its alpha, because Bevy multiplies the
-    // falloff by the fog colour's alpha. The camera's own clear colour stays opaque. Vanilla lerps
-    // Fog Near to Fog Far by the fog amount and Bevy's fog has no such lerp, so the far colour is
-    // the one the fog takes throughout.
+    // through - carrying vanilla's maximum fog strength as its alpha, because Bevy multiplies
+    // both transmittances by the fog colour's alpha. The camera's own clear colour stays
+    // opaque. Vanilla lerps Fog Near to Fog Far by the fog amount and Bevy's fog has no such
+    // lerp, so the lerp rides on the per-channel inscattering instead (see
+    // [`FOG_INSCATTERING`]); at full strength the inscattered light converges on Fog Far,
+    // which is also the colour fogged terrain fades into, so the horizon seam stays closed.
     let color = palette
         .clear_colour(CameraSpace::Exterior)
         .with_alpha(SKYRIM_CLEAR_FOG.max);
     DistanceFog {
         color,
-        // The sun's glow in the fog needs a sun in the sky. Until there is one, the fog is the
-        // plain Fog Far colour in every direction.
-        directional_light_color: color,
-        falloff: FogFalloff::Exponential {
-            density: FOG_DENSITY,
+        // The sun's glow in the fog needs a sun in the sky. Until there is one, no directional
+        // term: the fog takes the same colour in every direction.
+        directional_light_color: Color::NONE,
+        falloff: FogFalloff::Atmospheric {
+            extinction: Vec3::splat(FOG_DENSITY),
+            inscattering: FOG_INSCATTERING,
         },
         ..default()
     }
@@ -620,13 +653,15 @@ fn same_fog(current: &DistanceFog, wanted: &DistanceFog) -> bool {
     }
     match (&current.falloff, &wanted.falloff) {
         (
-            FogFalloff::Exponential {
-                density: current_density,
+            FogFalloff::Atmospheric {
+                extinction: current_extinction,
+                inscattering: current_inscattering,
             },
-            FogFalloff::Exponential {
-                density: wanted_density,
+            FogFalloff::Atmospheric {
+                extinction: wanted_extinction,
+                inscattering: wanted_inscattering,
             },
-        ) => current_density == wanted_density,
+        ) => current_extinction == wanted_extinction && current_inscattering == wanted_inscattering,
         _ => false,
     }
 }
@@ -712,6 +747,7 @@ mod tests {
         assert_eq!(palette.upper, Color::srgb_u8(21, 77, 117));
         assert_eq!(palette.lower, Color::srgb_u8(60, 135, 183));
         assert_eq!(palette.horizon, Color::srgb_u8(125, 163, 183));
+        assert_eq!(palette.fog_near, Color::srgb_u8(35, 98, 124));
         assert_eq!(palette.fog_far, Color::srgb_u8(116, 168, 203));
         assert_eq!(palette.brightness, 1.0);
         assert_eq!(SkyPalette::default(), palette);
@@ -1066,6 +1102,38 @@ mod tests {
     }
 
     #[test]
+    fn the_inscattered_fog_light_tracks_vanillas_near_to_far_lerp() {
+        // Vanilla adds `amount * lerp(Fog Near, Fog Far, amount)` of light; the engine adds
+        // `max * Fog Far * (1 - exp(-inscattering * d))` per channel. The old single-colour
+        // fog added Fog Far at the extinction rate, overshooting vanilla's added light by up
+        // to 0.08 per channel at these distances; the per-channel fit stays within 0.035.
+        let palette = SkyPalette::SKYRIM_CLEAR_DAY;
+        let far = palette.fog_far.to_linear();
+        let densities = [FOG_INSCATTERING.x, FOG_INSCATTERING.y, FOG_INSCATTERING.z];
+        for distance in [2_048.0, 4_096.0, 8_192.0, 16_384.0, 32_768.0, 65_536.0] {
+            let amount = SKYRIM_CLEAR_FOG.amount(distance);
+            let vanilla = Color::Srgba(palette.fog_colour(amount)).to_linear();
+            let vanilla = [
+                amount * vanilla.red,
+                amount * vanilla.green,
+                amount * vanilla.blue,
+            ];
+            let fog_far = [far.red, far.green, far.blue];
+            for channel in 0..3 {
+                let engine = SKYRIM_CLEAR_FOG.max
+                    * fog_far[channel]
+                    * (1.0 - (-densities[channel] * distance).exp());
+                assert!(
+                    (engine - vanilla[channel]).abs() <= 0.035,
+                    "channel {channel} at {distance} units: engine adds {engine}, \
+                     vanilla adds {}",
+                    vanilla[channel]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn fog_cameras_get_the_weathers_fog_and_lose_it_inside() {
         let mut app = sky_app();
         let palette = SkyPalette::SKYRIM_CLEAR_DAY;
@@ -1094,10 +1162,16 @@ mod tests {
             SKYRIM_CLEAR_FOG.max,
             "the fog colour's alpha is the cap vanilla puts on its fog"
         );
-        assert_eq!(fog.directional_light_color, fog.color);
+        assert_eq!(fog.directional_light_color, Color::NONE);
         match &fog.falloff {
-            FogFalloff::Exponential { density } => assert_relative(*density, FOG_DENSITY),
-            other => panic!("expected an exponential falloff, got {other:?}"),
+            FogFalloff::Atmospheric {
+                extinction,
+                inscattering,
+            } => {
+                assert_eq!(*extinction, Vec3::splat(FOG_DENSITY));
+                assert_eq!(*inscattering, FOG_INSCATTERING);
+            }
+            other => panic!("expected an atmospheric falloff, got {other:?}"),
         }
         assert!(app.world().get::<DistanceFog>(unfogged).is_none());
 

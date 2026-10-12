@@ -43,10 +43,11 @@ display transform. See [L1 color pipeline](color-pipeline.md) for domains, tests
 parity gaps. Existing encoded weather mixing and fog equations remain provisional pending retail
 comparison; the output correction does not validate those assumptions.
 
-- **Colours.** `SkyPalette` holds Sky-Upper, Sky-Lower, Horizon and Fog Far, plus a linear
-  brightness scale. The built-in palette is `SkyrimClear`'s day column (Upper 21,77,117;
-  Lower 60,135,183; Horizon 125,163,183; Fog Far 116,168,203, 8-bit sRGB). The table above is
-  `DOME_MASKS`. Both are plain constants so that weather records can replace them later.
+- **Colours.** `SkyPalette` holds Sky-Upper, Sky-Lower, Horizon, Fog Near and Fog Far, plus a
+  linear brightness scale. The built-in palette is `SkyrimClear`'s day column (Upper 21,77,117;
+  Lower 60,135,183; Horizon 125,163,183; Fog Near 35,98,124; Fog Far 116,168,203, 8-bit sRGB).
+  The table above is `DOME_MASKS`. Both are plain constants so that weather records can replace
+  them later.
 - **Gradient.** The CPU mixes each table row into a colour (in sRGB, as vanilla mixes the 8-bit
   values) and uploads the 16 rows. The fragment shader takes the elevation of the view ray,
   interpolates between rows, converts to linear and scales by the brightness.
@@ -71,16 +72,23 @@ comparison; the output correction does not validate those assumptions.
   `Power` 0.4, `Max` 0.85: a 0.4-power curve that reaches its full strength of 0.85 at 53,289 units
   and stays there. Its night column is the same curve over 40,000 units.
 - **The fit.** Bevy's distance fog is an exponential falloff, with neither a power of distance nor a
-  cap, so `VanillaFog` holds the four vanilla numbers and `FOG_DENSITY` is the least-squares fit of
-  `1 - exp(-density * d)` to vanilla's curve over 0 to 120,000 units: 6.2e-5, with an RMSE of 0.034.
-  The fit runs thin close in and thick far out - 0.10 against vanilla's 0.23 at 2,048 units, 0.54
-  against 0.53 at 16,384 units, 0.74 against 0.70 at the default camera's far plane. Vanilla stops
-  at `Max` and an exponential does not, so the cap rides on the fog colour's alpha: Bevy multiplies
-  the falloff by that alpha, which is `Max`, 0.85.
-- **Colour.** The fog colour is the same linear Fog Far colour the camera clears to, so fogged
-  terrain, the dome's transparent band and the clear colour meet at the horizon without a step. Fog
-  Near is not mixed in - Bevy's fog has no near-to-far colour lerp - and the sun's glow inside the
-  fog is left out until the sky has a sun, so the fog is one colour in every direction. The clear
+  cap, so `VanillaFog` holds the four vanilla numbers and the engine fits Bevy's atmospheric
+  falloff to vanilla in two parts. `FOG_DENSITY` is the extinction density: the least-squares fit
+  of `1 - exp(-density * d)` to vanilla's amount curve over 0 to 120,000 units, 6.2e-5 with an
+  RMSE of 0.034. The fit runs thin close in and thick far out - 0.10 against vanilla's 0.23 at
+  2,048 units, 0.54 against 0.53 at 16,384 units, 0.74 against 0.70 at the default camera's far
+  plane. Vanilla stops at `Max` and an exponential does not, so the cap rides on the fog colour's
+  alpha: Bevy multiplies both transmittances by that alpha, which is `Max`, 0.85.
+- **Colour.** Bevy's fog takes one colour and has no near-to-far lerp, so the lerp rides on the
+  inscattering instead: `FOG_INSCATTERING` fits `Max * Fog Far * (1 - exp(-b * d))` per channel
+  to vanilla's added light, `amount * lerp(Fog Near, Fog Far, amount)`, over the same range -
+  2.07e-5, 2.90e-5, 3.00e-5 for red, green, blue. Using Fog Far alone at the extinction rate
+  overshot vanilla's added light by up to 1.6x (worst in blue, which is why the haze read too
+  intense); the per-channel fit cuts the added-light RMSE from 0.038/0.056/0.081 to
+  0.009/0.018/0.026. The fog colour itself is still the linear Fog Far colour the camera clears
+  to, so at full strength fogged terrain, the dome's transparent band and the clear colour meet
+  at the horizon without a step. The sun's glow inside the fog is left out until the sky has a
+  sun, so the directional term is off and the fog takes one colour in every direction. The clear
   colour itself stays opaque while the fog colour carries `Max`.
 - **Which cameras.** Every camera marked `FogCamera`: the streaming world camera and the material,
   terrain/water, transform-bounds and renderer fixture cameras. Bevy applies `DistanceFog` to
