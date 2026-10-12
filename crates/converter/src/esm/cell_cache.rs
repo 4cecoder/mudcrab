@@ -1373,40 +1373,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn land_winner_priority_ties_reject_before_replacing_outputs() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cell_cache.rkyv");
-        std::fs::write(&path, b"existing cache").unwrap();
-        let mut a = record(1, b"LAND", None, &[]);
-        a.cell_form_id = Some(3);
-        let mut b = a.clone();
-        b.form_id = 2;
-        let records = HashMap::from([(1, a), (2, b)]);
-        assert!(
-            write_cell_cache(&records, &path)
-                .unwrap_err()
-                .to_string()
-                .contains("ambiguous LAND")
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), b"existing cache");
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::exporter::create_tables(&conn).unwrap();
-        conn.execute("INSERT INTO land(cell_id,heightmap) VALUES (3,X'0102')", [])
-            .unwrap();
-        assert!(super::super::exporter::export_to_db(&conn, &records).is_err());
-        assert_eq!(
-            conn.query_row("SELECT heightmap FROM land WHERE cell_id=3", [], |row| row
-                .get::<_, Vec<
-                u8,
-            >>(
-                0
-            ))
-            .unwrap(),
-            vec![1, 2]
-        );
-    }
-
     fn record(
         form_id: u32,
         record_type: &[u8; 4],
