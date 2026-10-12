@@ -507,6 +507,10 @@ $visualTemplate = [ordered]@{
         [ordered]@{ scenario = "stability"; status = "pending"; notes = "stable memory and lifecycle during the full-duration traversal" }
     )
 }
+if ($resolvedAssets -and $IncludeDenseLegacy) {
+    # Required by $expectedScenarios above, so the template must carry it or a reviewer cannot sign off.
+    $visualTemplate.checkpoints = @($visualTemplate.checkpoints) + [ordered]@{ scenario = "dense-legacy"; status = "pending"; notes = "the old dense place ($DenseLegacyGridX,$DenseLegacyGridY): dense references, materials, shadows" }
+}
 Write-JsonFile $visualTemplate (Join-Path $campaign "visual-review-template.json")
 $visualResult = [ordered]@{ supplied = $false; passed = $false; reviewer = $null; reviewed_at = $null; signature = $null; checkpoints = @() }
 if ($VisualReview) {
