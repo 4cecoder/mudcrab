@@ -1002,7 +1002,7 @@ dependencies = [
  "image 0.25.10",
  "ktx2",
  "rectangle-pack",
- "ruzstd",
+ "ruzstd 0.8.3",
  "serde",
  "thiserror 2.0.18",
  "tracing",
@@ -2362,7 +2362,7 @@ dependencies = [
  "rayon",
  "rkyv",
  "rusqlite",
- "ruzstd",
+ "ruzstd 0.9.1",
  "serde",
  "serde_json",
  "sha2",
@@ -6158,6 +6158,15 @@ name = "ruzstd"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
 dependencies = [
  "twox-hash",
 ]
