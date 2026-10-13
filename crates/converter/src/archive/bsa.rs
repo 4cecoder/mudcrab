@@ -429,11 +429,12 @@ mod tests {
                     dummy_content::Entry::new("textures/x/y.dds", b"b"),
                     dummy_content::Entry::new("sound/fx/hit.wav", b"c"),
                     dummy_content::Entry::new("a/ab.kf", b"d"),
+                    dummy_content::Entry::new("sound/fx/voice.adp", b"e"),
                 ],
                 compression,
             )
             .unwrap();
-            assert_eq!(iter_raw_entries(&bytes).unwrap().len(), 4);
+            assert_eq!(iter_raw_entries(&bytes).unwrap().len(), 5);
         }
     }
 
