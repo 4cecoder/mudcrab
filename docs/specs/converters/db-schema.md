@@ -295,6 +295,20 @@ enable flags, navmesh triangles and activation delays) are preserved. Unlisted f
 not an assurance that all FormIDs in arbitrary Skyrim or mod subrecords have
 been resolved.
 
+GRAS, LTEX, TXST, LAND, CELL and WRLD records validate every FormID the same
+way, but an invalid one is never kept as zero: a single-FormID field (such as
+`LTEX.GNAM`, `CELL.XCWT` or `WRLD.NAM2`) is removed, an unresolvable
+`GRAS.MODS` alternate texture or `LAND.VTEX` entry is removed from its list, and
+a `LAND` `BTXT` or `ATXT` layer is removed (an `ATXT` together with its `VTXT`
+weights), since a null texture would draw the default one. Malformed `MODS`,
+`BTXT`/`ATXT` that are not 8 bytes and `VTEX` that is not a multiple of 4 bytes
+are dropped the same way. These count in the same per-plugin warning. A record
+of these kinds whose own FormID, parent cell or parent worldspace is
+unresolvable is left out of the merge. Records whose payload cannot be
+decompressed or whose subrecord stream is malformed are also left out whole.
+Left-out records are counted in a second per-plugin warning with the first
+reason (Mudcrab #182).
+
 Existing packs must be converted again to obtain these corrected links. This
 does not change the schema-4 table or blob layout, so the database and asset
 cache versions are unchanged. Every pipeline run, including resume, rebuilds
