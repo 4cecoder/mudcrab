@@ -776,6 +776,66 @@ mod tests {
         assert!(!quadrant_uses_default(&cell(vec![layer(1, true, 0.0)]), 0));
     }
 
+    fn texture_database() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets (id INTEGER PRIMARY KEY, diffuse_path TEXT);
+                 CREATE TABLE landscape_textures (id INTEGER PRIMARY KEY, texture_set_id INTEGER);
+                 INSERT INTO texture_sets VALUES (1, 'textures/landscape/grass.dds');
+                 INSERT INTO landscape_textures VALUES (2, 1);",
+            )
+            .unwrap();
+        connection
+    }
+
+    #[test]
+    fn the_default_texture_is_extracted_loaded_and_hashed_when_a_quadrant_needs_it() {
+        let connection = texture_database();
+        let default_path = default_diffuse_path().unwrap();
+        assert!(
+            terrain_diffuse_paths(&connection)
+                .unwrap()
+                .contains(&PathBuf::from(&default_path)),
+            "the conversion extracts the default even though no LTEX names it"
+        );
+
+        let vfs = tempfile::tempdir().unwrap();
+        let spec = dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 64, 64)
+            .with_mip_levels(7);
+        let bytes =
+            dummy_content::dds::generate(&spec, &mut dummy_content::rng::Rng::new(1)).unwrap();
+        let file = vfs.path().join(&default_path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, &bytes).unwrap();
+
+        let needs_default = cell(vec![layer(0, true, 0.0)]);
+        let loaded = TerrainTextures::load(&connection, vfs.path(), &[needs_default]).unwrap();
+        assert!(loaded.textures.contains_key(&DEFAULT_TEXTURE_KEY));
+        assert_eq!(loaded.source_hashes[&default_path], hash_bytes(&bytes));
+
+        // A cell whose quadrants all name a texture never reads the default, so a data set
+        // without it still loads.
+        let mut covered = cell(Vec::new());
+        covered.layers = (0..4)
+            .map(|quadrant| TerrainLayer {
+                quadrant,
+                ..layer(2, true, 0.0)
+            })
+            .collect();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir_all(vfs.path().join("textures/landscape")).unwrap();
+        std::fs::write(vfs.path().join("textures/landscape/grass.dds"), &bytes).unwrap();
+        let loaded = TerrainTextures::load(&connection, vfs.path(), &[covered]).unwrap();
+        assert!(!loaded.textures.contains_key(&DEFAULT_TEXTURE_KEY));
+
+        // And a quadrant that needs it with the file missing fails naming the file.
+        let error = TerrainTextures::load(&connection, vfs.path(), &[cell(Vec::new())])
+            .err()
+            .expect("a missing default texture is an error");
+        assert!(format!("{error:#}").contains("dirt02.dds"), "{error:#}");
+    }
+
     #[test]
     fn lod_v9_rejects_invalid_layer_inputs() {
         let mut source = cell(vec![layer(1, true, 0.0), layer(2, false, 0.5)]);
