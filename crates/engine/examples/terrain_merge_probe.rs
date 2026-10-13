@@ -2,10 +2,12 @@
 //! blend and lighting maths predict. --output DIR.
 //!
 //! The probe builds two cells by hand: one with 8 slots per quadrant and one with 16, so both
-//! vertex layouts and both shader specialisations run, through the colour pass and the depth
-//! prepass. The textures are small solid-colour texture arrays in two classes, plus a normal
-//! class, so the class switch, the lookup table, the implied base weight and the cross-class blend
-//! are all exercised. Three more merged cells test lighting under the sun: a lit grey cell, seen
+//! vertex layouts and both shader specialisations run through the colour pass. The merged
+//! material stays out of the depth prepass (`MergedTerrainExtension::enable_prepass`), so the
+//! prepass is not exercised for merged cells; only the plain reference quads use it. The
+//! textures are small solid-colour texture arrays in two classes, plus a normal class, so the
+//! class switch, the lookup table, the implied base weight and the cross-class blend are all
+//! exercised. Three more merged cells test lighting under the sun: a lit grey cell, seen
 //! from the front and turned over, and an `unlit` twin that must read its albedo exactly. No
 //! converted data is read.
 use bevy::{
