@@ -1,6 +1,7 @@
 use crate::{
     config::EngineConfig,
     fingerprint::{RunFingerprint, records_measurements},
+    frame_budget::{FrameBudgetReport, FrameSides, ScoredFrame, attribute},
     pacing::{PacingReport, PacingTracker},
     profiling::{
         CpuReport, GpuPassReport, MemoryReport, MetricSummary, ProfilingState,
@@ -8,6 +9,7 @@ use crate::{
     },
     render::RendererMetrics,
     render_timing::{PipelineActivity, RenderTimingPlugin, RenderTimings},
+    route::{RouteReport, RouteRunner},
     streaming::StreamingMetrics,
 };
 use bevy::{
@@ -45,7 +47,9 @@ impl Plugin for AcceptanceMetricsPlugin {
             ))
             .add_systems(
                 Last,
-                collect_and_finish.after(crate::render_timing::end_main_world),
+                (record_frame_ledger, collect_and_finish)
+                    .chain()
+                    .after(crate::render_timing::end_main_world),
             );
         let measures_pacing = app
             .world()
@@ -118,6 +122,43 @@ struct BenchmarkSamples {
     measurement_complete: bool,
     screenshot_wait_started: Option<std::time::Instant>,
     finished: bool,
+    /// The frame-time distribution against the budget, scored frame by frame.
+    ledger: FrameLedger,
+    /// The route reached its last waypoint: the measured window ends with this frame.
+    route_finished: bool,
+}
+
+/// What the frame-budget section of the report is built from: every scored frame with its owner.
+///
+/// It keeps its own frame count, which advances in step with `BenchmarkSamples::frames_seen`
+/// (both count the frames of a benchmark run from the first, and stop together), so the same frames
+/// are warm-up for both.
+#[derive(Default)]
+struct FrameLedger {
+    frames_seen: u32,
+    /// The streaming commit counters as of the previous frame, to find what this frame added.
+    last_commit: Option<(u64, u64)>,
+    /// The commit time of the previous frame's cycle, which is the cycle the current frame time
+    /// measures.
+    previous_upload_ms: Option<f64>,
+    scored: Vec<ScoredFrame>,
+}
+
+impl FrameLedger {
+    /// The streaming commit time of the frame that just ran, in milliseconds: zero on a frame that
+    /// committed nothing. The counters only grow, so the first frame, which has nothing to compare
+    /// with, counts as zero.
+    fn commit_ms(&mut self, metrics: &StreamingMetrics) -> f64 {
+        let now = (metrics.commit_frames, metrics.total_frame_commit_micros);
+        let added = match self.last_commit {
+            Some((frames, micros)) if now.0 > frames => {
+                now.1.saturating_sub(micros) as f64 / 1000.0
+            }
+            _ => 0.0,
+        };
+        self.last_commit = Some(now);
+        added
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -152,6 +193,12 @@ struct BenchmarkReport {
     /// sit at the top level of the report and are absent for a run with no streaming.
     #[serde(flatten)]
     pacing: Option<PacingReport>,
+    /// The frame-time distribution against `--frame-budget-ms` (6.25 ms unless given), the frames
+    /// over it, and who owned them (see `frame_budget`). Present in every benchmark report. The
+    /// frames scored are the measured window's, or, for a route run, the route's.
+    frame_budget: FrameBudgetReport,
+    /// What the `--route` run was and how far it got (see `route`); `null` without a route.
+    route: Option<RouteReport>,
     /// What the run ran on: machine, renderer, world data, and the settings it rendered with (see
     /// `fingerprint`). `null` only for a run that recorded measurements without installing the
     /// fingerprint.
@@ -193,7 +240,9 @@ struct Thresholds {
 
 #[allow(clippy::too_many_arguments)]
 fn collect_and_finish(
-    time: Res<Time>,
+    // Real wall-clock deltas: Bevy's virtual `Time` clamps a frame to 250 ms (`Time<Virtual>`'s
+    // default max delta), so a 340 ms hitch would be recorded as 250 ms.
+    time: Res<Time<Real>>,
     config: Res<EngineConfig>,
     diagnostics: Res<DiagnosticsStore>,
     system: Option<Res<SystemInfo>>,
@@ -203,8 +252,8 @@ fn collect_and_finish(
     pacing: Option<Res<PacingTracker>>,
     fingerprint: Option<Res<RunFingerprint>>,
     render_measurement_probe: Option<Res<RenderMeasurementProbe>>,
-    meshes: Res<Assets<Mesh>>,
-    images: Res<Assets<Image>>,
+    route: Option<Res<RouteRunner>>,
+    (meshes, images): (Res<Assets<Mesh>>, Res<Assets<Image>>),
     mut samples: ResMut<BenchmarkSamples>,
     mut profiler: ResMut<ProfilingState>,
     mut exit: MessageWriter<AppExit>,
@@ -253,7 +302,9 @@ fn collect_and_finish(
         let duration_reached = config
             .benchmark_duration_secs
             .is_some_and(|limit| samples.frame_ms.iter().sum::<f64>() / 1000.0 >= limit);
-        if !frame_limit_reached && !duration_reached {
+        // A route ends the window when it reaches its last waypoint, so the report covers the route
+        // and not the standing around after it.
+        if !frame_limit_reached && !duration_reached && !samples.route_finished {
             return;
         }
         samples.measurement_complete = true;
@@ -358,8 +409,17 @@ fn collect_and_finish(
         core_count: value.core_count.clone(),
         memory: value.memory.clone(),
     });
+    let frame_budget = FrameBudgetReport::from_frames(
+        config.frame_budget_ms,
+        if route.is_some() {
+            "route window: the frames from the first full frame on the route to the end of the measured window"
+        } else {
+            "measured window: every frame after the warm-up"
+        },
+        &samples.ledger.scored,
+    );
     let report = BenchmarkReport {
-        format_version: 10,
+        format_version: 11,
         generated_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
@@ -406,6 +466,8 @@ fn collect_and_finish(
         render_world,
         render_pipelines,
         pacing: pacing_report,
+        frame_budget,
+        route: route.as_deref().map(RouteRunner::report),
         fingerprint: fingerprint.as_deref().cloned(),
         gpu_passes,
         scene,
@@ -490,6 +552,69 @@ fn collect_and_finish(
     } else {
         AppExit::error()
     });
+}
+
+/// Scores the frame that just ended: its real-clock duration and the side that owned it (see
+/// `frame_budget`). Runs just before [`collect_and_finish`] and follows it frame for frame, so the
+/// frames scored are the frames the report measures; for a route run only the frames on the route
+/// count, and the route's arrival is passed on as the end of the window.
+///
+/// The duration is the time from the start of the previous main frame to the start of this one, so
+/// the sides that explain it are the previous cycle's: its main schedule and commit time, and the
+/// render and extract time that ran in it (`RenderTimings::take_previous_cycle`).
+fn record_frame_ledger(
+    config: Res<EngineConfig>,
+    real_time: Res<Time<Real>>,
+    render_timings: Res<RenderTimings>,
+    streaming: Option<Res<StreamingMetrics>>,
+    route: Option<Res<RouteRunner>>,
+    mut samples: ResMut<BenchmarkSamples>,
+) {
+    if samples.finished || samples.measurement_complete || !config.is_benchmark_run() {
+        return;
+    }
+    let samples = &mut *samples;
+    if route.as_deref().is_some_and(RouteRunner::finished) {
+        samples.route_finished = true;
+    }
+    let ledger = &mut samples.ledger;
+    ledger.frames_seen = ledger.frames_seen.saturating_add(1);
+    let commit_ms = streaming
+        .as_deref()
+        .map(|metrics| ledger.commit_ms(metrics));
+    // Taken on every frame, warm-up included, so the records of frames nobody scores do not pile up.
+    let cycle = render_timings.take_previous_cycle();
+    let scored = frame_is_scored(
+        ledger.frames_seen,
+        config.benchmark_warmup_frames,
+        route.as_deref().map(RouteRunner::scoring),
+    );
+    let milliseconds = real_time.delta_secs_f64() * 1000.0;
+    if scored && milliseconds.is_finite() && milliseconds > 0.0 {
+        let cycle = cycle.unwrap_or_default();
+        let sides = FrameSides::from_samples(
+            cycle.main_ms,
+            cycle.extract_ms,
+            cycle.render_ms,
+            cycle.acquire_ms,
+            ledger.previous_upload_ms,
+        );
+        ledger.scored.push(ScoredFrame {
+            ms: milliseconds,
+            owner: attribute(milliseconds, &sides),
+            wait_ms: cycle.wait_ms,
+        });
+    }
+    ledger.previous_upload_ms = commit_ms;
+}
+
+/// Whether a frame belongs to the frame budget's window. A run with no route scores the frames
+/// after the warm-up, as the rest of the report does. A route run scores the route's own frames
+/// and nothing else: the route's start (waiting for the world, or none at all) is what opens the
+/// window, so the warm-up frames are not trimmed on top of it, which would drop the first frames
+/// of a route that starts at once.
+fn frame_is_scored(frames_seen: u32, warmup_frames: u32, on_route: Option<bool>) -> bool {
+    on_route.unwrap_or(frames_seen > warmup_frames)
 }
 
 fn memory_settle_seconds(config: &EngineConfig) -> f64 {
@@ -807,6 +932,21 @@ mod tests {
         .unwrap();
         assert_eq!(value["world_ready_reached"], serde_json::json!(true));
         assert_eq!(value["frames"], serde_json::json!(3));
+    }
+
+    /// A route run scores from the route's start, with no warm-up trimmed: a route that starts on
+    /// the first frame loses none of its frames. Without a route the warm-up is dropped.
+    #[test]
+    fn route_runs_score_from_the_route_start_without_a_warmup_trim() {
+        // No route: frames 1..=60 are warm-up, 61 is the first scored.
+        assert!(!frame_is_scored(60, 60, None));
+        assert!(frame_is_scored(61, 60, None));
+        // A route that has not started, or is on its first frame, scores nothing, whatever the
+        // frame number.
+        assert!(!frame_is_scored(500, 60, Some(false)));
+        // A route scoring on frame 3 (it started on frame 2) is scored inside the warm-up.
+        assert!(frame_is_scored(3, 60, Some(true)));
+        assert!(frame_is_scored(500, 60, Some(true)));
     }
 
     #[test]
