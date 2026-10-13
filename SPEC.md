@@ -234,6 +234,8 @@ V178: Terrain performance converter commands validated by converter parse_comman
 
 V210: CI ! dispatch software Vulkan UASTC encoder, decode synthetic color/alpha/normal/mip/partial-block cases with CPU comparison; absent adapter fails explicit run; production CPU-adapter rejection retained.
 
+V190: Record-aware remap ! exact faction SNAM length 8; rank/padding unchanged; WRLD RNAM coordinates & TNAM strings unchanged; consumed single links remap under relocated full/light slots.
+
 ## §T TASKS
 
 id|status|task|cites
@@ -284,6 +286,8 @@ T70|x|Remove redundant atlas compression; fuse diffuse decode/tier resizing; sha
 T71|~|Isolate GPU-default terrain encoding from archive/cache integration; preserve legacy/CPU selection, authored mips & safe non-reusable fallback; focused converter/launcher/CLI checks & three native Metal correctness fixtures; quiet-host performance remains separate|V175,V176,V177,V178,V210
 
 T110|x|Exercise actual GPU batch/dispatch/readback with software Vulkan in CI|V210
+
+T90|x|Fix faction remap & reject aliased non-FormID fields; independent full/light field regressions|V190
 
 ## §B BUGS
 
@@ -380,3 +384,4 @@ B210|2026-10-05|GPU tests validated shader/container without dispatching encoder
 B211|2026-10-05|New GPU fixture used constant chunks_exact under Rust1.98 strict Clippy|use as_chunks::<4>(); mechanical lint fix, V210 unchanged
 
 B212|2026-10-05|Package-only ignored GPU step changed feature unification & rebuilt after workspace tests; cold combined CI exceeded30min|V210,V118; same workspace/target selection for both test steps
+B190|2026-10-05|Four-byte global guard skipped NPC faction structures; WRLD RNAM/TNAM mistaken for links|V190
