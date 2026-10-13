@@ -35,7 +35,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 $script:repository = Split-Path -Parent $PSScriptRoot
 # The report format this script reads back. The engine writes it into every benchmark report; a
 # `frame-metrics.json` left by another build is not accepted as this invocation's report.
-$script:benchmarkReportFormatVersion = 10
+$script:benchmarkReportFormatVersion = 11
 
 function Get-ProfilingRepository {
     return $script:repository

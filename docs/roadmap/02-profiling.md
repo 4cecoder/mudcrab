@@ -41,7 +41,7 @@ per-frame sampling for any of them.
 
 ### Fingerprint
 
-`fingerprint` appears in the benchmark report (report `format_version` 10) and in the bundle's
+`fingerprint` appears in the benchmark report (report `format_version` 11) and in the bundle's
 `metadata.json` (format version 2):
 
 - `commit`, `dirty_worktree` — the `--profile-commit` / `--profile-dirty-worktree` values.
@@ -186,7 +186,7 @@ retains the complete bundles as CI artifacts.
 
 These measurements show where world-loading time goes; they change nothing about what the engine
 loads or in what order. They are fields of the benchmark report (`--benchmark-output`, report
-`format_version` 10) and spans and events in the profiling bundle. They are installed only when the
+`format_version` 11) and spans and events in the profiling bundle. They are installed only when the
 run measures pacing (`EngineConfig::measures_pacing`: a benchmark run, or a jump target with no
 frame limit); an ordinary play session adds none of the marker schedules, asset-arrival counts or
 window scans.
@@ -231,9 +231,10 @@ window scans.
   blocking on its upscaling pipeline, 150 ms and more) with the hitches that matter, those while cells
   load during play. Two windows separate them, each as `{ frames, p99_ms, worst_ms, over_33ms,
   over_50ms }` (warm-up frames included; `null` for a window
-  with no frames). These two windows take their frame deltas from the real (wall) clock, not the
-  virtual `Time` the report's own `frame_ms_*` use: Bevy clamps the virtual delta to 250 ms by
-  default, so a one-second hitch would read as 250 ms, while the real delta is unclamped. A frame's
+  with no frames). These two windows take their frame deltas from the real (wall) clock, as the
+  report's own `frame_ms_*` now do (they read Bevy's virtual `Time` before the route work): Bevy
+  clamps the virtual delta to 250 ms by default, so a one-second hitch would read as 250 ms, while
+  the real delta is unclamped. A frame's
   delta is the interval that ended at that frame, so a window's first
   entry covers the work that led up to the frame that opened it. `frames_after_ready` covers every
   frame after the first world-ready latch, so startup is excluded; in a jump run it covers the jump's
@@ -280,7 +281,7 @@ cargo run --release -p engine -- --assets D:\SkyrimConverted --grid-x 0 --grid-y
   --benchmark-output target/pacing-fly.json --run-label pacing-fly
 ```
 
-## Scene counts and CPU time in the report (format version 10)
+## Scene counts and CPU time in the report (format version 11)
 
 The benchmark report (`acceptance.json`, and the same value as the bundle's `frame-metrics.json`)
 carries two more sections, and every field in them is `null` plus a reason rather than a zero when
@@ -350,15 +351,18 @@ windows and the expected duration before starting, and reuses `phase2-profile.ps
 definitions and engine invocation (that file is dot-sourced with `-AsLibrary`, so the two commands
 cannot drift apart).
 
-- **Windows.** Every scenario gets a standing-still window. A scenario that moves — `stress` and
+- **Windows.** The route scenarios `travel` and `check` get one window, the moving one. Every
+  other scenario gets a standing-still window. A scenario that moves — `stress` and
   `stability`, which fly the camera — gets a second, streaming window: the same scene once with the
   camera left in place and once as the scenario defines it. That is how steady frames and streaming
   frames are reported separately; nothing in the engine's CLI measures both in one run. Every
   engine run is labelled `--run-label "baseline <scenario> <n>/<repeats>"`, and the streaming
   window adds `streaming`.
-- **Scenarios.** The default set is `synthetic`, `rural`, `dense`, `water`, `stress`. `stability`
-  is left out because it is a 30-minute soak, not a baseline; `-Scenarios all` includes it, and
-  `-Scenarios` takes any of the names `phase2-profile.ps1` knows. Without `-Assets` the bare
+- **Scenarios.** The default set is `synthetic`, `rural`, `dense`, `water`, `stress`, plus `travel`
+  when `-Assets` is given (see "Travelling and the frame budget" below). `stability` is left out
+  because it is a 30-minute soak, not a baseline, and `check` because it is the held-out route;
+  `-Scenarios all` includes both, and `-Scenarios` takes any of the names `phase2-profile.ps1` knows
+  and the two route scenarios `travel` and `check`. Without `-Assets` the bare
   default runs `synthetic` only, the one scene that needs no converted data, because the default is
   a convenience rather than a request. An explicit request is not narrowed that way: naming a world
   scenario without `-Assets` fails, and `-Scenarios all` without `-Assets` fails with that reason
@@ -446,6 +450,101 @@ cannot drift apart).
 - **CI.** Nothing here runs in CI: the `performance` job is converter-side and has no GPU, and only
   the manual self-hosted runner can run even the synthetic scene. A baseline is a local,
   same-machine measurement.
+
+## Travelling and the frame budget
+
+**The goal.** The portal demo should hold 160 frames per second (6.25 ms a frame) while the player
+travels. A mean or a p95 cannot show that: one 40 ms hitch every few seconds hides in both. The
+baseline therefore measures a moving scene and reports the frame-time distribution against a budget.
+
+**The pass bar (proposed).** At least 99.9% of the frames of a travel window are within the budget
+(6.25 ms) and no frame is over twice the budget (12.5 ms). `--frame-budget-ms` changes the budget
+(default 6.25); the report says whether the window met the bar (`meets_pass_bar`) for whatever budget
+it was given. The bar is a proposal, not a decision.
+
+**The routes.** `--route <file>` makes the camera follow a route file (`scripts/routes/`): waypoints in
+Skyrim world units, a speed in units per second (Skyrim running is about 400), an eye height above
+the terrain (default 120), optionally `"loop": true` (the last leg returns to the first waypoint).
+The camera moves along straight legs at that speed, faces the direction of travel, and stays the
+eye height above the terrain. The terrain height is read from the converted height field of the
+cells along the route before the run, so following the ground costs nothing while measuring; a
+frame with no terrain under the camera keeps the previous height and is counted in the report's
+`route.route_frames_without_ground`. (It is the height field the terrain mesh is built from, and
+not a physics ray: a benchmark run builds no terrain colliders, and adding them would change what is
+measured.) The route starts when the world is first ready, so the walk is not the cold load of the
+start cell (`"start": "immediately"` skips the wait); from then on the runner never waits for
+loading, never slows down and hides nothing. The route ends the benchmark window when its last
+waypoint is reached, so the report covers the route, and the distance travelled follows the real
+clock, so a hitch costs the camera its distance. Frame times are scored from the first full frame on the
+route (the benchmark's warm-up frames are not trimmed on top of that). The engine knows no route: the files are data, and `-Scenarios travel` or `check` only names a
+file.
+
+- `scripts/routes/travel.json` (`-Scenarios travel`): about 23,800 units at 400 units per second, a
+  minute, from the start of the Riverwood road in grid 4,-12 north-east over the hills towards
+  Whiterun, across 8 cell borders (9 cells). Its waypoints come from the world database's terrain
+  and water heights: every point is above its cell's water level, and the route avoids a river bed
+  that the straight line along the road would cross.
+- `scripts/routes/check.json` (`-Scenarios check`): a different place of about the same length, the
+  farmland around Rorikstead in the west (grid -13,-10 north to -14,-5, 6 cell borders). **It is the
+  held-out check route: nobody tunes against it.** It is run and reported next to `travel`, and it is
+  never used to choose a setting, a threshold or a budget; if a change improves `travel` and worsens
+  `check`, that is the finding. Its waypoints change only if the converted data changes under them.
+
+**The report.** Every benchmark report (report format 11; the new fields are additive) carries
+`frame_budget` for the measured window (a route run: the route's frames) and `route` (`null` without
+a route). Every frame time in the report is a real-clock delta: this branch changed the older
+`frame_ms_*` fields (with `average_fps` and the duration limit) from Bevy's virtual clock, which
+clamps a frame at 250 ms, to the real clock, and the two differ only for frames longer than 250 ms.
+A route run uses two windows: the older `frame_ms_*` fields cover every frame after the benchmark
+warm-up, which includes the wait for the world to become ready before the route starts, while
+`frame_budget` covers the route's own frames from the first full frame on it (the report names that
+window in `frame_budget.scope`). The two therefore differ by the warm-up and by that wait. A route
+that ends before the warm-up has passed leaves the `frame_ms_*` fields at zero (no frames measured)
+while `frame_budget` is filled. `frame_budget` has: `budget_ms`,
+`frames`, `window_seconds`, `p50_ms`,
+`p99_ms`, `p99_9_ms` (nearest rank: the smallest frame time with at least that share of frames at or
+below it; the older `frame_ms_p99` takes the higher of the two ranks around `(n - 1) * 0.99`, so the
+two can differ by one rank), `worst_ms`, `frames_over_budget`, `share_within_budget`,
+`over_budget_per_minute`, `frames_over_double_budget`, `meets_pass_bar`, and
+`over_budget_owners`, the frames over the budget by owner. `baseline.json` and `baseline.md` carry
+the same numbers as median/min/max over the repeats; the owner counts are per run, and
+`runs_meeting_pass_bar` counts the repeats that met the bar. `baseline.json` stays at format 3: the
+new fields are additive, and `scenario_inputs` gains a `route` entry (file name and SHA-256 of the
+file) that is `null` for every other scenario, so older baselines still compare. `-FrameBudgetMs`
+passes `--frame-budget-ms` to every window.
+
+**Who owned an over-budget frame.** A frame time is the time from the start of one main-thread frame
+to the start of the next, and with pipelined rendering (the Bevy default) the main thread runs frame
+`n + 1` while the render thread renders frame `n`, then waits for it, so a frame is roughly the
+larger of the two sides plus the extract. The engine keeps one small record per main-thread frame
+(`render_timing::CycleSides`) with the main schedule, the extract, the render schedule and the
+swapchain wait that ran in that cycle, and files the render frame under the cycle it ran in (the
+next one when pipelined). The owner is the side with the largest time in the frame's cycle:
+
+| Owner | What it is |
+|---|---|
+| `main_world` | the main thread: the main schedule plus the extract, less the streaming commit |
+| `upload` | the streaming commit time of the frame (`streaming/frame_commit`), measured on the main thread, only on frames that committed a cell or LOD chunk |
+| `render_thread` | the render schedule's CPU time, less the swapchain wait |
+| `gpu` | the render thread's wait for a swapchain image (`render/swapchain_acquire`), where a GPU-bound or presentation-bound frame shows up on the CPU |
+| `unknown` | no owner can be named: the cycle has no main-thread or render-thread record (the first measured frame, a run with no renderer), or no side reaches half of the frame (for example main-thread work and streaming upload each under half) |
+
+Ties go to the first in that order. The limits are real. `gpu` is a lower bound: a render thread that
+blocks in submit or present rather than in the swapchain acquire is counted as `render_thread`,
+because those waits are not split out of `render/graph_and_present`. GPU pass timestamps
+(`gpu_passes`) are not used for a per-frame owner: Bevy publishes them from a readback that arrives
+a frame or more late with no frame number on it, so matching one to a frame would be a guess, and
+the report does not guess. `upload` covers the streaming commit only; the renderer's own asset
+preparation is on the render thread. The owner counts of a window sum to its `frames_over_budget`,
+and `unknown` is counted, not hidden.
+
+`over_budget_main_thread_wait` is a diagnostic beside the owners, not an owner: for the frames over
+the budget that have the measurement (pipelined rendering only), the median and the largest time the
+main thread waited for the render thread to hand the render world back
+(`render_timing`'s `wait_for_render_thread`, filed under the main frame that waited), and how many
+frames it covers. A frame owned by `render_thread` with a large wait is a busy render thread holding
+the main thread; the same owner with a small wait means the main thread was not blocked on it. It is
+`null` when no over-budget frame has the measurement.
 
 ## Interpretation
 
