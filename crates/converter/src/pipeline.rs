@@ -2984,8 +2984,9 @@ async fn compile_lod_chunks_with_cancel(
                     *refusals.entry(reason).or_default() += 1;
                 }
             }
-            send(
-                progress_tx,
+            // Batch updates are replaceable; the committed totals below are awaited.
+            // Awaiting here would hold a non-Send SQLite transaction across suspension.
+            let _ = progress_tx.try_send(ProgressEvent::new(
                 ProgressStage::LodChunks,
                 index as u64,
                 worlds.len() as u64,
@@ -2995,8 +2996,7 @@ async fn compile_lod_chunks_with_cancel(
                     accepted.len(),
                     jobs.len()
                 ),
-            )
-            .await;
+            ));
         }
         textures.verify_sources(&staging.join("vfs"))?;
         if let Some(error) = content_error {
