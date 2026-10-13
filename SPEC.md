@@ -239,6 +239,8 @@ V210: CI ! dispatch software Vulkan UASTC encoder, decode synthetic color/alpha/
 
 V190: Record-aware remap ! exact faction SNAM length 8; rank/padding unchanged; WRLD RNAM coordinates & TNAM strings unchanged; consumed single links remap under relocated full/light slots.
 
+V179: Terrain blocking worker ! current-thread progress/cancellation responsive; caller drop cancels while normal output/repair or metadata source/destination leases remain owned until worker stops; full progress wait interruptible; per-world rollback & proofs unchanged.
+
 ## §T TASKS
 
 id|status|task|cites
@@ -293,6 +295,8 @@ T73|~|Implement opt-in pinned offline conventional/cluster comparison from immut
 T110|x|Exercise actual GPU batch/dispatch/readback with software Vulkan in CI|V210
 
 T90|x|Fix faction remap & reject aliased non-FormID fields; independent full/light field regressions|V190
+
+T72|x|Move terrain compiler into owned blocking pool; retain leases on abort, cancel channel waits & verify current-thread regressions|V179
 
 ## §B BUGS
 
@@ -390,3 +394,5 @@ B211|2026-10-05|New GPU fixture used constant chunks_exact under Rust1.98 strict
 
 B212|2026-10-05|Package-only ignored GPU step changed feature unification & rebuilt after workspace tests; cold combined CI exceeded30min|V210,V118; same workspace/target selection for both test steps
 B190|2026-10-05|Four-byte global guard skipped NPC faction structures; WRLD RNAM/TNAM mistaken for links|V190
+
+B179|2026-10-12|Synchronous world compilation prevented current-thread progress/Stop; detached worker could release publication locks before writes ceased|V179; owned leases, drop cancellation, interruptible progress & bounded transactional checks

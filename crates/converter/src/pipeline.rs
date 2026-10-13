@@ -360,8 +360,8 @@ impl AssetPipeline {
             &progress_tx,
             &cancellation,
             Arc::new(LodWorkerOwnership {
-                _runtime: output_lock.clone(),
-                _repair: ownership.clone(),
+                _runtime: vec![output_lock.clone()],
+                _repair: Some(ownership.clone()),
             }),
         )
         .await;
@@ -2754,6 +2754,7 @@ pub(crate) async fn compile_lod_chunks(
     plugin_hashes: &[String],
     progress_tx: &Sender<ProgressEvent>,
     report: &mut PipelineReport,
+    ownership: Option<Arc<LodWorkerOwnership>>,
 ) -> Result<()> {
     compile_lod_chunks_with_cancel(
         config,
@@ -2764,15 +2765,15 @@ pub(crate) async fn compile_lod_chunks(
         progress_tx,
         &Cancellation::new(),
         report,
-        None,
+        ownership,
     )
     .await
 }
 
 /// The blocking compiler retains both publication leases if its caller is dropped.
-struct LodWorkerOwnership {
-    _runtime: Arc<AssetLock>,
-    _repair: Arc<crate::repair::OutputOwnership>,
+pub(crate) struct LodWorkerOwnership {
+    pub(crate) _runtime: Vec<Arc<AssetLock>>,
+    pub(crate) _repair: Option<Arc<crate::repair::OutputOwnership>>,
 }
 
 struct CancelLodWorkerOnDrop(Option<Cancellation>);
@@ -4055,8 +4056,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("modern");
         let ownership = Arc::new(LodWorkerOwnership {
-            _runtime: Arc::new(AssetLock::acquire_exclusive(&output).unwrap()),
-            _repair: Arc::new(crate::repair::OutputOwnership::acquire(&output).unwrap()),
+            _runtime: vec![Arc::new(AssetLock::acquire_exclusive(&output).unwrap())],
+            _repair: Some(Arc::new(
+                crate::repair::OutputOwnership::acquire(&output).unwrap(),
+            )),
         });
         let cancellation = Cancellation::new();
         let observed = cancellation.clone();
@@ -4169,8 +4172,17 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let mut report = PipelineReport::default();
         FAIL_LOD_GPU_INIT.with(|fail| fail.set(true));
-        let result =
-            compile_lod_chunks(&config, &staging, &staging, &[], &[], &tx, &mut report).await;
+        let result = compile_lod_chunks(
+            &config,
+            &staging,
+            &staging,
+            &[],
+            &[],
+            &tx,
+            &mut report,
+            None,
+        )
+        .await;
         FAIL_LOD_GPU_INIT.with(|fail| fail.set(false));
         result.unwrap();
         assert_eq!(report.lod_chunks, 0);
@@ -4758,6 +4770,7 @@ mod tests {
             &hashes,
             &tx,
             &mut report,
+            None,
         )
         .await
         .unwrap();
@@ -4809,6 +4822,7 @@ mod tests {
             &hashes,
             &tx,
             &mut mixed,
+            None,
         )
         .await
         .unwrap();
@@ -4914,6 +4928,7 @@ mod tests {
             &hashes,
             &tx,
             &mut report,
+            None,
         )
         .await
         .unwrap();
