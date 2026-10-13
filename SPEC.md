@@ -237,6 +237,8 @@ V181: Offline meshoptimizer experiment pins v1.3 commit, builder/driver/settings
 
 V210: CI ! dispatch software Vulkan UASTC encoder, decode synthetic color/alpha/normal/mip/partial-block cases with CPU comparison; absent adapter fails explicit run; production CPU-adapter rejection retained.
 
+V190: Record-aware remap ! exact faction SNAM length 8; rank/padding unchanged; WRLD RNAM coordinates & TNAM strings unchanged; consumed single links remap under relocated full/light slots.
+
 ## §T TASKS
 
 id|status|task|cites
@@ -289,6 +291,8 @@ T72|x|Implement shared conservative object eligibility, independent identity & g
 T73|~|Implement opt-in pinned offline conventional/cluster comparison from immutable GLB inputs; omissions, deterministic candidates, grouped-cut checks & source-preservation fixtures; real-model smoke distinct from visual/runtime/performance acceptance|V181
 
 T110|x|Exercise actual GPU batch/dispatch/readback with software Vulkan in CI|V210
+
+T90|x|Fix faction remap & reject aliased non-FormID fields; independent full/light field regressions|V190
 
 ## §B BUGS
 
@@ -385,3 +389,4 @@ B210|2026-10-05|GPU tests validated shader/container without dispatching encoder
 B211|2026-10-05|New GPU fixture used constant chunks_exact under Rust1.98 strict Clippy|use as_chunks::<4>(); mechanical lint fix, V210 unchanged
 
 B212|2026-10-05|Package-only ignored GPU step changed feature unification & rebuilt after workspace tests; cold combined CI exceeded30min|V210,V118; same workspace/target selection for both test steps
+B190|2026-10-05|Four-byte global guard skipped NPC faction structures; WRLD RNAM/TNAM mistaken for links|V190
