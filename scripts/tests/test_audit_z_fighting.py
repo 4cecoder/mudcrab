@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sqlite3
 import struct
@@ -72,6 +73,15 @@ class OverlapTests(unittest.TestCase):
         self.assertAlmostEqual(result["examples"][0]["overlap_area"], .5)
         self.assertEqual(result["examples"][0]["a"]["shape_block"], 9)
 
+    def test_overlap_area_remains_finite_after_a_large_translation(self):
+        offset = 1e160
+        width = 8 * math.ulp(offset)
+        points = [(offset, offset, 0), (offset + width, offset, 0),
+                  (offset, offset + width, 0)]
+        area = AUDIT.overlap_area(points, points, (0, 0, 1))
+        self.assertTrue(math.isfinite(area))
+        self.assertAlmostEqual(area / (width * width / 2), 1.)
+
     def test_partial_overlap_with_different_triangulation(self):
         result = self.scan([(0,0,0), (2,0,0), (0,2,0), (1,0,0), (3,0,0), (1,2,0)])
         self.assertEqual(result["pairs"], 1)
@@ -134,6 +144,44 @@ class OverlapTests(unittest.TestCase):
 
 
 class InputTests(unittest.TestCase):
+    def test_cli_translated_duplicate_triangles_remain_overlap_risks(self):
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "meshes").mkdir()
+                document, binary = fixture([(0,0,0), (1,0,0), (0,1,0)] * 2,
+                    nodes=[{"mesh": 0, "translation": [1e8, 1e8, 0]}])
+                write_glb(root / "meshes/test.glb", document, binary)
+                create_database(root / "skyrim_world.db")
+                report = root / "report.json"
+                process = subprocess.run([sys.executable, str(SPEC.origin), str(root),
+                    "--jobs", str(jobs), "--out", str(report)], capture_output=True, text=True)
+                self.assertEqual(process.returncode, 1, process.stderr)
+                result = json.loads(report.read_text())
+                self.assertEqual(result["coverage"]["overlapping_triangle_pairs"], 1)
+                self.assertAlmostEqual(result["files"][0]["geometry"]["examples"][0]["overlap_area"], .5)
+                self.assertFalse(result["static_scope_passed"])
+                self.assertEqual(result["coverage_gaps"], [])
+
+    def test_nonfinite_overlap_area_produces_an_incomplete_report(self):
+        for area in (float("nan"), float("inf")):
+            with self.subTest(area=area), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "meshes").mkdir()
+                document, binary = fixture([(0,0,0), (1,0,0), (0,1,0)] * 2)
+                write_glb(root / "meshes/test.glb", document, binary)
+                create_database(root / "skyrim_world.db")
+                report = root / "report.json"
+                with mock.patch.object(AUDIT, "overlap_area", return_value=area):
+                    self.assertEqual(AUDIT.main([str(root), "--out", str(report)]), 2)
+                result = json.loads(report.read_text())
+                self.assertFalse(result["static_scope_passed"])
+                self.assertFalse(result["risks_found"])
+                self.assertTrue(result["coverage_gaps"])
+                self.assertFalse(result["files"][0]["geometry"]["complete"])
+                self.assertEqual(result["files"][0]["geometry"]["reason"],
+                                 "nonfinite triangle overlap area")
+
     def test_cli_handled_depth_flags_are_inventory_not_risks(self):
         for jobs in (1, 2):
             with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:

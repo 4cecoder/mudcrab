@@ -309,6 +309,12 @@ def overlap_area(a, b, normal):
             if new >= 0:
                 polygon.append(current)
             previous, old = current, new
+    if len(polygon) < 3:
+        return 0.
+    # The area is translation invariant. Subtract a nearby origin so absolute
+    # scene coordinates do not overflow or cancel the shoelace products.
+    origin = polygon[0]
+    polygon = [(p[0]-origin[0], p[1]-origin[1]) for p in polygon]
     projected = abs(sum(polygon[i][0]*polygon[(i+1) % len(polygon)][1]
                         - polygon[i][1]*polygon[(i+1) % len(polygon)][0] for i in range(len(polygon))))/2
     return projected / abs(normal[axis])
@@ -375,6 +381,8 @@ def find_overlaps(items, tolerance, minimum_area, max_comparisons, max_examples)
             if separation > tolerance:
                 continue
             area = overlap_area(old.points, current.points, old.normal)
+            if not math.isfinite(area):
+                raise AuditError("nonfinite triangle overlap area")
             if area <= minimum_area:
                 continue
             pairs += 1

@@ -109,7 +109,11 @@ the native renderer; those flags alone do not set `risks_found` or cause exit
 code `1`. Per-file `material_risks` remains empty for report compatibility.
 Geometry overlaps and duplicate placements remain candidates. The inventory
 preserves source flags and block identities for checking the runtime state
-applied to each material/pass.
+applied to each material/pass. These requirements remain unresolved until
+runtime evidence confirms the required state for each material/pass. Inventory
+classification is not proof that the renderer applied it: exit code `0`, an
+empty `material_risks` list, and `static_scope_passed` cannot close authored-depth
+requirements or establish rendered z-fighting correctness.
 
 ### Geometry method
 
