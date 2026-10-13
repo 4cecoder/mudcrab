@@ -254,12 +254,20 @@ fn export_records(
     master: &HashMap<u32, RawRecord>,
     order: Option<&LoadOrder>,
 ) -> Result<()> {
-    let land_winners = super::records::land_by_cell(master).map_err(|error| {
-        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            error.to_string(),
-        )))
-    })?;
+    let selection = super::records::land_by_cell(master);
+    for (priority, ties) in &selection.ties_by_plugin {
+        // Use the plugin supplying the winning records, not the FormID owner.
+        // Cache generation also selects LAND, but only this export emits warnings.
+        let plugin = order
+            .and_then(|order| order.names.get(*priority as usize))
+            .cloned()
+            .unwrap_or_else(|| format!("plugin priority {priority}"));
+        eprintln!(
+            "warning: {plugin}: {} ambiguous LAND cells ({} extra forms at winning plugin priority {priority}); lowest FormID retained (first: cell {:08X}, retained {:08X}, ignored {:08X}); physical record order unavailable",
+            ties.cells, ties.extra_forms, ties.first_cell, ties.retained_form, ties.ignored_form
+        );
+    }
+    let land_winners = selection.cells;
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM movement_types", [])?;
     tx.execute("DELETE FROM movement_game_settings", [])?;
