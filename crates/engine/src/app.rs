@@ -208,6 +208,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
         .add_plugins((
             VercidiumRendererPlugin,
+            crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
             SkyPlugin,
             ConsolePlugin,
             crate::nif_material::NifMaterialPlugin,
