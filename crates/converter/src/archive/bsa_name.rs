@@ -109,6 +109,23 @@ mod tests {
         assert_ne!(file_hash(b"dragon.nif"), file_hash(b"dragon.dds"));
     }
 
+    /// Pairs read from the stored hashes in the vanilla `Skyrim - Interface.bsa`,
+    /// so a wrong algorithm cannot pass by agreeing with itself.
+    #[test]
+    fn matches_hashes_stored_in_a_vanilla_archive() {
+        assert_eq!(
+            folder_hash(b"interface\x5ccontrols\x5c360"),
+            0x3dc5_f3f9_6916_3630
+        );
+        assert_eq!(
+            folder_hash(b"interface/controls/durango"),
+            0x443a_f134_691a_676f
+        );
+        assert_eq!(file_hash(b"keyboard_english.txt"), 0x1fdc_44b0_6b10_7368);
+        assert_eq!(file_hash(b"gamepad.txt"), 0x6cf7_7259_6707_6164);
+        assert_eq!(file_hash(b"controlmap.txt"), 0xafb8_af35_630a_6170);
+    }
+
     #[test]
     fn handles_names_shorter_than_the_hash_window() {
         for name in [&b""[..], b"a", b"ab", b"abc", b"abcd", b".nif", b"x."] {
