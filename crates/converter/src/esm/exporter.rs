@@ -458,8 +458,13 @@ fn export_records(
             }
             "TXST" => {
                 let view = SubrecordView::new(&record.subrecords);
+                // The slots are positional, not in column order: TX02 is the
+                // environment mask (or subsurface tint), TX03 glow (or detail),
+                // TX04 height, TX05 environment, TX06 multilayer, and TX07
+                // backlight mask/specular. Slot meanings follow xEdit's
+                // wbDefinitionsTES5.pas TXST definition.
                 tx.execute(
-                    "INSERT OR REPLACE INTO texture_sets(id,editor_id,diffuse_path,normal_path,glow_path,height_path,environment_path,mask_path,specular_path,detail_path) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    "INSERT OR REPLACE INTO texture_sets(id,editor_id,diffuse_path,normal_path,mask_path,glow_path,height_path,environment_path,specular_path,detail_path) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                     params![
                         form_id,
                         view.get_string(b"EDID"),
@@ -469,8 +474,8 @@ fn export_records(
                         view.get_string(b"TX03"),
                         view.get_string(b"TX04"),
                         view.get_string(b"TX05"),
-                        view.get_string(b"TX06"),
                         view.get_string(b"TX07"),
+                        view.get_string(b"TX06"),
                     ],
                 )?;
             }
@@ -701,7 +706,7 @@ pub fn insert_reference(
         .map(|bytes| {
             (
                 u32::from_le_bytes(bytes[..4].try_into().expect("four-byte XESP parent")),
-                u32::from_le_bytes(bytes[4..8].try_into().expect("four-byte XESP flags")),
+                u32::from(bytes[4]),
             )
         })
         .unzip();
@@ -1037,6 +1042,129 @@ mod tests {
         assert_eq!(material, Some(0x0001_2F38));
         assert_eq!(friction, Some(30.0));
         assert_eq!(restitution, Some(30.0));
+    }
+
+    /// TXST slots are positional: TX02 is the environment mask, TX03 glow,
+    /// TX04 height, TX05 the environment cubemap, TX06 multilayer, and TX07
+    /// backlight mask/specular. The texture pipeline
+    /// picks each texture's encoding from these columns, so a column holding
+    /// the wrong slot encodes the texture with the wrong meaning. The mask and
+    /// cubemap paths are those of Skyrim.esm's `EyesMale` sets; the rest are
+    /// made up so every slot is distinct.
+    #[test]
+    fn stores_txst_slots_in_their_named_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let path = |text: &str| {
+            let mut bytes = text.as_bytes().to_vec();
+            bytes.push(0);
+            bytes
+        };
+        let record = RawRecord {
+            form_id: 0x0001_0D4C,
+            record_type: *b"TXST",
+            flags: 0,
+            subrecords: vec![
+                (b"EDID".to_vec(), path("EyesMale")),
+                (
+                    b"TX00".to_vec(),
+                    path("Actors\\Character\\Eyes\\EyeBrown.dds"),
+                ),
+                (
+                    b"TX01".to_vec(),
+                    path("Actors\\Character\\Eyes\\EyeBrown_n.dds"),
+                ),
+                (
+                    b"TX02".to_vec(),
+                    path("Actors\\Character\\Eyes\\EyeEnvironmentMask_M.dds"),
+                ),
+                (
+                    b"TX03".to_vec(),
+                    path("Actors\\Character\\Eyes\\EyeGlow.dds"),
+                ),
+                (
+                    b"TX04".to_vec(),
+                    path("Actors\\Character\\Eyes\\EyeHeight_p.dds"),
+                ),
+                (b"TX05".to_vec(), path("Cubemaps\\EyeCubeMap.dds")),
+                (
+                    b"TX06".to_vec(),
+                    path("Actors\\Character\\Eyes\\EyeInner.dds"),
+                ),
+                (
+                    b"TX07".to_vec(),
+                    path("Actors\\Character\\Eyes\\EyeBrown_s.dds"),
+                ),
+            ],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 0,
+        };
+        let mut master = HashMap::new();
+        master.insert(record.form_id, record);
+        export_to_db(&conn, &master).unwrap();
+
+        let columns: [Option<String>; 8] = conn
+            .query_row(
+                "SELECT diffuse_path, normal_path, mask_path, glow_path, height_path, \
+                 environment_path, specular_path, detail_path FROM texture_sets WHERE id=?1",
+                [0x0001_0D4Cu32],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ])
+                },
+            )
+            .unwrap();
+        let expected = [
+            "Actors\\Character\\Eyes\\EyeBrown.dds",
+            "Actors\\Character\\Eyes\\EyeBrown_n.dds",
+            "Actors\\Character\\Eyes\\EyeEnvironmentMask_M.dds",
+            "Actors\\Character\\Eyes\\EyeGlow.dds",
+            "Actors\\Character\\Eyes\\EyeHeight_p.dds",
+            "Cubemaps\\EyeCubeMap.dds",
+            "Actors\\Character\\Eyes\\EyeBrown_s.dds",
+            "Actors\\Character\\Eyes\\EyeInner.dds",
+        ]
+        .map(|path| Some(path.to_owned()));
+        assert_eq!(columns, expected);
+    }
+
+    #[test]
+    fn xesp_flags_ignore_three_padding_bytes() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let record = RawRecord {
+            form_id: 0x800,
+            record_type: *b"REFR",
+            flags: 0,
+            subrecords: vec![
+                (b"NAME".to_vec(), 0x1234u32.to_le_bytes().to_vec()),
+                (
+                    b"XESP".to_vec(),
+                    [0x78, 0x56, 0x34, 0x12, 0x02, 0xA5, 0x5A, 0xFF].to_vec(),
+                ),
+            ],
+            cell_form_id: Some(1),
+            worldspace_form_id: None,
+            load_order: 0,
+        };
+        export_to_db(&conn, &HashMap::from([(record.form_id, record)])).unwrap();
+        let flags: u32 = conn
+            .query_row(
+                "SELECT enable_parent_flags FROM \"references\" WHERE id=0x800",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(flags, 0x02);
     }
 
     #[test]

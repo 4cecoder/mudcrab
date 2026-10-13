@@ -5470,7 +5470,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_producers_rebuild_meshes_and_textures_and_reuse_scripts() {
-        for old_schema in [16, 17, 18, 19, 20, 21, 22, 23] {
+        for old_schema in [16, 17, 18, 19, 20, 21, 22, 23, 24] {
             let temp = tempfile::tempdir().unwrap();
             let data = temp.path().join("Data");
             let output = temp.path().join("modern");

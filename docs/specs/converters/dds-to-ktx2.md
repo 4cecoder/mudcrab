@@ -69,12 +69,16 @@ reason is chained onto a later failure's error. Cubemaps and volumes of these la
 formats, palettes and L8 also fall back to UASTC. Under `--texture-encoder gpu` these textures are
 encoded to UASTC on the GPU instead.
 
-The combined native-BC DDS and authored surface-input producer uses converter schema 24.
+The combined native-BC DDS and authored surface-input producer uses converter schema 25. Schema 25
+maps TXST slots TX02 (environment mask), TX03 (glow), TX04 (height), TX05 (environment), TX06
+(multilayer) and TX07 (backlight mask/specular) to their named `texture_sets` columns; producers
+through 24 stored these texture roles in incorrect columns, so a texture reached through a texture
+set could get another slot's encoding. Slot names follow [xEdit's Skyrim TXST definition](https://github.com/TES5Edit/TES5Edit/blob/dev-4.1.6/Core/wbDefinitionsTES5.pas#L5261-L5269).
 Schema 18 was allocated independently to native-BC DDS and specular changes, so its numeric identity
-cannot prove mesh or texture compatibility. Manifests from known schemas 12–23 rebuild all textures,
+cannot prove mesh or texture compatibility. Manifests from known schemas 12–24 rebuild all textures,
 GLBs and world outputs, while source/configuration/output-verified scripts and archive ingestion
 remain reusable. Schemas 22 and 23 configuration hashes include CPU/GPU encoder selection and GPU quality;
-GPU batch size changes scheduling only. Staged outputs require exact schema 24 provenance; old bytes
+GPU batch size changes scheduling only. Staged outputs require exact schema 25 provenance; old bytes
 are never relabeled.
 
 Byte preservation is asserted per mip level in fixtures, and a Bevy engine test loads native
