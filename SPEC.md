@@ -291,6 +291,7 @@ V157: P0 repository/Data-relative evidence path keys ! POSIX separators on every
 V161: Dynamic ingestion: Complete SE structural verdict includes TES4, all groups/record/subrecord occurrences and complete byte accounting. Unknown semantics never block supported framing, but do not satisfy interpretation acceptance.
 
 V162: Dynamic ingestion: No-op archive-reopened output equals input bytes; complete archive remains usable without original Data files.
+V210: CI ! dispatch software Vulkan UASTC encoder, decode synthetic color/alpha/normal/mip/partial-block cases with CPU comparison; absent adapter fails explicit run; production CPU-adapter rejection retained.
 V190: Record-aware remap ! exact faction SNAM length 8; rank/padding unchanged; WRLD RNAM coordinates & TNAM strings unchanged; consumed single links remap under relocated full/light slots.
 
 ## §T TASKS
@@ -357,6 +358,7 @@ T53|.|Dynamic ingestion Deferred P7 after P6: earlier SE backwards and VR, compl
 T54|.|Dynamic ingestion Deferred P8 after P7: LE layouts/encoding/reference/corpus acceptance; preserve SE/VR compatibility|V122,V128,V133,V134,V135,V137
 T55|.|Dynamic ingestion Eventual P9 after P8: open separate other-game native ingestion plans using retained tes4skyrim research and applicable validators|V161,V128,V134,V135,V136,V137,V138
 T56|~|Dynamic ingestion P0 extend existing Mutagen pilot at validation owner; qualify synthetic observations/error/availability contract and xEdit runner; missing capability remains gap|V128,V134,V143,V144,V145,V147,V148,R26
+T110|x|Exercise actual GPU batch/dispatch/readback with software Vulkan in CI|V210
 T90|x|Fix faction remap & reject aliased non-FormID fields; independent full/light field regressions|V190
 
 ## §B BUGS
@@ -476,4 +478,9 @@ B133|2026-10-04|P0 manifest success predicate omitted unresolved load order, loc
 B134|2026-10-04|custom CCC missing/drift diagnostics hard-coded `Skyrim.ccc` instead of supplied descriptor path|V143; shared source provenance + custom missing-descriptor regression
 B135|2026-10-06|new main quaternion/performance entries reused schema V118/T42/B80/B81 before publication|preserve main V118/T42/B80/B81; schema V162/T59/B133/B134; three-way row/reference checks; no new behavior invariant
 
+B210|2026-10-05|GPU tests validated shader/container without dispatching encoder|V210
+
+B211|2026-10-05|New GPU fixture used constant chunks_exact under Rust1.98 strict Clippy|use as_chunks::<4>(); mechanical lint fix, V210 unchanged
+
+B212|2026-10-05|Package-only ignored GPU step changed feature unification & rebuilt after workspace tests; cold combined CI exceeded30min|V210,V118; same workspace/target selection for both test steps
 B190|2026-10-05|Four-byte global guard skipped NPC faction structures; WRLD RNAM/TNAM mistaken for links|V190

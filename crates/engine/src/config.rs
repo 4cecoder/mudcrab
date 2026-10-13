@@ -1024,10 +1024,9 @@ mod tests {
     /// it instead of keeping a second list of option names in step by hand.
     const CONFIG_SOURCE: &str = include_str!("config.rs");
 
-    /// Cargo, Git, `world-inspect`, dynamic-loader and audit-tool flags the
-    /// scripts also spell on a command line. Every other `--flag` in those
-    /// scripts goes to the engine. None of the audit tools starts the engine,
-    /// so their own options must not be mistaken for engine options.
+    /// Flags consumed by Cargo, Git, `world-inspect`, the dynamic loader,
+    /// audit tools and launch wrappers. Wrappers also contain engine invocations,
+    /// so every other scanned `--flag` must be accepted by the engine parser.
     const NON_ENGINE_FLAGS: &[&str] = &[
         "--artifact-dir",          // run_mutagen_p0.py
         "--all",                   // cargo fmt
@@ -1049,33 +1048,42 @@ mod tests {
         "--no-restore",            // dotnet build
         "--nologo",                // dotnet build
         "--oracle-source",         // run_mutagen_p0.py
-        "--porcelain",             // p0_tools.py (git worktree list)
+        "--porcelain",             // p0_tools.py (git worktree list), git status
         "--quiet",                 // git diff
         "--short",                 // git rev-parse
         "--use-lock-file",         // dotnet restore
         "--version",               // dotnet SDK
         "--verbosity",             // dotnet restore and build
-        "--output",                // world-inspect, corpus_manifest.py, dotnet build
-        "--radius",                // world-inspect
-        "--library-path",          // ld-linux
-        "--meshes",                // audit-collision.py
-        "--min-x",                 // audit-collision.py
-        "--max-x",                 // audit-collision.py
-        "--min-y",                 // audit-collision.py
-        "--max-y",                 // audit-collision.py
-        "--out",                   // audit-collision.py
-        "--expect-solid",          // audit-collision.py
-        "--expect-passable",       // audit-collision.py
-        "--original",              // audit_asset_sizes.py
-        "--json",                  // audit_asset_sizes.py
-        "--candidate-inventory",   // audit-riverwood-reuse.py
-        "--reference-inventory",   // audit-riverwood-reuse.py
-        "--manifest",              // audit-riverwood-reuse.py
-        "--locked",                // cargo run
-        "--manifest-path",         // cargo run
-        "--cpu-jobs",              // converter
-        "--io-jobs",               // converter
-        "--binary",                // git diff
+        // repeat-terrain-startup.py also consumes --output.
+        "--output",              // world-inspect, corpus_manifest.py, dotnet build
+        "--radius",              // world-inspect
+        "--library-path",        // ld-linux
+        "--meshes",              // audit-collision.py
+        "--min-x",               // audit-collision.py
+        "--max-x",               // audit-collision.py
+        "--min-y",               // audit-collision.py
+        "--max-y",               // audit-collision.py
+        "--out",                 // audit-collision.py
+        "--expect-solid",        // audit-collision.py
+        "--expect-passable",     // audit-collision.py
+        "--original",            // audit_asset_sizes.py
+        "--json",                // audit_asset_sizes.py
+        "--candidate-inventory", // audit-riverwood-reuse.py
+        "--reference-inventory", // audit-riverwood-reuse.py
+        "--manifest",            // audit-riverwood-reuse.py
+        "--locked",              // cargo run
+        "--manifest-path",       // cargo run
+        "--cpu-jobs",            // converter
+        "--io-jobs",             // converter
+        "--binary",              // git diff
+        "--engine",              // repeat-terrain-startup.py
+        "--repeats",             // repeat-terrain-startup.py
+        "--upload-budgets",      // repeat-terrain-startup.py
+        "--warmup",              // repeat-terrain-startup.py
+        "--duration",            // repeat-terrain-startup.py
+        "--timeout",             // repeat-terrain-startup.py
+        "--launch-prefix",       // repeat-terrain-startup.py
+        "--commit",              // repeat-terrain-startup.py
     ];
 
     fn run_config(arguments: &[&str]) -> EngineConfig {
