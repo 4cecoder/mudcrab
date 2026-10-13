@@ -226,6 +226,8 @@ V118: Quaternion normalization ! identity for zero/non-finite norm & unit finite
 
 V190: Record-aware remap ! exact faction SNAM length 8; rank/padding unchanged; WRLD RNAM coordinates & TNAM strings unchanged; consumed single links remap under relocated full/light slots.
 
+V191: Jump ascent ! proximity grounded feedback cannot reset positive jump velocity or allow airborne relaunch; descending contact resets motion; movement ordered before Rapier SyncBackend.
+
 ## §T TASKS
 
 id|status|task|cites
@@ -275,6 +277,8 @@ T41|x|Separate test-job kache cache; action input verified against upstream acti
 T42|x|Strengthen quaternion/performance regressions & preserve both legacy schema gates|V118
 
 T90|x|Fix faction remap & reject aliased non-FormID fields; independent full/light field regressions|V190
+
+T91|x|Preserve jump ascent through Rapier ground-probe overlap; reproduce native one-step apex & verify integration/48 physics checks|V191
 
 ## §B BUGS
 
@@ -363,3 +367,5 @@ B80|2026-10-05|Non-finite guard uncovered; ten-second tiny-workload budgets & ta
 B81|2026-10-05|Proposed20x scaling threshold uncalibrated; unchanged linear-pass writer measured26–28x across four release samples|V118; measured40x gate, keep warmed medians & absolute budgets
 
 B190|2026-10-05|Four-byte global guard skipped NPC faction structures; WRLD RNAM/TNAM mistaken for links|V190
+
+B191|2026-10-12|Rapier ground proximity stayed true after upward launch; next WALK integration zeroed velocity at 5.666668-unit rise|V191; ascent guard, deterministic feed ordering & descent/relaunch regression
