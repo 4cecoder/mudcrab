@@ -2938,69 +2938,76 @@ async fn compile_lod_chunks_with_cancel(
                 cell_hashes.insert(cell.cell_id, cell.fingerprint());
             }
         }
-        let tx = connection.unchecked_transaction()?;
-        let mut accepted = Vec::with_capacity(jobs.len());
-        let mut reused = 0u64;
-        let mut refusals = BTreeMap::<String, u64>::new();
-        let mut content_error = validation.err();
-        for batch in jobs.chunks(compiler_pool.current_num_threads()) {
-            if content_error.is_some() {
-                break;
-            }
-            interrupt(cancellation)?;
-            // Baking, mip generation and encoding finish together per chunk. Only
-            // this bounded batch holds GLB payloads; SQLite remains on this thread.
-            let compiled: Result<Vec<_>> = compiler_pool.install(|| {
-                batch
-                    .par_iter()
-                    .map(|job| {
-                        let input_hash = job.fingerprint(origin, &cell_hashes, &textures)?;
-                        let refusal = if let Some(reuse) = &reuse {
-                            match reuse.chunk(job, origin, &input_hash) {
-                                Ok(chunk) => return Ok((chunk, input_hash, true, None)),
-                                Err(error) => Some(format!("{error:#}")),
-                            }
-                        } else {
-                            None
-                        };
-                        Ok((job.compile(origin, &textures)?, input_hash, false, refusal))
-                    })
-                    .collect()
-            });
-            let chunks = match compiled {
-                Ok(chunks) => chunks,
-                Err(error) => {
-                    content_error = Some(error);
+        let (accepted, reused, refusals, content_error) = {
+            let tx = connection.unchecked_transaction()?;
+            let mut accepted = Vec::with_capacity(jobs.len());
+            let mut reused = 0u64;
+            let mut refusals = BTreeMap::<String, u64>::new();
+            let mut content_error = validation.err();
+            for batch in jobs.chunks(compiler_pool.current_num_threads()) {
+                if content_error.is_some() {
                     break;
                 }
-            };
-            interrupt(cancellation)?;
-            for (chunk, input_hash, hit, refusal) in chunks {
-                publish_chunk(&tx, staging, &chunk)?;
-                let relative = shared::lod::chunk_payload_path(chunk.key);
-                accepted.push((relative, input_hash, hash_bytes(&chunk.glb)));
-                reused += u64::from(hit);
-                if let Some(reason) = refusal {
-                    *refusals.entry(reason).or_default() += 1;
+                interrupt(cancellation)?;
+                // Baking, mip generation and encoding finish together per chunk. Only
+                // this bounded batch holds GLB payloads; SQLite remains on this thread.
+                let compiled: Result<Vec<_>> = compiler_pool.install(|| {
+                    batch
+                        .par_iter()
+                        .map(|job| {
+                            let input_hash = job.fingerprint(origin, &cell_hashes, &textures)?;
+                            let refusal = if let Some(reuse) = &reuse {
+                                match reuse.chunk(job, origin, &input_hash) {
+                                    Ok(chunk) => return Ok((chunk, input_hash, true, None)),
+                                    Err(error) => Some(format!("{error:#}")),
+                                }
+                            } else {
+                                None
+                            };
+                            Ok((job.compile(origin, &textures)?, input_hash, false, refusal))
+                        })
+                        .collect()
+                });
+                let chunks = match compiled {
+                    Ok(chunks) => chunks,
+                    Err(error) => {
+                        content_error = Some(error);
+                        break;
+                    }
+                };
+                interrupt(cancellation)?;
+                for (chunk, input_hash, hit, refusal) in chunks {
+                    publish_chunk(&tx, staging, &chunk)?;
+                    let relative = shared::lod::chunk_payload_path(chunk.key);
+                    accepted.push((relative, input_hash, hash_bytes(&chunk.glb)));
+                    reused += u64::from(hit);
+                    if let Some(reason) = refusal {
+                        *refusals.entry(reason).or_default() += 1;
+                    }
                 }
+                // Batch updates are replaceable; the committed totals below are awaited.
+                // Awaiting here would hold a non-Send SQLite transaction across suspension.
+                let _ = progress_tx.try_send(ProgressEvent::new(
+                    ProgressStage::LodChunks,
+                    index as u64,
+                    worlds.len() as u64,
+                    None,
+                    &format!(
+                        "Terrain LOD {editor_id}: {}/{} chunks ({reused} reused)",
+                        accepted.len(),
+                        jobs.len()
+                    ),
+                ));
             }
-            send(
-                progress_tx,
-                ProgressStage::LodChunks,
-                index as u64,
-                worlds.len() as u64,
-                None,
-                &format!(
-                    "Terrain LOD {editor_id}: {}/{} chunks ({reused} reused)",
-                    accepted.len(),
-                    jobs.len()
-                ),
-            )
-            .await;
-        }
-        textures.verify_sources(&staging.join("vfs"))?;
+            textures.verify_sources(&staging.join("vfs"))?;
+            if content_error.is_some() {
+                tx.rollback()?;
+            } else {
+                tx.commit()?;
+            }
+            (accepted, reused, refusals, content_error)
+        };
         if let Some(error) = content_error {
-            tx.rollback()?;
             let partial_world = staging.join(format!("lod/{worldspace_id:08x}"));
             if partial_world.exists() {
                 fs::remove_dir_all(partial_world)?;
@@ -3021,7 +3028,6 @@ async fn compile_lod_chunks_with_cancel(
             .await;
             continue 'world;
         }
-        tx.commit()?;
         for (reason, count) in refusals {
             let message =
                 format!("Terrain LOD {editor_id}: {count} cached chunks refused: {reason}");

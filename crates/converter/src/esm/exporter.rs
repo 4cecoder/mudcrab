@@ -706,6 +706,8 @@ pub fn insert_reference(
         .map(|bytes| f32::from_le_bytes(bytes[..4].try_into().expect("four-byte XRDS radius")));
     let (enable_parent_id, enable_parent_flags) = view
         .find(b"XESP")
+        // xEdit 4.1.5f, wbDefinitionsTES5.pas:5156 (wbXESP): FormID, one flags byte, three unused bytes.
+        // Pinned layout source: see SubrecordXESP.
         .and_then(SubrecordXESP::parse)
         .map(|parent| (parent.parent_ref, parent.flags))
         .unzip();
