@@ -1038,7 +1038,6 @@ mod tests {
         "--ccc",                   // corpus_manifest.py
         "--configfile",            // dotnet restore
         "--configuration",         // dotnet build
-        "--corpus-evidence",       // corpus_manifest.py
         "--data-dir",              // corpus_manifest.py
         "--disable-build-servers", // dotnet build
         "--dotnet",                // run_mutagen_p0.py
@@ -1056,7 +1055,6 @@ mod tests {
         "--use-lock-file",         // dotnet restore
         "--version",               // dotnet SDK
         "--verbosity",             // dotnet restore and build
-        "--wine",                  // run_xedit_p0.py
         "--output",                // world-inspect, corpus_manifest.py, dotnet build
         "--radius",                // world-inspect
         "--library-path",          // ld-linux
@@ -1070,7 +1068,6 @@ mod tests {
         "--expect-passable",       // audit-collision.py
         "--original",              // audit_asset_sizes.py
         "--json",                  // audit_asset_sizes.py
-        "--xdump",                 // run_xedit_p0.py
         "--candidate-inventory",   // audit-riverwood-reuse.py
         "--reference-inventory",   // audit-riverwood-reuse.py
         "--manifest",              // audit-riverwood-reuse.py
