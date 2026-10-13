@@ -2746,6 +2746,7 @@ fn persist_ingestion_cache(staging_cache: &Path, cache_root: &Path) -> Result<()
 /// compiled chunk's content hash, the configuration hash, and the converter
 /// schema (BUILD-01/02). It is written to `lod_build` and to the published
 /// manifest; the runtime refuses chunks whose manifest identity differs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn compile_lod_chunks(
     config: &PipelineConfig,
     staging: &Path,
