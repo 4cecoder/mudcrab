@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+printf 'DISPLAY=%s\nWAYLAND_DISPLAY=%s\n' "$DISPLAY" "${WAYLAND_DISPLAY:-}" > /home/taylor/Games/MudcrabComparison/artifacts/display.env
+exec sleep infinity

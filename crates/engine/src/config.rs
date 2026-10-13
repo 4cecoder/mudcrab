@@ -71,6 +71,10 @@ pub struct EngineConfig {
     pub start_grid: (i32, i32),
     pub stream_radius: i32,
     pub unload_radius: i32,
+    /// Optional upper bound for sun-shadow cascades from `[Display] fShadowDistance`.
+    pub sun_shadow_distance_limit: Option<f32>,
+    /// Optional sun bearing clockwise from north and elevation above the horizon, in degrees.
+    pub sun_position: Option<(f32, f32)>,
     pub terrain_lod: TerrainLodDistances,
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
@@ -149,6 +153,8 @@ impl Default for EngineConfig {
             // Skyrim's default `uGridsToLoad=5`.
             stream_radius: 2,
             unload_radius: 3,
+            sun_shadow_distance_limit: None,
+            sun_position: None,
             terrain_lod: TerrainLodDistances::default(),
             max_cell_commits_per_frame: 1,
             max_commit_micros_per_frame: 16_670,
@@ -257,6 +263,7 @@ Benchmark and profiling:
   --screenshot-camera-offset <x,y,z>    camera offset for the acceptance screenshot
   --matched-route <file>                execute exact route steps with transition and settled checkpoints
   --color-grade <off|saturation|full>    select color grading for matched shots (default: full)
+  --sun-position <azimuth,elevation>     sun bearing clockwise from north and elevation above horizon, degrees
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
   --shots-settle-timeout <seconds>      maximum settling time per shot (default: 30, maximum: 600)
   --shots-out <dir>                     where the shots' PNGs and shots.log go (default: beside the shots file)
@@ -723,6 +730,16 @@ impl EngineConfig {
                         )
                     })?;
                 }
+                "--sun-position" => {
+                    let raw = take_raw("--sun-position", SUN_POSITION_EXPECTED, args.next())?;
+                    config.sun_position = Some(parse_sun_position(&raw).ok_or_else(|| {
+                        ConfigError::invalid_value(
+                            "--sun-position",
+                            Some(raw),
+                            SUN_POSITION_EXPECTED,
+                        )
+                    })?);
+                }
                 "--shots" => {
                     config.shots = Some(take_value("--shots", "a shots file path", args.next())?);
                 }
@@ -772,6 +789,10 @@ pub const MAX_STREAM_RADIUS: i32 = (i32::MAX - 3) / 2;
 /// equal.
 const STREAM_RADIUS_EXPECTED: &str = "a cell count from 0 to 1073741822";
 
+/// What `--sun-position` takes: azimuth clockwise from north, then elevation above the horizon.
+const SUN_POSITION_EXPECTED: &str =
+    "two finite angles in degrees: azimuth,elevation (elevation -90 to 90)";
+
 /// Test shorthand for a command line that must ask for a run.
 #[cfg(test)]
 impl EngineConfig {
@@ -792,6 +813,20 @@ fn parse_offset(value: &str) -> Option<(f32, f32, f32)> {
         return None;
     }
     Some((x, y, z))
+}
+
+fn parse_sun_position(value: &str) -> Option<(f32, f32)> {
+    let mut parts = value.split(',');
+    let azimuth: f32 = parts.next()?.trim().parse().ok()?;
+    let elevation: f32 = parts.next()?.trim().parse().ok()?;
+    if parts.next().is_some()
+        || !azimuth.is_finite()
+        || !elevation.is_finite()
+        || !(-90.0..=90.0).contains(&elevation)
+    {
+        return None;
+    }
+    Some((azimuth.rem_euclid(360.0), elevation))
 }
 
 fn parse_u32(value: &str) -> Option<u32> {
@@ -1193,6 +1228,25 @@ mod tests {
         let config = run_config(&["--screenshot-camera-offset", "-10, 2.5 ,0"]);
         assert_eq!(config.screenshot_camera_offset, Some((-10.0, 2.5, 0.0)));
         assert_eq!(EngineConfig::default().screenshot_camera_offset, None);
+    }
+
+    #[test]
+    fn parses_the_optional_sun_bearing_and_elevation() {
+        let config = run_config(&["--sun-position", "450,35"]);
+        assert_eq!(config.sun_position, Some((90.0, 35.0)));
+
+        for value in ["0", "north,35", "0,91", "0,-91", "0,35,2", "NaN,35"] {
+            assert!(
+                matches!(
+                    parse_error(&["--sun-position", value]),
+                    ConfigError::InvalidValue {
+                        option: "--sun-position",
+                        ..
+                    }
+                ),
+                "{value} was accepted"
+            );
+        }
     }
 
     #[test]
