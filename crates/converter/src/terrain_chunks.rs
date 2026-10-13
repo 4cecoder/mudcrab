@@ -44,6 +44,9 @@ use std::{
 ///    flags, subrecords and master list, so the caller's order never matters), each with its master
 ///    list, serialized exactly as 2 and 3 are; the count comes first, and a cell that uses no
 ///    texture records hashes nothing here.
+/// 5. The LTEX FormIDs the LAND names that the land texture table has no entry for
+///    (`skipped_ltex`), sorted, with the count first: the mesh leaves those layers out, so the
+///    key must change when a texture that failed to convert in one run converts in the next.
 ///
 /// The load-order slot is not hashed (it is not part of what the mesh is built from; the master
 /// list stands for the plugin's context). The caller passes every LTEX the LAND names, present
@@ -57,6 +60,7 @@ pub fn cell_mesh_key(
     land: &RawRecord,
     land_masters: &[String],
     textures: &[(&RawRecord, &[String])],
+    skipped_ltex: &[u32],
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(TERRAIN_MESH_FORMAT_VERSION.to_le_bytes());
@@ -74,6 +78,16 @@ pub fn cell_mesh_key(
     put_count(&mut hasher, textures.len());
     for (record, masters) in textures {
         put_record(&mut hasher, record, masters);
+    }
+    // The LTEX records the LAND names that have no entry in the land texture table: the mesh
+    // skips those layers, so a texture that fails to convert in one run and converts in the next
+    // changes the mesh without changing any record. Sorted, so the order never matters.
+    let mut skipped: Vec<u32> = skipped_ltex.to_vec();
+    skipped.sort_unstable();
+    skipped.dedup();
+    put_count(&mut hasher, skipped.len());
+    for form_id in skipped {
+        hasher.update(form_id.to_le_bytes());
     }
     hasher.finalize().into()
 }
@@ -377,7 +391,7 @@ mod tests {
     fn placed(worldspace_id: u32, grid_x: i32, grid_y: i32, cell_id: u32) -> PlacedCellMesh {
         let record = land(cell_id);
         let known: HashSet<u32> = (0x100..0x104).collect();
-        let key = cell_mesh_key(&record, &names(&["Skyrim.esm"]), &[]);
+        let key = cell_mesh_key(&record, &names(&["Skyrim.esm"]), &[], &[]);
         let (mesh, _) = build_cell_mesh(cell_id, &record, &known, key).unwrap();
         PlacedCellMesh {
             worldspace_id,
@@ -394,10 +408,10 @@ mod tests {
         let masters = names(&["Skyrim.esm"]);
         let textures = [(&ltex, masters.as_slice())];
         assert_eq!(
-            cell_mesh_key(&land, &masters, &textures),
-            cell_mesh_key(&land, &masters, &textures)
+            cell_mesh_key(&land, &masters, &textures, &[]),
+            cell_mesh_key(&land, &masters, &textures, &[])
         );
-        let encoded = cell_mesh_key(&land, &masters, &textures);
+        let encoded = cell_mesh_key(&land, &masters, &textures, &[]);
         assert_eq!(encoded.len(), 32, "the key is the raw digest");
     }
 
@@ -409,21 +423,24 @@ mod tests {
         let ltex_b = ltex(0x101);
         let txst = record(*b"TXST", 0x200, b"TX00", b"textures\\landscape\\x.dds");
         let textures = [(&ltex_b, masters.as_slice()), (&ltex_a, masters.as_slice())];
-        let reference = cell_mesh_key(&land, &masters, &textures);
+        let reference = cell_mesh_key(&land, &masters, &textures, &[]);
         let reordered = [(&ltex_a, masters.as_slice()), (&ltex_b, masters.as_slice())];
         assert_eq!(
             reference,
-            cell_mesh_key(&land, &masters, &reordered),
+            cell_mesh_key(&land, &masters, &reordered, &[]),
             "the textures are sorted internally, so the caller's order must not matter"
         );
 
         let mut edited_land = land.clone();
         edited_land.subrecords[0].1[0] ^= 0x01;
-        assert_ne!(reference, cell_mesh_key(&edited_land, &masters, &textures));
+        assert_ne!(
+            reference,
+            cell_mesh_key(&edited_land, &masters, &textures, &[])
+        );
 
         assert_ne!(
             reference,
-            cell_mesh_key(&land, &names(&["Skyrim.esm", "Update.esm"]), &textures),
+            cell_mesh_key(&land, &names(&["Skyrim.esm", "Update.esm"]), &textures, &[]),
             "a master list change moves every FormID the record means"
         );
 
@@ -433,7 +450,7 @@ mod tests {
             (&ltex_b, masters.as_slice()),
             (&edited_ltex, masters.as_slice()),
         ];
-        assert_ne!(reference, cell_mesh_key(&land, &masters, &edited));
+        assert_ne!(reference, cell_mesh_key(&land, &masters, &edited, &[]));
 
         let with_txst = [
             (&ltex_b, masters.as_slice()),
@@ -442,7 +459,7 @@ mod tests {
         ];
         assert_ne!(
             reference,
-            cell_mesh_key(&land, &masters, &with_txst),
+            cell_mesh_key(&land, &masters, &with_txst, &[]),
             "a texture set change rebuilds the cell"
         );
 
@@ -454,8 +471,8 @@ mod tests {
             (&edited_txst, masters.as_slice()),
         ];
         assert_ne!(
-            cell_mesh_key(&land, &masters, &with_txst),
-            cell_mesh_key(&land, &masters, &with_edited_txst),
+            cell_mesh_key(&land, &masters, &with_txst, &[]),
+            cell_mesh_key(&land, &masters, &with_edited_txst, &[]),
             "an edit to an existing texture set's payload rebuilds the cell"
         );
 
@@ -463,7 +480,7 @@ mod tests {
         flagged_land.flags ^= 0x0004_0000;
         assert_ne!(
             reference,
-            cell_mesh_key(&flagged_land, &masters, &textures),
+            cell_mesh_key(&flagged_land, &masters, &textures, &[]),
             "a header flag change on the LAND record changes the key"
         );
 
@@ -475,7 +492,7 @@ mod tests {
         ];
         assert_ne!(
             reference,
-            cell_mesh_key(&land, &masters, &with_flagged_ltex),
+            cell_mesh_key(&land, &masters, &with_flagged_ltex, &[]),
             "a header flag change on a texture record changes the key"
         );
 
@@ -483,7 +500,7 @@ mod tests {
         moved_land.cell_form_id = Some(moved_land.cell_form_id.unwrap_or(0) ^ 0x10);
         assert_ne!(
             reference,
-            cell_mesh_key(&moved_land, &masters, &textures),
+            cell_mesh_key(&moved_land, &masters, &textures, &[]),
             "a LAND moved to another cell changes the key"
         );
     }
@@ -491,8 +508,8 @@ mod tests {
     #[test]
     fn fields_are_length_prefixed_so_boundaries_cannot_shift() {
         let land = land(0x1234);
-        let split_one = cell_mesh_key(&land, &names(&["ab", "c"]), &[]);
-        let split_two = cell_mesh_key(&land, &names(&["a", "bc"]), &[]);
+        let split_one = cell_mesh_key(&land, &names(&["ab", "c"]), &[], &[]);
+        let split_two = cell_mesh_key(&land, &names(&["a", "bc"]), &[], &[]);
         assert_ne!(split_one, split_two);
 
         let left = record(*b"LTEX", 0x100, b"ICON", b"abcdef");
@@ -501,8 +518,8 @@ mod tests {
         let split = [(&right, masters.as_slice())];
         let whole = [(&left, masters.as_slice())];
         assert_ne!(
-            cell_mesh_key(&land, &names(&["Skyrim.esm"]), &split),
-            cell_mesh_key(&land, &names(&["Skyrim.esm"]), &whole),
+            cell_mesh_key(&land, &names(&["Skyrim.esm"]), &split, &[]),
+            cell_mesh_key(&land, &names(&["Skyrim.esm"]), &whole, &[]),
             "a subrecord's data and the next field's bytes cannot shift into each other"
         );
     }
@@ -591,7 +608,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let mut placed = placed(TAMRIEL, -1, 2, 0x1000);
-        let key = cell_mesh_key(&land(0x1000), &names(&["Update.esm"]), &[]);
+        let key = cell_mesh_key(&land(0x1000), &names(&["Update.esm"]), &[], &[]);
         placed.mesh.key = key;
         let expected = placed.mesh.clone();
         write_terrain_chunks(root, vec![placed]).unwrap();
@@ -680,7 +697,7 @@ mod tests {
             record.subrecords.push((b"VTXT".to_vec(), vtxt));
         }
         let known: HashSet<u32> = (0x100..0x200).collect();
-        let key = cell_mesh_key(&record, &names(&["Skyrim.esm"]), &[]);
+        let key = cell_mesh_key(&record, &names(&["Skyrim.esm"]), &[], &[]);
         let (mesh, report) = build_cell_mesh(0x1000, &record, &known, key).unwrap();
         assert_eq!(mesh.slot_stride, 16);
         assert!(report.needed_stride_16);
@@ -704,5 +721,20 @@ mod tests {
             16 * QUADRANT_VERTICES * 4,
             "stride-16 weights survive the round trip"
         );
+    }
+
+    #[test]
+    fn the_textures_the_table_lacks_move_the_key() {
+        let land = land(0x1000);
+        let masters = names(&["Skyrim.esm"]);
+        let none = cell_mesh_key(&land, &masters, &[], &[]);
+        let one = cell_mesh_key(&land, &masters, &[], &[0x2000]);
+        assert_ne!(none, one, "a layer left out of the mesh changes the key");
+        assert_eq!(
+            cell_mesh_key(&land, &masters, &[], &[0x3000, 0x2000]),
+            cell_mesh_key(&land, &masters, &[], &[0x2000, 0x3000, 0x2000]),
+            "the order and repeats of the skipped textures never matter"
+        );
+        assert_ne!(one, cell_mesh_key(&land, &masters, &[], &[0x3000]));
     }
 }
