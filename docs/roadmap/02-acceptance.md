@@ -51,7 +51,8 @@ the converted world database):
 
 `dense-legacy` is accepted by the scripts but is not in the default scene sets. Baselines and
 `profiling-baseline.json` results made before this change are not comparable for `dense`, which is
-now a different, about twice as dense place: compare old results with `dense-legacy`.
+now a different, about twice as dense place. The scripts do not map an old `dense` entry to
+`dense-legacy`: compare an old `dense` median with a new `dense-legacy` median by hand.
 
 Pass `-IncludeDenseLegacy` to also run `dense-legacy`.
 

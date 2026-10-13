@@ -7,7 +7,7 @@ param(
     [int]$RuralGridX = 0,
     [int]$RuralGridY = 0,
     # Dense is Riverwood (about 2,900 references within two cells). `dense-legacy` is the place
-    # `dense` used to be (18,-5, about 1,530), kept for one release to compare older baselines.
+    # `dense` used to be (18,-5, about 1,530), kept for one release; the scripts do not map an old `dense` entry to it.
     [int]$DenseGridX = 3,
     [int]$DenseGridY = -12,
     [int]$DenseLegacyGridX = 18,
@@ -175,7 +175,7 @@ function Get-ScenarioArguments {
         if ($Name -eq "water") {
             $arguments += @("--grid-x", "$WaterGridX", "--grid-y", "$WaterGridY")
         } elseif ($Name -eq "dense-legacy") {
-            # The old dense place (18,-5), kept for one release so older baselines can be compared.
+            # The old dense place (18,-5), kept for one release; compare older `dense` medians with it by hand.
             $arguments += @("--grid-x", "$DenseLegacyGridX", "--grid-y", "$DenseLegacyGridY")
         } elseif ($Name -in @("dense", "stability")) {
             $arguments += @("--grid-x", "$DenseGridX", "--grid-y", "$DenseGridY")

@@ -225,6 +225,9 @@ function Get-FieldDifferences($Old, $New, [string]$Prefix = "") {
 
 function Format-FieldValue($Value) {
     if ($null -eq $Value) { return "null" }
+    # ConvertFrom-Json turns ISO 8601 strings into dates; compare them in the form they were written.
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime().ToString("o") }
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime.ToString("o") }
     return "$Value"
 }
 

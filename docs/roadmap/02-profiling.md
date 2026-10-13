@@ -338,9 +338,10 @@ runs under is given these coordinates, and a stored baseline for another place i
 
 `dense-legacy` is the old dense place, 18,-5 (about 1,530 references; `-DenseLegacyGridX`/`Y`). It
 is accepted by every script but is not in `-Scenario all` or the default sets, and is kept for one
-release so older baselines can still be compared, then removed. Baselines and
+release, then removed. Baselines and
 `profiling-baseline.json` results made before this change are not comparable for `dense`, which is
-now a different, about twice as dense place: compare old results with `dense-legacy`.
+now a different, about twice as dense place. The scripts do not map an old `dense` entry to
+`dense-legacy`: compare an old `dense` median with a new `dense-legacy` median by hand.
 
 Both scripts need PowerShell 7 (`pwsh`): they read reports with `ConvertFrom-Json -AsHashtable`.
 The command builds the engine once (`cargo build --release --bin engine`, skipped with `-NoBuild`,
