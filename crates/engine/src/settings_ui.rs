@@ -59,7 +59,7 @@ impl SettingsMenuState {
         self.was_paused = time.is_paused();
         *capture = CursorCapture::Released;
         time.pause();
-        motion.clear();
+        motion.clear_input();
     }
 
     fn close(&mut self, capture: &mut CursorCapture, time: &mut Time<Virtual>) {
@@ -1339,6 +1339,26 @@ mod tests {
         );
         assert!(app.world_mut().run_system_once(console_closed).unwrap());
         assert!(!app.world().resource::<Time<Virtual>>().is_paused());
+    }
+
+    #[test]
+    fn opening_menu_mid_jump_keeps_the_airborne_state_for_resume() {
+        let mut app = menu_app();
+        let body = app
+            .world_mut()
+            .spawn(crate::physics::WalkState {
+                vertical_velocity: 200.0,
+                grounded: false,
+                jump_active: true,
+                ..default()
+            })
+            .id();
+        key(&mut app, KeyCode::Escape, ButtonState::Pressed);
+        assert!(app.world().resource::<SettingsMenuState>().open);
+        let state = app.world().get::<crate::physics::WalkState>(body).unwrap();
+        assert_eq!(state.vertical_velocity, 200.0);
+        assert!(state.jump_active);
+        assert!(!state.grounded);
     }
 
     #[test]

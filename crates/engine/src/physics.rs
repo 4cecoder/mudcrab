@@ -939,6 +939,20 @@ pub(crate) struct MotionReset<'w, 's> {
 }
 
 impl MotionReset<'_, '_> {
+    /// Drops pending input only: walk intent, the sprint latch and the queued controller
+    /// translation. Velocity and jump state stay, so a pause resumes the motion where it stopped.
+    pub(crate) fn clear_input(&mut self) {
+        if let Some(intent) = self.intent.as_deref_mut() {
+            *intent = WalkIntent::default();
+        }
+        if let Some(sprint) = self.sprint.as_deref_mut() {
+            sprint.0 = false;
+        }
+        for mut controller in &mut self.controllers {
+            controller.translation = None;
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         if let (Some(intent), Some(sprint)) =
             (self.intent.as_deref_mut(), self.sprint.as_deref_mut())

@@ -483,6 +483,18 @@ fn follow_sky_cameras(
     }
 }
 
+/// The palette with the player's sky-brightness multiplier applied.
+fn scaled_palette(
+    palette: &SkyPalette,
+    settings: Option<&crate::settings::RenderingSettings>,
+) -> SkyPalette {
+    let mut scaled = *palette;
+    if let Some(settings) = settings {
+        scaled.brightness *= settings.sky_brightness_scale;
+    }
+    scaled
+}
+
 fn apply_sky(
     palette: Res<SkyPalette>,
     space: Res<CameraSpace>,
@@ -491,10 +503,7 @@ fn apply_sky(
     mut materials: ResMut<Assets<SkyMaterial>>,
     settings: Option<Res<crate::settings::RenderingSettings>>,
 ) {
-    let mut adjusted_palette = *palette;
-    if let Some(settings) = settings.as_deref() {
-        adjusted_palette.brightness *= settings.sky_brightness_scale;
-    }
+    let adjusted_palette = scaled_palette(&palette, settings.as_deref());
     let clear = adjusted_palette.clear_colour(*space);
     for mut camera in &mut cameras {
         let current = match camera.clear_color {
@@ -538,7 +547,8 @@ fn apply_fog(
         settings.as_deref().is_none_or(|settings| settings.fog),
     ) {
         (CameraSpace::Exterior, true) => {
-            let mut fog = fog_for(&palette);
+            // The fog is the clear colour, so it takes the same brightness scale as the sky.
+            let mut fog = fog_for(&scaled_palette(&palette, settings.as_deref()));
             if let Some(settings) = settings.as_deref() {
                 fog.falloff = FogFalloff::Exponential {
                     density: FOG_DENSITY * settings.fog_density_scale,
@@ -1032,5 +1042,36 @@ mod tests {
         *app.world_mut().resource_mut::<CameraSpace>() = CameraSpace::Exterior;
         app.update();
         assert!(app.world().get::<DistanceFog>(camera).is_some());
+    }
+
+    #[test]
+    fn fog_follows_the_sky_brightness_scale_so_it_matches_the_clear_colour() {
+        let mut app = sky_app();
+        app.insert_resource(crate::settings::RenderingSettings {
+            sky_brightness_scale: 2.0,
+            ..default()
+        });
+        let sky = app
+            .world_mut()
+            .spawn((
+                Camera::default(),
+                Transform::default(),
+                SkyCamera,
+                FogCamera,
+            ))
+            .id();
+        app.update();
+
+        let ClearColorConfig::Custom(clear) = app.world().get::<Camera>(sky).unwrap().clear_color
+        else {
+            panic!("the sky camera clears to a custom colour");
+        };
+        let fog = app.world().get::<DistanceFog>(sky).expect("fog outside");
+        assert_eq!(fog.color.with_alpha(1.0), clear);
+        assert_ne!(
+            clear,
+            SkyPalette::SKYRIM_CLEAR_DAY.clear_colour(CameraSpace::Exterior),
+            "the multiplier must change the clear colour for this test to mean anything"
+        );
     }
 }

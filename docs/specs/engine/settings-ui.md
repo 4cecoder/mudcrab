@@ -2,7 +2,7 @@
 
 Open **Settings / Controls** in the upper-right corner, or press **Escape**. The plain Bevy UI is temporary; rendering preferences and their consumers are independent of its appearance.
 
-The menu pauses virtual time, releases the cursor, and clears pending movement. Escape or Resume closes it. During gameplay, F3 releases the cursor without opening the menu; left click captures it again. Cursor capture returns on the following frame so a closing click or key cannot reach gameplay. A pause that existed before opening the menu stays paused. The developer console and menu cannot open over each other.
+The menu pauses virtual time, releases the cursor, and clears pending movement input; an airborne player keeps their velocity and jump state and resumes the arc after Resume. Escape or Resume closes it. During gameplay, F3 releases the cursor without opening the menu; left click captures it again. Cursor capture returns on the following frame so a closing click or key cannot reach gameplay. A pause that existed before opening the menu stays paused. The developer console and menu cannot open over each other.
 
 Buttons support mouse clicks and Tab / Shift+Tab navigation with Enter / Space activation. Left / Right adjust the focused setting, or switch tabs when a tab has focus. Only the current page participates in keyboard navigation; focused buttons scroll into view. Scroll with the wheel, Page Up / Page Down, or Home / End; a scrollbar shows position when a page overflows.
 
