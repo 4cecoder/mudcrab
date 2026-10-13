@@ -7,6 +7,7 @@ or invalid input. Reports always distinguish inventory from geometry coverage.
 Only Python's standard library is needed. All input files are read-only.
 """
 
+from contextlib import closing
 import argparse
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -394,7 +395,7 @@ def find_overlaps(items, tolerance, minimum_area, max_comparisons, max_examples)
 
 def duplicate_placements(database, max_examples):
     """Find exact same-model placements; conditional references remain unknown."""
-    with sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True) as connection:
+    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as connection, connection:
         rows = connection.execute('''SELECT f.id, f.cell_id, f.worldspace_id, f.is_exterior,
             f.pos_x, f.pos_y, f.pos_z, f.rot_x, f.rot_y, f.rot_z, f.scale,
             f.header_flags, f.enable_parent_id, s.model_path

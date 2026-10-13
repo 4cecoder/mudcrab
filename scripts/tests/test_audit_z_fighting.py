@@ -1,5 +1,6 @@
 """Synthetic regressions for the static depth-risk audit; no retail assets."""
 
+from contextlib import closing
 import importlib.util
 import json
 import math
@@ -46,7 +47,7 @@ def write_glb(path, document, binary):
 
 
 def create_database(path):
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.executescript('''CREATE TABLE "references" (id INTEGER, cell_id INTEGER,
             worldspace_id INTEGER, is_exterior INTEGER, pos_x REAL, pos_y REAL, pos_z REAL,
             rot_x REAL, rot_y REAL, rot_z REAL, scale REAL, header_flags INTEGER,
@@ -365,7 +366,7 @@ class InputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "world.db"
             create_database(path)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 for ident, cell, exterior, flags, parent in [(1,10,1,0,None), (2,11,1,0,None),
                         (3,12,1,0x800,None), (4,12,1,0,1), (5,10,0,0,None), (6,11,0,0,None)]:
                     db.execute('INSERT INTO "references" VALUES (?,?,60,?,0,0,0,0,0,0,1,?,?,1)',
@@ -401,7 +402,7 @@ class PlacementTests(unittest.TestCase):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "world.db"
                 create_database(path)
-                with sqlite3.connect(path) as db:
+                with closing(sqlite3.connect(path)) as db, db:
                     for ident in (1, 2, 3, 4):
                         insert_reference(db, ident)
                     db.execute(f'UPDATE "references" SET {field}=NULL WHERE id IN (3,4)')
@@ -416,7 +417,7 @@ class PlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "world.db"
             create_database(path)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 insert_reference(db, 1, transform=(None,) * 7)
                 insert_reference(db, 2, flags=None, transform=(None,) * 7)
             result = AUDIT.duplicate_placements(path, 10)
@@ -427,7 +428,7 @@ class PlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "world.db"
             create_database(path)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 for ident, flags, parent in ((1, 0x20, None), (2, 0x800, None),
                         (3, 0x20, 42), (4, 0x800, 42), (5, 0, 42), (6, None, 42)):
                     insert_reference(db, ident, flags, parent, (None,) * 7)
@@ -446,7 +447,7 @@ class PlacementTests(unittest.TestCase):
                 root = Path(tmp)
                 self.prepare_assets(root)
                 database = root / "skyrim_world.db"
-                with sqlite3.connect(database) as db:
+                with closing(sqlite3.connect(database)) as db, db:
                     for ident in (1, 2, 3):
                         insert_reference(db, ident)
                     db.execute(f'UPDATE "references" SET {field}=NULL WHERE id=3')
@@ -466,7 +467,7 @@ class PlacementTests(unittest.TestCase):
             with self.subTest(conditional=conditional), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 self.prepare_assets(root)
-                with sqlite3.connect(root / "skyrim_world.db") as db:
+                with closing(sqlite3.connect(root / "skyrim_world.db")) as db, db:
                     insert_reference(db, 1, 0x20, transform=(None,) * 7)
                     insert_reference(db, 2, 0x800, transform=(None,) * 7)
                     if conditional:
@@ -483,7 +484,7 @@ class PlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.prepare_assets(root)
-            with sqlite3.connect(root / "skyrim_world.db") as db:
+            with closing(sqlite3.connect(root / "skyrim_world.db")) as db, db:
                 insert_reference(db, 1, transform=("invalid", 0, 0, 0, 0, 0, 1))
             status, result = self.run_cli(root)
             self.assertEqual(status, 2)
@@ -497,7 +498,7 @@ class PlacementTests(unittest.TestCase):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "world.db"
                 create_database(path)
-                with sqlite3.connect(path) as db:
+                with closing(sqlite3.connect(path)) as db, db:
                     for ident in (1, 2, 3, 4):
                         insert_reference(db, ident)
                     db.execute(f'UPDATE "references" SET {mutation} WHERE id IN (3,4)')
@@ -512,7 +513,7 @@ class PlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "world.db"
             create_database(path)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 for ident in (1, 2, 3, 4):
                     insert_reference(db, ident)
                 db.execute('UPDATE "references" SET is_exterior=NULL,cell_id=NULL,worldspace_id=NULL,pos_x=NULL')
@@ -527,7 +528,7 @@ class PlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "world.db"
             create_database(path)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 for ident in (1, 2, 3, 4):
                     insert_reference(db, ident)
                 db.execute('UPDATE "references" SET cell_id=NULL WHERE id IN (1,2)')
@@ -545,7 +546,7 @@ class PlacementTests(unittest.TestCase):
                 root = Path(tmp)
                 self.prepare_assets(root)
                 database = root / "skyrim_world.db"
-                with sqlite3.connect(database) as db:
+                with closing(sqlite3.connect(database)) as db, db:
                     insert_reference(db, 1)
                     db.execute(f'UPDATE "references" SET {mutation}')
                 original_database = database.read_bytes()
@@ -565,7 +566,7 @@ class PlacementTests(unittest.TestCase):
                 root = Path(tmp)
                 self.prepare_assets(root)
                 database = root / "skyrim_world.db"
-                with sqlite3.connect(database) as db:
+                with closing(sqlite3.connect(database)) as db, db:
                     insert_reference(db, 1)
                     db.execute(f'UPDATE "references" SET {mutation}')
                 original_database = database.read_bytes()
@@ -582,7 +583,7 @@ class PlacementTests(unittest.TestCase):
                 root = Path(tmp)
                 self.prepare_assets(root)
                 database = root / "skyrim_world.db"
-                with sqlite3.connect(database) as db:
+                with closing(sqlite3.connect(database)) as db, db:
                     insert_reference(db, 1, 0x20)
                     insert_reference(db, 2, 0x800)
                     if conditional:
