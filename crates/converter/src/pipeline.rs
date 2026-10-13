@@ -114,6 +114,7 @@ fn conversion_is_complete(report: &PipelineReport) -> bool {
 #[derive(Clone, Default)]
 pub struct Cancellation {
     flag: Arc<AtomicBool>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl Cancellation {
@@ -123,10 +124,23 @@ impl Cancellation {
 
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Relaxed);
+        self.changed.notify_waiters();
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -261,7 +275,7 @@ impl AssetPipeline {
                 .ok_or_else(|| color_eyre::eyre::eyre!("output has no parent"))?,
         )
         .wrap_err("failed to create asset output parent")?;
-        let output_lock = AssetLock::acquire_exclusive(&config.output_dir).map_err(|error| {
+        let output_lock = Arc::new(AssetLock::acquire_exclusive(&config.output_dir).map_err(|error| {
             let message = if error.is_held() {
                 format!(
                     "asset output {} is in use; close its engine or inspector before conversion",
@@ -274,11 +288,11 @@ impl AssetPipeline {
                 )
             };
             color_eyre::Report::from(error).wrap_err(message)
-        })?;
+        })?);
         // Hold the runtime lock before repair-journal recovery can write the pack,
         // and the distinct repair lock before directory recovery or publication.
         // Both guards remain alive through cache cleanup; publication reuses output_lock.
-        let ownership = crate::repair::OutputOwnership::acquire(&config.output_dir)?;
+        let ownership = Arc::new(crate::repair::OutputOwnership::acquire(&config.output_dir)?);
         config.output_dir = ownership.output().to_path_buf();
         recover_interrupted_publication(&config.output_dir)?;
         let started = Instant::now();
@@ -345,6 +359,10 @@ impl AssetPipeline {
             &previous_manifest,
             &progress_tx,
             &cancellation,
+            Arc::new(LodWorkerOwnership {
+                _runtime: output_lock.clone(),
+                _repair: ownership.clone(),
+            }),
         )
         .await;
         let mut report = match run_result {
@@ -411,6 +429,7 @@ impl AssetPipeline {
         previous: &ConversionManifest,
         progress_tx: &Sender<ProgressEvent>,
         cancellation: &Cancellation,
+        ownership: Arc<LodWorkerOwnership>,
     ) -> Result<PipelineReport> {
         let mut report = PipelineReport::default();
         let expected_configuration = configuration_hash(config)?;
@@ -1002,6 +1021,7 @@ impl AssetPipeline {
             progress_tx,
             cancellation,
             &mut report,
+            Some(ownership),
         )
         .await?;
         report.lod_elapsed_ms = lod_started.elapsed().as_millis();
@@ -2744,12 +2764,107 @@ pub(crate) async fn compile_lod_chunks(
         progress_tx,
         &Cancellation::new(),
         report,
+        None,
     )
     .await
 }
 
+/// The blocking compiler retains both publication leases if its caller is dropped.
+struct LodWorkerOwnership {
+    _runtime: Arc<AssetLock>,
+    _repair: Arc<crate::repair::OutputOwnership>,
+}
+
+struct CancelLodWorkerOnDrop(Option<Cancellation>);
+
+impl Drop for CancelLodWorkerOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.0 {
+            cancellation.cancel();
+        }
+    }
+}
+
+async fn run_owned_lod_worker<T: Send + 'static>(
+    cancellation: Cancellation,
+    ownership: Option<Arc<LodWorkerOwnership>>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let mut guard = CancelLodWorkerOnDrop(Some(cancellation));
+    let worker = spawn_blocking(move || {
+        let _ownership = ownership;
+        work()
+    });
+    let result = worker.await.wrap_err("terrain LOD worker failed");
+    guard.0 = None;
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn compile_lod_chunks_with_cancel(
+    config: &PipelineConfig,
+    staging: &Path,
+    reuse_root: &Path,
+    plugins: &[PathBuf],
+    plugin_hashes: &[String],
+    progress_tx: &Sender<ProgressEvent>,
+    cancellation: &Cancellation,
+    report: &mut PipelineReport,
+    ownership: Option<Arc<LodWorkerOwnership>>,
+) -> Result<()> {
+    let config = config.clone();
+    let staging = staging.to_path_buf();
+    let reuse_root = reuse_root.to_path_buf();
+    let plugins = plugins.to_vec();
+    let plugin_hashes = plugin_hashes.to_vec();
+    let progress_tx = progress_tx.clone();
+    let worker_cancellation = cancellation.clone();
+    let mut worker_report = std::mem::take(report);
+    let runtime = tokio::runtime::Handle::current();
+    #[cfg(test)]
+    let fail_gpu_init = FAIL_LOD_GPU_INIT.with(std::cell::Cell::get);
+    let (result, returned_report) =
+        run_owned_lod_worker(cancellation.clone(), ownership, move || {
+            #[cfg(test)]
+            let _gpu_override = LodGpuInitOverride::new(fail_gpu_init);
+            let result = runtime.block_on(async {
+                // Cancellation must also release a worker waiting for a full progress
+                // channel. Synchronous transactions poll the same flag between batches.
+                tokio::select! {
+                    biased;
+                    _ = worker_cancellation.cancelled() => Err(Interrupted::new().into()),
+                    result = compile_lod_chunks_inline(
+                        &config, &staging, &reuse_root, &plugins, &plugin_hashes,
+                        &progress_tx, &worker_cancellation, &mut worker_report,
+                    ) => result,
+                }
+            });
+            (result, worker_report)
+        })
+        .await?;
+    *report = returned_report;
+    result
+}
+
+#[cfg(test)]
+struct LodGpuInitOverride(bool);
+
+#[cfg(test)]
+impl LodGpuInitOverride {
+    fn new(value: bool) -> Self {
+        Self(FAIL_LOD_GPU_INIT.with(|flag| flag.replace(value)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for LodGpuInitOverride {
+    fn drop(&mut self) {
+        FAIL_LOD_GPU_INIT.with(|flag| flag.set(self.0));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compile_lod_chunks_inline(
     config: &PipelineConfig,
     staging: &Path,
     reuse_root: &Path,
@@ -3934,6 +4049,106 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lod_worker_leaves_current_thread_free_and_retains_leases_after_abort() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("modern");
+        let ownership = Arc::new(LodWorkerOwnership {
+            _runtime: Arc::new(AssetLock::acquire_exclusive(&output).unwrap()),
+            _repair: Arc::new(crate::repair::OutputOwnership::acquire(&output).unwrap()),
+        });
+        let cancellation = Cancellation::new();
+        let observed = cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let worker_output = output.clone();
+        let task = tokio::spawn(run_owned_lod_worker(
+            cancellation,
+            Some(ownership),
+            move || {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                if !observed.is_cancelled() {
+                    fs::create_dir_all(&worker_output).unwrap();
+                    fs::write(worker_output.join("unexpected-write"), b"bad").unwrap();
+                }
+                finished_tx.send(()).unwrap();
+            },
+        ));
+        // The worker waits synchronously. A current-thread runtime must still
+        // deliver this signal and run the abort rather than block in compilation.
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(AssetLock::acquire_shared(&output).is_err());
+        assert!(crate::repair::OutputOwnership::acquire(&output).is_err());
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if AssetLock::acquire_exclusive(&output).is_ok()
+                    && crate::repair::OutputOwnership::acquire(&output).is_ok()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !output.exists(),
+            "aborted worker must observe cancellation before writing"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lod_worker_cancellation_releases_a_full_progress_channel() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = PipelineConfig {
+            no_lod: true,
+            ..cpu_lod_config(temp.path(), temp.path().join("out"))
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(ProgressEvent::notice(
+            ProgressStage::LodChunks,
+            None,
+            "full",
+        ))
+        .await
+        .unwrap();
+        let cancellation = Cancellation::new();
+        let trigger = cancellation.clone();
+        let task = tokio::spawn(async move {
+            compile_lod_chunks_with_cancel(
+                &config,
+                temp.path(),
+                temp.path(),
+                &[],
+                &[],
+                &tx,
+                &cancellation,
+                &mut PipelineReport::default(),
+                None,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        trigger.cancel();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.downcast_ref::<Interrupted>().is_some());
+    }
 
     fn cpu_lod_config(data: impl Into<PathBuf>, output: impl Into<PathBuf>) -> PipelineConfig {
         let mut config = PipelineConfig::new(data, output);
