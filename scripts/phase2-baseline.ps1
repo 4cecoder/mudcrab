@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     # Which scenes to measure. The default is the five the baseline compares: the synthetic scene
     # is the one a machine with no converted data can run, the four world scenes are the walk, the

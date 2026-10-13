@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet("all", "synthetic", "rural", "dense", "dense-legacy", "water", "stress", "stability")]
     [string]$Scenario = "all",
