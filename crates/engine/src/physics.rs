@@ -929,12 +929,11 @@ pub fn try_enter_walk(
     Err("no free capsule placement nearby".to_owned())
 }
 
-/// Everything `clear_motion_state` touches, optional so the console works in partial apps.
+/// The pending-input state a pause drops, optional so the console works in partial apps.
 #[derive(SystemParam)]
 pub(crate) struct MotionReset<'w, 's> {
     intent: Option<ResMut<'w, WalkIntent>>,
     sprint: Option<ResMut<'w, SprintLatch>>,
-    states: Query<'w, 's, &'static mut WalkState>,
     controllers: Query<'w, 's, &'static mut KinematicCharacterController>,
 }
 
@@ -950,14 +949,6 @@ impl MotionReset<'_, '_> {
         }
         for mut controller in &mut self.controllers {
             controller.translation = None;
-        }
-    }
-
-    pub(crate) fn clear(&mut self) {
-        if let (Some(intent), Some(sprint)) =
-            (self.intent.as_deref_mut(), self.sprint.as_deref_mut())
-        {
-            clear_motion_state(intent, sprint, &mut self.states, &mut self.controllers);
         }
     }
 }

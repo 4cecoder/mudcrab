@@ -437,9 +437,10 @@ fn console_input_system(
             *capture = CursorCapture::Released;
             // Virtual time already advanced this frame in `First`; the pause bites from the next.
             time.pause();
-            // Reset the walk intent, sprint latch and character controllers so a key held while
-            // opening does not leave stale movement behind; `ButtonInput` itself is untouched.
-            motion.clear();
+            // Reset the walk intent, sprint latch and queued controller translation so a key held
+            // while opening does not leave stale movement behind. Velocity and jump state stay, so
+            // closing resumes an airborne arc; `ButtonInput` itself is untouched.
+            motion.clear_input();
         }
     }
     for event in events.read() {
@@ -823,6 +824,34 @@ mod tests {
         insert_text(&mut buffer, "y");
         assert_eq!(buffer.chars().count(), INPUT_CAP);
         assert!(!buffer.contains('y'));
+    }
+
+    #[test]
+    fn opening_console_mid_jump_drops_input_but_keeps_the_airborne_state() {
+        use crate::physics::{SprintLatch, WalkIntent, WalkState};
+        let mut app = console_app();
+        app.insert_resource(WalkIntent {
+            jump_pressed: true,
+            ..default()
+        })
+        .insert_resource(SprintLatch(true));
+        let body = app
+            .world_mut()
+            .spawn(WalkState {
+                vertical_velocity: 200.0,
+                grounded: false,
+                jump_active: true,
+                ..default()
+            })
+            .id();
+        send_state(&mut app, KeyCode::Backquote, ButtonState::Pressed);
+        assert!(app.world().resource::<ConsoleState>().open);
+        assert!(!app.world().resource::<WalkIntent>().jump_pressed);
+        assert!(!app.world().resource::<SprintLatch>().0);
+        let state = app.world().get::<WalkState>(body).unwrap();
+        assert_eq!(state.vertical_velocity, 200.0);
+        assert!(state.jump_active);
+        assert!(!state.grounded);
     }
 
     #[test]
