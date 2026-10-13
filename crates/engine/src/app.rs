@@ -171,6 +171,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     }
     let render_asset_budget = upload_budget(&config);
     app.insert_resource(config.color_grade)
+        .insert_resource(config.visual_preset)
+        .insert_resource(config.visual_preset.sky_palette())
         .insert_resource(config)
         .insert_resource(origin)
         .insert_resource(render_asset_budget)

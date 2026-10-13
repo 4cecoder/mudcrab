@@ -1,4 +1,8 @@
-use crate::{color_pipeline::SceneGradeMode, skyrim_ini::SkyrimIni, world::components::CELL_SIZE};
+use crate::{
+    color_pipeline::{SCENE_GRADE_VALUES, SceneGradeMode, SceneVisualPreset},
+    skyrim_ini::SkyrimIni,
+    world::components::CELL_SIZE,
+};
 use bevy::prelude::Resource;
 use shared::lod::LodTier;
 use std::{fmt, path::PathBuf};
@@ -96,6 +100,8 @@ pub struct EngineConfig {
     pub hidden_window: bool,
     /// Select the cinematic A/B experiment without changing scene lighting.
     pub color_grade: SceneGradeMode,
+    /// Named sky and grading look; Vivid preserves the approved configuration.
+    pub visual_preset: SceneVisualPreset,
     pub benchmark_only: bool,
     pub benchmark_frames: Option<u32>,
     pub benchmark_duration_secs: Option<f64>,
@@ -177,6 +183,7 @@ impl Default for EngineConfig {
             headless: false,
             hidden_window: false,
             color_grade: SceneGradeMode::Full,
+            visual_preset: SceneVisualPreset::Vivid,
             benchmark_only: false,
             benchmark_frames: None,
             benchmark_duration_secs: None,
@@ -262,7 +269,8 @@ Benchmark and profiling:
   --acceptance-screenshot <file>        write a screenshot when the run ends
   --screenshot-camera-offset <x,y,z>    camera offset for the acceptance screenshot
   --matched-route <file>                execute exact route steps with transition and settled checkpoints
-  --color-grade <off|saturation|full>    select color grading for matched shots (default: full)
+  --color-grade <mode>                 off|saturation|full|snapshot-srgb|snapshot-linear (default: full)
+  --visual-preset <vivid|cool-gray>      select sky and grading look (default: vivid)
   --sun-position <azimuth,elevation>     sun bearing clockwise from north and elevation above horizon, degrees
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
   --shots-settle-timeout <seconds>      maximum settling time per shot (default: 30, maximum: 600)
@@ -721,12 +729,18 @@ impl EngineConfig {
                     )?);
                 }
                 "--color-grade" => {
-                    let raw = take_raw("--color-grade", "off, saturation or full", args.next())?;
+                    let raw = take_raw("--color-grade", SCENE_GRADE_VALUES, args.next())?;
                     config.color_grade = SceneGradeMode::parse(&raw).ok_or_else(|| {
+                        ConfigError::invalid_value("--color-grade", Some(raw), SCENE_GRADE_VALUES)
+                    })?;
+                }
+                "--visual-preset" => {
+                    let raw = take_raw("--visual-preset", "vivid or cool-gray", args.next())?;
+                    config.visual_preset = SceneVisualPreset::parse(&raw).ok_or_else(|| {
                         ConfigError::invalid_value(
-                            "--color-grade",
+                            "--visual-preset",
                             Some(raw),
-                            "off, saturation or full",
+                            "vivid or cool-gray",
                         )
                     })?;
                 }
@@ -791,7 +805,7 @@ const STREAM_RADIUS_EXPECTED: &str = "a cell count from 0 to 1073741822";
 
 /// What `--sun-position` takes: azimuth clockwise from north, then elevation above the horizon.
 const SUN_POSITION_EXPECTED: &str =
-    "two finite angles in degrees: azimuth,elevation (elevation -90 to 90)";
+    "two finite angles in degrees: azimuth,elevation (elevation 0 to 90)";
 
 /// Test shorthand for a command line that must ask for a run.
 #[cfg(test)]
@@ -822,7 +836,7 @@ fn parse_sun_position(value: &str) -> Option<(f32, f32)> {
     if parts.next().is_some()
         || !azimuth.is_finite()
         || !elevation.is_finite()
-        || !(-90.0..=90.0).contains(&elevation)
+        || !(0.0..=90.0).contains(&elevation)
     {
         return None;
     }
@@ -1004,6 +1018,16 @@ mod tests {
         "--short",               // git rev-parse
         "--output",              // world inspection, profiling, startup runner
         "--pairs-output",        // correlate_drawables.py
+        "--native-preset",       // prepare_skyrim_comparison.py
+        "--calibration",         // prepare_skyrim_comparison.py
+        "--timeout",             // run_skyrim_comparison.py
+        "--user",                // systemctl
+        "--property",            // systemctl
+        "--value",               // systemctl
+        "--onlyvisible",         // xdotool
+        "--name",                // xdotool
+        "--sync",                // xdotool
+        "--psm",                 // tesseract
         "--radius",              // world-inspect
         "--library-path",        // ld-linux
         "--meshes",              // audit-collision.py
@@ -1098,11 +1122,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_visual_preset_without_changing_diagnostic_grade() {
+        assert_eq!(
+            EngineConfig::default().visual_preset,
+            SceneVisualPreset::Vivid
+        );
+        for (value, expected) in [
+            ("vivid", SceneVisualPreset::Vivid),
+            ("COOL-GRAY", SceneVisualPreset::CoolGray),
+        ] {
+            let config = run_config(&["--visual-preset", value, "--color-grade", "saturation"]);
+            assert_eq!(config.visual_preset, expected);
+            assert_eq!(config.color_grade, SceneGradeMode::Saturation);
+        }
+        for args in [
+            &["--visual-preset"][..],
+            &["--visual-preset", "invalid"][..],
+        ] {
+            assert!(parse_error(args).to_string().contains("--visual-preset"));
+        }
+    }
+
+    #[test]
     fn parses_color_grade_and_rejects_unknown_modes() {
         for (value, wanted) in [
             ("off", SceneGradeMode::Off),
             ("saturation", SceneGradeMode::Saturation),
             ("FULL", SceneGradeMode::Full),
+            ("SNAPSHOT-SRGB", SceneGradeMode::SnapshotSrgb),
+            ("snapshot-linear", SceneGradeMode::SnapshotLinear),
         ] {
             assert_eq!(run_config(&["--color-grade", value]).color_grade, wanted);
         }
@@ -1110,7 +1158,7 @@ mod tests {
         assert!(
             parse_error(&["--color-grade", "bad"])
                 .to_string()
-                .contains("off, saturation or full")
+                .contains(SCENE_GRADE_VALUES)
         );
         assert!(
             parse_error(&["--color-grade"])
@@ -1235,7 +1283,7 @@ mod tests {
         let config = run_config(&["--sun-position", "450,35"]);
         assert_eq!(config.sun_position, Some((90.0, 35.0)));
 
-        for value in ["0", "north,35", "0,91", "0,-91", "0,35,2", "NaN,35"] {
+        for value in ["0", "north,35", "0,91", "0,-1", "0,35,2", "NaN,35"] {
             assert!(
                 matches!(
                     parse_error(&["--sun-position", value]),

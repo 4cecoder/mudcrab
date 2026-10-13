@@ -46,6 +46,59 @@ grade and domains; material probes now register the full post pass.
 
 ## A/B controls and matched captures
 
+### Sleeping Giant Inn snapshot experiment
+
+`SceneGrade snapshot-srgb` and `SceneGrade snapshot-linear` reproduce the rounded
+Photo Mode UI values supplied on 2026-10-13: saturation 1.66, brightness 1.15,
+contrast 1.50, tint amount 0.56, and tint RGB `(0.88, 0.81, 0.72)`. Photo Mode
+lists the tint sliders as Red, Blue, Green; the experiment stores RGB in normal order.
+These are one scene's current base-grade values, not universal Skyrim defaults.
+
+Both modes disable Bevy post-saturation and evaluate saturation followed by tint
+in the cinematic post pass. The original luminance feeds both operations; negative
+channels produced by saturation are retained until tint, brightness, and contrast
+have run, then the output is clipped. `snapshot-srgb` operates on sRGB-encoded
+post-tonemap values; `snapshot-linear` operates directly on linear post-tonemap
+values. Alpha passes through and reflections remain ungraded.
+
+The modes keep the selected sky preset, exposure, TonyMcMapface, and the fixed 0.18
+contrast pivot. They do not reproduce Skyrim's native tone curve, adaptation,
+bloom, final gamma, or modifier composition. The UI values are rounded, and the
+correct native sampled domain remains a capture gate. These are controlled domain
+experiments rather than a full retail renderer port.
+
+Use `--color-grade snapshot-srgb|snapshot-linear` at startup. Return to
+`SceneGrade full` to restore Vivid or Cool Gray's existing grading. `ScenePreset`
+remains an independent sky/preset selector. Both presets and the startup defaults
+retain their existing values. Shot receipts include the resolved grading values,
+which saturation stage is active, and the post-pass domain flag. For a small GPU
+composition check, run `color_pipeline_probe --gray --color-grade snapshot-srgb`
+or `snapshot-linear` with a fresh `--output` directory.
+
+### Presets and diagnostic stages
+
+Two named visual presets preserve the approved look while allowing experiments:
+
+| Preset | Bevy post-saturation | Sky upper / lower / horizon (sRGB bytes) |
+|---|---|---|
+| Vivid (default) | 1.5 | `(21,77,117)` / `(60,135,183)` / `(125,163,183)` |
+| Cool Gray | 1.25 | `(178,187,198)` / `(194,202,209)` / `(207,214,220)` |
+
+Vivid retains the existing clear-day configuration exactly. Cool Gray uses a light,
+slightly blue gray gradient and lower saturation. Both retain brightness 1.135,
+contrast 1.4, tint amount 0.42 and its existing RGB, EV100 9.7, and TonyMcMapface.
+Lights, shadows, fog colors, fog density and camera pose remain unchanged. Sky
+colors are authored inputs before tone mapping and grading, not final display RGB.
+
+Run `ScenePreset vivid`, `ScenePreset cool-gray`, or `ScenePreset toggle` in the
+backtick console. With no argument, `ScenePreset` reports the active preset and
+diagnostic grade mode. Switching is immediate and reversible. Use
+`--visual-preset vivid|cool-gray` at startup; Vivid remains the default. Preset
+selection does not change the independent `SceneGrade` mode below. Use full
+grading to see each complete look. Presets are built into the engine; console
+selection lasts for the current process. Shot receipts record `visual_preset`
+and `preset_saturation` alongside the diagnostic grade mode.
+
 Open the backtick console and run `SceneGrade off`, `SceneGrade saturation` or
 `SceneGrade full`. With no argument, `SceneGrade` reports the current mode. `off`
 disables both grading stages; `saturation` enables only Bevy post-saturation;
