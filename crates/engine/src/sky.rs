@@ -489,8 +489,13 @@ fn apply_sky(
     mut cameras: Query<&mut Camera, With<SkyCamera>>,
     mut domes: Query<(&MeshMaterial3d<SkyMaterial>, &mut Visibility), With<SkyDome>>,
     mut materials: ResMut<Assets<SkyMaterial>>,
+    settings: Option<Res<crate::settings::RenderingSettings>>,
 ) {
-    let clear = palette.clear_colour(*space);
+    let mut adjusted_palette = *palette;
+    if let Some(settings) = settings.as_deref() {
+        adjusted_palette.brightness *= settings.sky_brightness_scale;
+    }
+    let clear = adjusted_palette.clear_colour(*space);
     for mut camera in &mut cameras {
         let current = match camera.clear_color {
             ClearColorConfig::Custom(colour) => Some(colour),
@@ -500,16 +505,19 @@ fn apply_sky(
             camera.clear_color = ClearColorConfig::Custom(clear);
         }
     }
-    let visibility = match *space {
-        CameraSpace::Exterior => Visibility::Inherited,
-        CameraSpace::Interior => Visibility::Hidden,
+    let visibility = match (
+        *space,
+        settings.as_ref().is_none_or(|settings| settings.sky),
+    ) {
+        (CameraSpace::Exterior, true) => Visibility::Inherited,
+        _ => Visibility::Hidden,
     };
     for (material, mut dome_visibility) in &mut domes {
         dome_visibility.set_if_neq(visibility);
-        if palette.is_changed()
+        if (palette.is_changed() || settings.as_ref().is_some_and(|s| s.is_changed()))
             && let Some(mut sky_material) = materials.get_mut(&material.0)
         {
-            sky_material.sky = SkyUniform::new(&palette);
+            sky_material.sky = SkyUniform::new(&adjusted_palette);
         }
     }
 }
@@ -523,10 +531,22 @@ fn apply_fog(
     palette: Res<SkyPalette>,
     space: Res<CameraSpace>,
     cameras: Query<(Entity, Option<&DistanceFog>), With<FogCamera>>,
+    settings: Option<Res<crate::settings::RenderingSettings>>,
 ) {
-    let wanted = match *space {
-        CameraSpace::Exterior => Some(fog_for(&palette)),
-        CameraSpace::Interior => None,
+    let wanted = match (
+        *space,
+        settings.as_deref().is_none_or(|settings| settings.fog),
+    ) {
+        (CameraSpace::Exterior, true) => {
+            let mut fog = fog_for(&palette);
+            if let Some(settings) = settings.as_deref() {
+                fog.falloff = FogFalloff::Exponential {
+                    density: FOG_DENSITY * settings.fog_density_scale,
+                };
+            }
+            Some(fog)
+        }
+        _ => None,
     };
     for (camera, current) in &cameras {
         let up_to_date = match (&wanted, current) {
