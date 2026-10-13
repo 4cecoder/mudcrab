@@ -103,11 +103,13 @@ Exit codes:
 - `1`: candidates found, with complete coverage in that scope.
 - `2`: incomplete coverage or invalid input, including a material-only run.
 
-`rendered_z_fighting_verified` is always false in this tool. The material section
-is an authored-requirements inventory against the baseline loader's omissions;
-it still lists decal requirements after the renderer fix below. Closing a
-requirement requires evidence of the runtime state actually applied to that
-material/pass, not deleting its authored flag from the report.
+`rendered_z_fighting_verified` is always false in this tool. The
+`material_requirements` section inventories authored depth settings handled by
+the native renderer; those flags alone do not set `risks_found` or cause exit
+code `1`. Per-file `material_risks` remains empty for report compatibility.
+Geometry overlaps and duplicate placements remain candidates. The inventory
+preserves source flags and block identities for checking the runtime state
+applied to each material/pass.
 
 ### Geometry method
 

@@ -57,8 +57,10 @@ impl NifDepthState {
         } else {
             CompareFunction::Always
         });
-        depth.bias.constant = if self.decal { DECAL_DEPTH_BIAS } else { 0 };
-        depth.bias.slope_scale = if self.decal { DECAL_SLOPE_BIAS } else { 0.0 };
+        if self.decal {
+            depth.bias.constant = DECAL_DEPTH_BIAS;
+            depth.bias.slope_scale = DECAL_SLOPE_BIAS;
+        }
     }
 
     pub fn excludes_shadow(&self) -> bool {
@@ -116,10 +118,7 @@ impl MaterialExtension for NifDepthExtension {
     }
 }
 
-pub fn depth_material(mut base: StandardMaterial, state: NifDepthState) -> NifDepthMaterial {
-    if state.decal {
-        base.depth_bias = DECAL_DEPTH_BIAS as f32;
-    }
+pub fn depth_material(base: StandardMaterial, state: NifDepthState) -> NifDepthMaterial {
     NifDepthMaterial {
         base,
         extension: NifDepthExtension { state },
@@ -134,6 +133,28 @@ pub(crate) struct NifDepthMaterialSource(pub Handle<StandardMaterial>);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nondecal_depth_override_preserves_existing_raster_bias() {
+        let state = NifDepthState::from_flags(DEPTH_TEST, 0, AlphaMode::Opaque).unwrap();
+        let mut depth = DepthStencilState {
+            format: bevy::render::render_resource::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::Greater),
+            stencil: default(),
+            bias: bevy::render::render_resource::DepthBiasState {
+                constant: 7,
+                slope_scale: 0.25,
+                clamp: 0.125,
+            },
+        };
+        state.apply(&mut depth);
+        assert_eq!(depth.depth_write_enabled, Some(false));
+        assert_eq!(depth.depth_compare, Some(CompareFunction::GreaterEqual));
+        assert_eq!(depth.bias.constant, 7);
+        assert_eq!(depth.bias.slope_scale, 0.25);
+        assert_eq!(depth.bias.clamp, 0.125);
+    }
 
     #[test]
     fn ordinary_depth_and_blending_keep_their_original_material_path() {
@@ -203,11 +224,12 @@ mod tests {
             assert!(state.excludes_shadow());
             let base = StandardMaterial {
                 alpha_mode: AlphaMode::Mask(0.4),
+                depth_bias: 2.0,
                 ..default()
             };
             let material = depth_material(base, state);
             assert_eq!(material.base.alpha_mode, AlphaMode::Mask(0.4));
-            assert_eq!(material.base.depth_bias, DECAL_DEPTH_BIAS as f32);
+            assert_eq!(material.base.depth_bias, 2.0);
         }
         let state = NifDepthState::from_flags(DEPTH_TEST, 0, AlphaMode::Opaque).unwrap();
         assert!(!state.decal);

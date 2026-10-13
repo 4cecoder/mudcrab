@@ -1,8 +1,6 @@
 //! Native construction of converted NIF materials using Bevy's glTF extension hooks.
-use crate::nif_depth::{
-    DECAL, DEPTH_TEST, DEPTH_WRITE, DYNAMIC_DECAL, NifDepthMaterial, NifDepthMaterialSource,
-    NifDepthState, depth_material,
-};
+use crate::nif_depth::{NifDepthMaterial, NifDepthMaterialSource, NifDepthState, depth_material};
+use ::gltf::material::AlphaMode as GltfAlphaMode;
 use bevy::{
     asset::LoadContext,
     gltf::{
@@ -72,14 +70,15 @@ fn native_uv_transform(material: &gltf::Material<'_>) -> Option<bevy::math::Affi
 }
 
 fn needs_native_material(material: &gltf::Material<'_>) -> bool {
+    let alpha_mode = match material.alpha_mode() {
+        GltfAlphaMode::Opaque => AlphaMode::Opaque,
+        GltfAlphaMode::Mask => AlphaMode::Mask(material.alpha_cutoff().unwrap_or(0.5)),
+        GltfAlphaMode::Blend => AlphaMode::Blend,
+    };
     has_normal_alpha_mask(material)
         || native_tag(material, "normalConvention", "directx")
         || native_uv_transform(material).is_some()
-        || native_depth_flags(material).is_some_and(|(flags_1, flags_2)| {
-            flags_1 & (DECAL | DYNAMIC_DECAL) != 0
-                || flags_1 & DEPTH_TEST == 0
-                || flags_2 & DEPTH_WRITE == 0
-        })
+        || native_depth_state(material, alpha_mode).is_some()
 }
 
 fn native_depth_flags(material: &gltf::Material<'_>) -> Option<(u32, u32)> {
@@ -196,6 +195,36 @@ impl GltfExtensionHandler for NativeMaterialHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nif_depth::{DECAL, DEPTH_TEST, DEPTH_WRITE, DYNAMIC_DECAL};
+
+    #[test]
+    fn ordinary_blend_without_depth_write_keeps_loaded_material() {
+        for decal in [0, DECAL, DYNAMIC_DECAL] {
+            let document = gltf::Gltf::from_slice(
+                &serde_json::to_vec(&serde_json::json!({
+                    "asset":{"version":"2.0"},"materials":[{
+                        "alphaMode":"BLEND",
+                        "extras":{"openSkyrim":{
+                            "shaderFlags1":DEPTH_TEST | decal,"shaderFlags2":0
+                        }}
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let source = document.materials().next().unwrap();
+            let loaded = StandardMaterial {
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            };
+            assert_eq!(needs_native_material(&source), decal != 0);
+            assert_eq!(native_material(&source, &loaded).is_some(), decal != 0);
+            assert_eq!(
+                native_depth_state(&source, loaded.alpha_mode).is_some(),
+                decal != 0
+            );
+        }
+    }
 
     #[test]
     fn native_depth_requires_both_valid_flags_and_keeps_generic_gltf_unchanged() {

@@ -134,11 +134,46 @@ class OverlapTests(unittest.TestCase):
 
 
 class InputTests(unittest.TestCase):
+    def test_cli_handled_depth_flags_are_inventory_not_risks(self):
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                meshes = root / "meshes"
+                meshes.mkdir()
+                create_database(root / "skyrim_world.db")
+                authored = [
+                    material(AUDIT.DEPTH_TEST | AUDIT.DECAL, 0),
+                    material(AUDIT.DEPTH_TEST | AUDIT.DYNAMIC_DECAL, 0, alphaMode="MASK"),
+                    material(first=0),
+                    material(second=0, alphaMode="MASK"),
+                    material(second=0, alphaMode="BLEND"),
+                ]
+                for index, source in enumerate(authored):
+                    document, binary = fixture([(0,0,0), (1,0,0), (0,1,0)], materials=[source])
+                    write_glb(meshes / f"handled-{index}.glb", document, binary)
+                report = root / "report.json"
+                process = subprocess.run([sys.executable, str(SPEC.origin), str(root),
+                    "--jobs", str(jobs), "--out", str(report)], capture_output=True, text=True)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                result = json.loads(report.read_text())
+                self.assertFalse(result["risks_found"])
+                self.assertTrue(result["static_scope_passed"])
+                self.assertEqual(result["coverage_gaps"], [])
+                inventory = result["material_requirements"]
+                self.assertEqual(inventory["native_handled_materials"], 4)
+                self.assertEqual(inventory["authored_decal"], 1)
+                self.assertEqual(inventory["authored_dynamic_decal"], 1)
+                self.assertEqual(inventory["depth_test_disabled"], 1)
+                self.assertEqual(inventory["opaque_or_mask_depth_write_disabled"], 3)
+                self.assertEqual(len(result["files"]), 4)
+                self.assertTrue(all(not entry["material_risks"] for entry in result["files"]))
+                self.assertTrue(all(entry["material_requirements"] for entry in result["files"]))
+
     def test_optional_metadata_accepts_non_object_json(self):
         for value in (None, [], "x", 7, 1.5, True):
             for metadata in ({"extras": value}, {"extras": {"openSkyrim": value}}):
                 with self.subTest(metadata=metadata):
-                    self.assertIsNone(AUDIT.material_risks(metadata))
+                    self.assertIsNone(AUDIT.material_requirements(metadata))
                     document, binary = fixture([(0,0,0), (1,0,0), (0,1,0)], materials=[metadata])
                     geometry, _ = AUDIT.triangles(document, binary, 100)
                     self.assertEqual(len(geometry), 1)
@@ -178,7 +213,7 @@ class InputTests(unittest.TestCase):
                                            ("e-tag", {"extras": {"openSkyrim": "x"}})):
                         document, binary = fixture(points, materials=[metadata])
                         write_glb(meshes / (name + ".glb"), document, binary)
-                    document, binary = fixture(points, materials=[material(
+                    document, binary = fixture(points * (2 if risk else 1), materials=[material(
                         first=AUDIT.DEPTH_TEST | (AUDIT.DECAL if risk else 0))])
                     write_glb(meshes / "z-valid.glb", document, binary)
                     report = root / "report.json"
@@ -199,12 +234,12 @@ class InputTests(unittest.TestCase):
                         self.assertIn("z-valid.glb", [entry["path"] for entry in result["files"]])
 
     def test_depth_requirements_and_blend_exception(self):
-        self.assertEqual(AUDIT.material_risks(material()), [])
-        self.assertEqual(AUDIT.material_risks(material(AUDIT.DEPTH_TEST | AUDIT.DECAL | AUDIT.DYNAMIC_DECAL, 0)),
+        self.assertEqual(AUDIT.material_requirements(material()), [])
+        self.assertEqual(AUDIT.material_requirements(material(AUDIT.DEPTH_TEST | AUDIT.DECAL | AUDIT.DYNAMIC_DECAL, 0)),
             ["authored_decal", "authored_dynamic_decal", "opaque_or_mask_depth_write_disabled"])
-        self.assertEqual(AUDIT.material_risks(material(second=0, alphaMode="BLEND")), [])
-        self.assertEqual(AUDIT.material_risks(material(first=0)), ["depth_test_disabled"])
-        self.assertIsNone(AUDIT.material_risks({}))
+        self.assertEqual(AUDIT.material_requirements(material(second=0, alphaMode="BLEND")), [])
+        self.assertEqual(AUDIT.material_requirements(material(first=0)), ["depth_test_disabled"])
+        self.assertIsNone(AUDIT.material_requirements({}))
 
     def test_strided_positions_and_uint16_indices(self):
         binary = b"".join(struct.pack("<4f", *p, 99) for p in [(0,0,0), (1,0,0), (0,1,0)]) + struct.pack("<3H", 2,1,0)
@@ -262,7 +297,7 @@ class InputTests(unittest.TestCase):
             self.assertTrue(json.loads(report.read_text())["static_scope_passed"])
             self.assertEqual(AUDIT.main([str(root), "--materials-only", "--out", str(report)]), 2)
             self.assertFalse(json.loads(report.read_text())["static_scope_passed"])
-            document["materials"][0] = material(first=AUDIT.DEPTH_TEST | AUDIT.DECAL)
+            document, binary = fixture([(0,0,0), (1,0,0), (0,1,0)] * 2)
             write_glb(root / "meshes/test.glb", document, binary)
             self.assertEqual(AUDIT.main([str(root), "--out", str(report)]), 1)
             document["nodes"][0]["skin"] = 0
