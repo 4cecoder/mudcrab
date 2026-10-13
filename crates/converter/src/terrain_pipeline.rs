@@ -502,6 +502,7 @@ pub fn cell_key(
     merged: &HashMap<u32, RawRecord>,
     masters: &PluginMasters,
     land: &RawRecord,
+    known: &HashSet<u32>,
 ) -> Result<[u8; 32]> {
     let land_masters = masters_of(masters, land)?;
     let (layers, _) = extract_texture_layers(&land.subrecords)
@@ -512,6 +513,12 @@ pub fn cell_key(
             named.insert(layer.texture_form_id);
         }
     }
+    // The named LTEX records the table has no entry for: the mesh skips those layers.
+    let skipped: Vec<u32> = named
+        .iter()
+        .copied()
+        .filter(|form_id| !known.contains(form_id))
+        .collect();
     let mut textures: Vec<(&RawRecord, &[String])> = Vec::new();
     for form_id in named {
         let Some(ltex) = merged
@@ -534,7 +541,7 @@ pub fn cell_key(
             textures.push((txst, masters_of(masters, txst)?));
         }
     }
-    Ok(cell_mesh_key(land, land_masters, &textures))
+    Ok(cell_mesh_key(land, land_masters, &textures, &skipped))
 }
 
 /// One cell's mesh and placement, or why it was left out.
@@ -571,7 +578,7 @@ fn cell_mesh(
     let Some(worldspace_id) = cell.worldspace_form_id.or(land.worldspace_form_id) else {
         return Err(skip(grid, "its cell sits in no worldspace".to_string()));
     };
-    let key = cell_key(merged, masters, land).map_err(|error| {
+    let key = cell_key(merged, masters, land, known).map_err(|error| {
         skip(
             grid,
             format!("its derived-data key cannot be computed: {error:#}"),
@@ -1256,10 +1263,10 @@ mod tests {
         )
         .unwrap();
         let land = land_of_slot(&merged, 1);
-        let key = cell_key(&merged, &masters, &land).unwrap();
+        let key = cell_key(&merged, &masters, &land, &HashSet::new()).unwrap();
         assert_eq!(
             key,
-            cell_key(&merged, &masters, &land).unwrap(),
+            cell_key(&merged, &masters, &land, &HashSet::new()).unwrap(),
             "the same records and load order give the same key"
         );
 
@@ -1269,14 +1276,14 @@ mod tests {
         first_changed.insert(0, vec!["Dawnguard.esm".to_string()]);
         assert_eq!(
             key,
-            cell_key(&merged, &first_changed, &land).unwrap(),
+            cell_key(&merged, &first_changed, &land, &HashSet::new()).unwrap(),
             "a LAND keys with its own plugin's masters, not the first plugin's"
         );
         let mut own_changed = masters.clone();
         own_changed.insert(1, vec!["Update.esm".to_string()]);
         assert_ne!(
             key,
-            cell_key(&merged, &own_changed, &land).unwrap(),
+            cell_key(&merged, &own_changed, &land, &HashSet::new()).unwrap(),
             "its own plugin's master list is part of the key"
         );
 
@@ -1302,7 +1309,7 @@ mod tests {
         assert_eq!(shifted_land.load_order, 2);
         assert_eq!(
             key,
-            cell_key(&shifted, &shifted_masters, &shifted_land).unwrap(),
+            cell_key(&shifted, &shifted_masters, &shifted_land, &HashSet::new()).unwrap(),
             "a plugin that keeps its master list keeps its key when another loads around it"
         );
 
@@ -1325,7 +1332,7 @@ mod tests {
         let moved_land = land_of_slot(&moved_merged, 2);
         assert_ne!(
             key,
-            cell_key(&moved_merged, &moved_masters, &moved_land).unwrap(),
+            cell_key(&moved_merged, &moved_masters, &moved_land, &HashSet::new()).unwrap(),
             "a plugin earlier in the order joining the LAND's master list moves its key"
         );
     }
@@ -1341,10 +1348,10 @@ mod tests {
         );
         let records = merged(&[land.clone(), ltex.clone(), texture_set.clone()]);
         let order = masters(0, &["Skyrim.esm"]);
-        let key = cell_key(&records, &order, &land).unwrap();
+        let key = cell_key(&records, &order, &land, &HashSet::new()).unwrap();
         assert_eq!(
             key,
-            cell_key(&records, &order, &land).unwrap(),
+            cell_key(&records, &order, &land, &HashSet::new()).unwrap(),
             "the same records and masters give the same key"
         );
 
@@ -1355,7 +1362,7 @@ mod tests {
         moved.insert(moved_ltex.form_id, moved_ltex);
         assert_ne!(
             key,
-            cell_key(&moved, &order, &land).unwrap(),
+            cell_key(&moved, &order, &land, &HashSet::new()).unwrap(),
             "a texture set change on a named LTEX must rebuild the cell"
         );
 
@@ -1367,7 +1374,7 @@ mod tests {
         edited.insert(edited_ltex.form_id, edited_ltex);
         assert_ne!(
             key,
-            cell_key(&edited, &order, &land).unwrap(),
+            cell_key(&edited, &order, &land, &HashSet::new()).unwrap(),
             "any edit to a named LTEX must rebuild the cell"
         );
 
@@ -1378,7 +1385,7 @@ mod tests {
         edited_txst.insert(edited_set.form_id, edited_set);
         assert_ne!(
             key,
-            cell_key(&edited_txst, &order, &land).unwrap(),
+            cell_key(&edited_txst, &order, &land, &HashSet::new()).unwrap(),
             "an edit to an existing texture set's payload must rebuild the cell"
         );
 
@@ -1387,7 +1394,7 @@ mod tests {
         unrelated.insert(0x300, txst(0x300, "textures\\landscape\\other.dds", ""));
         assert_eq!(
             key,
-            cell_key(&unrelated, &order, &land).unwrap(),
+            cell_key(&unrelated, &order, &land, &HashSet::new()).unwrap(),
             "only the LTEX the LAND names are hashed"
         );
     }
@@ -1402,6 +1409,7 @@ mod tests {
             &merged(&[land.clone(), ltex.clone(), texture_set.clone()]),
             &masters(0, &["Skyrim.esm"]),
             &land,
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -1432,6 +1440,7 @@ mod tests {
                 (1, vec!["Skyrim.esm".to_string(), "Update.esm".to_string()]),
             ]),
             &shifted_land,
+            &HashSet::new(),
         )
         .unwrap();
         assert_ne!(
@@ -1446,7 +1455,8 @@ mod tests {
             cell_key(
                 &unchanged,
                 &masters(0, &["Skyrim.esm", "Update.esm"]),
-                &land
+                &land,
+                &HashSet::new()
             )
             .unwrap(),
             "a master list change moves every FormID the record means"

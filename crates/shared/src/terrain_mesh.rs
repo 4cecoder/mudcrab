@@ -444,11 +444,20 @@ impl LandTextureTable {
                     ltex_form_id: entry.ltex_form_id,
                 });
             }
-            for layer in std::iter::once(entry.diffuse).chain(entry.normal) {
+            let layers = std::iter::once((entry.diffuse, LandTextureUsage::DiffuseSrgb)).chain(
+                entry
+                    .normal
+                    .map(|layer| (layer, LandTextureUsage::NormalLinear)),
+            );
+            for (layer, usage) in layers {
+                // The array must be the entry's own usage: a diffuse layer in a normal array
+                // would sample the wrong texture class and colour space with nothing to report it.
                 let known = self
                     .arrays
                     .get(usize::from(layer.array))
-                    .is_some_and(|file| u32::from(layer.layer) < file.layers);
+                    .is_some_and(|file| {
+                        file.usage == usage && u32::from(layer.layer) < file.layers
+                    });
                 if !known {
                     return Err(TerrainMeshError::TableArray {
                         id: entry.id,
@@ -739,5 +748,35 @@ mod tests {
         assert!(json.contains("\"diffuse_srgb\""), "{json}");
         let typo = json.replace("diffuse_srgb", "diffuse_srbg");
         assert!(serde_json::from_str::<LandTextureTable>(&typo).is_err());
+    }
+
+    #[test]
+    fn validate_refuses_a_layer_in_an_array_of_the_other_usage() {
+        let normal_array = LandTextureArray {
+            path: "terrain/land-normal-bc3-1024.ktx2".into(),
+            usage: LandTextureUsage::NormalLinear,
+            format: LandTextureFormat::Bc3,
+            size: 1024,
+            layers: 3,
+        };
+        let mut ok = table(3);
+        ok.arrays.push(normal_array);
+        ok.entries[1].normal = Some(ArrayLayer { array: 1, layer: 1 });
+        assert_eq!(ok.validate(), Ok(()));
+
+        // A diffuse layer that names the normal array would sample the wrong class and colour space.
+        let mut diffuse_in_normal = ok.clone();
+        diffuse_in_normal.entries[1].diffuse = ArrayLayer { array: 1, layer: 1 };
+        assert_eq!(
+            diffuse_in_normal.validate(),
+            Err(TerrainMeshError::TableArray { id: 1, array: 1 })
+        );
+        // And a normal layer that names a diffuse array.
+        let mut normal_in_diffuse = ok.clone();
+        normal_in_diffuse.entries[1].normal = Some(ArrayLayer { array: 0, layer: 1 });
+        assert_eq!(
+            normal_in_diffuse.validate(),
+            Err(TerrainMeshError::TableArray { id: 1, array: 0 })
+        );
     }
 }
