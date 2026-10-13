@@ -130,7 +130,7 @@ impl AssetPipeline {
             &mut manifest,
             &progress_tx,
             Arc::new(LodWorkerOwnership {
-                _runtime: vec![source_lock, output_lock.clone()],
+                _runtime: vec![source_lock.clone(), output_lock.clone()],
                 _repair: None,
             }),
         )
