@@ -163,35 +163,44 @@ pub enum SettingKind {
 pub struct SettingSpec {
     pub label: &'static str,
     pub page: SettingsPage,
+    /// Heading the menu lists this setting under; entries of a group stay contiguous.
+    pub group: &'static str,
     pub kind: SettingKind,
+    /// When present and false, the setting has no visible effect and the menu dims it.
+    pub requires: Option<fn(&RenderingSettings) -> bool>,
     pub read: fn(&RenderingSettings) -> f64,
     pub write: fn(&mut RenderingSettings, f64),
 }
 
 macro_rules! toggle {
-    ($label:literal, $field:ident) => {
+    ($group:literal, $label:literal, $field:ident) => {
         SettingSpec {
             label: $label,
             page: SettingsPage::Graphics,
+            group: $group,
             kind: SettingKind::Toggle,
+            requires: None,
             read: |s| u8::from(s.$field) as f64,
             write: |s, value| s.$field = value != 0.0,
         }
     };
 }
 macro_rules! number {
-    ($page:ident, $label:literal, $field:ident $( [$index:literal] )?; $min:expr, $max:expr, $step:expr) => { SettingSpec {
-        label: $label, page: SettingsPage::$page,
+    ($page:ident, $group:literal, $label:literal, $field:ident $( [$index:literal] )?; $min:expr, $max:expr, $step:expr) => { SettingSpec {
+        label: $label, page: SettingsPage::$page, group: $group,
         kind: SettingKind::Number { min: $min, max: $max, step: $step },
+        requires: None,
         read: |s| s.$field $( [$index] )? as f64, write: |s, value| s.$field $( [$index] )? = value as _,
     } };
 }
 macro_rules! choice {
-    ($label:literal, $field:ident, $choices:expr) => {
+    ($group:literal, $label:literal, $field:ident, $choices:expr) => {
         SettingSpec {
             label: $label,
             page: SettingsPage::Graphics,
+            group: $group,
             kind: SettingKind::Choice($choices),
+            requires: None,
             read: |s| s.$field as f64,
             write: |s, value| s.$field = value as usize,
         }
@@ -200,49 +209,61 @@ macro_rules! choice {
 
 /// One inventory supplies UI controls and saved-file validation.
 pub static SETTING_SPECS: &[SettingSpec] = &[
-    toggle!("Point lights", point_lights),
-    number!(Graphics, "Enabled point-light budget", point_light_budget; 0.0, 256.0, 8.0),
-    toggle!("Point-light shadows", point_light_shadows),
+    toggle!("Point lights", "Point lights", point_lights),
+    number!(Graphics, "Point lights", "Enabled point-light budget", point_light_budget; 0.0, 256.0, 8.0)
+        .when(|s| s.point_lights),
+    toggle!("Point lights", "Point-light shadows", point_light_shadows).when(|s| s.point_lights),
     choice!(
+        "Point lights",
         "Point-light shadow-map resolution",
         point_shadow_size,
         &["512", "1024", "2048", "4096"]
-    ),
-    toggle!("Sun lighting", sun),
-    number!(Graphics, "Sun illuminance (lux)", sun_illuminance; 0.0, 100_000.0, 1000.0),
-    number!(Graphics, "Sun red", sun_color[0]; 0.0, 1.0, 0.05),
-    number!(Graphics, "Sun green", sun_color[1]; 0.0, 1.0, 0.05),
-    number!(Graphics, "Sun blue", sun_color[2]; 0.0, 1.0, 0.05),
-    number!(Graphics, "Ambient brightness", ambient_brightness; 0.0, 2000.0, 20.0),
-    number!(Graphics, "Ambient red", ambient_color[0]; 0.0, 1.0, 0.05),
-    number!(Graphics, "Ambient green", ambient_color[1]; 0.0, 1.0, 0.05),
-    number!(Graphics, "Ambient blue", ambient_color[2]; 0.0, 1.0, 0.05),
-    toggle!("Sun shadows", shadows),
+    )
+    .when(|s| s.point_lights && s.point_light_shadows),
+    toggle!("Sun and ambient light", "Sun lighting", sun),
+    number!(Graphics, "Sun and ambient light", "Sun illuminance (lux)", sun_illuminance; 0.0, 100_000.0, 1000.0)
+        .when(|s| s.sun),
+    number!(Graphics, "Sun and ambient light", "Sun red", sun_color[0]; 0.0, 1.0, 0.05).when(|s| s.sun),
+    number!(Graphics, "Sun and ambient light", "Sun green", sun_color[1]; 0.0, 1.0, 0.05).when(|s| s.sun),
+    number!(Graphics, "Sun and ambient light", "Sun blue", sun_color[2]; 0.0, 1.0, 0.05).when(|s| s.sun),
+    number!(Graphics, "Sun and ambient light", "Ambient brightness", ambient_brightness; 0.0, 2000.0, 20.0),
+    number!(Graphics, "Sun and ambient light", "Ambient red", ambient_color[0]; 0.0, 1.0, 0.05),
+    number!(Graphics, "Sun and ambient light", "Ambient green", ambient_color[1]; 0.0, 1.0, 0.05),
+    number!(Graphics, "Sun and ambient light", "Ambient blue", ambient_color[2]; 0.0, 1.0, 0.05),
+    toggle!("Sun shadows", "Sun shadows", shadows).when(|s| s.sun),
     choice!(
+        "Sun shadows",
         "Sun shadow-map resolution",
         shadow_size,
         &["512", "1024", "2048", "4096"]
-    ),
-    number!(Graphics, "Sun shadow cascades", shadow_cascades; 1.0, 4.0, 1.0),
-    number!(Graphics, "Sun shadow-distance multiplier", shadow_distance_scale; 0.25, 4.0, 0.25),
-    toggle!("Sky dome", sky),
-    number!(Graphics, "Sky-brightness multiplier", sky_brightness_scale; 0.0, 4.0, 0.1),
-    toggle!("Exterior distance fog", fog),
-    number!(Graphics, "Fog-density multiplier", fog_density_scale; 0.0, 4.0, 0.1),
-    toggle!("Water reflections", water_reflections),
-    number!(Graphics, "Water reflection multiplier", water_reflection_strength; 0.0, 1.0, 0.1),
-    toggle!("Water waves", water_waves),
-    toggle!("Water flow normals", water_flow_normals),
-    number!(Graphics, "Water wave scale", wave_scale; 0.001, 0.05, 0.001),
-    number!(Graphics, "Water wave speed", wave_speed; 0.0, 2.0, 0.05),
-    number!(Graphics, "Water wave strength", wave_strength; 0.0, 2.0, 0.05),
-    toggle!("CPU frustum culling", cpu_frustum_culling),
-    toggle!("GPU indirect drawing", indirect_drawing),
-    toggle!("GPU occlusion culling", occlusion_culling),
-    toggle!("Depth prepass", depth_prepass),
-    choice!("MSAA", msaa, &["Off", "2x", "4x", "8x"]),
-    number!(Graphics, "Exposure (EV100)", exposure_ev100; -5.0, 20.0, 0.25),
+    )
+    .when(|s| s.sun && s.shadows),
+    number!(Graphics, "Sun shadows", "Sun shadow cascades", shadow_cascades; 1.0, 4.0, 1.0)
+        .when(|s| s.sun && s.shadows),
+    number!(Graphics, "Sun shadows", "Sun shadow-distance multiplier", shadow_distance_scale; 0.25, 4.0, 0.25)
+        .when(|s| s.sun && s.shadows),
+    toggle!("Sky and fog", "Sky dome", sky),
+    number!(Graphics, "Sky and fog", "Sky-brightness multiplier", sky_brightness_scale; 0.0, 4.0, 0.1)
+        .when(|s| s.sky),
+    toggle!("Sky and fog", "Exterior distance fog", fog),
+    number!(Graphics, "Sky and fog", "Fog-density multiplier", fog_density_scale; 0.0, 4.0, 0.1)
+        .when(|s| s.fog),
+    toggle!("Water", "Water reflections", water_reflections),
+    number!(Graphics, "Water", "Water reflection multiplier", water_reflection_strength; 0.0, 1.0, 0.1)
+        .when(|s| s.water_reflections),
+    toggle!("Water", "Water waves", water_waves),
+    toggle!("Water", "Water flow normals", water_flow_normals),
+    number!(Graphics, "Water", "Water wave scale", wave_scale; 0.001, 0.05, 0.001).when(|s| s.water_waves),
+    number!(Graphics, "Water", "Water wave speed", wave_speed; 0.0, 2.0, 0.05).when(|s| s.water_waves),
+    number!(Graphics, "Water", "Water wave strength", wave_strength; 0.0, 2.0, 0.05).when(|s| s.water_waves),
+    toggle!("Culling and drawing", "CPU frustum culling", cpu_frustum_culling),
+    toggle!("Culling and drawing", "GPU indirect drawing", indirect_drawing),
+    toggle!("Culling and drawing", "GPU occlusion culling", occlusion_culling),
+    toggle!("Culling and drawing", "Depth prepass", depth_prepass),
+    choice!("Image", "MSAA", msaa, &["Off", "2x", "4x", "8x"]),
+    number!(Graphics, "Image", "Exposure (EV100)", exposure_ev100; -5.0, 20.0, 0.25),
     choice!(
+        "Image",
         "Tone mapping",
         tone_map,
         &[
@@ -257,38 +278,58 @@ pub static SETTING_SPECS: &[SettingSpec] = &[
             "Khronos PBR neutral",
         ]
     ),
-    number!(Graphics, "Vertical field of view (degrees)", fov_degrees; 30.0, 110.0, 5.0),
-    toggle!("VSync", vsync),
+    number!(Graphics, "Image", "Vertical field of view (degrees)", fov_degrees; 30.0, 110.0, 5.0),
+    toggle!("Window", "VSync", vsync),
     choice!(
+        "Window",
         "Window mode",
         window_mode,
         &["Windowed", "Borderless fullscreen"]
     ),
     choice!(
+        "Window",
         "Windowed resolution",
         window_size,
         &["1280 x 720", "1600 x 900", "1920 x 1080", "2560 x 1440"]
     ),
-    toggle!("Status HUD", hud),
+    toggle!("Interface and diagnostics", "Status HUD", hud),
     toggle!(
+        "Interface and diagnostics",
         "Diagnostic fallbacks (new loads)",
         diagnostic_asset_fallbacks
     ),
-    number!(Streaming, "Full-detail radius (cells)", stream_radius; 0.0, 16.0, 1.0),
-    number!(Streaming, "Unload radius (cells)", unload_radius; 0.0, 32.0, 1.0),
-    number!(Streaming, "Level-4 terrain LOD distance (units)", lod_level0_distance; 0.0, 1_000_000.0, 5000.0),
-    number!(Streaming, "Level-8 terrain LOD distance (units)", lod_level1_distance; 0.0, 1_000_000.0, 5000.0),
-    number!(Streaming, "Level-16 terrain LOD distance (units)", lod_maximum_distance; 0.0, 1_000_000.0, 10_000.0),
-    number!(Streaming, "Terrain LOD distance multiplier", lod_multiplier; 0.0, 4.0, 0.25),
-    number!(Streaming, "Cell commits per frame", cell_commits; 1.0, 64.0, 1.0),
-    number!(Streaming, "Cell commit budget (ms; 0 = unlimited)", commit_ms; 0.0, 100.0, 0.5),
-    number!(Streaming, "Cell unloads per frame (0 = unlimited)", cell_unloads; 0.0, 128.0, 1.0),
-    number!(Streaming, "Model spawns per frame (0 = unlimited)", model_spawns; 0.0, 512.0, 8.0),
-    number!(Streaming, "Asset upload MiB per frame (0 = unlimited)", upload_mib; 0.0, 256.0, 4.0),
-    number!(Streaming, "IO threads (restart; 0 = automatic)", io_threads; 0.0, 64.0, 1.0),
+    number!(Streaming, "Range", "Full-detail radius (cells)", stream_radius; 0.0, 16.0, 1.0),
+    number!(Streaming, "Range", "Unload radius (cells)", unload_radius; 0.0, 32.0, 1.0),
+    number!(Streaming, "Terrain level of detail", "Level-4 terrain LOD distance (units)", lod_level0_distance; 0.0, 1_000_000.0, 5000.0),
+    number!(Streaming, "Terrain level of detail", "Level-8 terrain LOD distance (units)", lod_level1_distance; 0.0, 1_000_000.0, 5000.0),
+    number!(Streaming, "Terrain level of detail", "Level-16 terrain LOD distance (units)", lod_maximum_distance; 0.0, 1_000_000.0, 10_000.0),
+    number!(Streaming, "Terrain level of detail", "Terrain LOD distance multiplier", lod_multiplier; 0.0, 4.0, 0.25),
+    number!(Streaming, "Per-frame budgets", "Cell commits per frame", cell_commits; 1.0, 64.0, 1.0),
+    number!(Streaming, "Per-frame budgets", "Cell commit budget (ms; 0 = unlimited)", commit_ms; 0.0, 100.0, 0.5),
+    number!(Streaming, "Per-frame budgets", "Cell unloads per frame (0 = unlimited)", cell_unloads; 0.0, 128.0, 1.0),
+    number!(Streaming, "Per-frame budgets", "Model spawns per frame (0 = unlimited)", model_spawns; 0.0, 512.0, 8.0),
+    number!(Streaming, "Per-frame budgets", "Asset upload MiB per frame (0 = unlimited)", upload_mib; 0.0, 256.0, 4.0),
+    number!(Streaming, "Threads", "IO threads (restart; 0 = automatic)", io_threads; 0.0, 64.0, 1.0),
 ];
 
 impl SettingSpec {
+    const fn when(self, requires: fn(&RenderingSettings) -> bool) -> Self {
+        Self {
+            requires: Some(requires),
+            ..self
+        }
+    }
+
+    /// False when a controlling setting makes this one have no visible effect.
+    pub fn relevant(&self, settings: &RenderingSettings) -> bool {
+        self.requires.is_none_or(|requires| requires(settings))
+    }
+
+    /// True when the session value differs from what Reset defaults restores.
+    pub fn is_modified(&self, settings: &RenderingSettings) -> bool {
+        (self.read)(settings) != (self.read)(&RenderingSettings::default())
+    }
+
     pub fn value_label(&self, settings: &RenderingSettings) -> String {
         let value = (self.read)(settings);
         match self.kind {
@@ -742,6 +783,38 @@ mod tests {
             ConfigAction::Run(config) => *config,
             ConfigAction::Help => panic!("expected a run"),
         }
+    }
+
+    #[test]
+    fn setting_groups_are_contiguous_per_page_so_the_menu_headings_do_not_repeat() {
+        for page in [SettingsPage::Graphics, SettingsPage::Streaming] {
+            let mut seen: Vec<&str> = Vec::new();
+            for spec in SETTING_SPECS.iter().filter(|spec| spec.page == page) {
+                if seen.last() != Some(&spec.group) {
+                    assert!(!seen.contains(&spec.group), "{} is split", spec.group);
+                    seen.push(spec.group);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dependent_settings_report_relevance_and_modification() {
+        let budget = SETTING_SPECS
+            .iter()
+            .find(|spec| spec.label == "Enabled point-light budget")
+            .unwrap();
+        let lights = SETTING_SPECS
+            .iter()
+            .find(|spec| spec.label == "Point lights")
+            .unwrap();
+        let mut settings = RenderingSettings::default();
+        assert!(!lights.is_modified(&settings));
+        assert!(!budget.relevant(&settings));
+        lights.adjust(&mut settings, 1);
+        assert!(lights.is_modified(&settings));
+        assert!(budget.relevant(&settings));
+        assert!(!budget.is_modified(&settings));
     }
 
     #[test]

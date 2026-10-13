@@ -4,7 +4,7 @@ use crate::{
     console::{ConsoleInputSet, ConsoleState},
     physics::{CursorCapture, MotionReset},
     settings::{
-        RenderingSettings, SETTING_SPECS, SettingKind, SettingsFile, SettingsPage,
+        RenderingSettings, SETTING_SPECS, SettingKind, SettingSpec, SettingsFile, SettingsPage,
         apply_render_settings,
     },
 };
@@ -103,8 +103,10 @@ impl Plugin for SettingsPlugin {
                     menu_actions,
                     apply_render_settings,
                     refresh_menu,
+                    style_rows,
                     scroll_menu,
                     scroll_focused_button,
+                    update_scrollbar,
                 )
                     .chain()
                     .in_set(SettingsUiSet),
@@ -112,14 +114,65 @@ impl Plugin for SettingsPlugin {
     }
 }
 
+const TEXT: Color = Color::srgb(0.9, 0.92, 0.95);
+const TEXT_MUTED: Color = Color::srgb(0.58, 0.63, 0.7);
+const TEXT_DIM: Color = Color::srgb(0.38, 0.42, 0.48);
+const ACCENT: Color = Color::srgb(0.45, 0.7, 1.0);
+const ACCENT_DIM: Color = Color::srgb(0.2, 0.3, 0.42);
+const GOOD: Color = Color::srgb(0.5, 0.85, 0.62);
+const WARNING: Color = Color::srgb(1.0, 0.68, 0.4);
+const PANEL: Color = Color::srgb(0.055, 0.065, 0.08);
+const SEPARATOR: Color = Color::srgb(0.12, 0.14, 0.18);
+const BORDER: Color = Color::srgb(0.26, 0.3, 0.36);
+const FOCUS: Color = Color::srgb(0.85, 0.93, 1.0);
+const KEYCAP: Color = Color::srgb(0.1, 0.12, 0.16);
+const PAGES: [SettingsPage; 3] = [
+    SettingsPage::Graphics,
+    SettingsPage::Streaming,
+    SettingsPage::Controls,
+];
+
+/// Resting, hovered, and pressed backgrounds for one button style.
+type ButtonStyle = (Color, Color, Color);
+const NEUTRAL: ButtonStyle = (
+    Color::srgb(0.13, 0.16, 0.21),
+    Color::srgb(0.2, 0.26, 0.34),
+    Color::srgb(0.28, 0.38, 0.5),
+);
+const TAB_ACTIVE: ButtonStyle = (
+    Color::srgb(0.17, 0.25, 0.36),
+    Color::srgb(0.21, 0.31, 0.44),
+    Color::srgb(0.28, 0.38, 0.5),
+);
+const PRIMARY: ButtonStyle = (
+    Color::srgb(0.2, 0.4, 0.68),
+    Color::srgb(0.26, 0.48, 0.8),
+    Color::srgb(0.32, 0.54, 0.88),
+);
+const SWITCH_ON: ButtonStyle = (
+    Color::srgb(0.13, 0.38, 0.27),
+    Color::srgb(0.17, 0.46, 0.33),
+    Color::srgb(0.22, 0.54, 0.4),
+);
+
 #[derive(Component)]
 struct MenuRoot;
 #[derive(Component)]
 struct MenuLauncher;
+/// Holds one page's scroll area and scrollbar; hidden unless that page is selected.
+#[derive(Component)]
+struct PageFrame(SettingsPage);
 #[derive(Component)]
 struct PageRoot(SettingsPage);
 #[derive(Component)]
+struct PageScrollbar(SettingsPage);
+#[derive(Component)]
+struct SettingLabel(usize);
+#[derive(Component)]
 struct SettingValue(usize);
+/// Accent bar at the start of a row whose value differs from the defaults.
+#[derive(Component)]
+struct SettingMark(usize);
 #[derive(Component)]
 struct StatusText;
 #[derive(Component)]
@@ -148,6 +201,34 @@ impl MenuAction {
             Self::CollisionDebug => menu.open && menu.page == SettingsPage::Graphics,
             _ => menu.open,
         }
+    }
+}
+
+fn step_page(page: SettingsPage, direction: i32) -> SettingsPage {
+    let current = PAGES.iter().position(|candidate| *candidate == page);
+    let next = (current.unwrap_or(0) as i32 + direction).rem_euclid(PAGES.len() as i32);
+    PAGES[next as usize]
+}
+
+fn button_style(
+    action: MenuAction,
+    active: bool,
+    settings: &RenderingSettings,
+    collision_on: bool,
+) -> ButtonStyle {
+    match action {
+        MenuAction::Save => PRIMARY,
+        MenuAction::Page(_) if active => TAB_ACTIVE,
+        MenuAction::Adjust(index, _) => {
+            let spec = &SETTING_SPECS[index];
+            if matches!(spec.kind, SettingKind::Toggle) && (spec.read)(settings) != 0.0 {
+                SWITCH_ON
+            } else {
+                NEUTRAL
+            }
+        }
+        MenuAction::CollisionDebug if collision_on => SWITCH_ON,
+        _ => NEUTRAL,
     }
 }
 
@@ -212,24 +293,31 @@ fn menu_actions(
     let keyboard_activation = keys.just_pressed(KeyCode::Enter)
         || keys.just_pressed(KeyCode::NumpadEnter)
         || keys.just_pressed(KeyCode::Space);
+    // Left / Right nudge the focused control, or move between tabs when a tab has focus.
+    let sideways = i32::from(keys.just_pressed(KeyCode::ArrowRight))
+        - i32::from(keys.just_pressed(KeyCode::ArrowLeft));
+    let collision_on = debug.as_deref().is_some_and(|debug| debug.enabled);
     let mut actions = Vec::new();
+    let mut tab_focus = None;
     for (entity, interaction, action, mut background, mut border) in &mut buttons {
         if !action.available(&menu, console.as_ref().is_some_and(|c| c.open || c.closing)) {
             continue;
         }
         let focused = focus.get() == Some(entity);
         let active = matches!(action, MenuAction::Page(page) if *page == menu.page);
+        let (rest, hover, pressed) = button_style(*action, active, &settings, collision_on);
         let color = match *interaction {
-            Interaction::Pressed => Color::srgb(0.32, 0.42, 0.53),
-            Interaction::Hovered => Color::srgb(0.23, 0.28, 0.34),
-            Interaction::None if active => Color::srgb(0.25, 0.34, 0.44),
-            Interaction::None => Color::srgb(0.12, 0.15, 0.19),
+            Interaction::Pressed => pressed,
+            Interaction::Hovered => hover,
+            Interaction::None => rest,
         };
         background.set_if_neq(BackgroundColor(color));
         border.set_if_neq(BorderColor::all(if focused {
-            Color::srgb(0.7, 0.8, 0.9)
+            FOCUS
+        } else if active {
+            ACCENT
         } else {
-            Color::srgb(0.3, 0.35, 0.4)
+            BORDER
         }));
         // Interactions remain Pressed while the mouse is held; only the transition activates.
         if (interaction.is_changed() && *interaction == Interaction::Pressed)
@@ -237,6 +325,16 @@ fn menu_actions(
         {
             focus.set(entity, FocusCause::Pressed);
             actions.push(*action);
+        } else if focused && sideways != 0 {
+            match action {
+                MenuAction::Adjust(index, _) => actions.push(MenuAction::Adjust(*index, sideways)),
+                MenuAction::Page(_) => {
+                    let page = step_page(menu.page, sideways);
+                    actions.push(MenuAction::Page(page));
+                    tab_focus = Some(page);
+                }
+                _ => {}
+            }
         }
     }
     for action in actions {
@@ -273,14 +371,43 @@ fn menu_actions(
             }
         }
     }
+    // Keyboard tab switching keeps focus on the tab that is now showing.
+    if let Some(page) = tab_focus {
+        for (entity, _, action, _, _) in &buttons {
+            if matches!(action, MenuAction::Page(candidate) if *candidate == page) {
+                focus.set(entity, FocusCause::Navigated);
+            }
+        }
+    }
 }
 
 fn text_bundle(text: impl Into<String>, size: f32) -> impl Bundle {
     (
         Text::new(text),
         TextFont::from_font_size(size),
-        TextColor(Color::srgb(0.9, 0.92, 0.95)),
+        TextColor(TEXT),
     )
+}
+
+fn muted_text(text: impl Into<String>, size: f32) -> impl Bundle {
+    (
+        Text::new(text),
+        TextFont::from_font_size(size),
+        TextColor(TEXT_MUTED),
+    )
+}
+
+fn button_node(width: f32) -> Node {
+    Node {
+        min_width: Val::Px(width),
+        min_height: Val::Px(32.0),
+        flex_shrink: 0.0,
+        padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
+        border: UiRect::all(Val::Px(1.0)),
+        align_items: AlignItems::Center,
+        justify_content: JustifyContent::Center,
+        ..default()
+    }
 }
 
 fn button(parent: &mut ChildSpawnerCommands, label: &str, action: MenuAction, width: f32) {
@@ -289,22 +416,355 @@ fn button(parent: &mut ChildSpawnerCommands, label: &str, action: MenuAction, wi
             Button,
             action,
             TabIndex(0),
-            Node {
-                min_width: Val::Px(width),
-                min_height: Val::Px(32.0),
-                flex_shrink: 0.0,
-                padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)),
-                border: UiRect::all(Val::Px(1.0)),
-                align_items: AlignItems::Center,
-                justify_content: JustifyContent::Center,
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.12, 0.15, 0.19)),
-            BorderColor::all(Color::srgb(0.3, 0.35, 0.4)),
+            button_node(width),
+            BackgroundColor(NEUTRAL.0),
+            BorderColor::all(BORDER),
         ))
         .with_children(|parent| {
             parent.spawn(text_bundle(label, 16.0));
         });
+}
+
+/// A button whose caption is live text, so it reads as a switch showing its state.
+fn switch(parent: &mut ChildSpawnerCommands, action: MenuAction, width: f32, caption: impl Bundle) {
+    parent
+        .spawn((
+            Button,
+            action,
+            TabIndex(0),
+            button_node(width),
+            BackgroundColor(NEUTRAL.0),
+            BorderColor::all(BORDER),
+        ))
+        .with_children(|parent| {
+            parent.spawn(caption);
+        });
+}
+
+fn row_node() -> Node {
+    Node {
+        min_height: Val::Px(42.0),
+        flex_shrink: 0.0,
+        align_items: AlignItems::Center,
+        column_gap: Val::Px(10.0),
+        padding: UiRect::horizontal(Val::Px(8.0)),
+        border: UiRect::bottom(Val::Px(1.0)),
+        ..default()
+    }
+}
+
+fn group_heading(parent: &mut ChildSpawnerCommands, title: &str) {
+    parent
+        .spawn((
+            Node {
+                margin: UiRect::top(Val::Px(18.0)),
+                padding: UiRect::new(Val::Px(8.0), Val::Px(8.0), Val::Px(0.0), Val::Px(6.0)),
+                border: UiRect::bottom(Val::Px(1.0)),
+                flex_shrink: 0.0,
+                ..default()
+            },
+            BorderColor::all(ACCENT_DIM),
+        ))
+        .with_children(|heading| {
+            heading.spawn((
+                Text::new(title.to_uppercase()),
+                TextFont::from_font_size(14.0),
+                TextColor(ACCENT),
+            ));
+        });
+}
+
+fn note(parent: &mut ChildSpawnerCommands, text: &str) -> Entity {
+    parent
+        .spawn((
+            muted_text(text, 14.0),
+            Node {
+                margin: UiRect::new(Val::Px(8.0), Val::Px(8.0), Val::Px(8.0), Val::Px(0.0)),
+                flex_shrink: 0.0,
+                ..default()
+            },
+        ))
+        .id()
+}
+
+fn setting_row(
+    parent: &mut ChildSpawnerCommands,
+    index: usize,
+    spec: &SettingSpec,
+    settings: &RenderingSettings,
+) {
+    let value = spec.value_label(settings);
+    parent
+        .spawn((row_node(), BorderColor::all(SEPARATOR)))
+        .with_children(|row| {
+            row.spawn((
+                SettingMark(index),
+                Node {
+                    width: Val::Px(4.0),
+                    height: Val::Px(20.0),
+                    flex_shrink: 0.0,
+                    ..default()
+                },
+                BackgroundColor(Color::NONE),
+            ));
+            row.spawn((
+                SettingLabel(index),
+                text_bundle(spec.label, 16.0),
+                Node {
+                    flex_grow: 1.0,
+                    flex_basis: Val::Px(0.0),
+                    ..default()
+                },
+            ));
+            row.spawn(Node {
+                width: Val::Px(300.0),
+                flex_shrink: 0.0,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::FlexEnd,
+                column_gap: Val::Px(8.0),
+                ..default()
+            })
+            .with_children(|controls| {
+                if matches!(spec.kind, SettingKind::Toggle) {
+                    switch(
+                        controls,
+                        MenuAction::Adjust(index, 1),
+                        96.0,
+                        (SettingValue(index), text_bundle(value, 16.0)),
+                    );
+                    return;
+                }
+                let (less, more) = if matches!(spec.kind, SettingKind::Choice(_)) {
+                    ("<", ">")
+                } else {
+                    ("-", "+")
+                };
+                button(controls, less, MenuAction::Adjust(index, -1), 36.0);
+                controls.spawn((
+                    SettingValue(index),
+                    text_bundle(value, 16.0),
+                    TextLayout::justify(Justify::Center),
+                    Node {
+                        flex_grow: 1.0,
+                        flex_basis: Val::Px(0.0),
+                        justify_content: JustifyContent::Center,
+                        ..default()
+                    },
+                ));
+                button(controls, more, MenuAction::Adjust(index, 1), 36.0);
+            });
+        });
+}
+
+/// Context shown after the last setting of a group.
+fn group_note(group: &str) -> Option<&'static str> {
+    match group {
+        "Culling and drawing" => Some(
+            "Room culling: not available yet (#188). Occlusion culling needs depth prepass \
+             and indirect drawing; enabling it enables both.",
+        ),
+        "Image" => Some(
+            "HDR composition stays on. Material colors, texture tiling, and per-water factors \
+             come from converted assets.",
+        ),
+        "Threads" => Some(
+            "Distance changes update streaming around the current camera. IO threads require \
+             Save and a restart.",
+        ),
+        _ => None,
+    }
+}
+
+fn spawn_settings(
+    body: &mut ChildSpawnerCommands,
+    page: SettingsPage,
+    settings: &RenderingSettings,
+) {
+    let mut current: Option<&str> = None;
+    let close_group = |body: &mut ChildSpawnerCommands, group: Option<&str>| {
+        if let Some(text) = group.and_then(group_note) {
+            note(body, text);
+        }
+    };
+    for (index, spec) in SETTING_SPECS
+        .iter()
+        .enumerate()
+        .filter(|(_, spec)| spec.page == page)
+    {
+        if current != Some(spec.group) {
+            close_group(body, current);
+            group_heading(body, spec.group);
+            current = Some(spec.group);
+        }
+        setting_row(body, index, spec, settings);
+    }
+    close_group(body, current);
+    if page != SettingsPage::Graphics {
+        return;
+    }
+    group_heading(body, "Debug tools");
+    body.spawn((row_node(), BorderColor::all(SEPARATOR)))
+        .with_children(|row| {
+            row.spawn(Node {
+                width: Val::Px(4.0),
+                flex_shrink: 0.0,
+                ..default()
+            });
+            row.spawn((
+                text_bundle("Collision outlines (session only)", 16.0),
+                Node {
+                    flex_grow: 1.0,
+                    flex_basis: Val::Px(0.0),
+                    ..default()
+                },
+            ));
+            row.spawn(Node {
+                width: Val::Px(300.0),
+                flex_shrink: 0.0,
+                justify_content: JustifyContent::FlexEnd,
+                ..default()
+            })
+            .with_children(|controls| {
+                switch(
+                    controls,
+                    MenuAction::CollisionDebug,
+                    96.0,
+                    (CollisionText, text_bundle("", 16.0)),
+                );
+            });
+        });
+    let renderer = note(body, "");
+    body.commands().entity(renderer).insert(RendererText);
+}
+
+fn spawn_header(panel: &mut ChildSpawnerCommands) {
+    panel
+        .spawn(Node {
+            justify_content: JustifyContent::SpaceBetween,
+            align_items: AlignItems::FlexEnd,
+            flex_shrink: 0.0,
+            ..default()
+        })
+        .with_children(|header| {
+            header.spawn(text_bundle("Settings", 28.0));
+            header.spawn(muted_text(
+                "Changes apply immediately. Save keeps them for the next launch.",
+                14.0,
+            ));
+        });
+}
+
+fn spawn_tabs(panel: &mut ChildSpawnerCommands) {
+    panel
+        .spawn(Node {
+            column_gap: Val::Px(8.0),
+            flex_shrink: 0.0,
+            ..default()
+        })
+        .with_children(|tabs| {
+            for (label, page) in [
+                ("Graphics", SettingsPage::Graphics),
+                ("Streaming", SettingsPage::Streaming),
+                ("Controls", SettingsPage::Controls),
+            ] {
+                button(tabs, label, MenuAction::Page(page), 130.0);
+            }
+        });
+}
+
+fn spawn_page(panel: &mut ChildSpawnerCommands, page: SettingsPage, settings: &RenderingSettings) {
+    panel
+        .spawn((
+            PageFrame(page),
+            Node {
+                display: if page == SettingsPage::Graphics {
+                    Display::Flex
+                } else {
+                    Display::None
+                },
+                flex_grow: 1.0,
+                flex_basis: Val::Px(0.0),
+                min_height: Val::Px(0.0),
+                ..default()
+            },
+        ))
+        .with_children(|frame| {
+            frame
+                .spawn((
+                    PageRoot(page),
+                    ScrollPosition::default(),
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        flex_grow: 1.0,
+                        flex_basis: Val::Px(0.0),
+                        min_width: Val::Px(0.0),
+                        min_height: Val::Px(0.0),
+                        overflow: Overflow::scroll_y(),
+                        padding: UiRect::right(Val::Px(16.0)),
+                        ..default()
+                    },
+                ))
+                .with_children(|body| {
+                    if page == SettingsPage::Controls {
+                        spawn_controls(body);
+                    } else {
+                        spawn_settings(body, page, settings);
+                    }
+                });
+            frame.spawn((
+                PageScrollbar(page),
+                Node {
+                    display: Display::None,
+                    position_type: PositionType::Absolute,
+                    right: Val::Px(2.0),
+                    top: Val::Percent(0.0),
+                    width: Val::Px(6.0),
+                    height: Val::Percent(100.0),
+                    ..default()
+                },
+                BackgroundColor(BORDER),
+            ));
+        });
+}
+
+fn spawn_footer(panel: &mut ChildSpawnerCommands) {
+    panel
+        .spawn((
+            Node {
+                column_gap: Val::Px(8.0),
+                align_items: AlignItems::Center,
+                flex_shrink: 0.0,
+                padding: UiRect::top(Val::Px(12.0)),
+                border: UiRect::top(Val::Px(1.0)),
+                ..default()
+            },
+            BorderColor::all(SEPARATOR),
+        ))
+        .with_children(|footer| {
+            footer.spawn((
+                StatusText,
+                muted_text("", 14.0),
+                Node {
+                    flex_grow: 1.0,
+                    flex_basis: Val::Px(0.0),
+                    margin: UiRect::right(Val::Px(12.0)),
+                    ..default()
+                },
+            ));
+            button(footer, "Reset defaults", MenuAction::Defaults, 150.0);
+            button(footer, "Resume", MenuAction::Resume, 110.0);
+            button(footer, "Save", MenuAction::Save, 110.0);
+        });
+    panel.spawn((
+        muted_text(
+            "Escape resume    Tab move    Left / Right adjust    Enter / Space activate    Wheel / Page Up / Page Down scroll",
+            13.0,
+        ),
+        Node {
+            flex_shrink: 0.0,
+            ..default()
+        },
+    ));
 }
 
 fn spawn_settings_ui(mut commands: Commands, settings: Res<RenderingSettings>) {
@@ -327,75 +787,48 @@ fn spawn_settings_ui(mut commands: Commands, settings: Res<RenderingSettings>) {
                 180.0,
             );
         });
-    commands.spawn((
-        Name::new("Settings menu"), MenuRoot, TabGroup::modal(),
-        Node {
-            display: Display::None, position_type: PositionType::Absolute,
-            width: Val::Percent(100.0), height: Val::Percent(100.0),
-            justify_content: JustifyContent::Center, align_items: AlignItems::Center, ..default()
-        },
-        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.65)), GlobalZIndex(2000),
-    )).observe(handle_tab_navigation).with_children(|root| {
-        root.spawn((
+    commands
+        .spawn((
+            Name::new("Settings menu"),
+            MenuRoot,
+            TabGroup::modal(),
             Node {
-                width: Val::Percent(92.0), max_width: Val::Px(1050.0), height: Val::Percent(92.0),
-                padding: UiRect::all(Val::Px(16.0)), flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(10.0), border: UiRect::all(Val::Px(1.0)), ..default()
+                display: Display::None,
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
             },
-            BackgroundColor(Color::srgb(0.055, 0.065, 0.08)), BorderColor::all(Color::srgb(0.3, 0.35, 0.4)),
-        )).with_children(|panel| {
-            panel.spawn(text_bundle("Settings", 26.0));
-            panel.spawn(text_bundle("Escape: resume    Tab: focus    Enter / Space: activate    Wheel / Page Up / Page Down: scroll", 14.0));
-            panel.spawn(Node { column_gap: Val::Px(8.0), flex_shrink: 0.0, ..default() }).with_children(|tabs| {
-                button(tabs, "Graphics", MenuAction::Page(SettingsPage::Graphics), 130.0);
-                button(tabs, "Streaming", MenuAction::Page(SettingsPage::Streaming), 130.0);
-                button(tabs, "Controls", MenuAction::Page(SettingsPage::Controls), 130.0);
-            });
-            for page in [SettingsPage::Graphics, SettingsPage::Streaming, SettingsPage::Controls] {
-                panel.spawn((
-                    PageRoot(page), ScrollPosition::default(),
-                    Node {
-                        display: if page == SettingsPage::Graphics { Display::Flex } else { Display::None },
-                        flex_direction: FlexDirection::Column, flex_grow: 1.0, flex_basis: Val::Px(0.0),
-                        min_height: Val::Px(0.0), overflow: Overflow::scroll_y(), row_gap: Val::Px(6.0),
-                        padding: UiRect::right(Val::Px(10.0)), ..default()
-                    },
-                )).with_children(|body| {
-                    if page == SettingsPage::Controls { spawn_controls(body); return; }
-                    for (index, spec) in SETTING_SPECS.iter().enumerate().filter(|(_, spec)| spec.page == page) {
-                        body.spawn(Node {
-                            min_height: Val::Px(38.0), flex_shrink: 0.0, align_items: AlignItems::Center,
-                            column_gap: Val::Px(8.0), ..default()
-                        }).with_children(|row| {
-                            row.spawn((text_bundle(spec.label, 16.0), Node { flex_grow: 1.0, flex_basis: Val::Px(0.0), ..default() }));
-                            if !matches!(spec.kind, SettingKind::Toggle) { button(row, "-", MenuAction::Adjust(index, -1), 32.0); }
-                            row.spawn((SettingValue(index), text_bundle(spec.value_label(&settings), 16.0), TextLayout::justify(Justify::Center), Node {
-                                width: Val::Px(if matches!(spec.kind, SettingKind::Choice(_)) { 215.0 } else { 110.0 }),
-                                justify_content: JustifyContent::Center, ..default()
-                            }));
-                            button(row, if matches!(spec.kind, SettingKind::Toggle) { "Toggle" } else { "+" }, MenuAction::Adjust(index, 1), 70.0);
-                        });
-                    }
-                    if page == SettingsPage::Graphics {
-                        button(body, "Toggle collision outlines (session only)", MenuAction::CollisionDebug, 250.0);
-                        body.spawn((CollisionText, text_bundle("", 14.0)));
-                        body.spawn(text_bundle("Room culling: not available yet", 16.0));
-                        body.spawn(text_bundle("HDR composition: on. Material colors, texture tiling, and per-water factors come from converted assets.", 14.0));
-                        body.spawn((RendererText, text_bundle("", 14.0)));
-                        body.spawn(text_bundle("Occlusion culling needs depth prepass and indirect drawing; enabling it enables both.", 14.0));
-                    } else {
-                        body.spawn(text_bundle("Distance changes update streaming around the current camera. IO threads require Save and a restart.", 14.0));
-                    }
-                });
-            }
-            panel.spawn((StatusText, text_bundle("", 14.0), Node { flex_shrink: 0.0, ..default() }));
-            panel.spawn(Node { column_gap: Val::Px(8.0), flex_shrink: 0.0, ..default() }).with_children(|footer| {
-                button(footer, "Save", MenuAction::Save, 110.0);
-                button(footer, "Reset defaults", MenuAction::Defaults, 170.0);
-                button(footer, "Resume", MenuAction::Resume, 110.0);
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.65)),
+            GlobalZIndex(2000),
+        ))
+        .observe(handle_tab_navigation)
+        .with_children(|root| {
+            root.spawn((
+                Node {
+                    width: Val::Percent(92.0),
+                    max_width: Val::Px(1000.0),
+                    height: Val::Percent(92.0),
+                    padding: UiRect::all(Val::Px(20.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(12.0),
+                    border: UiRect::all(Val::Px(1.0)),
+                    ..default()
+                },
+                BackgroundColor(PANEL),
+                BorderColor::all(BORDER),
+            ))
+            .with_children(|panel| {
+                spawn_header(panel);
+                spawn_tabs(panel);
+                for page in PAGES {
+                    spawn_page(panel, page, &settings);
+                }
+                spawn_footer(panel);
             });
         });
-    });
 }
 
 pub const CONTROL_GROUPS: &[(&str, &[(&str, &str)])] = &[
@@ -417,7 +850,11 @@ pub const CONTROL_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Backtick", "Open / close developer console"),
             (
                 "Tab / Shift+Tab",
-                "Next / previous menu button; Tab completes console commands",
+                "Next / previous menu control; Tab completes console commands",
+            ),
+            (
+                "Left / Right",
+                "Adjust the focused setting; switch tabs when a tab has focus",
             ),
             (
                 "Enter / Space",
@@ -457,34 +894,61 @@ pub const CONTROL_GROUPS: &[(&str, &[(&str, &str)])] = &[
                 "Console: Help",
                 "List available commands; Help <text> filters them",
             ),
-            ("Console: tcl / tcg", "Toggle NOCLIP / collision outlines"),
+            ("Console: tcl", "Toggle NOCLIP"),
+            ("Console: tcg", "Toggle collision outlines"),
         ],
     ),
 ];
 
 fn spawn_controls(parent: &mut ChildSpawnerCommands) {
     for (heading, controls) in CONTROL_GROUPS {
-        parent.spawn((
-            text_bundle(*heading, 21.0),
-            Node {
-                margin: UiRect::top(Val::Px(10.0)),
-                flex_shrink: 0.0,
-                ..default()
-            },
-        ));
-        for (key, description) in *controls {
+        group_heading(parent, heading);
+        for (keys, description) in *controls {
             parent
-                .spawn(Node {
-                    display: Display::Grid,
-                    grid_template_columns: vec![GridTrack::px(235.0), GridTrack::flex(1.0)],
-                    column_gap: Val::Px(12.0),
-                    min_height: Val::Px(30.0),
-                    flex_shrink: 0.0,
-                    ..default()
-                })
+                .spawn((
+                    Node {
+                        padding: UiRect::vertical(Val::Px(6.0)),
+                        ..row_node()
+                    },
+                    BorderColor::all(SEPARATOR),
+                ))
                 .with_children(|row| {
-                    row.spawn((text_bundle(*key, 16.0), Node::default()));
-                    row.spawn((text_bundle(*description, 16.0), Node::default()));
+                    row.spawn(Node {
+                        width: Val::Px(400.0),
+                        flex_shrink: 0.0,
+                        flex_wrap: FlexWrap::Wrap,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(6.0),
+                        row_gap: Val::Px(4.0),
+                        ..default()
+                    })
+                    .with_children(|cell| {
+                        for (position, key) in keys.split(" / ").enumerate() {
+                            if position > 0 {
+                                cell.spawn(muted_text("/", 14.0));
+                            }
+                            cell.spawn((
+                                Node {
+                                    padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(KEYCAP),
+                                BorderColor::all(BORDER),
+                            ))
+                            .with_children(|cap| {
+                                cap.spawn(text_bundle(key, 15.0));
+                            });
+                        }
+                    });
+                    row.spawn((
+                        muted_text(*description, 15.0),
+                        Node {
+                            flex_grow: 1.0,
+                            flex_basis: Val::Px(0.0),
+                            ..default()
+                        },
+                    ));
                 });
         }
     }
@@ -496,9 +960,9 @@ fn refresh_menu(
     settings: Res<RenderingSettings>,
     file: Res<SettingsFile>,
     adapter: Option<Res<RenderAdapterInfo>>,
-    mut roots: Query<&mut Node, (With<MenuRoot>, Without<PageRoot>)>,
-    mut pages: Query<(&PageRoot, &mut Node), Without<MenuRoot>>,
-    mut launchers: Query<&mut Node, (With<MenuLauncher>, Without<MenuRoot>, Without<PageRoot>)>,
+    mut roots: Query<&mut Node, (With<MenuRoot>, Without<PageFrame>)>,
+    mut pages: Query<(&PageFrame, &mut Node), Without<MenuRoot>>,
+    mut launchers: Query<&mut Node, (With<MenuLauncher>, Without<MenuRoot>, Without<PageFrame>)>,
     mut text: Query<(
         &mut Text,
         Option<&SettingValue>,
@@ -571,20 +1035,26 @@ fn refresh_menu(
             Some(file.status.clone())
         } else if renderer {
             Some(adapter.as_deref().map_or_else(
-            || "Renderer information unavailable".into(),
-            |adapter| format!("Renderer: {:?} / {}. Backend and GPU capabilities are selected at startup.", adapter.backend, adapter.name),
-        ))
+                || "Renderer information unavailable".into(),
+                |adapter| {
+                    format!(
+                        "Renderer: {:?} / {}. Backend and GPU capabilities are selected at startup.",
+                        adapter.backend, adapter.name
+                    )
+                },
+            ))
         } else if collision_text {
-            Some(format!(
-                "Collision outlines: {}",
+            Some(
                 collision
                     .as_deref()
-                    .map_or("unavailable", |debug| if debug.enabled {
-                        "On"
-                    } else {
-                        "Off"
-                    })
-            ))
+                    .map_or(
+                        "Unavailable",
+                        |debug| {
+                            if debug.enabled { "On" } else { "Off" }
+                        },
+                    )
+                    .to_owned(),
+            )
         } else {
             None
         };
@@ -592,6 +1062,68 @@ fn refresh_menu(
             && text.0 != value
         {
             text.0 = value;
+        }
+    }
+}
+
+/// Marks modified rows, dims settings whose controlling option is off, and colors the status.
+#[allow(clippy::type_complexity)]
+fn style_rows(
+    menu: Res<SettingsMenuState>,
+    settings: Res<RenderingSettings>,
+    file: Res<SettingsFile>,
+    mut labels: Query<(&SettingLabel, &mut TextColor), Without<SettingValue>>,
+    mut values: Query<(&SettingValue, &mut TextColor), Without<SettingLabel>>,
+    mut marks: Query<(&SettingMark, &mut BackgroundColor)>,
+    mut status: Query<
+        &mut TextColor,
+        (
+            With<StatusText>,
+            Without<SettingLabel>,
+            Without<SettingValue>,
+        ),
+    >,
+) {
+    if !menu.open {
+        return;
+    }
+    for (label, mut color) in &mut labels {
+        let wanted = if SETTING_SPECS[label.0].relevant(&settings) {
+            TEXT
+        } else {
+            TEXT_DIM
+        };
+        if color.0 != wanted {
+            color.0 = wanted;
+        }
+    }
+    for (value, mut color) in &mut values {
+        let wanted = if SETTING_SPECS[value.0].relevant(&settings) {
+            TEXT
+        } else {
+            TEXT_DIM
+        };
+        if color.0 != wanted {
+            color.0 = wanted;
+        }
+    }
+    for (mark, mut background) in &mut marks {
+        let modified = SETTING_SPECS[mark.0].is_modified(&settings);
+        background.set_if_neq(BackgroundColor(if modified { ACCENT } else { Color::NONE }));
+    }
+    let wanted = if file.status.starts_with("Could not")
+        || file.status.contains("ignored")
+        || file.status.contains("unavailable")
+    {
+        WARNING
+    } else if file.status.starts_with("Settings saved") {
+        GOOD
+    } else {
+        TEXT_MUTED
+    };
+    for mut color in &mut status {
+        if color.0 != wanted {
+            color.0 = wanted;
         }
     }
 }
@@ -693,6 +1225,48 @@ fn scroll_menu(
     }
 }
 
+/// Sizes each page's scrollbar thumb from its scroll position; hides it when nothing scrolls.
+fn update_scrollbar(
+    menu: Res<SettingsMenuState>,
+    pages: Query<(&PageRoot, &ComputedNode, &ScrollPosition)>,
+    mut thumbs: Query<(&PageScrollbar, &mut Node)>,
+) {
+    if !menu.open {
+        return;
+    }
+    for (page, computed, position) in &pages {
+        if page.0 != menu.page {
+            continue;
+        }
+        let view = computed.size().y;
+        let content = computed.content_size().y;
+        let scrolls = content > view + 1.0 && view > 0.0;
+        let top = position.y / (content * computed.inverse_scale_factor()).max(1.0) * 100.0;
+        for (thumb, mut node) in &mut thumbs {
+            if thumb.0 != page.0 {
+                continue;
+            }
+            let display = if scrolls {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+            if scrolls {
+                let (top, height) = (Val::Percent(top), Val::Percent(view / content * 100.0));
+                if node.top != top {
+                    node.top = top;
+                }
+                if node.height != height {
+                    node.height = height;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,9 +1354,12 @@ mod tests {
         key(&mut app, KeyCode::Backquote, ButtonState::Pressed);
         assert!(app.world().resource::<ConsoleState>().open);
         key(&mut app, KeyCode::Backquote, ButtonState::Released);
+        // Escape belongs to the console while it is open: it closes the console, not opens the menu.
         key(&mut app, KeyCode::Escape, ButtonState::Pressed);
         assert!(!app.world().resource::<SettingsMenuState>().open);
-        assert!(app.world().resource::<ConsoleState>().open);
+        assert!(!app.world().resource::<ConsoleState>().open);
+        key(&mut app, KeyCode::Escape, ButtonState::Released);
+        assert!(!app.world().resource::<SettingsMenuState>().open);
     }
 
     #[test]
@@ -822,5 +1399,44 @@ mod tests {
             .set(button, FocusCause::Navigated);
         key(&mut app, KeyCode::Space, ButtonState::Pressed);
         assert!(!app.world().resource::<RenderingSettings>().point_lights);
+    }
+
+    #[test]
+    fn arrow_keys_adjust_the_focused_setting_and_step_between_tabs() {
+        let mut app = menu_app();
+        key(&mut app, KeyCode::Escape, ButtonState::Pressed);
+        key(&mut app, KeyCode::Escape, ButtonState::Released);
+        let find = |app: &mut App, wanted: fn(&MenuAction) -> bool| {
+            app.world_mut()
+                .query::<(Entity, &MenuAction)>()
+                .iter(app.world())
+                .find_map(|(entity, action)| wanted(action).then_some(entity))
+                .unwrap()
+        };
+        let adjust = find(&mut app, |action| {
+            matches!(action, MenuAction::Adjust(0, 1))
+        });
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(adjust, FocusCause::Navigated);
+        key(&mut app, KeyCode::ArrowRight, ButtonState::Pressed);
+        assert!(app.world().resource::<RenderingSettings>().point_lights);
+        key(&mut app, KeyCode::ArrowRight, ButtonState::Released);
+        key(&mut app, KeyCode::ArrowLeft, ButtonState::Pressed);
+        assert!(!app.world().resource::<RenderingSettings>().point_lights);
+        key(&mut app, KeyCode::ArrowLeft, ButtonState::Released);
+
+        let tab = find(&mut app, |action| {
+            matches!(action, MenuAction::Page(SettingsPage::Graphics))
+        });
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(tab, FocusCause::Navigated);
+        key(&mut app, KeyCode::ArrowRight, ButtonState::Pressed);
+        assert!(app.world().resource::<SettingsMenuState>().page == SettingsPage::Streaming);
+        let streaming = find(&mut app, |action| {
+            matches!(action, MenuAction::Page(SettingsPage::Streaming))
+        });
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(streaming));
     }
 }
