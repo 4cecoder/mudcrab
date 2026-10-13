@@ -19,6 +19,7 @@ pub mod load_order;
 pub mod lodsettings;
 pub mod mmap_reader;
 pub mod records;
+pub mod terrain_mesh;
 pub mod types;
 
 pub struct EsmParser;
