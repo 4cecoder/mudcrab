@@ -34,6 +34,9 @@ pub struct SubrecordXAPR {
 }
 
 /// Enable Parent Subrecord: four-byte parent, one flags byte, three unused bytes.
+///
+/// Layout source: xEdit 4.1.5f, `wbXESP` (`itU8` flags and three unused bytes):
+/// <https://github.com/TES5Edit/TES5Edit/blob/f5c00f3fa3ee39511185515802647246c807f759/Core/wbDefinitionsTES5.pas#L5156-L5163>.
 #[derive(Debug)]
 pub struct SubrecordXESP {
     pub parent_ref: u32,
