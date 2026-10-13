@@ -2,6 +2,7 @@
 # mudcrab-cli-owner: lod-experiment
 """Compare conventional index LODs with a cluster DAG without modifying GLBs."""
 import argparse
+import copy
 from collections import Counter, defaultdict
 import hashlib
 import json
@@ -462,7 +463,127 @@ def material_dependencies(document, binary, material, source_path, asset_root):
     return dependencies, watched
 
 
-def run_experiment(input_path, output_path, builder_path, asset_root=None, max_triangles=128, limit=32):
+def encode_glb(document, binary):
+    document = copy.deepcopy(document)
+    document.setdefault("buffers", [{}])[0]["byteLength"] = len(binary)
+    text = canonical(document)
+    text += b" " * (-len(text) % 4)
+    padded = binary + b"\0" * (-len(binary) % 4)
+    return (struct.pack("<4sII", b"glTF", 2, 28 + len(text) + len(padded))
+            + struct.pack("<II", len(text), 0x4E4F534A) + text
+            + struct.pack("<II", len(padded), 0x004E4942) + padded)
+
+
+def embed_control_images(document, binary, source, asset_root, watched):
+    """Make the whole-model control portable, including retained primitives."""
+    document = copy.deepcopy(document)
+    binary = bytearray(binary)
+    for image in document.get("images", []):
+        uri = image.get("uri")
+        if uri is None or uri.startswith("data:"):
+            continue
+        parsed = urlsplit(uri)
+        if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+            raise Omission("control image URI is not local")
+        path = without_symlinks(source.parent / unquote(parsed.path), asset_root)
+        if not path.is_file():
+            raise Omission("control image is missing")
+        if path.stat().st_size > 128 * 1024 * 1024:
+            raise Omission("control image exceeds 128 MiB experiment limit")
+        data = path.read_bytes()
+        watch(watched, path, digest(data))
+        mime = image.get("mimeType") or {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".ktx2": "image/ktx2"}.get(path.suffix.lower())
+        if mime not in {"image/png", "image/jpeg", "image/ktx2"}:
+            raise Omission("control image has unsupported MIME type")
+        binary.extend(b"\0" * (-len(binary) % 4))
+        image["bufferView"] = len(document.setdefault("bufferViews", []))
+        document["bufferViews"].append({"buffer": 0, "byteOffset": len(binary), "byteLength": len(data)})
+        image["mimeType"] = mime
+        del image["uri"]
+        binary.extend(data)
+    return document, bytes(binary)
+
+
+def verify_control_glb(data, source_document, source_binary, portable_document, portable_binary, replacements):
+    """Decode new indices independently and prove all source payloads survive."""
+    document, binary = parse_glb(data)
+    if binary[:len(source_binary)] != source_binary:
+        raise ValueError("control changed original vertex/image/omitted payload bytes")
+    if binary[:len(portable_binary)] != portable_binary:
+        raise ValueError("control changed embedded dependency bytes")
+    for key in set(source_document) | set(document):
+        if key not in {"buffers", "bufferViews", "accessors", "meshes", "images"} and document.get(key) != source_document.get(key):
+            raise ValueError("control changed scene/node/material metadata: " + key)
+    for key in ("bufferViews", "accessors"):
+        if document.get(key, [])[:len(source_document.get(key, []))] != source_document.get(key, []):
+            raise ValueError("control changed source " + key)
+    if document.get("images", []) != portable_document.get("images", []):
+        raise ValueError("control changed image mapping")
+    if len(document.get("meshes", [])) != len(source_document.get("meshes", [])):
+        raise ValueError("control changed mesh coverage")
+    for mesh_index, source_mesh in enumerate(source_document.get("meshes", [])):
+        mesh = document["meshes"][mesh_index]
+        if {k: v for k, v in mesh.items() if k != "primitives"} != {k: v for k, v in source_mesh.items() if k != "primitives"}:
+            raise ValueError("control changed mesh metadata")
+        if len(mesh["primitives"]) != len(source_mesh["primitives"]):
+            raise ValueError("control lost primitive coverage")
+        for primitive_index, original in enumerate(source_mesh["primitives"]):
+            emitted = mesh["primitives"][primitive_index]
+            indices = replacements.get((mesh_index, primitive_index))
+            if indices is None:
+                if emitted != original:
+                    raise ValueError("control changed retained primitive")
+                continue
+            if {k: v for k, v in emitted.items() if k != "indices"} != {k: v for k, v in original.items() if k != "indices"}:
+                raise ValueError("control changed attributes/material/primitive metadata")
+            accessor, decoded = read_accessor(document, binary, emitted["indices"])
+            if accessor.get("componentType") != 5125 or accessor.get("type") != "SCALAR" or [row[0] for row in decoded] != indices:
+                raise ValueError("control index stream differs from complete selected cut")
+            for index in original["attributes"].values():
+                if read_accessor(document, binary, index) != read_accessor(source_document, source_binary, index):
+                    raise ValueError("control changed decoded vertex attributes")
+    return document, binary
+
+
+def export_model_controls(stage, name, document, binary, source, asset_root, watched, candidates):
+    portable, portable_binary = embed_control_images(document, binary, source, asset_root, watched)
+    variants = [("source", {}, {})]
+    for level in range(3):
+        variants.append((f"conventional-{level}", {key: candidate["conventional"][level]["indices"] for key, candidate in candidates.items()}, {}))
+    max_depth = max(len(candidate["uniform_cuts"]) for candidate in candidates.values())
+    for depth in range(max_depth):
+        replacements, selected_depths = {}, {}
+        for key, candidate in candidates.items():
+            selected = candidate["uniform_cuts"][min(depth, len(candidate["uniform_cuts"]) - 1)]
+            replacements[key] = [index for cluster_id in selected["cluster_ids"] for index in candidate["clusters"][cluster_id]["indices"]]
+            selected_depths[f"{key[0]}:{key[1]}"] = selected["depth"]
+        variants.append((f"cluster-depth-{depth}", replacements, selected_depths))
+    folder = stage / "controls" / name
+    folder.mkdir(parents=True)
+    artifacts = []
+    for label, replacements, selected_depths in variants:
+        emitted = copy.deepcopy(portable)
+        payload = bytearray(portable_binary)
+        for (mesh_index, primitive_index), indices in sorted(replacements.items()):
+            payload.extend(b"\0" * (-len(payload) % 4))
+            view = len(emitted.setdefault("bufferViews", []))
+            emitted["bufferViews"].append({"buffer": 0, "byteOffset": len(payload), "byteLength": len(indices) * 4, "target": 34963})
+            payload.extend(struct.pack("<" + "I" * len(indices), *indices))
+            accessor = len(emitted.setdefault("accessors", []))
+            emitted["accessors"].append({"bufferView": view, "componentType": 5125, "count": len(indices), "type": "SCALAR", "min": [min(indices)], "max": [max(indices)]})
+            emitted["meshes"][mesh_index]["primitives"][primitive_index]["indices"] = accessor
+        data = encode_glb(emitted, bytes(payload))
+        verify_control_glb(data, document, binary, portable, portable_binary, replacements)
+        path = folder / (label + ".glb")
+        path.write_bytes(data)
+        artifacts.append({"kind": label, "path": path.relative_to(stage).as_posix(), "sha256": digest(data), "bytes": len(data),
+                          "replaced_primitive_triangles": {f"{key[0]}:{key[1]}": len(indices) // 3 for key, indices in replacements.items()},
+                          "selected_cluster_depths": selected_depths})
+    return {"status": "exported", "coverage": "whole model; omitted/failed primitives retain original payload", "portable_images": True,
+            "certified_visual_quality": False, "adaptive_view_cut": False, "artifacts": artifacts}
+
+
+def run_experiment(input_path, output_path, builder_path, asset_root=None, max_triangles=128, limit=32, export_controls=False):
     if not 4 <= max_triangles <= 256 or limit < 0:
         raise ValueError("max-cluster-triangles must be in 4..256 and limit must be nonnegative")
     if input_path.is_symlink():
@@ -495,7 +616,7 @@ def run_experiment(input_path, output_path, builder_path, asset_root=None, max_t
         "cluster_recipe": "clodDefaultConfig; permissive/fallback/sloppy/clamped/dilate disabled; preserve_folds enabled",
         "meshoptimizer_commit": PIN, "builder_sha256": receipt["builder_sha256"],
         "builder_source_sha256": receipt["builder_source_sha256"], "driver_sha256": digest(DRIVER_BYTES),
-        "limit": limit,
+        "limit": limit, "export_controls": export_controls,
     }
     settings_hash = digest(canonical(settings))
     manifest = {"format": "offline-lod-experiment-v1", "runtime_payload": False,
@@ -527,6 +648,7 @@ def run_experiment(input_path, output_path, builder_path, asset_root=None, max_t
                 meshes = document.get("meshes", [])
                 if not meshes:
                     raise Omission("GLB has no meshes")
+                model_candidates = {}
                 for mesh_index, mesh in enumerate(meshes):
                     for primitive_index, _ in enumerate(mesh.get("primitives", [])):
                         row = {"mesh": mesh_index, "primitive": primitive_index}
@@ -551,6 +673,7 @@ def run_experiment(input_path, output_path, builder_path, asset_root=None, max_t
                                         "vertex_count": len(primitive["positions"]), "triangle_count": len(primitive["indices"]) // 3},
                                 settings_sha256=settings_hash, simplification_input_sha256=digest(request))
                             name = f"{checksum[:16]}-{digest(relative.encode())[:12]}-m{mesh_index}-p{primitive_index}.json"
+                            model_candidates[(mesh_index, primitive_index)] = candidate
                             candidate_data = canonical(candidate)
                             (stage / "candidates" / name).write_bytes(candidate_data)
                             row.update(status="candidate", candidate="candidates/" + name, sha256=digest(candidate_data),
@@ -567,6 +690,9 @@ def run_experiment(input_path, output_path, builder_path, asset_root=None, max_t
                             row.update(status="omitted", reason=str(error))
                         except (ValueError, KeyError, TypeError, OverflowError, subprocess.SubprocessError) as error:
                             row.update(status="failed", reason=str(error))
+                if export_controls and model_candidates:
+                    file_row["controls"] = export_model_controls(stage, checksum[:16] + "-" + digest(relative.encode())[:12],
+                        document, binary, path, asset_root, watched, model_candidates)
             except Omission as error:
                 file_row.update(status="omitted", reason=str(error))
             except (ValueError, KeyError, TypeError, OSError) as error:
@@ -594,11 +720,12 @@ def main():
     parser.add_argument("--builder", type=Path, required=True)
     parser.add_argument("--max-cluster-triangles", type=int, default=128)
     parser.add_argument("--limit", type=int, default=32, help="maximum models; 0 selects all")
+    parser.add_argument("--export-controls", action="store_true", help="export portable whole-model source, conventional and complete cluster GLBs")
     args = parser.parse_args()
     if not 4 <= args.max_cluster_triangles <= 256 or args.limit < 0:
         parser.error("max-cluster-triangles must be in 4..256 and limit must be nonnegative")
     try:
-        manifest = run_experiment(args.input, args.output, args.builder, args.asset_root, args.max_cluster_triangles, args.limit)
+        manifest = run_experiment(args.input, args.output, args.builder, args.asset_root, args.max_cluster_triangles, args.limit, args.export_controls)
     except (OSError, ValueError, InputChanged) as error:
         parser.exit(2, str(error) + "\n")
     print(json.dumps(manifest["counts"], sort_keys=True))

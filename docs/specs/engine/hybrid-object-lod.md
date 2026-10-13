@@ -267,3 +267,20 @@ Metal/Vulkan/DX12 comparisons. Preserve the current conservative `STAT`
 eligibility and separate tree/dynamic deliveries. Missing authored variants
 allow verified generation; missing or unsuitable source assets remain explicit
 omissions. These additions require review before the experiment broadens.
+
+## Offline control export implemented
+
+The opt-in `--export-controls` experiment now writes whole-model source,
+conventional and complete uniform cluster-cut GLBs from the same admitted
+primitives. It preserves source vertex bytes, accessor layouts, node transforms,
+materials and scene ownership. Omitted primitives retain their source geometry;
+local images are embedded, including dependencies used only by retained
+primitives. The manifest hashes each control and records retained coverage,
+per-primitive triangle counts and selected terminal depths.
+
+Independent decoding verifies index selection and source payload/metadata
+preservation. This provides renderable controls for the next comparison gate.
+It does not implement adaptive view cuts, a runtime sidecar ABI, paging or HLOD,
+and does not certify conservative error or rendered quality. Vanilla and modded
+asset sets still need independent provenance, identical camera/material
+settings, and matched-quality visual and timing comparisons before promotion.

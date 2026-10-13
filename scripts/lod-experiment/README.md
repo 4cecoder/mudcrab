@@ -33,7 +33,7 @@ python3 scripts/lod-experiment/experiment.py \
   --input /tmp/lod-input/grid.glb \
   --asset-root /tmp/lod-input \
   --output /tmp/lod-grid-results \
-  --builder /tmp/mudcrab-lod-builder
+  --builder /tmp/mudcrab-lod-builder --export-controls
 
 env PYTHONDONTWRITEBYTECODE=1 LOD_EXPERIMENT_BUILDER=/tmp/mudcrab-lod-builder \
   python3 -m unittest discover -s scripts/lod-experiment/tests -v
@@ -74,11 +74,30 @@ source package rather than a directory being regenerated.
 ## Results and checks
 
 `manifest.json` and `candidates/*.json` contain deterministic metadata and
-index candidates for the same inputs, settings and built binary. Timings live
+index candidates for the same inputs, settings and built binary. With
+`--export-controls`, `controls/<model-identity>/` also contains portable
+whole-model GLBs: source rendering, three conventional tiers, and every
+complete uniform cluster depth. Each primitive uses its own terminal cut when
+a model's other primitives have deeper hierarchies. Timings live
 separately in `measurements.json`. Exit 0 permits explicit omissions; exit 1
 reports failed files/primitives in a published diagnostic result; preflight or
 input-boundary failures exit 2 without publishing a result. An omitted category
 is not successful generation.
+
+Control export changes only admitted index streams. Original vertex/accessor
+bytes, materials, node transforms, scene ownership and unsupported primitives
+survive. Every local image in the model, including images used only by retained
+primitives, is embedded with the same bytes; URLs, missing images, unsupported
+MIME types and escaping paths prevent control export. Outputs need no source
+package paths. The manifest hashes each GLB and records the replaced primitive
+triangle counts, chosen cluster depths and whole-model retention policy.
+
+An independent decode verifies selected indices, unchanged vertex attributes,
+source buffer/accessor metadata, material/node/scene parity and retained
+primitive coverage before writing controls. Candidate validation still proves
+the complete uniform cuts and original oriented-triangle coverage. These GLBs
+support later rendering comparisons; they do not establish matched silhouette
+or material quality, arbitrary adaptive cuts, or runtime acceptance.
 
 Each candidate contains three conventional ratios (1/2, 1/4 and 1/8), the
 cluster groups/indices, source vertex/accessor/material/node mappings and
@@ -126,7 +145,8 @@ a busy host, does not establish throughput, parallel scaling or frame gains.
 - The runner caps GLBs at 128 MiB and accessor counts at one million, and
   applies a 120-second timeout per primitive. It does not compute a reusable
   cache, page hierarchy, spatial HLOD, view cuts, indirect commands or a renderer.
-- It records index candidates rather than exportable conventional GLBs. Native
-  visual comparison, silhouette/material error, peak memory, backend behavior,
+- Renderable controls are opt-in and preserve omitted primitives at source
+  detail. Their retained geometry must be included when comparing draw cost.
+  Native visual comparison, silhouette/material error, peak memory, backend behavior,
   cache acceptance and performance/default promotion remain later gates in
   [the hybrid contract](../../docs/specs/engine/hybrid-object-lod.md).

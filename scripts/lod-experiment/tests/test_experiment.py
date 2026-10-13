@@ -260,6 +260,103 @@ class AdapterTests(unittest.TestCase):
             self.assertGreaterEqual(timing["cluster_seconds"], 0)
             self.assertGreater(timing["candidate_json_bytes"], 0)
 
+    def test_renderable_controls_preserve_whole_model_and_portable_images(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets = root / "assets"
+            assets.mkdir()
+            document, binary = synthetic.grid(24)
+            document["nodes"][0].update(translation=[1, 2, 3], scale=[2, 3, 4])
+            document["materials"].append({"alphaMode": "MASK", "normalTexture": {"index": 0}})
+            omitted = copy.deepcopy(document["meshes"][0]["primitives"][0])
+            omitted["material"] = 1
+            document["meshes"][0]["primitives"].append(omitted)
+            document["materials"][0]["normalTexture"] = {"index": 0}
+            document["textures"] = [{"source": 0}]
+            document["images"] = [{"uri": "texture%20one.png"}]
+            import base64
+            image_bytes = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            (assets / "texture one.png").write_bytes(image_bytes)
+            source = assets / "grid.glb"
+            original = synthetic.glb(document, binary)
+            source.write_bytes(original)
+            output = root / "output"
+            manifest = experiment.run_experiment(assets, output, self.builder, export_controls=True)
+            self.assertEqual(manifest["counts"], {"candidate": 1, "omitted": 1, "failed": 0})
+            controls = manifest["files"][0]["controls"]
+            self.assertEqual(controls["status"], "exported")
+            candidate = json.loads((output / manifest["files"][0]["primitives"][0]["candidate"]).read_text())
+            self.assertEqual(len(controls["artifacts"]), 4 + len(candidate["uniform_cuts"]))
+            for artifact in controls["artifacts"]:
+                data = (output / artifact["path"]).read_bytes()
+                self.assertEqual(experiment.digest(data), artifact["sha256"])
+                emitted, payload = experiment.parse_glb(data)
+                self.assertEqual(emitted["nodes"], document["nodes"])
+                self.assertEqual(emitted["materials"], document["materials"])
+                self.assertEqual(emitted["meshes"][0]["primitives"][1], omitted)
+                self.assertEqual(payload[:len(binary)], binary)
+                self.assertNotIn("uri", emitted["images"][0])
+                self.assertEqual(experiment.view_bytes(emitted, payload, emitted["images"][0]["bufferView"])[1], image_bytes)
+                primitive = emitted["meshes"][0]["primitives"][0]
+                self.assertEqual(primitive["attributes"], document["meshes"][0]["primitives"][0]["attributes"])
+                _, indices = experiment.read_accessor(emitted, payload, primitive["indices"])
+                if artifact["kind"] == "cluster-depth-0":
+                    from collections import Counter
+                    source_indices = experiment.extract_primitive(document, binary, 0, 0)["indices"]
+                    flattened = [row[0] for row in indices]
+                    self.assertEqual(Counter(experiment.oriented_triangle(flattened[i:i + 3]) for i in range(0, len(flattened), 3)),
+                                     Counter(experiment.oriented_triangle(source_indices[i:i + 3]) for i in range(0, len(source_indices), 3)))
+                if artifact["kind"] == "conventional-0":
+                    self.assertEqual([row[0] for row in indices], candidate["conventional"][0]["indices"])
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual((assets / "texture one.png").read_bytes(), image_bytes)
+            # Independent verification rejects a changed node transform.
+            portable, portable_binary = experiment.embed_control_images(document, binary, source, assets, {})
+            changed = copy.deepcopy(portable)
+            changed["nodes"][0]["scale"][0] = 9
+            with self.assertRaisesRegex(ValueError, "scene/node/material"):
+                experiment.verify_control_glb(experiment.encode_glb(changed, portable_binary), document, binary, portable, portable_binary, {})
+
+            corrupted = bytearray(portable_binary)
+            corrupted[-1] ^= 1
+            with self.assertRaisesRegex(ValueError, "embedded dependency bytes"):
+                experiment.verify_control_glb(experiment.encode_glb(portable, bytes(corrupted)),
+                    document, binary, portable, portable_binary, {})
+
+    def test_controls_check_images_of_retained_primitives_and_abort_mutation(self):
+        for missing in (True, False):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                assets = root / "assets"
+                assets.mkdir()
+                document, binary = synthetic.grid(24)
+                document["materials"].append({"alphaMode": "MASK", "normalTexture": {"index": 0}})
+                omitted = copy.deepcopy(document["meshes"][0]["primitives"][0])
+                omitted["material"] = 1
+                document["meshes"][0]["primitives"].append(omitted)
+                document["textures"] = [{"source": 0}]
+                document["images"] = [{"uri": "retained.png"}]
+                source = assets / "grid.glb"
+                source.write_bytes(synthetic.glb(document, binary))
+                output = root / "output"
+                if missing:
+                    manifest = experiment.run_experiment(assets, output, self.builder, export_controls=True)
+                    self.assertEqual(manifest["files"][0]["status"], "omitted")
+                    self.assertIn("control image is missing", manifest["files"][0]["reason"])
+                    self.assertFalse(list(output.rglob("*.glb")))
+                else:
+                    image = assets / "retained.png"
+                    image.write_bytes(b"original image")
+                    original = experiment.export_model_controls
+                    def mutate_after_export(*args):
+                        result = original(*args)
+                        image.write_bytes(b"changed image")
+                        return result
+                    with mock.patch.object(experiment, "export_model_controls", side_effect=mutate_after_export):
+                        with self.assertRaisesRegex(ValueError, "source input changed"):
+                            experiment.run_experiment(assets, output, self.builder, export_controls=True)
+                    self.assertFalse(output.exists())
+
     def test_invalid_builder_requests_and_new_output_guards(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
