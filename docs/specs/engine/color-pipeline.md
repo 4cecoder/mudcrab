@@ -77,6 +77,24 @@ or `snapshot-linear` with a fresh `--output` directory.
 
 ### Presets and diagnostic stages
 
+For a visible tuning session, `--start-shot <file>` seeds the world camera from a
+validated file containing one exterior pose. It sets the streaming cell, worldspace,
+rotation and horizontal FOV without selecting the automated shots runner. Add
+`--stdin-console` to control that process through its stdin using the same console
+commands as the backtick UI. This bridge is opt-in and has no network listener.
+`SceneState` reports grading and streaming/upload readiness. `SceneShot <png-path>`
+captures the visible window only after readiness checks pass and writes a JSON
+state receipt alongside the image. It refuses existing output paths. The receipt
+records grading state at request and binds camera/readiness evidence to the captured
+render frame; use `--shots` for strict automated pose and grading evidence. Existing interactive mouse and movement controls
+remain available unless an automated option such as `--acceptance-screenshot`
+selects a stationary camera session.
+
+`--no-render-diagnostics` disables Bevy's GPU timing and pipeline-statistics queries
+for troubleshooting Metal counter-buffer allocation failures. It preserves the
+scene settings, CPU frame timing, streaming gauges, and capture-readiness checks.
+GPU timing evidence is unavailable in runs using this option.
+
 Two named visual presets preserve the approved look while allowing experiments:
 
 | Preset | Bevy post-saturation | Sky upper / lower / horizon (sRGB bytes) |

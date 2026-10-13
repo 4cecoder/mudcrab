@@ -102,6 +102,12 @@ pub struct EngineConfig {
     pub color_grade: SceneGradeMode,
     /// Named sky and grading look; Vivid preserves the approved configuration.
     pub visual_preset: SceneVisualPreset,
+    /// Seed a live world camera from a validated one-pose shots file.
+    pub start_shot: Option<PathBuf>,
+    /// Accept developer console commands on this process's stdin.
+    pub stdin_console: bool,
+    /// Disable Bevy's GPU timing and pipeline-statistics query collection.
+    pub no_render_diagnostics: bool,
     pub benchmark_only: bool,
     pub benchmark_frames: Option<u32>,
     pub benchmark_duration_secs: Option<f64>,
@@ -184,6 +190,9 @@ impl Default for EngineConfig {
             hidden_window: false,
             color_grade: SceneGradeMode::Full,
             visual_preset: SceneVisualPreset::Vivid,
+            start_shot: None,
+            stdin_console: false,
+            no_render_diagnostics: false,
             benchmark_only: false,
             benchmark_frames: None,
             benchmark_duration_secs: None,
@@ -239,6 +248,9 @@ Assets and start position:
   --worldspace <id>                     worldspace form id, decimal or 0x-hex (default: 0x3c)
   --grid-x <cell>                       starting cell x (default: 0)
   --grid-y <cell>                       starting cell y (default: 0)
+  --start-shot <file>                  start the live camera at one exterior shot pose
+  --stdin-console                     accept developer console commands on stdin
+  --no-render-diagnostics             disable GPU timing and pipeline-statistics queries
   --allow-incomplete-assets             run despite a failed manifest or integration-report gate
   --headless                            run without opening a window
   --hidden-window                       render screenshots without showing a window
@@ -757,6 +769,15 @@ impl EngineConfig {
                 "--shots" => {
                     config.shots = Some(take_value("--shots", "a shots file path", args.next())?);
                 }
+                "--start-shot" => {
+                    config.start_shot = Some(take_value(
+                        "--start-shot",
+                        "a one-pose shots file",
+                        args.next(),
+                    )?);
+                }
+                "--stdin-console" => config.stdin_console = true,
+                "--no-render-diagnostics" => config.no_render_diagnostics = true,
                 "--shots-settle-timeout" => {
                     const EXPECTED: &str = "a positive number of seconds up to 600";
                     let raw = take_raw("--shots-settle-timeout", EXPECTED, args.next())?;
@@ -1119,6 +1140,27 @@ mod tests {
             .expect("--help has a --max-model-spawns-per-frame line");
         let default = EngineConfig::default().max_model_spawns_per_frame;
         assert!(line.ends_with(&format!("(default: {default})")), "{line}");
+    }
+
+    #[test]
+    fn parses_live_start_camera_and_opt_in_stdin_console() {
+        let config = run_config(&[
+            "--start-shot",
+            "camera.json",
+            "--stdin-console",
+            "--no-render-diagnostics",
+        ]);
+        assert_eq!(config.start_shot, Some(PathBuf::from("camera.json")));
+        assert!(config.stdin_console);
+        assert!(config.no_render_diagnostics);
+        assert!(config.interactive_world_physics());
+        assert!(!EngineConfig::default().stdin_console);
+        assert!(!EngineConfig::default().no_render_diagnostics);
+        assert!(
+            parse_error(&["--start-shot"])
+                .to_string()
+                .contains("--start-shot")
+        );
     }
 
     #[test]

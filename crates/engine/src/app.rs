@@ -57,12 +57,56 @@ use std::{
 struct InitialCameraGroundHeight(f32);
 
 #[derive(Resource)]
+struct InitialWorldCameraPose {
+    shot: crate::shots::Shot,
+    aspect: f32,
+    resolution: bevy::window::WindowResolution,
+}
+
+fn prepare_start_camera(config: &mut EngineConfig) -> Result<Option<InitialWorldCameraPose>> {
+    let Some(path) = &config.start_shot else {
+        return Ok(None);
+    };
+    color_eyre::eyre::ensure!(
+        config.shots.is_none()
+            && config.matched_route.is_none()
+            && !config.benchmark_only
+            && config.benchmark_frames.is_none()
+            && config.benchmark_duration_secs.is_none()
+            && config.auto_fly_speed == 0.0
+            && !config.material_fixture
+            && !config.terrain_water_fixture
+            && !config.transform_bounds_fixture
+            && !config.renderer_fixture
+            && !config.streaming_fixture
+            && !config.physics_fixture,
+        "--start-shot requires a live world run without another automated camera mode"
+    );
+    let file = ShotsFile::load(path)?;
+    color_eyre::eyre::ensure!(
+        file.shots.len() == 1 && file.shots[0].is_exterior(),
+        "--start-shot requires exactly one exterior camera pose"
+    );
+    let (worldspace, grid) = file.start().expect("validated exterior camera pose");
+    config.start_grid = grid;
+    if let Some(worldspace) = worldspace {
+        config.worldspace_id = worldspace;
+    }
+    Ok(Some(InitialWorldCameraPose {
+        shot: file.shots[0].clone(),
+        aspect: file.aspect(),
+        resolution: file.window_resolution(),
+    }))
+}
+
+#[derive(Resource)]
 struct AssetDirectoryReadLock {
     _guard: shared::asset_lock::AssetLock,
 }
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
     validate_fixture_selection(&config)?;
+    let start_camera = prepare_start_camera(&mut config)?;
     let shots = prepare_shots(&mut config)?;
     let shots_active = shots.is_some();
     configure_io_task_pool(config.io_threads)?;
@@ -138,7 +182,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // Start the window at the reference size; shots use an independent exact-size image target.
         resolution: match &shots {
             Some(run) => run.file.window_resolution(),
-            None => (1600, 900).into(),
+            None => start_camera
+                .as_ref()
+                .map_or_else(|| (1600, 900).into(), |pose| pose.resolution.clone()),
         },
         // Visible timing and shots runs open in the middle of the primary screen.
         position: if benchmark_active || shots_active {
@@ -155,6 +201,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     });
     let origin = RenderOrigin(IVec2::new(config.start_grid.0, config.start_grid.1));
     let mut app = App::new();
+    if let Some(pose) = start_camera {
+        app.insert_resource(pose);
+    }
+    if config.stdin_console {
+        app.add_plugins(crate::live_console::StdinConsolePlugin);
+    }
     if let Some(tuning) = movement_tuning {
         app.insert_resource(tuning);
     }
@@ -201,7 +253,6 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             },
             AcceptanceMetricsPlugin,
             ProfilingPlugin,
-            RenderDiagnosticsPlugin,
         ))
         .add_plugins((
             VercidiumRendererPlugin,
@@ -259,6 +310,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         app.add_systems(Startup, setup_world);
         app.add_systems(Startup, setup_synthetic_benchmark);
+    }
+    if !app.world().resource::<EngineConfig>().no_render_diagnostics {
+        app.add_plugins(RenderDiagnosticsPlugin);
+    }
+    if app.world().resource::<EngineConfig>().stdin_console && !shots_active {
+        app.add_plugins(crate::capture_frame::CaptureFramePlugin);
     }
     if let Some(run) = shots {
         info!(
@@ -2010,6 +2067,7 @@ fn setup_world(
     config: Res<EngineConfig>,
     ground_height: Option<Res<InitialCameraGroundHeight>>,
     tuning: Option<Res<MovementTuning>>,
+    start_camera: Option<Res<InitialWorldCameraPose>>,
 ) {
     let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
     let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
@@ -2021,16 +2079,27 @@ fn setup_world(
     };
     let camera_position = target + camera_offset;
     let far = crate::world::components::CELL_SIZE * (config.stream_radius.max(1) + 2) as f32 * 2.0;
-    let camera_transform = if config.interactive_world_physics() {
+    let mut camera_transform = if config.interactive_world_physics() {
         Transform::from_translation(camera_position)
             .looking_at(camera_position + Vec3::NEG_Z, Vec3::Y)
     } else {
         Transform::from_translation(camera_position).looking_at(target, Vec3::Y)
     };
+    let mut perspective = PerspectiveProjection { far, ..default() };
+    if let Some(pose) = start_camera {
+        camera_transform.translation = crate::shots::shot_camera_translation(
+            pose.shot.position,
+            IVec2::new(config.start_grid.0, config.start_grid.1),
+        );
+        camera_transform.rotation =
+            crate::shots::shot_camera_rotation(pose.shot.yaw, pose.shot.pitch);
+        perspective.fov =
+            crate::shots::vertical_fov_degrees(pose.shot.hfov, pose.aspect).to_radians();
+    }
     let mut camera = commands.spawn((
         Camera3d::default(),
         crate::color_pipeline::SceneColorPipeline::default(),
-        Projection::Perspective(PerspectiveProjection { far, ..default() }),
+        Projection::Perspective(perspective),
         camera_transform,
         StreamingCamera,
         // This camera draws the streamed world, so the weather's distance fog covers it.
@@ -3503,6 +3572,46 @@ mod tests {
                 "the streaming camera must render layer {layer}"
             );
         }
+    }
+
+    #[test]
+    fn live_start_pose_seeds_streaming_and_camera_without_selecting_shots_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("pose.json");
+        std::fs::write(&file, r#"{"width":1920,"height":1080,"shots":[{"name":"inn","worldspace_id":60,"position":[21750,-44530,140],"yaw":90,"pitch":-3,"hfov":80}]}"#).unwrap();
+        let mut config = EngineConfig {
+            start_shot: Some(file),
+            ..default()
+        };
+        let pose = prepare_start_camera(&mut config).unwrap().unwrap();
+        assert_eq!(config.start_grid, (5, -11));
+        assert_eq!(config.worldspace_id, 60);
+        assert!(config.interactive_world_physics());
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(pose)
+            .add_systems(Startup, setup_world);
+        app.update();
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<(&Transform, &Projection), With<StreamingCamera>>();
+        let (transform, projection) = cameras.single(app.world()).unwrap();
+        assert_eq!(
+            transform.translation,
+            crate::shots::shot_camera_translation([21750.0, -44530.0, 140.0], IVec2::new(5, -11))
+        );
+        assert_eq!(
+            transform.rotation,
+            crate::shots::shot_camera_rotation(90.0, -3.0)
+        );
+        let Projection::Perspective(projection) = projection else {
+            panic!("perspective camera")
+        };
+        assert_eq!(
+            projection.fov,
+            crate::shots::vertical_fov_degrees(80.0, 1920.0 / 1080.0).to_radians()
+        );
+        assert!(app.world().get_resource::<ShotsRun>().is_none());
     }
 
     #[test]
