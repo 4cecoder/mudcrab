@@ -227,6 +227,10 @@ V171: LOD chunk reuse ! current explicit compiler/producer identity, exact consu
 V172: LOD pipeline retains ≤ CPU worker count completed chunk payloads per batch; invalid content rolls back entire world & removes partial payloads; cancellation/input mutation/publication/DB errors remain fatal. SQLite transaction never crosses an await; intermediate batch progress best-effort, committed world totals reliable.
 V173: Winning LAND selected by highest plugin priority; distinct LAND records tied at the winning priority abort before publishing, including user mod lists. LOD cell-cache snapshot read/validated once per stage; each winning diffuse source read once & each selected authored DDS mip decoded once per stage; tier images shared across worlds/FormIDs; source bytes reverified before publication.
 V174: Complete XESP ! little-endian parent FormID bytes 0–3 & flags byte 4; bytes 5–7 unused, excluded from typed/exported flags. Raw flags/unused bytes retained; normal load-order path remaps parent only & drops non-eight-byte XESP. Missing/truncated XESP → absent parent/flags.
+V175: New PipelineConfig/CLI terrain atlases default to GPU; explicit --lod-encoder cpu & omitted legacy serialized encoder retain CPU. Ordinary texture selection independent; --no-lod skips GPU initialization; verified all-hit terrain builds do not initialize encoder.
+V176: Terrain encoder version/quality participates in chunk & LOD build proof, not ordinary asset configuration. GPU-requested CPU fallback stays drawable but publishes no reusable chunk-input proof; next GPU-requested run retries; explicit CPU permits verified reuse. Fresh GPU, fallback & reused counters remain distinct.
+V177: GPU terrain atlases encode the supplied three authored/baked mip levels once each with border padding and CPU decode validation; failed GPU initialization/encode/validation uses the existing CPU route. Bounded CPU-worker chunk batches, per-world rollback & fatal publication/input/cancellation semantics retained.
+V178: Terrain performance converter commands validated by converter parse_command; Engine CLI drift scanner classifies exact registered files by verified CLI ownership, never exempts an entire LOD script directory or nested lookalike.
 
 V210: CI ! dispatch software Vulkan UASTC encoder, decode synthetic color/alpha/normal/mip/partial-block cases with CPU comparison; absent adapter fails explicit run; production CPU-adapter rejection retained.
 
@@ -277,6 +281,7 @@ T40|.|Deferred by owner 2026-10-03: PR105 final-head Fiji stationary/moving/reco
 T41|x|Separate test-job kache cache; action input verified against upstream action.yml; main CI log confirms shared-key save collision and 0/778 hits|V117
 T42|x|Strengthen quaternion/performance regressions & preserve both legacy schema gates|V118
 T70|x|Remove redundant atlas compression; fuse diffuse decode/tier resizing; share stage inputs; bounded transactional chunk batches; verified prior-package chunk reuse; correctness regressions & cold/warm Fiji measurements|V29,V72,V92,V93,V100,V103,V105,V114,V115,V170,V171,V172,V173
+T71|~|Isolate GPU-default terrain encoding from archive/cache integration; preserve legacy/CPU selection, authored mips & safe non-reusable fallback; focused converter/launcher/CLI checks & three native Metal correctness fixtures; quiet-host performance remains separate|V175,V176,V177,V178,V210
 
 T110|x|Exercise actual GPU batch/dispatch/readback with software Vulkan in CI|V210
 
