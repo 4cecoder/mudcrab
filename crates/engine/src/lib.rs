@@ -1,6 +1,7 @@
 pub mod app;
 pub mod color_pipeline;
 pub mod config;
+pub mod console;
 pub mod fingerprint;
 pub mod lights;
 pub mod metrics;
