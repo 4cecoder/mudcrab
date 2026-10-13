@@ -1,5 +1,6 @@
 mod ba2;
 mod bsa;
+mod bsa_name;
 
 use crate::{
     asset_path::{AssetKind, canonical_asset_path},
