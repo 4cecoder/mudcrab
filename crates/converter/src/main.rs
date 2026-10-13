@@ -1023,7 +1023,7 @@ terrain and ordinary assets remain available. Omit it on a later run to build LO
 
 --merged-terrain builds the merged terrain of #215 after the world database and the land
 textures: the land texture arrays, one merged mesh per exterior cell and the terrain chunk
-files. It is off by default because the engine does not read those outputs yet.
+files. It is off by default; the engine uses them when present.
 --terrain-default-texture picks what a cell quadrant with no BTXT blends: the generated
 white texture (default), or the game's own [Landscape] default.
 --terrain-ini names the Skyrim.ini that default is read from; without it the built-in

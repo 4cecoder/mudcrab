@@ -91,6 +91,11 @@ impl CellCache {
         })
     }
 
+    /// Whether the cache holds a LAND for `cell_id`, without reading it.
+    pub fn has_terrain(&self, cell_id: u32) -> bool {
+        self.index.contains_key(&cell_id)
+    }
+
     pub fn len(&self) -> usize {
         self.index.len()
     }
