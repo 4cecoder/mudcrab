@@ -12,7 +12,7 @@ use bevy::{
     window::PrimaryWindow,
 };
 use engine::{
-    color_pipeline::SceneColorPipeline,
+    color_pipeline::{SceneColorPipeline, SkyrimCinematicPostPlugin},
     config::EngineConfig,
     console::ConsolePlugin,
     lights::LightsPlugin,
@@ -56,6 +56,7 @@ fn main() {
             SkyPlugin,
             ConsolePlugin,
             LightsPlugin,
+            SkyrimCinematicPostPlugin,
             SettingsPlugin,
         ))
         .add_systems(PostStartup, setup)

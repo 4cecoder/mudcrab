@@ -1,12 +1,14 @@
 //! Shared scene-linear composition for world views and diagnostic fixtures.
 //!
 //! HDR moves the display transform after sky, fog and transparent composition. The exposure
-//! and tone curve below are pinned Bevy baselines; the color grade is the one part of
-//! Skyrim's image space (`IMGS`) carried here, mapped onto Bevy's `ColorGrading`.
+//! and tone curve below are pinned Bevy baselines. The experimental grade uses reported
+//! Skyrim image-space (`IMGS`) values with Bevy saturation and an sRGB-domain post pass.
+//! Its appearance was approved in Riverwood; its mapping is not verified retail parity.
 
+use crate::console::{AppConsoleExt, ConsoleCommand};
 use bevy::{
     asset::embedded_asset,
-    camera::{Exposure, Hdr},
+    camera::{CompositingSpace, Exposure, Hdr},
     core_pipeline::{
         Core3dSystems,
         fullscreen_material::{FullscreenMaterial, FullscreenMaterialPlugin},
@@ -22,14 +24,144 @@ use bevy::{
     shader::ShaderRef,
 };
 
+/// Diagnostic selection; exposure, tone mapping, lighting and fog stay fixed.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SceneGradeMode {
+    Off,
+    Saturation,
+    #[default]
+    Full,
+}
+
+impl SceneGradeMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "saturation" => Some(Self::Saturation),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Saturation => "saturation",
+            Self::Full => "full",
+        }
+    }
+
+    /// Position in the settings menu's choice list: off, saturation, full.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Saturation => 1,
+            Self::Full => 2,
+        }
+    }
+
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::Off,
+            1 => Self::Saturation,
+            _ => Self::Full,
+        }
+    }
+}
+
+/// The grade the scene cameras carry while the mode is not `Off`. Defaults to the reported
+/// clear-day values; the settings menu adjusts it live. Mode selection stays separate so the
+/// console and automation can switch stages without touching the tuned values.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub struct SceneGradeTuning {
+    pub grade: SkyrimCinematicGrade,
+    /// Display-range pivot for brightness and contrast; see [`CINEMATIC_PIVOT`].
+    pub pivot: f32,
+}
+
+impl Default for SceneGradeTuning {
+    fn default() -> Self {
+        Self {
+            grade: SkyrimCinematicGrade::SKYRIM_CLEAR_DAY,
+            pivot: CINEMATIC_PIVOT,
+        }
+    }
+}
+
+/// Identifies shared scene cameras without treating reflections as graded views.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub enum SceneGradeTarget {
+    Scene,
+    Reflection,
+}
+
+fn scene_grade_command() -> ConsoleCommand {
+    ConsoleCommand {
+        name: "SceneGrade",
+        short: None,
+        usage: "SceneGrade [off|saturation|full]",
+        help: "inspect or change color grading without changing exposure, lighting or fog",
+        handler: Box::new(|world, args| {
+            match args {
+                [] => {}
+                [value] => {
+                    let mode = SceneGradeMode::parse(value)
+                        .ok_or("usage: SceneGrade [off|saturation|full]")?;
+                    *world.resource_mut::<SceneGradeMode>() = mode;
+                    // Keep the settings menu showing the mode that is in effect.
+                    if let Some(mut settings) =
+                        world.get_resource_mut::<crate::settings::RenderingSettings>()
+                    {
+                        settings.color_grade = mode.index();
+                    }
+                }
+                _ => return Err("usage: SceneGrade [off|saturation|full]".into()),
+            }
+            Ok(format!(
+                "scene grade: {}",
+                world.resource::<SceneGradeMode>().name()
+            ))
+        }),
+    }
+}
+
+pub(crate) fn apply_scene_grade_mode(
+    mode: Res<SceneGradeMode>,
+    tuning: Res<SceneGradeTuning>,
+    mut cameras: Query<(
+        Ref<SceneGradeTarget>,
+        &mut ColorGrading,
+        &mut SkyrimCinematicPost,
+    )>,
+) {
+    for (target, mut grading, mut post) in &mut cameras {
+        let stale = mode.is_changed() || tuning.is_changed() || target.is_added();
+        if *target == SceneGradeTarget::Reflection || !stale {
+            continue;
+        }
+        grading.global.post_saturation = if *mode == SceneGradeMode::Off {
+            1.0
+        } else {
+            tuning.grade.saturation
+        };
+        *post = SkyrimCinematicPost {
+            pivot: tuning.pivot,
+            enabled: if *mode == SceneGradeMode::Full {
+                1.0
+            } else {
+                0.0
+            },
+            ..tuning.grade.post()
+        };
+    }
+}
+
 /// Pinned Bevy exposure baseline; not a calibrated Skyrim image-space value.
 pub const DEFAULT_SCENE_EV100: f32 = 9.7;
 
-/// Fixed display-range pivot for the post-tonemap brightness/contrast, as a
-/// stand-in for the adapted scene luminance vanilla pivots on. Phase 2 replaces
-/// this with the metered average from Bevy's auto-exposure, which is also where
-/// the `HNAM` eye-adaptation fields (Speed 45.0, Strength 5.0 for the day slot)
-/// belong.
+/// Artistic sRGB-encoded pivot for the experimental brightness/contrast pass.
+/// This is not a measured Skyrim adapted luminance. Auto-exposure integration
+/// and the relationship to the record's `HNAM` fields remain unresolved.
 pub const CINEMATIC_PIVOT: f32 = 0.18;
 
 /// One weather's cinematic grade: the `CNAM` triple and `TNAM` tint of its image
@@ -47,7 +179,7 @@ pub struct SkyrimCinematicGrade {
     pub saturation: f32,
     pub brightness: f32,
     pub contrast: f32,
-    /// `TNAM` tint amount: how far each pixel moves toward its luminance tinted by
+    /// Experimental interpretation of `TNAM`: mix toward luminance tinted by
     /// [`SkyrimCinematicGrade::tint_rgb`].
     pub tint_amount: f32,
     /// `TNAM` tint colour, RGB in 0..1.
@@ -55,11 +187,13 @@ pub struct SkyrimCinematicGrade {
 }
 
 impl SkyrimCinematicGrade {
-    /// The grade for `SkyrimClear`'s day slot, read from the winning records in the
+    /// Reported grade for `SkyrimClear`'s day slot, read from the winning records in the
     /// local game data (`Skyrim.esm` as overridden by `Update.esm`): the weather's
     /// `IMSP` day slot names `ISSkyrimClearDAY` (`IMGS` 0x00012F88), whose `CNAM`
     /// holds Saturation 1.5, Brightness 1.135 and Contrast 1.4, and whose `TNAM`
     /// holds tint amount 0.42 toward RGB 0.894, 0.839, 0.773.
+    /// These constants preserve the earlier local extraction; this module does
+    /// not parse records or verify their mapping into retail shader slots.
     pub const SKYRIM_CLEAR_DAY: Self = Self {
         saturation: 1.5,
         brightness: 1.135,
@@ -83,29 +217,19 @@ impl SkyrimCinematicGrade {
 
     /// The Bevy grade for this cinematic grade.
     ///
-    /// Domain decides the mapping. Vanilla's cinematic pass
-    /// (`ISHDRTonemapBlendCinematic` in the shipped image-space shaders) runs
-    /// after its HDR tone curve, on display-range values: saturation mixes
-    /// toward luminance there, and brightness/contrast pivot around the adapted
-    /// scene luminance. Bevy's sectional grading runs before its tone curve, in
-    /// linear HDR, with contrast pivoted on a fixed 0.5; carrying the record
-    /// values there (saturation 1.5, contrast 1.4, gain 1.135) blows the image
-    /// out. Only one Bevy field sits in vanilla's position:
+    /// Bevy applies `post_saturation` after its tone curve, in linear RGB.
+    /// Brightness, contrast and tint use the separate sRGB-encoded post pass.
+    /// This split preserves the approved experimental appearance; it does not
+    /// reproduce a verified Skyrim pipeline. Bevy's luminance weights also
+    /// differ slightly from the weights used by the custom tint pass.
     ///
-    /// - Saturation maps to the global `post_saturation`, applied after the
-    ///   tone curve with the same mix-toward-luminance formula vanilla uses.
-    /// - Brightness, Contrast and the `TNAM` tint are applied by
-    ///   [`SkyrimCinematicPost`], a fullscreen pass scheduled after the tone
-    ///   curve, in vanilla's order (tint, then brightness/contrast). Bevy's
-    ///   sectional fields cannot carry them: wrong domain, wrong pivot.
-    /// - Gamma and lift stay at their identities (1.0 and 0.0): no `IMGS` field
-    ///   corresponds to them.
-    /// - The global exposure offset stays at 0.0 and temperature, tint and hue stay
-    ///   at 0.0. The day slot's `HNAM` HDR fields (Eye Adapt Speed 45.0, Bloom Blur
-    ///   Radius 7.0, Bloom Threshold 0.8, Bloom Scale 4.0, Receive Bloom Threshold
-    ///   0.8, White 1.0, Sunlight Scale 2.8, Sky Scale 0.05, Eye Adapt Strength 5.0)
-    ///   have no sourced mapping onto Bevy exposure or grading, so they are recorded
-    ///   here and left unapplied; exposure and bloom remain separate systems.
+    /// Sectional gamma, lift, contrast and gain remain at identity. Global
+    /// exposure, temperature, tint and hue remain at zero. The reported day
+    /// slot's `HNAM` fields (Eye Adapt Speed 45.0, Bloom Blur Radius 7.0,
+    /// Bloom Threshold 0.8, Bloom Scale 4.0, Receive Bloom Threshold 0.8,
+    /// White 1.0, Sunlight Scale 2.8, Sky Scale 0.05, Eye Adapt Strength 5.0)
+    /// remain unapplied. No calibrated mapping to Bevy exposure, bloom or
+    /// adaptation has been established.
     pub fn color_grading(&self) -> ColorGrading {
         ColorGrading::with_identical_sections(
             ColorGradingGlobal {
@@ -154,11 +278,10 @@ impl FullscreenMaterial for SkyrimCinematicPost {
         "embedded://engine/shaders/cinematic_post.wgsl".into()
     }
 
-    /// Run after the tonemapping system, still inside `PostProcess` (before
-    /// upscaling), so the pass reads display-range values exactly where
-    /// vanilla's cinematic pass reads them. The stock fullscreen-material
-    /// order runs before tonemapping, which is the pre-tonemap domain that
-    /// blew out with these values.
+    /// Run after Bevy tonemapping, inside `PostProcess` and before upscaling.
+    /// The shader expects linear RGB storage and grades its sRGB encoding.
+    /// Cameras using this experiment must retain `CompositingSpace::Linear`.
+    /// Ordering relative to AA and CAS has not been validated.
     fn schedule_configs(system: ScheduleConfigs<BoxedSystem>) -> ScheduleConfigs<BoxedSystem> {
         system
             .in_set(Core3dSystems::PostProcess)
@@ -172,7 +295,11 @@ pub struct SkyrimCinematicPostPlugin;
 impl Plugin for SkyrimCinematicPostPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/cinematic_post.wgsl");
-        app.add_plugins(FullscreenMaterialPlugin::<SkyrimCinematicPost>::default());
+        app.init_resource::<SceneGradeMode>()
+            .init_resource::<SceneGradeTuning>()
+            .add_console_command(scene_grade_command())
+            .add_systems(PostUpdate, apply_scene_grade_mode)
+            .add_plugins(FullscreenMaterialPlugin::<SkyrimCinematicPost>::default());
     }
 }
 
@@ -181,7 +308,10 @@ impl Plugin for SkyrimCinematicPostPlugin {
 /// before tone mapping, so the main view grades it once.
 #[derive(Bundle)]
 pub struct SceneColorPipeline {
+    pub grade_target: SceneGradeTarget,
     pub hdr: Hdr,
+    /// The custom post pass expects linear RGB input.
+    pub compositing_space: CompositingSpace,
     pub exposure: Exposure,
     pub tonemapping: Tonemapping,
     pub grading: ColorGrading,
@@ -192,7 +322,9 @@ pub struct SceneColorPipeline {
 impl Default for SceneColorPipeline {
     fn default() -> Self {
         Self {
+            grade_target: SceneGradeTarget::Scene,
             hdr: Hdr,
+            compositing_space: CompositingSpace::Linear,
             exposure: Exposure {
                 ev100: DEFAULT_SCENE_EV100,
             },
@@ -207,6 +339,7 @@ impl SceneColorPipeline {
     /// Compose reflected radiance without applying the main view's display transform.
     pub fn reflection() -> Self {
         Self {
+            grade_target: SceneGradeTarget::Reflection,
             tonemapping: Tonemapping::None,
             grading: ColorGrading::default(),
             cinematic_post: SkyrimCinematicPost::default(),
@@ -217,9 +350,8 @@ impl SceneColorPipeline {
 
 #[cfg(test)]
 fn assert_grading_matches(grading: &ColorGrading, wanted: &SkyrimCinematicGrade) {
-    let expected = wanted.color_grading();
-    for (actual, section) in grading.all_sections().zip(expected.all_sections()) {
-        assert_eq!(actual, section, "sections stay at the converted grade");
+    for actual in grading.all_sections() {
+        assert_eq!(*actual, ColorGradingSection::default());
     }
     assert_eq!(grading.global.exposure, 0.0);
     assert_eq!(grading.global.temperature, 0.0);
@@ -261,10 +393,228 @@ mod tests {
     use super::*;
 
     #[test]
+    fn console_modes_preserve_scene_state_and_leave_reflection_ungraded() {
+        let mut app = App::new();
+        app.init_resource::<SceneGradeMode>()
+            .init_resource::<SceneGradeTuning>()
+            .init_resource::<crate::console::ConsoleState>()
+            .add_console_command(scene_grade_command())
+            .add_systems(PostUpdate, apply_scene_grade_mode);
+        let transform = Transform::from_xyz(7.0, 11.0, 13.0);
+        let fog = bevy::pbr::DistanceFog {
+            color: Color::srgb(0.2, 0.3, 0.4),
+            ..default()
+        };
+        let main = app
+            .world_mut()
+            .spawn((SceneColorPipeline::default(), transform, fog))
+            .id();
+        let reflection = app.world_mut().spawn(SceneColorPipeline::reflection()).id();
+        for (command, saturation, enabled) in [
+            ("SceneGrade off", 1.0, 0.0),
+            ("scenegrade SATURATION", 1.5, 0.0),
+            ("SceneGrade full", 1.5, 1.0),
+        ] {
+            crate::console::execute_line(app.world_mut(), command);
+            app.update();
+            let world = app.world();
+            assert_eq!(
+                world
+                    .get::<ColorGrading>(main)
+                    .unwrap()
+                    .global
+                    .post_saturation,
+                saturation
+            );
+            let post = world.get::<SkyrimCinematicPost>(main).unwrap();
+            assert_eq!(post.enabled, enabled);
+            assert_eq!(post.brightness, 1.135);
+            assert_eq!(
+                world.get::<Exposure>(main).unwrap().ev100,
+                DEFAULT_SCENE_EV100
+            );
+            assert_eq!(
+                *world.get::<Tonemapping>(main).unwrap(),
+                Tonemapping::TonyMcMapface
+            );
+            assert_eq!(*world.get::<Transform>(main).unwrap(), transform);
+            assert_eq!(
+                world.get::<bevy::pbr::DistanceFog>(main).unwrap().color,
+                Color::srgb(0.2, 0.3, 0.4)
+            );
+            assert!(world.get::<Hdr>(main).is_some());
+            assert_eq!(
+                world
+                    .get::<ColorGrading>(reflection)
+                    .unwrap()
+                    .global
+                    .post_saturation,
+                1.0
+            );
+            assert_eq!(
+                world
+                    .get::<SkyrimCinematicPost>(reflection)
+                    .unwrap()
+                    .enabled,
+                0.0
+            );
+        }
+        crate::console::execute_line(app.world_mut(), "SceneGrade invalid");
+        assert_eq!(
+            *app.world().resource::<SceneGradeMode>(),
+            SceneGradeMode::Full
+        );
+        assert!(
+            app.world()
+                .resource::<crate::console::ConsoleState>()
+                .scrollback
+                .last()
+                .unwrap()
+                .contains("usage:")
+        );
+        crate::console::execute_line(app.world_mut(), "SceneGrade off");
+        app.update();
+        let later = app.world_mut().spawn(SceneColorPipeline::default()).id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<SkyrimCinematicPost>(later)
+                .unwrap()
+                .enabled,
+            0.0
+        );
+        assert_eq!(
+            app.world()
+                .get::<ColorGrading>(later)
+                .unwrap()
+                .global
+                .post_saturation,
+            1.0
+        );
+    }
+
+    #[test]
+    fn console_mode_is_mirrored_into_the_settings_menu() {
+        let mut app = App::new();
+        app.init_resource::<SceneGradeMode>()
+            .init_resource::<SceneGradeTuning>()
+            .init_resource::<crate::console::ConsoleState>()
+            .init_resource::<crate::settings::RenderingSettings>()
+            .add_console_command(scene_grade_command());
+        crate::console::execute_line(app.world_mut(), "SceneGrade saturation");
+        assert_eq!(
+            app.world()
+                .resource::<crate::settings::RenderingSettings>()
+                .color_grade,
+            SceneGradeMode::Saturation.index()
+        );
+        // A rejected mode changes neither the resource nor the menu.
+        crate::console::execute_line(app.world_mut(), "SceneGrade sepia");
+        assert_eq!(
+            app.world()
+                .resource::<crate::settings::RenderingSettings>()
+                .color_grade,
+            SceneGradeMode::Saturation.index()
+        );
+    }
+
+    #[test]
+    fn tuning_reaches_the_scene_camera_and_not_the_reflection() {
+        let mut app = App::new();
+        app.init_resource::<SceneGradeMode>()
+            .init_resource::<SceneGradeTuning>()
+            .add_systems(PostUpdate, apply_scene_grade_mode);
+        let main = app.world_mut().spawn(SceneColorPipeline::default()).id();
+        let reflection = app.world_mut().spawn(SceneColorPipeline::reflection()).id();
+        app.update();
+        *app.world_mut().resource_mut::<SceneGradeTuning>() = SceneGradeTuning {
+            grade: SkyrimCinematicGrade {
+                saturation: 0.8,
+                brightness: 1.2,
+                contrast: 1.1,
+                tint_amount: 0.3,
+                tint_rgb: [1.0, 0.9, 0.8],
+            },
+            pivot: 0.25,
+        };
+        app.update();
+        let world = app.world();
+        assert_eq!(
+            world
+                .get::<ColorGrading>(main)
+                .unwrap()
+                .global
+                .post_saturation,
+            0.8
+        );
+        let post = world.get::<SkyrimCinematicPost>(main).unwrap();
+        assert_eq!(
+            (post.brightness, post.contrast, post.tint_amount, post.pivot),
+            (1.2, 1.1, 0.3, 0.25)
+        );
+        assert_eq!(post.tint_rgb, Vec3::new(1.0, 0.9, 0.8));
+        assert_eq!(post.enabled, 1.0);
+        assert_eq!(
+            *world.get::<SkyrimCinematicPost>(reflection).unwrap(),
+            SkyrimCinematicPost::default()
+        );
+        assert_eq!(
+            world
+                .get::<ColorGrading>(reflection)
+                .unwrap()
+                .global
+                .post_saturation,
+            1.0
+        );
+    }
+
+    #[test]
+    fn cinematic_shader_validates_and_matches_uniform_layout() {
+        // Supply only Bevy's imported vertex interface; validate the actual
+        // embedded fragment source rather than a second copy of its formula.
+        let source = include_str!("shaders/cinematic_post.wgsl").replace(
+            "#import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput",
+            "struct FullscreenVertexOutput {\n\
+                @builtin(position) position: vec4<f32>,\n\
+                @location(0) uv: vec2<f32>,\n\
+            }",
+        );
+        let module = wgpu::naga::front::wgsl::parse_str(&source).unwrap();
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        let uniform = module
+            .types
+            .iter()
+            .find_map(|(_, ty)| {
+                (ty.name.as_deref() == Some("SkyrimCinematicPost")).then_some(&ty.inner)
+            })
+            .unwrap();
+        let wgpu::naga::TypeInner::Struct { members, span } = uniform else {
+            panic!("cinematic uniform must be a struct");
+        };
+        assert_eq!(u64::from(*span), SkyrimCinematicPost::min_size().get());
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.offset)
+                .collect::<Vec<_>>(),
+            [0, 4, 8, 12, 16, 28]
+        );
+    }
+
+    #[test]
     fn scene_views_compose_in_hdr_with_explicit_output_settings() {
         let mut world = World::new();
         let entity = world.spawn(SceneColorPipeline::default()).id();
         assert!(world.get::<Hdr>(entity).is_some());
+        assert_eq!(
+            *world.get::<CompositingSpace>(entity).unwrap(),
+            CompositingSpace::Linear
+        );
         assert_eq!(world.get::<Exposure>(entity).unwrap().ev100, 9.7);
         assert_eq!(
             *world.get::<Tonemapping>(entity).unwrap(),
@@ -281,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn skyrim_clear_day_grade_matches_the_winning_imagespace_record() {
+    fn skyrim_clear_day_grade_preserves_reported_record_constants() {
         // ISSkyrimClearDAY (IMGS 0x00012F88, Update.esm winner), read from the
         // local game data: CNAM Saturation 1.5, Brightness 1.135, Contrast 1.4;
         // TNAM tint amount 0.42 toward RGB 0.894, 0.839, 0.773.
@@ -296,11 +646,11 @@ mod tests {
         for section in grading.all_sections() {
             assert_eq!(*section, ColorGradingSection::default());
         }
-        // Saturation lands after the tone curve, where vanilla applies it.
+        // Bevy saturation lands after its tone curve in linear RGB.
         assert_eq!(grading.global.post_saturation, 1.5);
         assert_eq!(grading.global.exposure, 0.0);
         // Brightness, contrast and tint land in the post-tonemap pass, in
-        // vanilla's domain, around the fixed pivot.
+        // the experimental sRGB domain, around the artistic pivot.
         assert_eq!(
             grade.post(),
             SkyrimCinematicPost {

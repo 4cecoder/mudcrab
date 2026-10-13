@@ -17,7 +17,9 @@ use bevy::{
     window::{ExitCondition, WindowPlugin},
 };
 use engine::{
-    color_pipeline::{SceneColorPipeline, SkyrimCinematicPostPlugin},
+    color_pipeline::{
+        SceneColorPipeline, SceneGradeMode, SkyrimCinematicPost, SkyrimCinematicPostPlugin,
+    },
     profiling::ProfilingState,
     render::{
         TerrainExtension, TerrainMaterial, VercidiumRendererPlugin, WaterExtension, WaterMaterial,
@@ -68,6 +70,11 @@ fn main() {
         }
     }
     let result = App::new()
+        .insert_resource(if legacy_output {
+            SceneGradeMode::Off
+        } else {
+            SceneGradeMode::Full
+        })
         .insert_resource(Probe {
             output,
             interior,
@@ -87,11 +94,11 @@ fn main() {
                 .set(RenderPlugin {
                     // Exercise the same material shaders without requesting every optional adapter
                     // feature. Terrain's six color/normal pairs exceed WebGPU's default 16 textures.
+                    // They share one sampler; retain the default 16-sampler limit for Metal.
                     render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
                         priority: WgpuSettingsPriority::WebGPU,
                         limits: WgpuLimits {
                             max_sampled_textures_per_shader_stage: 32,
-                            max_samplers_per_shader_stage: 32,
                             ..default()
                         },
                         ..default()
@@ -212,7 +219,10 @@ fn setup(
         ))
         .id();
     if probe.legacy_output {
-        commands.entity(main_camera).remove::<Hdr>();
+        commands.entity(main_camera).remove::<Hdr>().insert((
+            bevy::render::view::ColorGrading::default(),
+            SkyrimCinematicPost::default(),
+        ));
     }
     let quad = meshes.add(Rectangle::new(3.0, 1.5));
     // Sample centres: mesh (200,150), fog (600,150), terrain (200,450), water (600,450).
@@ -332,7 +342,8 @@ fn evaluate(
     ];
     let mut samples = serde_json::Map::new();
     let reference = image.get_pixel(200, 150).0;
-    let mut passed = reference.iter().all(|v| *v > 10 && *v < 250);
+    let reference_unclipped = reference.iter().all(|v| *v > 10 && *v < 250);
+    let mut composition_consistent = true;
     for (name, x, y) in locations {
         let expected = if probe.interior && name == "background" {
             [0; 3]
@@ -350,18 +361,25 @@ fn evaluate(
                 }
             }
         }
-        passed &= max_error <= 2;
+        composition_consistent &= max_error <= 2;
         samples.insert(name.into(), serde_json::json!({"pixel": [x,y], "rgb": image.get_pixel(x,y).0, "max_error_u8": max_error}));
     }
+    let passed = reference_unclipped && composition_consistent;
     let report = serde_json::json!({
         "kind": "synthetic-output-consistency", "retail_parity": false,
         "space": if probe.interior { "interior" } else { "exterior" },
         "input_linear": probe.color.to_f32_array(), "ev100": engine::color_pipeline::DEFAULT_SCENE_EV100,
         "tonemapping": "TonyMcMapface", "legacy_output": probe.legacy_output,
+        "cinematic_grade": if probe.legacy_output { "disabled" } else { "experimental-clear-day" },
+        "saturation_domain": if probe.legacy_output { None } else { Some("linear-post-tonemap") },
+        "post_grade_domain": if probe.legacy_output { None } else { Some("srgb") },
+        "artistic_pivot": engine::color_pipeline::CINEMATIC_PIVOT,
         "reflection_format": if probe.legacy_output { "Rgba8UnormSrgb" } else { "Rgba16Float" },
         "resolution": [800,600], "camera": {"position": [0,0,10], "projection": "orthographic", "vertical_size": 6},
         "adapter": {"name": adapter.name, "backend": format!("{:?}", adapter.backend), "driver": adapter.driver, "driver_info": adapter.driver_info},
-        "tolerance_u8": 2, "samples": samples, "passed": passed,
+        "tolerance_u8": 2, "samples": samples,
+        "reference_unclipped": reference_unclipped,
+        "composition_consistent": composition_consistent, "passed": passed,
     });
     std::fs::write(
         probe.output.join("probe.json"),

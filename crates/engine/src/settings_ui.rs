@@ -896,6 +896,10 @@ pub const CONTROL_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ),
             ("Console: tcl", "Toggle NOCLIP"),
             ("Console: tcg", "Toggle collision outlines"),
+            (
+                "Console: SceneGrade",
+                "Color grade: off, saturation or full (also in Graphics settings)",
+            ),
         ],
     ),
 ];
