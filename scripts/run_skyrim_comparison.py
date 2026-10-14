@@ -192,10 +192,11 @@ def run_session(output, timeout, state):
     state['phase'] = 'save-load-wait'
     while time.monotonic() < deadline:
         window = run(xdotool, 'search', '--onlyvisible', '--name', '^Skyrim Special Edition$', env=env, check=False)
-        if window.returncode:
+        window_ids = window.stdout.split()
+        if window.returncode or not window_ids:
             time.sleep(2)
             continue
-        wid = window.stdout.splitlines()[-1]
+        wid = window_ids[-1]
         capture(output / 'current.png')
         state['phase'] = 'screen-recognition'
         text = run(str(ocr), str(output / 'current.png'), 'stdout', '--psm', '11').stdout.lower()
@@ -286,3 +287,4 @@ def main(argv=None):
 
 if __name__ == '__main__':
     raise SystemExit(main())
+

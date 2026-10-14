@@ -51,7 +51,8 @@ def prepare(shots, template, calibration):
             raise ValueError("Shot angles must be finite and FOV between 0 and 180")
         pitch = math.radians(calibration["pitch_sign"] * shot["pitch"])
         yaw = math.radians((calibration["yaw_sign"] * shot["yaw"] + offset) % 360)
-        if pitch == 0 and yaw == 0:
+        yaw_wrapped = min(yaw % math.tau, math.tau - yaw % math.tau)
+        if abs(pitch) <= 1e-9 and yaw_wrapped <= 1e-9:
             raise ValueError(f"{name}: Photo Mode skips [0, 0] rotation; use a calibrated framework client for this pose")
         fov = shot["hfov"]
         if calibration["fov_axis"] == "vertical":
@@ -94,3 +95,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

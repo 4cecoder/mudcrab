@@ -133,7 +133,7 @@ Open the backtick console and run `SceneGrade off`, `SceneGrade saturation` or
 disables both grading stages; `saturation` enables only Bevy post-saturation;
 `full` enables the experimental sRGB brightness/contrast/tint pass too. Exposure,
 tone mapping, camera pose, lighting and fog remain fixed. Reflections stay ungraded,
-and newly spawned scene cameras inherit the current mode. Full remains the default.
+and newly spawned scene cameras inherit the current mode. The runtime default is `snapshot-srgb`.
 
 Use `--color-grade off|saturation|full` for startup selection. For a repeatable
 three-mode capture, run:
@@ -468,3 +468,4 @@ B31|2026-10-03|Reference-shot prose omits existing failure counters from settle 
 B32|2026-10-03|Emission migration prose retained latest-only launcher requirement after shared compatibility range landed|Align prose with existing 15–19 readiness gate and schema-range tests; documentation-only, no new invariant
 
 Camera-mod research and remaining native calibration gates are recorded in [Skyrim camera comparison](skyrim-camera-comparison.md).
+

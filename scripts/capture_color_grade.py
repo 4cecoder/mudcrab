@@ -9,6 +9,9 @@ import subprocess
 import struct
 
 
+VISUAL_PRESET = "cool-gray"
+
+
 def main():
     repository = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -32,7 +35,7 @@ def main():
     manifest = {
         "kind": "mudcrab-color-grade-ab", "retail_parity": False,
         "engine": str(engine), "engine_sha256": hashlib.sha256(engine.read_bytes()).hexdigest(),
-        "assets": str(assets), "shots": poses, "runs": [], "passed": False,
+        "assets": str(assets), "visual_preset": VISUAL_PRESET, "shots": poses, "runs": [], "passed": False,
     }
     manifest_path = output / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -43,6 +46,7 @@ def main():
             str(engine), "--assets", str(assets), "--shots", str(shots),
             "--shots-out", str(directory), "--hidden-window", "--lights",
             "--stream-radius", "2", "--color-grade", mode,
+            "--visual-preset", VISUAL_PRESET,
             "--shots-settle-timeout", "120",
         ]
         print(f"Capturing {mode}: {directory}", flush=True)
@@ -66,6 +70,7 @@ def main():
         for index, (receipt, pose) in enumerate(zip(receipts, poses["shots"])):
             if (receipt["capture"] != index or receipt["kind"] != "settled"
                     or receipt["timed_out"] or receipt["color_grade"] != mode
+                    or receipt.get("visual_preset") != VISUAL_PRESET
                     or receipt["water_time_seconds"] != 1.0):
                 raise SystemExit(f"{mode}: invalid capture receipt for {pose['name']}")
             image = directory / f"{pose['name']}.png"
@@ -98,3 +103,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

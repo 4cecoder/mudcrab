@@ -94,8 +94,8 @@ fn dispatch_stdin(world: &mut World) {
         receiver.try_iter().take(16).collect::<Vec<_>>()
     };
     for line in lines {
-        execute_line(world, &line);
-        if let Some(result) = world.resource::<ConsoleState>().scrollback.last() {
+        let output = execute_line(world, &line);
+        for result in output.lines() {
             info!(target: "live_console", "{result}");
         }
     }
@@ -198,3 +198,4 @@ mod tests {
         assert_eq!(app.world().resource::<ConsoleState>().scrollback.len(), 34);
     }
 }
+

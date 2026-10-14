@@ -55,7 +55,7 @@ class RunnerEvidenceTests(unittest.TestCase):
             display_file = artifacts / 'display.env'
             source = root / 'gamescope.png'
             png = b'\x89PNG\r\n\x1a\nsynthetic\x00\x00\x00\x00IEND\xaeB`\x82'
-            calls = {'xprop': 0}
+            calls = {'xprop': 0, 'search': 0}
 
             def fake_run(*command, env=None, check=True):
                 if command[:3] == ('systemctl', '--user', 'start') and command[-1] == runner.DISPLAY_SERVICE:
@@ -66,7 +66,12 @@ class RunnerEvidenceTests(unittest.TestCase):
                 if command[:3] == ('systemctl', '--user', 'is-active'):
                     return subprocess.CompletedProcess(command, 0, 'active\n', '')
                 if command[0].endswith('/xdotool') and command[1] == 'search':
-                    return subprocess.CompletedProcess(command, 0, '100\n', '')
+                    calls['search'] += 1
+                    if calls['search'] <= 2:
+                        self.assertEqual(calls['xprop'], 0)
+                        return subprocess.CompletedProcess(command, 0,
+                                                           '' if calls['search'] == 1 else '  \n', '')
+                    return subprocess.CompletedProcess(command, 0, '99\n100\n', '')
                 if command[0].endswith('/tesseract'):
                     return subprocess.CompletedProcess(command, 0, '', '')
                 if command[0].endswith('/xprop'):
@@ -86,6 +91,7 @@ class RunnerEvidenceTests(unittest.TestCase):
                  redirect_stdout(stdout), redirect_stderr(stderr):
                 result = runner.main(['--output', str(output)])
 
+            self.assertEqual(calls['search'], 3)
             self.assertEqual(result, 1)
             receipt = json.loads((output / 'failure.json').read_text())
             self.assertEqual(receipt['phase'], 'capture-request')
@@ -99,3 +105,4 @@ class RunnerEvidenceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

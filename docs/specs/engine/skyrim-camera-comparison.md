@@ -40,7 +40,7 @@ Authenticated Nexus metadata identifies [Photo Mode](https://www.nexusmods.com/s
 
 This provides a declarative camera input without building a separate framework client. Save one native preset first, preserve its metadata and cell/player fields, and edit the camera pose fields for each Mudcrab shot. `rotation` is the free-camera's two-component pitch/yaw, stored directly in native radians; it is not the framework's three-component degree array. `ApplyToCamera` restores translation, nonzero rotation, world FOV, and view roll. A rotation array of `[0, 0]` is skipped by the loader, so it cannot reliably restore that orientation from an arbitrary prior pose. Loading a preset also does not automatically load or teleport into an unattached cell. Load the scene first and calibrate the camera's angle signs and FOV against Mudcrab before accepting a reference.
 
-The same mod exposes time freezing, time-of-day, and weather controls. For matched stills, start with Photo Mode's JSON presets and these controls; use FreeCamera Framework when timeline playback or a custom API client is needed. This recommendation is based on source and metadata, not an installed-game test.
+The same mod exposes time freezing, time-of-day, and weather controls. For matched stills, start with Photo Mode's JSON presets and these controls; use FreeCamera Framework when timeline playback or a custom API client is needed. Source and metadata establish the supported input format; the isolated session subsequently verified Photo Mode loading and native camera readback, while cross-engine calibration remains open.
 
 ## Other candidates
 
@@ -51,6 +51,7 @@ The same mod exposes time freezing, time-of-day, and weather controls. For match
 | [Screenshot Location and Metadata](https://github.com/maxkagamine/ScreenshotLocationAndMetadata) | Candidate metadata recorder for capture readback | Recording metadata does not establish camera input control. Verify the fields and runtime compatibility before relying on it. |
 | [Camera Scripter](https://www.nexusmods.com/skyrim/mods/79041) | Legacy `.scs` camera scripting | A 32-bit Skyrim mod; the author's SE port restriction makes it unsuitable for this SE workflow. |
 
-The present evidence consists of public documentation/source and Mudcrab captures. No Skyrim mod was installed or run, and no matched retail capture or retail color-grading parity was verified.
+The present evidence includes public documentation/source, Mudcrab captures, and the [isolated Skyrim session](../../../tools/skyrim-comparison/README.md): SKSE and five native plugins loaded, and Photo Mode wrote a native camera readback for the Riverwood overlook. No matched retail capture or retail color-grading parity was verified.
 
 Authenticated Nexus metadata checked on 2026-10-12 confirms FreeCamera Framework 1.1.0 (174046), AutoTest 1.2.0 (42520), and Photo Mode 3.0.4 (91701). Photo Mode also exposes time freezing, time-of-day, and weather controls; preserve the target game state and avoid its image filters when collecting vanilla references.
+

@@ -27,6 +27,20 @@ class PresetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "skips"):
             prepare(self.shots, self.template, self.calibration)
 
+    def test_near_zero_and_full_turn_rotations_are_refused(self):
+        for pitch, yaw in [(0, 90.0000000001), (0, 89.9999999999),
+                           (1e-10, 90), (0, 450), (0, -270)]:
+            with self.subTest(pitch=pitch, yaw=yaw):
+                self.shots["shots"][0].update(pitch=pitch, yaw=yaw)
+                with self.assertRaisesRegex(ValueError, "skips"):
+                    prepare(self.shots, self.template, self.calibration)
+
+    def test_nonzero_rotations_are_preserved(self):
+        for pitch, yaw in [(0.001, 90), (0, 90.001)]:
+            with self.subTest(pitch=pitch, yaw=yaw):
+                self.shots["shots"][0].update(pitch=pitch, yaw=yaw)
+                self.assertEqual(len(prepare(self.shots, self.template, self.calibration)), 1)
+
     def test_missing_calibration_is_refused(self):
         del self.calibration["evidence"]
         with self.assertRaisesRegex(ValueError, "evidence"):
@@ -44,3 +58,4 @@ class PresetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
