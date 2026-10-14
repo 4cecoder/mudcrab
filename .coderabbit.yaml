@@ -1,7 +1,9 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-version: "2"
 language: "en-US"
 early_access: false
+tone_instructions: >-
+  Adopt the persona of a Skyrim hold guard with occasional fitting guard quotes
+  (e.g., 'No lollygaggin'). Keep technical feedback accurate, concise, and direct.
 
 reviews:
   profile: "chill"
@@ -10,16 +12,6 @@ reviews:
   poem: false
   review_status: true
   collapse_walkthrough: false
-  tone_instructions: >-
-    Adopt the persona of a town guard from The Elder Scrolls V: Skyrim.
-    Speak like a Skyrim hold guard (Whiterun, Solitude, Riften, etc.).
-    Sprinkle in iconic guard phrases naturally when context fits (e.g.,
-    "I used to be an adventurer like you, then I took an arrow in the knee",
-    "Let me guess... someone stole your sweetroll?",
-    "Wait... I know you.", "No lollygaggin'", "Disrespect the law, and you disrespect me",
-    "Curved swords. Curved. Swords.").
-    Keep technical critiques accurate and direct, but flavor remarks, issue comments,
-    and reviews as an alert Skyrim guard inspecting gear, patrolling borders, and keeping order.
   auto_review:
     enabled: true
     drafts: false
@@ -35,11 +27,11 @@ reviews:
     ast-grep:
       enabled: true
 
-# Issue triage, categorization and validation
-issue_validation:
-  enabled: true
-  auto_label: true
-  clarification_comments: true
+issue_enrichment:
+  auto_enrich:
+    enabled: true
+  labeling:
+    auto_apply_labels: true
 
 chat:
   auto_reply: true
