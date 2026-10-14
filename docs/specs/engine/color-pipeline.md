@@ -21,7 +21,7 @@ Code baseline: `a9f2310ccfc691eebb97fde18df1e8d334b7d744`; Bevy 0.19. The source
 | `DistanceFog` | Exposed surface RGB + linear fog palette → fogged linear RGB | Existing Bevy visibility-based atmospheric fog toward Fog Far stays explicit. Interior fog removal is current behavior, not complete Skyrim interior semantics. L2 owns the correction. |
 | `render.rs` reflection camera | Scene at main-view exposure → `Rgba16Float`, tone mapping disabled | Floating linear target preserves values above 1. Reflection gate copies exposure even while inactive. Existing reflected layers and geometry selection remain unchanged. |
 | `shaders/water.wgsl` | Exposed water lighting + exposed linear reflection → blend → surface fog | Reflection receives neither a second lighting evaluation nor a display transform. Existing Fresnel/waves and reflection coverage are approximations. |
-| `color_pipeline.rs` / scene cameras | HDR composition → `TonyMcMapface` → Bevy linear `post_saturation` → sRGB-domain cinematic post pass → display encoding | Experimental clear-day grade uses reported `ISSkyrimClearDAY` (0x00012F88, `Update.esm` winner) CNAM 1.5/1.135/1.4 and TNAM 0.42 toward 0.894/0.839/0.773. Brightness/contrast use an artistic sRGB pivot of 0.18. Tone curve and EV100 remain pinned Bevy baselines; `HNAM` remains unapplied. L4 owns adaptation and record-driven behavior. |
+| `color_pipeline.rs` / scene cameras | HDR composition → `TonyMcMapface` → selected post-tonemap grade → display encoding | Runtime starts with Cool Gray sky and the Sleeping Giant sRGB snapshot described below. The saved `full` grade uses Bevy linear `post_saturation`, followed by sRGB brightness/contrast/tint from reported `ISSkyrimClearDAY` (0x00012F88, `Update.esm` winner) CNAM 1.5/1.135/1.4 and TNAM 0.42 toward 0.894/0.839/0.773. Contrast uses an artistic pivot of 0.18. Tone curve and EV100 remain pinned Bevy baselines; `HNAM` remains unapplied. L4 owns adaptation and record-driven behavior. |
 
 The previous non-HDR mesh path tone-mapped in each material shader. The custom sky shader bypassed that operation, and reflection RGB passed through tone mapping in both the reflection and water passes. HDR composition moves the tone transform after composition. The experimental cinematic grade adds a fullscreen shader pass. It changes images and consumes more render-target memory; target-hardware performance remains an acceptance requirement.
 
@@ -35,8 +35,8 @@ runs in linear RGB with slightly different luminance weights from the custom tin
 pass. Negative input and out-of-gamut output are clipped; alpha is preserved and
 retail alpha/bloom-feed grading is omitted. `HNAM` is recorded but unapplied.
 
-The shared default applies the clear-day grade to interiors and diagnostic
-fixtures too; no weather/interior image-space selection exists yet. All apps using
+Scene cameras share the selected grade, including interiors; no weather/interior
+image-space selection exists yet. All apps using
 these camera settings must register `SkyrimCinematicPostPlugin`. Cameras must keep
 `CompositingSpace::Linear`; overriding it with sRGB or Oklab is unsupported. Ordering
 relative to AA and CAS remains unvalidated. Reflection currently incurs a disabled
@@ -48,11 +48,15 @@ grade and domains; material probes now register the full post pass.
 
 ### Sleeping Giant Inn snapshot experiment
 
-`SceneGrade snapshot-srgb` and `SceneGrade snapshot-linear` reproduce the rounded
+`SceneGrade snapshot-srgb` and `SceneGrade snapshot-linear` start from the rounded
 Photo Mode UI values supplied on 2026-10-13: saturation 1.66, brightness 1.15,
 contrast 1.50, tint amount 0.56, and tint RGB `(0.88, 0.81, 0.72)`. Photo Mode
 lists the tint sliders as Red, Blue, Green; the experiment stores RGB in normal order.
 These are one scene's current base-grade values, not universal Skyrim defaults.
+
+The sRGB mode now applies a user-requested 20% brightness increase, from 1.15 to
+1.38. Saturation, contrast, tint, exposure, and fog remain unchanged by this tuning.
+The original snapshot values and the linear mode retain brightness 1.15.
 
 Both modes disable Bevy post-saturation and evaluate saturation followed by tint
 in the cinematic post pass. The original luminance feeds both operations; negative
@@ -61,7 +65,7 @@ have run, then the output is clipped. `snapshot-srgb` operates on sRGB-encoded
 post-tonemap values; `snapshot-linear` operates directly on linear post-tonemap
 values. Alpha passes through and reflections remain ungraded.
 
-The modes keep the selected sky preset, exposure, TonyMcMapface, and the fixed 0.18
+The modes keep the selected sky/fog preset, exposure, TonyMcMapface, and the fixed 0.18
 contrast pivot. They do not reproduce Skyrim's native tone curve, adaptation,
 bloom, final gamma, or modifier composition. The UI values are rounded, and the
 correct native sampled domain remains a capture gate. These are controlled domain
@@ -69,8 +73,12 @@ experiments rather than a full retail renderer port.
 
 Use `--color-grade snapshot-srgb|snapshot-linear` at startup. Return to
 `SceneGrade full` to restore Vivid or Cool Gray's existing grading. `ScenePreset`
-remains an independent sky/preset selector. Both presets and the startup defaults
-retain their existing values. Shot receipts include the resolved grading values,
+remains an independent sky/preset selector. Both saved presets retain their existing
+values. The engine starts with the Cool Gray sky and `snapshot-srgb` grading. This
+uses the snapshot's saturation 1.66; Cool Gray's saved saturation 1.25 applies when
+`SceneGrade full` is selected. Restore the original Vivid look with
+`--visual-preset vivid --color-grade full`, or run `ScenePreset vivid` followed by
+`SceneGrade full` in the console. Shot receipts include the resolved grading values,
 which saturation stage is active, and the post-pass domain flag. For a small GPU
 composition check, run `color_pipeline_probe --gray --color-grade snapshot-srgb`
 or `snapshot-linear` with a fresh `--output` directory.
@@ -97,21 +105,24 @@ GPU timing evidence is unavailable in runs using this option.
 
 Two named visual presets preserve the approved look while allowing experiments:
 
-| Preset | Bevy post-saturation | Sky upper / lower / horizon (sRGB bytes) |
+| Preset | Bevy post-saturation in `full` mode | Sky upper / lower / horizon (sRGB bytes) |
 |---|---|---|
-| Vivid (default) | 1.5 | `(21,77,117)` / `(60,135,183)` / `(125,163,183)` |
+| Vivid | 1.5 | `(21,77,117)` / `(60,135,183)` / `(125,163,183)` |
 | Cool Gray | 1.25 | `(178,187,198)` / `(194,202,209)` / `(207,214,220)` |
 
 Vivid retains the existing clear-day configuration exactly. Cool Gray uses a light,
 slightly blue gray gradient and lower saturation. Both retain brightness 1.135,
 contrast 1.4, tint amount 0.42 and its existing RGB, EV100 9.7, and TonyMcMapface.
-Lights, shadows, fog colors, fog density and camera pose remain unchanged. Sky
+Cool Gray uses one quarter of the original fog density, equivalent to visibility
+increasing from 48,300 to 193,200 Creation units. Its Fog Far color is a subdued
+snowy blue-white: `(210,222,235)` instead of `(116,168,203)` in sRGB bytes. Vivid retains the original
+fog color and density. Lights, shadows and camera pose remain unchanged. Sky
 colors are authored inputs before tone mapping and grading, not final display RGB.
 
 Run `ScenePreset vivid`, `ScenePreset cool-gray`, or `ScenePreset toggle` in the
 backtick console. With no argument, `ScenePreset` reports the active preset and
 diagnostic grade mode. Switching is immediate and reversible. Use
-`--visual-preset vivid|cool-gray` at startup; Vivid remains the default. Preset
+`--visual-preset vivid|cool-gray` at startup; Cool Gray is the runtime default. Preset
 selection does not change the independent `SceneGrade` mode below. Use full
 grading to see each complete look. Presets are built into the engine; console
 selection lasts for the current process. Shot receipts record `visual_preset`

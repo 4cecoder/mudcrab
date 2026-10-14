@@ -100,7 +100,7 @@ pub struct EngineConfig {
     pub hidden_window: bool,
     /// Select the cinematic A/B experiment without changing scene lighting.
     pub color_grade: SceneGradeMode,
-    /// Named sky and grading look; Vivid preserves the approved configuration.
+    /// Named sky, fog and grading look; Vivid preserves the approved configuration.
     pub visual_preset: SceneVisualPreset,
     /// Seed a live world camera from a validated one-pose shots file.
     pub start_shot: Option<PathBuf>,
@@ -188,8 +188,8 @@ impl Default for EngineConfig {
             max_upload_mib_per_frame: 16,
             headless: false,
             hidden_window: false,
-            color_grade: SceneGradeMode::Full,
-            visual_preset: SceneVisualPreset::Vivid,
+            color_grade: SceneGradeMode::SnapshotSrgb,
+            visual_preset: SceneVisualPreset::CoolGray,
             start_shot: None,
             stdin_console: false,
             no_render_diagnostics: false,
@@ -281,8 +281,8 @@ Benchmark and profiling:
   --acceptance-screenshot <file>        write a screenshot when the run ends
   --screenshot-camera-offset <x,y,z>    camera offset for the acceptance screenshot
   --matched-route <file>                execute exact route steps with transition and settled checkpoints
-  --color-grade <mode>                 off|saturation|full|snapshot-srgb|snapshot-linear (default: full)
-  --visual-preset <vivid|cool-gray>      select sky and grading look (default: vivid)
+  --color-grade <mode>                 off|saturation|full|snapshot-srgb|snapshot-linear (default: snapshot-srgb)
+  --visual-preset <vivid|cool-gray>      select sky and grading look (default: cool-gray)
   --sun-position <azimuth,elevation>     sun bearing clockwise from north and elevation above horizon, degrees
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
   --shots-settle-timeout <seconds>      maximum settling time per shot (default: 30, maximum: 600)
@@ -1167,7 +1167,7 @@ mod tests {
     fn parses_visual_preset_without_changing_diagnostic_grade() {
         assert_eq!(
             EngineConfig::default().visual_preset,
-            SceneVisualPreset::Vivid
+            SceneVisualPreset::CoolGray
         );
         for (value, expected) in [
             ("vivid", SceneVisualPreset::Vivid),
@@ -1196,7 +1196,10 @@ mod tests {
         ] {
             assert_eq!(run_config(&["--color-grade", value]).color_grade, wanted);
         }
-        assert_eq!(EngineConfig::default().color_grade, SceneGradeMode::Full);
+        assert_eq!(
+            EngineConfig::default().color_grade,
+            SceneGradeMode::SnapshotSrgb
+        );
         assert!(
             parse_error(&["--color-grade", "bad"])
                 .to_string()

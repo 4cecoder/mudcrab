@@ -61,9 +61,12 @@ impl SceneGradeMode {
     /// Resolve the screenshot's grade independently of the selected sky preset.
     pub fn grade(self, preset: SceneVisualPreset) -> SkyrimCinematicGrade {
         match self {
-            Self::SnapshotSrgb | Self::SnapshotLinear => {
-                SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT
-            }
+            Self::SnapshotSrgb => SkyrimCinematicGrade {
+                // User-tuned 20% brightness lift; preserve the original Photo Mode snapshot.
+                brightness: SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT.brightness * 1.2,
+                ..SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT
+            },
+            Self::SnapshotLinear => SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT,
             _ => preset.grade(),
         }
     }
@@ -101,7 +104,7 @@ pub enum SceneGradeTarget {
 }
 
 /// Named artistic looks. Vivid preserves the approved clear-day configuration.
-/// Exposure, tone mapping, lights, shadows and fog parameters are shared.
+/// Exposure, tone mapping, lights and shadows are shared.
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SceneVisualPreset {
     #[default]
@@ -135,7 +138,7 @@ impl SceneVisualPreset {
         }
     }
 
-    /// Authored sRGB sky colors, before tone mapping and grading. Fog is unchanged.
+    /// Authored sky and fog settings, before tone mapping and grading.
     pub fn sky_palette(self) -> SkyPalette {
         match self {
             Self::Vivid => SkyPalette::SKYRIM_CLEAR_DAY,
@@ -143,6 +146,8 @@ impl SceneVisualPreset {
                 upper: Color::srgb_u8(178, 187, 198),
                 lower: Color::srgb_u8(194, 202, 209),
                 horizon: Color::srgb_u8(207, 214, 220),
+                fog_far: Color::srgb_u8(210, 222, 235),
+                fog_density_scale: 0.25,
                 ..SkyPalette::SKYRIM_CLEAR_DAY
             },
         }
@@ -154,7 +159,7 @@ fn scene_preset_command() -> ConsoleCommand {
         name: "ScenePreset",
         short: None,
         usage: "ScenePreset [vivid|cool-gray|toggle]",
-        help: "inspect or switch the sky and color grading preset",
+        help: "inspect or switch the sky, fog and color grading preset",
         handler: Box::new(|world, args| {
             let current = *world.resource::<SceneVisualPreset>();
             let next = match args {
@@ -504,9 +509,9 @@ mod tests {
         );
         assert_eq!(snapshot.tint_amount, 0.56);
         assert_eq!(snapshot.tint_rgb, [0.88, 0.81, 0.72]);
-        for (command, domain) in [
-            ("SceneGrade SNAPSHOT-SRGB", 0),
-            ("SceneGrade snapshot-linear", 1),
+        for (command, domain, brightness) in [
+            ("SceneGrade SNAPSHOT-SRGB", 0, snapshot.brightness * 1.2),
+            ("SceneGrade snapshot-linear", 1, snapshot.brightness),
         ] {
             crate::console::execute_line(app.world_mut(), command);
             app.update();
@@ -516,10 +521,14 @@ mod tests {
                 *post,
                 SkyrimCinematicPost {
                     saturation: 1.66,
+                    brightness,
                     linear_domain: domain,
                     ..snapshot.post()
                 }
             );
+            if domain == 0 {
+                assert!((post.brightness - 1.38).abs() < 1e-6);
+            }
             assert_eq!(
                 world
                     .get::<ColorGrading>(main)
@@ -630,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn presets_restore_vivid_and_keep_camera_lighting_and_fog_state() {
+    fn presets_restore_vivid_and_keep_camera_and_lighting_state() {
         let mut app = App::new();
         app.init_resource::<SceneGradeMode>()
             .init_resource::<SceneVisualPreset>()
@@ -657,7 +666,9 @@ mod tests {
             let world = app.world();
             let preset = *world.resource::<SceneVisualPreset>();
             assert_eq!(*world.resource::<SkyPalette>(), preset.sky_palette());
-            assert_fog_matches(&crate::sky::fog_for(world.resource::<SkyPalette>()), &fog);
+            if preset == SceneVisualPreset::Vivid {
+                assert_fog_matches(&crate::sky::fog_for(world.resource::<SkyPalette>()), &fog);
+            }
             assert_grading_matches(world.get::<ColorGrading>(main).unwrap(), &preset.grade());
             assert_eq!(
                 *world.get::<SkyrimCinematicPost>(main).unwrap(),
