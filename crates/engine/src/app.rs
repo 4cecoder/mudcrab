@@ -346,8 +346,16 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
     else {
         return Ok(None);
     };
-    let other_mode = (config.shots.is_some() && config.matched_route.is_some())
-        || config.benchmark_only
+    color_eyre::eyre::ensure!(
+        config.shots.is_none() || config.matched_route.is_none(),
+        "--shots and --matched-route cannot be combined: pass only one of them"
+    );
+    let option = if config.matched_route.is_some() {
+        "--matched-route"
+    } else {
+        "--shots"
+    };
+    let other_mode = config.benchmark_only
         || config.benchmark_frames.is_some()
         || config.benchmark_duration_secs.is_some()
         || config.acceptance_screenshot.is_some()
@@ -360,12 +368,12 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         || config.physics_fixture;
     color_eyre::eyre::ensure!(
         !other_mode,
-        "--shots renders the converted world on its own: it cannot be combined with a benchmark, \
+        "{option} renders the converted world on its own: it cannot be combined with a benchmark, \
          an acceptance screenshot, --auto-fly-speed or a fixture"
     );
     if config.headless {
         // The logger is not installed yet, so a `warn!` here would never be seen.
-        eprintln!("warning: --shots photographs the window, so --headless is ignored");
+        eprintln!("warning: {option} photographs the window, so --headless is ignored");
     }
     let (file, checkpoints) = if config.matched_route.is_some() {
         let (file, checkpoints) = crate::matched_route::MatchedRoute::load(&path)?.expand()?;

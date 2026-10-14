@@ -194,12 +194,18 @@ impl ParseWarnings {
         }
     }
 
-    fn report(&self, source: &str) {
-        if let Some(first) = &self.first {
-            eprintln!(
-                "warning: {source}: skipped {} malformed record/frame occurrence(s); first: {first}; complete neighboring records retained",
+    fn summary(&self, source: &str) -> Option<String> {
+        self.first.as_ref().map(|first| {
+            format!(
+                "{source}: skipped {} malformed record/frame occurrence(s); first: {first}; complete neighboring records retained",
                 self.count
-            );
+            )
+        })
+    }
+
+    fn report(&self, source: &str) {
+        if let Some(summary) = self.summary(source) {
+            eprintln!("warning: {summary}");
         }
     }
 }
@@ -362,11 +368,24 @@ fn decode_record_subrecords_inner(
 }
 
 pub fn parse_plugin_file(path: &Path) -> Result<Vec<RawRecord>> {
+    let (records, warning) = parse_plugin_file_with_warning(path)?;
+    if let Some(warning) = warning {
+        eprintln!("warning: {warning}");
+    }
+    Ok(records)
+}
+
+/// Parse a plugin and return, instead of printing, the summary of skipped malformed records and
+/// frames. Callers that publish a conversion report must count it: the records it describes are
+/// missing from the result even though parsing succeeded.
+pub(crate) fn parse_plugin_file_with_warning(
+    path: &Path,
+) -> Result<(Vec<RawRecord>, Option<String>)> {
     parse_plugin_file_inner(path)
         .wrap_err_with(|| format!("failed to parse plugin {}", path.display()))
 }
 
-fn parse_plugin_file_inner(path: &Path) -> Result<Vec<RawRecord>> {
+fn parse_plugin_file_inner(path: &Path) -> Result<(Vec<RawRecord>, Option<String>)> {
     let reader = EsmReader::open(path)?;
     let data = reader.as_slice();
 
@@ -403,9 +422,9 @@ fn parse_plugin_file_inner(path: &Path) -> Result<Vec<RawRecord>> {
         &mut records,
         &mut warnings,
     );
-    warnings.report(&path.file_name().unwrap_or_default().to_string_lossy());
+    let warning = warnings.summary(&path.file_name().unwrap_or_default().to_string_lossy());
 
-    Ok(records)
+    Ok((records, warning))
 }
 
 /// Parses REFR payload for Position and Base Form ID pointers
@@ -727,6 +746,25 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn skipped_plugin_frames_are_returned_for_the_conversion_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let header = [b"TES4".as_slice(), &[0; 20]].concat();
+        let path = directory.path().join("clean.esp");
+        std::fs::write(&path, &header).unwrap();
+        assert_eq!(parse_plugin_file_with_warning(&path).unwrap().1, None);
+
+        let path = directory.path().join("torn.esp");
+        std::fs::write(&path, [header.as_slice(), &[0; 7]].concat()).unwrap();
+        let (records, warning) = parse_plugin_file_with_warning(&path).unwrap();
+        assert!(records.is_empty());
+        let warning = warning.expect("a torn frame must be reported");
+        assert!(
+            warning.starts_with("torn.esp: skipped 1 ") && warning.contains("trailing 7 bytes"),
+            "{warning}"
+        );
     }
 
     #[test]

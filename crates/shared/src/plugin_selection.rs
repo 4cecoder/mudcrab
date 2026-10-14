@@ -243,11 +243,6 @@ pub fn select_plugin_names(
             add(key, warnings);
         }
     }
-    for entry in entries {
-        if !entry.checked && !always.contains(&entry.key) && !installed.contains(&entry.key) {
-            add(&entry.key, warnings);
-        }
-    }
     selected
 }
 

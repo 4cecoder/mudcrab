@@ -1,5 +1,5 @@
 use crate::esm::{
-    binary::parse_plugin_file,
+    binary::parse_plugin_file_with_warning,
     exporter::{create_tables, validate_inhouse_record},
     records::RawRecord,
 };
@@ -104,6 +104,7 @@ impl EsmParser {
             reader,
             inhouse::StringSources::PluginLooseFirst(strings_root),
             schemas,
+            &mut Vec::new(),
         )
     }
 
@@ -114,11 +115,14 @@ impl EsmParser {
         reader: crate::config::RecordReader,
         string_sources: inhouse::StringSources<'_>,
         schemas: Option<&crate::records::addons::RuntimeSchemas>,
+        parse_warnings: &mut Vec<String>,
     ) -> Result<HashMap<u32, RawRecord>> {
         match reader {
-            crate::config::RecordReader::Legacy => {
-                Self::convert_plugins_with_records(plugin_paths, db_path)
-            }
+            crate::config::RecordReader::Legacy => Self::convert_plugins_with_records_and_warnings(
+                plugin_paths,
+                db_path,
+                parse_warnings,
+            ),
             crate::config::RecordReader::Inhouse => match string_sources {
                 inhouse::StringSources::PluginLooseFirst(strings_root) => {
                     if let Some(schemas) = schemas {
@@ -152,8 +156,17 @@ impl EsmParser {
         plugin_paths: &[PathBuf],
         db_path: &Path,
     ) -> Result<HashMap<u32, RawRecord>> {
+        Self::convert_plugins_with_records_and_warnings(plugin_paths, db_path, &mut Vec::new())
+    }
+
+    /// As `convert_plugins_with_records`, also returning skipped-record parse warnings.
+    fn convert_plugins_with_records_and_warnings(
+        plugin_paths: &[PathBuf],
+        db_path: &Path,
+        parse_warnings: &mut Vec<String>,
+    ) -> Result<HashMap<u32, RawRecord>> {
         let order = load_order::LoadOrder::read(plugin_paths)?;
-        let master = Self::merge_plugins_with_load_order(plugin_paths, &order)?;
+        let master = Self::merge_plugins_with_load_order(plugin_paths, &order, parse_warnings)?;
         let conn = Connection::open(db_path)?;
         create_tables(&conn)?;
         exporter::export_plugins_to_db(&conn, &master, &order, plugin_paths)?;
@@ -164,13 +177,16 @@ impl EsmParser {
     /// Merge plugin records with validated slots and EditorID-based game settings.
     pub fn merge_plugins(plugin_paths: &[PathBuf]) -> Result<HashMap<u32, RawRecord>> {
         let order = load_order::LoadOrder::read(plugin_paths)?;
-        Self::merge_plugins_with_load_order(plugin_paths, &order)
+        Self::merge_plugins_with_load_order(plugin_paths, &order, &mut Vec::new())
     }
 
     /// Use one load-order mapping for both merging and ownership export.
+    /// Malformed records and frames skipped while parsing are printed and appended to
+    /// `parse_warnings`, so a caller can mark its conversion incomplete.
     fn merge_plugins_with_load_order(
         plugin_paths: &[PathBuf],
         order: &load_order::LoadOrder,
+        parse_warnings: &mut Vec<String>,
     ) -> Result<HashMap<u32, RawRecord>> {
         let mut merged = HashMap::new();
         // Unlike ordinary forms, game settings override by EditorID. Retain
@@ -183,7 +199,12 @@ impl EsmParser {
             // Final ID -> (source ID, whether its master index was out of range). Two different
             // source IDs that resolve to one final ID would silently replace each other.
             let mut sources: HashMap<u32, (u32, bool)> = HashMap::new();
-            for mut record in parse_plugin_file(path)? {
+            let (records, parse_warning) = parse_plugin_file_with_warning(path)?;
+            if let Some(warning) = parse_warning {
+                eprintln!("warning: {warning}");
+                parse_warnings.push(warning);
+            }
+            for mut record in records {
                 record.load_order = priority as u32;
                 let source_id = record.form_id;
                 let out_of_range = (source_id >> 24) as usize > masters.len();

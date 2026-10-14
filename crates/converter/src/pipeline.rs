@@ -721,13 +721,18 @@ impl AssetPipeline {
             } else {
                 crate::esm::inhouse::StringSources::PluginLooseFirst(&strings_root)
             };
+            // Records skipped inside a parsed plugin leave the world incomplete, so they must
+            // reach the report and manifest rather than only stderr.
+            let mut parse_warnings = Vec::new();
             let merged = EsmParser::convert_plugins_with_reader_and_schemas_with_string_sources(
                 &plugins,
                 &db_path,
                 config.record_reader,
                 string_sources,
                 Some(config.schemas()?.as_ref()),
+                &mut parse_warnings,
             )?;
+            report.warnings.extend(parse_warnings);
             validate_database(&Connection::open(&db_path)?)?;
             if config.record_reader == crate::config::RecordReader::Inhouse {
                 crate::esm::inhouse::write_terrain_caches(&merged, &db_path, staging)?;
