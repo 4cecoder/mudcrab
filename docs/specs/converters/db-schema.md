@@ -245,8 +245,9 @@ the winning plugin's priority. Game settings override by case-insensitive
 EditorID and retain the first definition's identity. A deletion with no EDID
 resolves through any previously encountered non-null FormID alias; an unknown
 header-only deletion is skipped with a warning. Later restorations keep the
-original identity. Ambiguous aliases and live settings without an EDID are
-errors, rather than silently replacing or dropping another record.
+original identity. Ambiguous aliases are errors, rather than silently replacing
+another record. Live settings without an EDID, or whose identity resolves to a
+null FormID, are left out and counted in the per-plugin skipped-records warning.
 
 Known FormID fields inside the published subrecord blobs (`records.data`,
 `cells.data`, `references.data`) are rewritten into the same load-order numbering
