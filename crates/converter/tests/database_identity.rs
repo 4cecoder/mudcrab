@@ -321,7 +321,10 @@ fn unusable_game_setting_identities_are_skipped_with_neighbors_preserved() {
         .concat(),
     );
     let merged = EsmParser::merge_plugins(&[base]).unwrap();
-    assert_eq!(merged.keys().copied().collect::<Vec<_>>(), [0x800, 0x802]);
+    // `merged` is a HashMap, so its key order is not defined.
+    let mut ids = merged.keys().copied().collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, [0x800, 0x802]);
 }
 
 #[test]

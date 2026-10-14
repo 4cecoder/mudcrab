@@ -590,7 +590,7 @@ fn remap_record_form_ids(
         ]
         .into_iter()
         .flatten()
-        .find_map(|form_id| unresolvable(form_id))
+        .find_map(&unresolvable)
     {
         warnings.skipped_records(
             plugin_name,
@@ -623,7 +623,7 @@ fn remap_record_form_ids(
             continue;
         }
         if record_type == *b"GRAS" && tag.as_slice() == b"MODS" {
-            match remap_alternate_textures(data, &resolve_link)? {
+            match remap_alternate_textures(data, resolve_link)? {
                 Ok(dropped) => dropped.into_iter().for_each(&skip_field),
                 Err(reason) => {
                     skip_field(reason);
