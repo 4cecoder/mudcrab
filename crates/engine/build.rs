@@ -104,6 +104,10 @@ fn watch_git_path(root: &Path, name: &str) {
         } else {
             root.join(path)
         };
-        println!("cargo:rerun-if-changed={}", path.display());
+        // Cargo reruns on every build for a missing watched path, so skip absent
+        // files such as `packed-refs` or a ref stored only in `packed-refs`.
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
     }
 }

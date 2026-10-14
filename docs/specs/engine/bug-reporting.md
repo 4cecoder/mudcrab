@@ -316,7 +316,7 @@ the normal per-user output directory. Reports also support direct engine launche
 For an asset-free native check, run:
 
 ```sh
-CARGO_TARGET_DIR=/private/tmp/mudcrab-settings-ui-target cargo run --offline --locked --profile quick -p engine --example bug_report_smoke -- /private/tmp/mudcrab-bug-report-evidence
+cargo run --locked --profile quick -p engine --example bug_report_smoke -- /tmp/mudcrab-bug-report-evidence
 ```
 
 The smoke example opens its own window, deliberately requests a missing GLB, keeps failure/fallback

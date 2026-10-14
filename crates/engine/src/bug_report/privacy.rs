@@ -144,9 +144,23 @@ fn sensitive_key(key: &str) -> bool {
             | "authtoken"
             | "clientsecret"
             | "setcookie"
-    ) || key.ends_with("_token")
-        || key.ends_with("_password")
-        || key.ends_with("_secret")
+    ) || key.contains("password")
+        || key.contains("passwd")
+        || key.contains("secret")
+        || key.ends_with("token")
+        || key.ends_with("_pwd")
+        || [
+            "api_key",
+            "apikey",
+            "access_key",
+            "accesskey",
+            "private_key",
+            "privatekey",
+            "session_key",
+            "sessionkey",
+        ]
+        .iter()
+        .any(|suffix| key.ends_with(suffix))
 }
 
 fn replace_matches(
@@ -248,7 +262,9 @@ static URL_USERINFO: LazyLock<Regex> =
 static FILE_URI: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)(\bfile:)[\\/]{1,3}[^\s\x00-\x1f'"`<>;,\)\]\}]+"#).unwrap());
 static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(\b(?:password|passwd|pwd|(?:client[_-]?)?secret|(?:api[_-]?|session[_-]?)key|(?:access[_-]?|refresh[_-]?|auth[_-]?)?token)\b["']?[\t ]*[=:][\t ]*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&\r\n]+)"#).unwrap()
+    // Names may carry a prefix (`DB_PASSWORD`, `GITLAB_TOKEN`) and a separated or camel-case
+    // suffix (`AWS_SECRET_ACCESS_KEY`, `secretKey`) without matching words like `tokens`.
+    Regex::new(r#"(?i)(\b[a-z0-9_-]*?(?:password|passwd|pwd|secret|token|(?:api|session|access|private)[_-]?key)(?:[_-][a-z0-9_-]*|(?-i:[A-Z][A-Za-z0-9_]*))?\b["']?[\t ]*[=:][\t ]*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&\r\n]+)"#).unwrap()
 });
 static SECRET_HEADER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(\b(?:authorization|(?:set[_-]?)?cookie)\b["']?[\t ]*[=:][\t ]*)[^\r\n]*"#)
@@ -369,9 +385,21 @@ mod tests {
         assert!(!text.contains("PASSWORD_SENTINEL"));
         assert!(!text.contains("TOKEN_SENTINEL"));
         assert!(text.contains("safe"));
-        let mut value = json!({"accessToken":"CAMEL_SENTINEL", "clientSecret":"CLIENT_SENTINEL", "privateKey":"PRIVATE_SENTINEL"});
+        let mut value = json!({"accessToken":"CAMEL_SENTINEL", "clientSecret":"CLIENT_SENTINEL", "privateKey":"PRIVATE_SENTINEL", "DB_PASSWORD":"DB_SENTINEL", "aws_secret_access_key":"AWS_SENTINEL", "GITLAB_TOKEN":"GITLAB_SENTINEL", "stripe_api_key":"STRIPE_SENTINEL"});
         sanitizer().sanitize_value(&mut value);
         let text = value.to_string();
         assert!(!text.contains("SENTINEL"));
+    }
+
+    #[test]
+    fn prefixed_and_compound_credential_assignments_are_redacted() {
+        let text = sanitizer().sanitize(
+            "DB_PASSWORD=hunter2 MY_SECRET=MINE GITLAB_TOKEN=glpat-abc AWS_SECRET_ACCESS_KEY=wJalr/K7MDENG secretKey: CAMEL max_tokens=4096 tokenizer=bpe",
+        );
+        for sentinel in ["hunter2", "MINE", "glpat-abc", "wJalr", "CAMEL"] {
+            assert!(!text.contains(sentinel), "leaked {sentinel}: {text}");
+        }
+        assert!(text.contains("max_tokens=4096"), "{text}");
+        assert!(text.contains("tokenizer=bpe"), "{text}");
     }
 }

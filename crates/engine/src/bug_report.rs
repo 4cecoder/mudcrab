@@ -671,7 +671,20 @@ fn open_browser(url: &str, cancelled: &AtomicBool) -> Result<(), String> {
 
 #[cfg(windows)]
 fn open_system_browser(url: &str, _cancelled: &AtomicBool) -> Result<(), String> {
-    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+    use windows_sys::Win32::{
+        System::Com::{
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+        },
+        UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+    };
+    // ShellExecuteW may load COM-based shell extensions that need an STA on this worker.
+    // RPC_E_CHANGED_MODE leaves the existing apartment in place and must not be balanced.
+    let com = unsafe {
+        CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        )
+    };
     let wide: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
     let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
     // Both UTF-16 strings are terminated and remain live through this native shell call.
@@ -685,6 +698,10 @@ fn open_system_browser(url: &str, _cancelled: &AtomicBool) -> Result<(), String>
             SW_SHOWNORMAL,
         )
     } as isize;
+    if com >= 0 {
+        // S_OK and S_FALSE both require a matching uninitialize on this thread.
+        unsafe { CoUninitialize() };
+    }
     if result > 32 {
         Ok(())
     } else {
