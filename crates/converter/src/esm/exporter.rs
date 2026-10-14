@@ -427,15 +427,19 @@ fn export_records(
                 )?;
             }
             // Overrides were merged key by key in merge_plugins_with_load_order.
+            // A DOBJ without usable pairs (a mod's empty override, or a DNAM the remap
+            // dropped as malformed) adds no defaults; the engine keeps its fallback.
             "DOBJ" => {
-                let data = view
-                    .find(b"DNAM")
-                    .ok_or_else(|| invalid_movement_field(form_id, "DOBJ DNAM"))?;
+                let Some(data) = view.find(b"DNAM") else {
+                    eprintln!("warning: DOBJ {form_id:08X} has no DNAM; no default objects");
+                    continue;
+                };
                 if !data.len().is_multiple_of(8) {
-                    return Err(invalid_movement_field(
-                        form_id,
-                        "DOBJ DNAM length (expected 8-byte pairs)",
-                    ));
+                    eprintln!(
+                        "warning: DOBJ {form_id:08X} DNAM is {} bytes, not 8-byte pairs; no default objects",
+                        data.len()
+                    );
+                    continue;
                 }
                 for pair in data.as_chunks::<8>().0 {
                     let key = String::from_utf8_lossy(&pair[..4]);
@@ -985,6 +989,47 @@ mod tests {
         let error =
             export_to_db(&conn, &HashMap::from([(broken_race.form_id, broken_race)])).unwrap_err();
         assert!(error.to_string().contains("RACE WKMV length"));
+    }
+
+    #[test]
+    fn default_objects_without_usable_dnam_are_skipped_not_fatal() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let dobj = |form_id: u32, subrecords: Vec<(Vec<u8>, Vec<u8>)>| RawRecord {
+            form_id,
+            record_type: *b"DOBJ",
+            flags: 0,
+            subrecords,
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 3,
+        };
+        let missing = dobj(0x0100_0031, vec![(b"EDID".to_vec(), b"Mod\0".to_vec())]);
+        let malformed = dobj(0x0200_0031, vec![(b"DNAM".to_vec(), vec![1, 2, 3])]);
+        let valid = dobj(
+            0x0000_0031,
+            vec![(
+                b"DNAM".to_vec(),
+                [*b"DMWL", 0x0003_580Du32.to_le_bytes()].concat(),
+            )],
+        );
+        export_to_db(
+            &conn,
+            &HashMap::from([
+                (missing.form_id, missing),
+                (malformed.form_id, malformed),
+                (valid.form_id, valid),
+            ]),
+        )
+        .unwrap();
+        let rows: Vec<(String, u32)> = conn
+            .prepare("SELECT key, form_id FROM default_objects")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, [("DMWL".to_string(), 0x0003_580D)]);
     }
 
     #[test]
