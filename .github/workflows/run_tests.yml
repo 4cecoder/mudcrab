@@ -220,13 +220,13 @@ jobs:
         uses: taiki-e/install-action@cargo-audit
 
       - name: Audit dependencies
+        # RUSTSEC-2026-0344 (ruzstd DoS): blocked on bevy_image 0.19, which pins
+        # ruzstd ^0.8 via the workspace zstd_rust feature. Remove that ignore
+        # once Bevy moves to ruzstd >= 0.9.1.
         run: >-
           cargo audit
           --ignore RUSTSEC-2026-0194
           --ignore RUSTSEC-2026-0195
-          # RUSTSEC-2026-0344 (ruzstd DoS): blocked on bevy_image 0.19, which pins
-          # ruzstd ^0.8 via the workspace zstd_rust feature. Remove this ignore
-          # once Bevy moves to ruzstd >= 0.9.1.
           --ignore RUSTSEC-2026-0344
 
   performance:
