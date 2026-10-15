@@ -314,9 +314,13 @@ pub(crate) fn scene_dependencies_available(
     materials: &Assets<StandardMaterial>,
 ) -> bool {
     scene.world.iter_entities().all(|entity| {
-        entity
-            .get::<MeshMaterial3d<StandardMaterial>>()
-            .is_none_or(|material| materials.contains(material.0.id()))
+        match entity.get::<MeshMaterial3d<StandardMaterial>>() {
+            Some(material) => materials.contains(material.0.id()),
+            // A mesh with an unrecognised binding is not an empty dependency
+            // list. Its material and images need a typed observer before we
+            // can release preparation or prove disposal.
+            None => !entity.contains::<Mesh3d>(),
+        }
     })
 }
 

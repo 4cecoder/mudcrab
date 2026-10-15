@@ -56,6 +56,12 @@ pub(crate) struct RuntimeSnapshot {
     pub orphan_reserved_bytes: u64,
     pub memory_limit_bytes: Option<u64>,
     pub memory_denied_total: u64,
+    /// Admission denials since the preceding control update, not queued scenes.
+    pub memory_denied_since_last_update: u64,
+    /// Physical pressure or a reservation denial in the preceding interval.
+    pub memory_blocked: bool,
+    pub physical_memory_blocked: bool,
+    pub unobserved_scene_dependencies: usize,
     pub unknown_scene_estimates: usize,
     pub catalog_loaded: bool,
     pub process_rss_bytes: Option<u64>,
@@ -86,6 +92,9 @@ struct ResourceWatch {
     root_entity: Option<Entity>,
     texture_path: Option<String>,
     orphaned_frame: Option<u64>,
+    /// A loaded source scene had dependencies that we could not inspect.
+    /// Keep its charge even after the root disappears; empty IDs prove nothing.
+    unobserved_scenes: HashSet<AssetId<WorldAsset>>,
 }
 
 #[derive(Resource)]
@@ -111,6 +120,7 @@ pub(crate) struct StreamingRuntime {
     pub previous_spawn_ms: f64,
     pub previous_validation_ms: f64,
     pressure_blocked: bool,
+    previous_denied_total: u64,
     memory_limit: Option<u64>,
     pub deferred_responses: VecDeque<DatabaseResponse>,
 }
@@ -134,7 +144,9 @@ impl FromWorld for StreamingRuntime {
         let catalog = match loaded {
             Some(Ok(catalog)) => catalog,
             Some(Err(error)) => {
-                warn!(path = %path.display(), %error, "Streaming cost metadata unavailable; unknown assets require conservative reservations");
+                warn!(path = %path.display(), %error, unknown_resident_bytes = UNKNOWN_BYTES,
+                    unknown_transient_bytes = UNKNOWN_BYTES,
+                    "Streaming cost metadata unavailable; conservative reservations can leave required scenery queued indefinitely. Reconvert the pack or generate a sidecar with streaming-costs --assets <pack> --output <new-file-outside-pack> and pass --streaming-costs <new-file-outside-pack>");
                 StreamingCostCatalog::empty(fingerprint.clone())
             }
             None => StreamingCostCatalog::empty(fingerprint.clone()),
@@ -182,6 +194,7 @@ impl FromWorld for StreamingRuntime {
             previous_spawn_ms: 0.0,
             previous_validation_ms: 0.0,
             pressure_blocked: false,
+            previous_denied_total: 0,
             memory_limit: automatic_memory_limit(config, world),
             deferred_responses: default(),
         }
@@ -261,6 +274,7 @@ impl StreamingRuntime {
                 root_entity,
                 texture_path,
                 orphaned_frame: None,
+                unobserved_scenes: HashSet::new(),
             },
         );
     }
@@ -847,6 +861,10 @@ pub(super) fn update_streaming_control(world: &mut World) {
         upload.max_bytes = Some(decision.budgets.max_upload_bytes_per_frame as usize);
     }
     let totals = runtime.ledger.totals();
+    let denied = totals
+        .denied_total
+        .saturating_sub(runtime.previous_denied_total);
+    runtime.previous_denied_total = totals.denied_total;
     runtime.snapshot = Some(RuntimeSnapshot {
         frame: runtime.frame,
         control: decision,
@@ -856,6 +874,15 @@ pub(super) fn update_streaming_control(world: &mut World) {
         orphan_reserved_bytes: totals.orphan_bytes().unwrap_or(u64::MAX),
         memory_limit_bytes: runtime.memory_limit,
         memory_denied_total: totals.denied_total,
+        memory_denied_since_last_update: denied,
+        memory_blocked: runtime.pressure_blocked || denied != 0,
+        physical_memory_blocked: runtime.pressure_blocked,
+        unobserved_scene_dependencies: runtime
+            .watches
+            .values()
+            .flat_map(|watch| watch.unobserved_scenes.iter().copied())
+            .collect::<HashSet<_>>()
+            .len(),
         unknown_scene_estimates: runtime
             .scenes
             .values()
@@ -886,6 +913,9 @@ pub(super) fn update_streaming_control(world: &mut World) {
 }
 
 fn cpu_absent(world: &World, watch: &ResourceWatch) -> bool {
+    if !watch.unobserved_scenes.is_empty() {
+        return false;
+    }
     let server = world.resource::<AssetServer>();
     if watch
         .root_entity
@@ -1040,6 +1070,23 @@ pub(super) fn observe_streaming_ownership(world: &mut World) {
         if !jobs.contains_key(key) {
             orphan_owners.push(scene.owner.clone());
             continue;
+        }
+        if let Some(id) = scene.id
+            && !scene.dependencies_cached
+            && let Some(asset) = world.resource::<Assets<WorldAsset>>().get(id)
+        {
+            let unavailable =
+                !scene_dependencies_available(asset, world.resource::<Assets<StandardMaterial>>());
+            for resource in &scene.resources {
+                // Shared textures can have several source scenes. Discovering
+                // one scene must not clear another scene's unknown ownership.
+                let watch = runtime.watches.get_mut(resource).unwrap();
+                if unavailable {
+                    watch.unobserved_scenes.insert(id);
+                } else {
+                    watch.unobserved_scenes.remove(&id);
+                }
+            }
         }
         if let Some(id) = scene.id
             && !scene.dependencies_cached
