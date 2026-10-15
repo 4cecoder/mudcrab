@@ -46,6 +46,7 @@ HASH_CHUNK_SIZE = 1024 * 1024
 
 class PluginFormatError(ValueError):
     def __init__(self, code: str, detail: str):
+        """Retain a machine-readable format error code and its explanation."""
         super().__init__(detail)
         self.code = code
         self.detail = detail
@@ -60,6 +61,7 @@ class MissingSourceError(SourceDriftError):
 
 
 def _stat_token(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    """Return file identity, size and timestamps for detecting source drift."""
     return (
         file_stat.st_dev,
         file_stat.st_ino,
@@ -71,6 +73,7 @@ def _stat_token(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int
 
 
 def _file_identity_token(file_stat: os.stat_result) -> tuple[int, int, int]:
+    """Return device, inode and file type without timestamp metadata."""
     return (
         file_stat.st_dev,
         file_stat.st_ino,
@@ -79,6 +82,7 @@ def _file_identity_token(file_stat: os.stat_result) -> tuple[int, int, int]:
 
 
 def _same_path_descriptor_state(path_stat: os.stat_result, descriptor_stat: os.stat_result) -> bool:
+    """Compare path and descriptor metadata, allowing Windows timestamp skew."""
     if _file_identity_token(path_stat) != _file_identity_token(descriptor_stat):
         return False
     if path_stat.st_size != descriptor_stat.st_size:
@@ -89,6 +93,7 @@ def _same_path_descriptor_state(path_stat: os.stat_result, descriptor_stat: os.s
 
 
 def _path_stat(path: Path) -> os.stat_result:
+    """Stat a regular source file without following its final symlink."""
     try:
         result = path.lstat()
     except OSError as exc:
@@ -178,6 +183,7 @@ def _read_verified_file(
 
 
 def _decode_plugin_filename(raw: bytes) -> str:
+    """Decode one NUL-terminated ASCII master name, rejecting path components."""
     if not raw or raw[-1] != 0 or b"\0" in raw[:-1]:
         raise PluginFormatError("invalid_master_filename", "MAST filename must be one NUL-terminated name")
     try:
@@ -193,6 +199,7 @@ def _decode_plugin_filename(raw: bytes) -> str:
 
 
 def _decode_zlib_payload(payload: bytes) -> bytes:
+    """Decompress TES4 metadata within its declared size and the capture limit."""
     if len(payload) < 4:
         raise PluginFormatError("truncated_compressed_tes4", "compressed TES4 payload lacks its decoded-size word")
     expected_size = struct.unpack_from("<I", payload, 0)[0]
@@ -326,6 +333,7 @@ def parse_tes4_header(raw_record: bytes, file_size: int) -> dict:
 
 
 def _source_path(source_root: Path, path: Path, label: str) -> dict:
+    """Return labeled source provenance, rejecting paths outside the root."""
     try:
         relative_path = path.relative_to(source_root).as_posix()
     except ValueError as exc:
@@ -334,6 +342,7 @@ def _source_path(source_root: Path, path: Path, label: str) -> dict:
 
 
 def scan_plugin(path: Path, source_root: Path, root_label: str = "data") -> dict:
+    """Hash a stable plugin read and record TES4 metadata or format errors."""
     provenance = _source_path(source_root, path, root_label)
     try:
         digest, size, header_bytes = _read_verified_file(path, capture_tes4=True)
@@ -354,6 +363,7 @@ def scan_plugin(path: Path, source_root: Path, root_label: str = "data") -> dict
 
 
 def _scan_hashed_file(path: Path, source_root: Path, root_label: str, kind: str) -> dict:
+    """Record a verified file hash, size, kind and source provenance."""
     provenance = _source_path(source_root, path, root_label)
     digest, size, _ = _read_verified_file(path)
     return {
@@ -367,6 +377,7 @@ def _scan_hashed_file(path: Path, source_root: Path, root_label: str, kind: str)
 
 
 def _exact_object(value: object, keys: set[str], label: str) -> dict:
+    """Require a JSON object with exactly the specified keys."""
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
     actual = set(value)
@@ -383,12 +394,14 @@ def _exact_object(value: object, keys: set[str], label: str) -> dict:
 
 
 def _required_text(value: object, label: str) -> str:
+    """Return stripped nonempty text or raise a labeled validation error."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be a non-empty string")
     return value.strip()
 
 
 def _required_name_list(value: object, label: str, *, allow_empty: bool) -> list[str]:
+    """Validate plain plugin filenames and reject case-insensitive duplicates."""
     if not isinstance(value, list) or (not value and not allow_empty):
         qualifier = "a list" if allow_empty else "a non-empty list"
         raise ValueError(f"{label} must be {qualifier} of plugin filenames")
@@ -409,6 +422,7 @@ def _required_name_list(value: object, label: str, *, allow_empty: bool) -> list
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict:
+    """Build a JSON object while rejecting repeated keys."""
     result = {}
     for key, value in pairs:
         if key in result:
@@ -420,6 +434,7 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict:
 def _read_evidence_artifact(
     descriptor_path: Path, value: object, label: str
 ) -> dict:
+    """Verify a referenced artifact's bytes without certifying its claims."""
     evidence = _exact_object(value, {"path", "sha256"}, f"{label}.evidence")
     declared_path = _required_text(evidence["path"], f"{label}.evidence.path")
     expected_digest = evidence["sha256"]
@@ -451,6 +466,7 @@ def _read_evidence_artifact(
 
 
 def _read_corpus_evidence(path: Path | None) -> dict | None:
+    """Read optional bounded evidence JSON and verify its referenced hashes."""
     if path is None:
         return None
     descriptor_path = Path(path).expanduser().absolute()
@@ -560,6 +576,7 @@ def _read_corpus_evidence(path: Path | None) -> dict | None:
 
 
 def _validate_supplied_load_order(load_order: dict, plugins: list[dict]) -> dict:
+    """Check installed plugin classification and master-before-dependent order."""
     by_name: dict[str, list[dict]] = {}
     for plugin in plugins:
         by_name.setdefault(plugin["name"].casefold(), []).append(plugin)
@@ -626,9 +643,11 @@ def _validate_supplied_load_order(load_order: dict, plugins: list[dict]) -> dict
 
 
 def _discover_files(data_root: Path, suffixes: set[str], issues: list[dict]) -> list[Path]:
+    """Discover sorted matching files, recording traversal and symlink issues."""
     found = []
 
     def on_walk_error(error: OSError) -> None:
+        """Retain a directory traversal failure as a manifest issue."""
         issues.append({"code": "data_walk_error", "path": str(error.filename or data_root), "detail": str(error)})
 
     for directory, child_dirs, filenames in os.walk(data_root, followlinks=False, onerror=on_walk_error):
@@ -661,6 +680,7 @@ def _discover_files(data_root: Path, suffixes: set[str], issues: list[dict]) -> 
 
 
 def _scan_ccc(path: Path, game_root: Path) -> dict:
+    """Hash a bounded CCC list without treating its names as active load order."""
     provenance = _source_path(game_root, path, "game")
     digest, size, raw = _read_verified_file(path, capture_bytes=MAX_CCC_BYTES + 1)
     if size > MAX_CCC_BYTES:
@@ -698,6 +718,7 @@ def _scan_ccc(path: Path, game_root: Path) -> dict:
 
 
 def _dependency_closure(plugins: list[dict], issues: list[dict]) -> dict:
+    """Report missing or ambiguous masters, duplicate names and dependency cycles."""
     by_name: dict[str, list[dict]] = {}
     for plugin in plugins:
         by_name.setdefault(plugin["name"].casefold(), []).append(plugin)
@@ -766,6 +787,7 @@ def build_manifest(
     ccc_path: Path | None = None,
     corpus_evidence_path: Path | None = None,
 ) -> dict:
+    """Inventory source bytes and supplied evidence with explicit completion limits."""
     game_root = Path(game_root).resolve(strict=True)
     data_root = Path(data_root).resolve(strict=True)
     executable = _normalize_leaf_path(executable)
@@ -1139,6 +1161,7 @@ def build_manifest(
 
 
 def ensure_output_outside_sources(output: Path, game_root: Path, data_root: Path) -> Path:
+    """Resolve an output path and reject destinations within either source root."""
     output = Path(output).expanduser().resolve(strict=False)
     for source_root in (Path(game_root).resolve(strict=True), Path(data_root).resolve(strict=True)):
         try:
@@ -1150,6 +1173,7 @@ def ensure_output_outside_sources(output: Path, game_root: Path, data_root: Path
 
 
 def _paths_overlap(first: Path, second: Path) -> bool:
+    """Return whether either path equals or contains the other."""
     try:
         second.relative_to(first)
         return True
@@ -1162,6 +1186,7 @@ def _paths_overlap(first: Path, second: Path) -> bool:
 
 
 def write_manifest(output: Path, manifest: dict, game_root: Path, data_root: Path) -> None:
+    """Atomically write sorted UTF-8 JSON outside the game and Data roots."""
     output = ensure_output_outside_sources(output, game_root, data_root)
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
@@ -1186,6 +1211,7 @@ def write_manifest(output: Path, manifest: dict, game_root: Path, data_root: Pat
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse source, optional evidence and output paths for the manifest CLI."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--game-root", type=Path, required=True, help="installed Skyrim Special Edition root")
     parser.add_argument("--data-dir", type=Path, required=True, help="selected installed Data source directory")
@@ -1201,6 +1227,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Write a candidate manifest, returning 2 for errors or incomplete evidence."""
     args = _parse_args(argv)
     try:
         game_root = args.game_root.expanduser().resolve(strict=True)

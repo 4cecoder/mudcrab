@@ -2,6 +2,9 @@
 // Keep the existing placed and placed-lo branches byte-for-byte intact.
 static class MutagenP0Inspect
 {
+    /// <summary>
+    /// Emit typed observations as JSON; return 2 on failure without a completed report.
+    /// </summary>
     public static int Run(string pluginPath)
     {
         var originalOut = Console.Out;
@@ -146,6 +149,9 @@ static class MutagenP0Inspect
         }
     }
 
+    /// <summary>
+    /// Find the declared group signature on a record type or its base types, or return null.
+    /// </summary>
     private static string? FindSignature(Type recordType)
     {
         for (var type = recordType; type is not null; type = type.BaseType)

@@ -15,6 +15,7 @@ import run_xedit_p0
 @contextmanager
 def configured_environment(values):
     # Keep PATH and Windows process-launch variables while isolating root config.
+    """Isolate protected-root settings while preserving process-launch variables."""
     with mock.patch.dict(os.environ):
         for name in p0_tools.PROTECTED_ROOT_ENVIRONMENT:
             os.environ.pop(name, None)
@@ -24,6 +25,7 @@ def configured_environment(values):
 
 class ConfiguredArtifactDestinationTests(unittest.TestCase):
     def test_configured_external_roots_reject_descendants_and_ancestors(self):
+        """Verify configured roots reject overlapping artifacts and allow separate paths."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             for name in p0_tools.PROTECTED_ROOT_ENVIRONMENT:
@@ -39,6 +41,7 @@ class ConfiguredArtifactDestinationTests(unittest.TestCase):
                 self.assertEqual(list(protected.iterdir()), [])
 
     def test_configured_symlink_alias_is_protected(self):
+        """Verify a configured directory alias protects its resolved target."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             protected = root / "store"
@@ -54,6 +57,7 @@ class ConfiguredArtifactDestinationTests(unittest.TestCase):
             self.assertFalse((protected / "artifacts").exists())
 
     def test_empty_or_relative_configuration_fails_closed(self):
+        """Verify invalid protected-root settings cannot permit artifact writes."""
         for name in p0_tools.PROTECTED_ROOT_ENVIRONMENT:
             for value in ("", " ", "relative/store"):
                 with self.subTest(name=name, value=value), configured_environment({name: value}):
@@ -61,6 +65,7 @@ class ConfiguredArtifactDestinationTests(unittest.TestCase):
                         p0_tools.validate_artifact_destination(Path("/unused/artifacts"), Path("/unused/oracle"))
 
     def test_mutagen_cli_protects_each_explicit_root_before_tool_lookup(self):
+        """Verify repeated CLI roots are protected before resolving the SDK."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             sources = (root / "research", root / "store")
@@ -82,6 +87,7 @@ class ConfiguredArtifactDestinationTests(unittest.TestCase):
                 self.assertFalse(candidate.exists())
 
     def test_mutagen_programmatic_entry_protects_explicit_roots(self):
+        """Verify the Mutagen API rejects protected artifacts before SDK lookup."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             source = root / "research"
@@ -96,6 +102,7 @@ class ConfiguredArtifactDestinationTests(unittest.TestCase):
             self.assertEqual(list(source.iterdir()), [])
 
     def test_xedit_protects_explicit_roots_before_tool_read(self):
+        """Verify xEdit rejects protected artifacts before reading its tool binary."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             source = root / "store"

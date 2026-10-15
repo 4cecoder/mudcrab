@@ -40,6 +40,7 @@ HAND_ENCODED_EXPECTED = {
 
 
 def _subrecord(signature: str, payload: bytes) -> bytes:
+    """Encode a four-byte ASCII subrecord tag and a short-length payload."""
     encoded_signature = signature.encode("ascii")
     if len(encoded_signature) != 4:
         raise ValueError(f"subrecord signature must be four ASCII bytes: {signature!r}")
@@ -56,12 +57,14 @@ def _record(
     flags: int = 0,
     form_version: int = 44,
 ) -> bytes:
+    """Frame a major record payload with its FormID, flags and form version."""
     return RECORD_HEADER.pack(
         signature.encode("ascii"), len(payload), flags, form_id, 0, form_version, 0
     ) + payload
 
 
 def _group(label: bytes | int, group_type: int, contents: bytes) -> bytes:
+    """Frame group contents with a four-byte label and group type."""
     if isinstance(label, int):
         encoded_label = struct.pack("<I", label)
     else:
@@ -74,6 +77,7 @@ def _group(label: bytes | int, group_type: int, contents: bytes) -> bytes:
 
 
 def _interior_cell_tree(cell_id: int, cell: bytes, persistent_records: bytes) -> bytes:
+    """Nest a CELL and persistent records in interior block and child groups."""
     persistent = _group(cell_id, 8, persistent_records)
     children = _group(cell_id, 6, persistent)
     subblock = _group(0, 3, cell + children)
@@ -88,6 +92,7 @@ def _tes4(
     flags: int = 0,
     masters: tuple[str, ...] = (),
 ) -> bytes:
+    """Encode a TES4 header with declared counts, flags and master dependencies."""
     fields = [_subrecord("HEDR", struct.pack("<fII", 1.7, record_count, next_object_id))]
     fields.append(_subrecord("CNAM", b"Mudcrab P0 hand fixture\0"))
     for master in masters:
@@ -145,6 +150,7 @@ def hand_encoded_full() -> bytes:
 
 
 def hand_encoded_light() -> bytes:
+    """Return a light plugin containing one GLOB with a known float value."""
     glob = _record(
         "GLOB",
         0x800,
@@ -229,6 +235,7 @@ def hand_encoded_override() -> bytes:
 
 
 def hand_encoded_localized() -> bytes:
+    """Return a localized ARMO plugin with a name ID and no string table."""
     localized_armor = _record(
         "ARMO",
         0x800,
@@ -319,4 +326,5 @@ def hand_encoded_cases() -> dict[str, tuple[bytes, str]]:
 
 
 def sha256(data: bytes) -> str:
+    """Return the lowercase SHA-256 hex digest of fixture bytes."""
     return hashlib.sha256(data).hexdigest()

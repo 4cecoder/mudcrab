@@ -24,10 +24,12 @@ BASE_PLUGINS = (
 
 
 def subrecord(signature: bytes, data: bytes) -> bytes:
+    """Frame a synthetic subrecord with its short payload length."""
     return signature + struct.pack("<H", len(data)) + data
 
 
 def tes4_plugin(masters=(), extra_subrecords=()) -> bytes:
+    """Build a minimal TES4 plugin with optional masters and extra subrecords."""
     header_data = bytearray(subrecord(b"HEDR", struct.pack("<fII", 1.7, 0, 0x800)))
     for master in masters:
         header_data += subrecord(b"MAST", master.encode("ascii") + b"\0")
@@ -47,6 +49,7 @@ def tes4_plugin(masters=(), extra_subrecords=()) -> bytes:
 
 
 def make_tree(root: Path, plugins=None, executable=b"test runtime", ccc=b""):
+    """Create a synthetic game tree and return its source paths."""
     game_root = root / "game"
     data_root = game_root / "Data"
     data_root.mkdir(parents=True)
@@ -62,6 +65,7 @@ def make_tree(root: Path, plugins=None, executable=b"test runtime", ccc=b""):
 
 
 def make_corpus_evidence(root: Path, active_plugins, unloaded_optional_plugins=(), target=None):
+    """Write synthetic evidence artifacts and their hash-bound JSON descriptor."""
     evidence_root = root / "evidence"
     evidence_root.mkdir(parents=True, exist_ok=True)
     artifact_bytes = {
@@ -81,6 +85,7 @@ def make_corpus_evidence(root: Path, active_plugins, unloaded_optional_plugins=(
     }
 
     def artifact(name):
+        """Describe one evidence artifact with its relative path and digest."""
         return {
             "path": name,
             "sha256": hashlib.sha256(artifact_bytes[name]).hexdigest(),
@@ -106,6 +111,7 @@ def make_corpus_evidence(root: Path, active_plugins, unloaded_optional_plugins=(
 
 
 def make_symlink_or_skip(link: Path, target: str | Path, *, target_is_directory=False):
+    """Create a symlink or skip when the host denies or lacks symlink support."""
     try:
         link.symlink_to(target, target_is_directory=target_is_directory)
     except OSError as exc:
@@ -123,6 +129,7 @@ def make_symlink_or_skip(link: Path, target: str | Path, *, target_is_directory=
 
 class CorpusManifestTests(unittest.TestCase):
     def test_v150_deep_evidence_json_fails_cleanly_without_manifest(self):
+        """Verify deeply nested evidence JSON fails cleanly before output creation."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             game, data, executable, _ = make_tree(root)
@@ -141,6 +148,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertFalse(output.exists())
 
     def test_hash_and_tes4_metadata_share_verified_read_with_path_provenance(self):
+        """Verify plugin hashes, metadata and provenance describe the same input."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(
@@ -170,6 +178,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertEqual(manifest["ccc"]["listed_plugin_names"], ["ccExample.esl"])
 
     def test_missing_base_and_master_are_explicit_and_break_closure(self):
+        """Verify missing base plugins and master dependencies are reported."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(
@@ -188,6 +197,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertIn("missing_base_plugin", {item["code"] for item in manifest["issues"]})
 
     def test_nested_plugins_are_observed_but_do_not_satisfy_loadable_dependencies_or_bases(self):
+        """Verify nested plugins cannot satisfy Data-root dependencies or base requirements."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(
@@ -224,6 +234,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertEqual(manifest["ccc"]["declared_names_missing_from_data"], [])
 
     def test_empty_plugin_fixture_is_really_empty(self):
+        """Verify an explicitly empty fixture produces no plugin observations."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root, {})
@@ -234,6 +245,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertEqual(manifest["corpus_hashes"]["plugins"], [])
 
     def test_nested_duplicate_name_does_not_create_loadable_plugin_ambiguity(self):
+        """Verify nested name duplicates do not make loadable plugins ambiguous."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(
@@ -251,6 +263,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertIn("nested_plugin_not_loadable", {item["code"] for item in manifest["issues"]})
 
     def test_dependency_graph_is_stack_safe_and_reports_a_cycle(self):
+        """Verify a long dependency chain is stack safe and cycles are reported."""
         long_chain = []
         for index in range(1500):
             name = f"Plugin{index:04}.esl"
@@ -282,6 +295,7 @@ class CorpusManifestTests(unittest.TestCase):
         self.assertEqual([item["code"] for item in cycle_issues], ["master_dependency_cycle"])
 
     def test_truncated_tes4_header_is_reported_without_a_complete_verdict(self):
+        """Verify truncated headers produce explicit errors and an incomplete manifest."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root, {})
@@ -295,6 +309,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertNotEqual(manifest["verdict"], "complete")
 
     def test_extended_subrecord_length_and_malformed_xxxx(self):
+        """Verify extended subrecords decode and malformed XXXX markers fail."""
         extended_payload = b"x" * 70_000
         extended = b"XXXX" + struct.pack("<H", 4) + struct.pack("<I", len(extended_payload))
         extended += b"JUNK" + struct.pack("<H", 0) + extended_payload
@@ -309,6 +324,7 @@ class CorpusManifestTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "invalid_xxxx_length")
 
     def test_compressed_tes4_metadata_is_bounded_and_decoded(self):
+        """Verify a compressed TES4 header yields its master metadata."""
         original = tes4_plugin(masters=("Skyrim.esm",))
         decoded_payload = original[manifest_tool.RECORD_HEADER_SIZE :]
         encoded_payload = struct.pack("<I", len(decoded_payload)) + zlib.compress(decoded_payload)
@@ -324,6 +340,7 @@ class CorpusManifestTests(unittest.TestCase):
         self.assertEqual(parsed["master_dependencies"][0]["data_size_bytes"], 0)
 
     def test_truncated_tes4_payload_and_subrecord_bounds_are_rejected(self):
+        """Verify declared record and subrecord lengths cannot exceed available bytes."""
         valid = bytearray(tes4_plugin())
         struct.pack_into("<I", valid, 4, len(valid))
         with self.assertRaises(manifest_tool.PluginFormatError) as raised:
@@ -342,6 +359,7 @@ class CorpusManifestTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "truncated_subrecord_payload")
 
     def test_nonfinite_hedr_and_unknown_master_encoding_are_not_decoded(self):
+        """Verify nonfinite header versions and non-ASCII master names are rejected."""
         nonfinite_hedr = subrecord(b"HEDR", struct.pack("<fII", float("nan"), 0, 0x800))
         malformed_hedr = b"TES4" + struct.pack("<I", len(nonfinite_hedr)) + b"\0" * 16 + nonfinite_hedr
         with self.assertRaises(manifest_tool.PluginFormatError) as raised:
@@ -356,6 +374,7 @@ class CorpusManifestTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "master_filename_encoding_unknown")
 
     def test_tes4_declared_header_limit_is_checked_before_reading_payload(self):
+        """Verify oversized TES4 declarations fail without a captured payload."""
         raw = bytearray(tes4_plugin())
         raw[4:8] = struct.pack("<I", manifest_tool.MAX_TES4_HEADER_BYTES)
         with self.assertRaises(manifest_tool.PluginFormatError) as raised:
@@ -363,6 +382,7 @@ class CorpusManifestTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "tes4_header_over_limit")
 
     def test_source_mutation_during_hash_fails_the_pin(self):
+        """Verify a source mutation during hashing invalidates the observed pin."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             data_root = root / "Data"
@@ -373,6 +393,7 @@ class CorpusManifestTests(unittest.TestCase):
             calls = 0
 
             def mutate_before_final_fstat(fd):
+                """Rewrite source bytes and advance mtime before the final descriptor stat."""
                 nonlocal calls
                 calls += 1
                 if calls == 2:
@@ -393,6 +414,7 @@ class CorpusManifestTests(unittest.TestCase):
                     manifest_tool.scan_plugin(source, data_root, "data")
 
     def test_path_descriptor_timestamp_skew_keeps_same_file_identity(self):
+        """Verify only Windows permits timestamp skew for matching file identities."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             data_root = root / "Data"
@@ -402,6 +424,7 @@ class CorpusManifestTests(unittest.TestCase):
             original_path_stat = manifest_tool._path_stat
 
             def skewed_path_stat(path):
+                """Return matching file identity and size with deliberately skewed timestamps."""
                 observed = original_path_stat(path)
                 return SimpleNamespace(
                     st_dev=observed.st_dev,
@@ -429,6 +452,7 @@ class CorpusManifestTests(unittest.TestCase):
                 manifest_tool.scan_plugin(source, data_root, "data")
 
     def test_source_path_replacement_during_hash_fails_the_pin(self):
+        """Verify replacing the source path during hashing invalidates the pin."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             data_root = root / "Data"
@@ -441,6 +465,7 @@ class CorpusManifestTests(unittest.TestCase):
             calls = 0
 
             def replace_before_final_path_stat(path):
+                """Replace the source file before its final path identity check."""
                 nonlocal calls
                 calls += 1
                 if calls == 2:
@@ -452,6 +477,7 @@ class CorpusManifestTests(unittest.TestCase):
                     manifest_tool.scan_plugin(source, data_root, "data")
 
     def test_missing_runtime_is_explicit_and_cannot_complete_pin(self):
+        """Verify a missing executable is reported and prevents a successful pin."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -464,6 +490,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertIn("missing_required_input", {item["code"] for item in manifest["issues"]})
 
     def test_missing_alternate_ccc_uses_its_own_source_path(self):
+        """Verify missing alternate CCC diagnostics retain the requested filename."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, _ = make_tree(root)
@@ -477,6 +504,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertEqual(issue["path"], "Alternate.ccc")
 
     def test_alternate_ccc_drift_uses_its_own_source_path(self):
+        """Verify a rejected CCC symlink retains its alternate source path."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -491,6 +519,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertEqual(issue["path"], "Alternate.ccc")
 
     def test_api_and_cli_resolve_executable_and_ccc_directory_aliases_without_resolving_leaf(self):
+        """Verify API and CLI normalize parent aliases for runtime and CCC paths."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -530,6 +559,7 @@ class CorpusManifestTests(unittest.TestCase):
                 self.assertEqual(cli_manifest["ccc"]["source"]["relative_path"], "Skyrim.ccc")
 
     def test_api_and_cli_reject_leaf_symlinks_after_parent_normalization(self):
+        """Verify API and CLI reject runtime and CCC symlinks at the final component."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -558,6 +588,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertEqual(cli_manifest["ccc"]["status"], "source_drift")
 
     def test_output_must_be_outside_game_and_data_sources(self):
+        """Verify manifest output cannot be placed within the game source tree."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root = root / "game"
@@ -568,6 +599,7 @@ class CorpusManifestTests(unittest.TestCase):
                 manifest_tool.ensure_output_outside_sources(game_root / "manifest.json", game_root, data_root)
 
     def test_archive_is_hashed_while_bundled_tables_still_block_completion(self):
+        """Verify archive hashes leave uninspected bundled string tables unresolved."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -592,6 +624,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertIn("ordered names declared by Skyrim.ccc", manifest["ccc"]["interpretation"])
 
     def test_archive_mutation_during_hash_is_rejected_by_verified_file_reader(self):
+        """Verify archive mutation during hashing raises a source drift error."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             _, data_root, _, _ = make_tree(root)
@@ -601,6 +634,7 @@ class CorpusManifestTests(unittest.TestCase):
             calls = 0
 
             def mutate_before_final_path_stat(path):
+                """Change archive bytes before the final path metadata check."""
                 nonlocal calls
                 if path == archive:
                     calls += 1
@@ -615,6 +649,7 @@ class CorpusManifestTests(unittest.TestCase):
                     manifest_tool._scan_hashed_file(archive, data_root, "data", "archive")
 
     def test_unresolved_order_locale_and_corpus_pins_block_success(self):
+        """Verify a matching runtime alone cannot complete corpus evidence."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             executable_bytes = b"synthetic runtime matching test-only target"
@@ -639,6 +674,7 @@ class CorpusManifestTests(unittest.TestCase):
             })
 
     def test_loose_string_tables_are_hashed_without_inferring_locale(self):
+        """Verify loose string-table hashes do not establish a locale."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -654,6 +690,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertEqual(manifest["corpus_hashes"]["loose_string_tables"][0]["sha256"], hashlib.sha256(b"fixture table").hexdigest())
 
     def test_supplied_profile_locale_and_order_are_hash_checked_but_not_accepted(self):
+        """Verify supplied evidence hashes and dependency order do not grant acceptance."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             plugins = {name: () for name in BASE_PLUGINS}
@@ -692,6 +729,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertTrue(manifest["archive_observations"]["coverage_complete"])
 
     def test_external_evidence_hash_mismatch_fails_before_manifest_creation(self):
+        """Verify changed evidence artifact bytes prevent manifest construction."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -702,6 +740,7 @@ class CorpusManifestTests(unittest.TestCase):
                 manifest_tool.build_manifest(game_root, data_root, executable, ccc, evidence_path)
 
     def test_missing_external_evidence_artifact_fails_clearly(self):
+        """Verify a missing referenced evidence file raises an explicit source error."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -713,6 +752,7 @@ class CorpusManifestTests(unittest.TestCase):
                 manifest_tool.build_manifest(game_root, data_root, executable, ccc, evidence_path)
 
     def test_missing_or_malformed_corpus_evidence_input_fails_clearly(self):
+        """Verify missing or invalid evidence descriptors fail with useful errors."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -731,6 +771,7 @@ class CorpusManifestTests(unittest.TestCase):
                 )
 
     def test_oversized_evidence_descriptor_is_rejected_before_hash_read(self):
+        """Verify oversized evidence JSON is rejected before its bytes are read."""
         with tempfile.TemporaryDirectory() as temp_dir:
             descriptor = Path(temp_dir) / "oversized-evidence.json"
             with descriptor.open("wb") as stream:
@@ -743,6 +784,7 @@ class CorpusManifestTests(unittest.TestCase):
                     manifest_tool._read_corpus_evidence(descriptor)
 
     def test_profile_target_must_match_fixed_newest_steam_build(self):
+        """Verify a supplied profile must match the manifest's fixed runtime target."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -757,6 +799,7 @@ class CorpusManifestTests(unittest.TestCase):
                 manifest_tool.build_manifest(game_root, data_root, executable, ccc, evidence_path)
 
     def test_profile_cannot_supply_acceptance_or_provenance_claims(self):
+        """Verify the strict profile schema rejects supplied acceptance claims."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -768,6 +811,7 @@ class CorpusManifestTests(unittest.TestCase):
                 manifest_tool.build_manifest(game_root, data_root, executable, ccc, evidence_path)
 
     def test_cli_writes_supplied_evidence_candidate_and_keeps_incomplete_exit_status(self):
+        """Verify the CLI saves supplied evidence while reporting incomplete status."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -795,6 +839,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertIn("accepted_corpus_pin_set_missing", observed["completion_blockers"])
 
     def test_cli_rejects_load_order_evidence_as_output_before_replacing_it(self):
+        """Verify manifest output cannot overwrite a load-order evidence artifact."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -821,6 +866,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertIn("manifest output overlaps", stderr.getvalue())
 
     def test_cli_rejects_symlink_alias_and_ancestor_of_evidence_artifact(self):
+        """Verify output aliases and ancestors cannot replace evidence artifacts."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)
@@ -866,6 +912,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertIn("manifest output overlaps", stderr.getvalue())
 
     def test_supplied_load_order_rejects_unknown_and_unclassified_plugins(self):
+        """Verify load order rejects unknown names and omitted installed plugins."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             plugins = {name: () for name in BASE_PLUGINS} | {"Addon.esl": ()}
@@ -880,6 +927,7 @@ class CorpusManifestTests(unittest.TestCase):
                 manifest_tool.build_manifest(game_root, data_root, executable, ccc, omitted_path)
 
     def test_supplied_load_order_rejects_duplicates_and_dependency_order_errors(self):
+        """Verify load order rejects duplicate names and dependents before masters."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             plugins = {name: () for name in BASE_PLUGINS} | {"Addon.esl": ("Skyrim.esm",)}
@@ -896,6 +944,7 @@ class CorpusManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "places master Skyrim.esm after dependent plugin Addon.esl"):
                 manifest_tool.build_manifest(game_root, data_root, executable, ccc, order_path)
     def test_v157_issue_paths_use_posix_relative_paths_for_nested_sources(self):
+        """Verify source failure paths use POSIX separators relative to Data."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root, {"Addon.esp": ()})
@@ -909,6 +958,7 @@ class CorpusManifestTests(unittest.TestCase):
             original_scan_plugin = manifest_tool.scan_plugin
 
             def fail_addon_plugin(path, source_root, root_label="data"):
+                """Simulate a missing addon while preserving normal scans for other plugins."""
                 if path.name == "Addon.esp":
                     raise manifest_tool.MissingSourceError(f"required source is missing: {path}")
                 return original_scan_plugin(path, source_root, root_label)
@@ -933,6 +983,7 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertEqual(issues_by_path["Archives/Addon.bsa"], "source_drift")
 
     def test_manifest_is_deterministic_and_serializable(self):
+        """Verify repeated scans serialize to identical JSON for stable inputs."""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             game_root, data_root, executable, ccc = make_tree(root)

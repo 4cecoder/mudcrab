@@ -24,6 +24,7 @@ def _popen_waits_for_markers(*markers: Path, readiness_timeout: float = 5):
     ready_at = {}
 
     def popen_and_wait(*args, **kwargs):
+        """Launch a child and await fixture markers, cleaning it up if readiness fails."""
         process = real_popen(*args, **kwargs)
         deadline = time.monotonic() + readiness_timeout
         try:
@@ -67,6 +68,7 @@ def _popen_waits_for_markers(*markers: Path, readiness_timeout: float = 5):
 class XEditProbeTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "requires a detached process group")
     def test_timeout_case_writer_keeps_partial_output_and_cleanup_error(self):
+        """Verify xEdit timeout reports retain partial streams and cleanup failures."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tool = root / "tools/xDump64.exe"
@@ -87,11 +89,13 @@ class XEditProbeTests(unittest.TestCase):
             real_killpg = os.killpg
 
             def signal_group(pid, sig):
+                """Simulate a SIGKILL permission failure while forwarding other group signals."""
                 if sig == 9:
                     raise PermissionError(errno.EPERM, "synthetic cleanup failure")
                 return real_killpg(pid, sig)
 
             def supervised(command, **kwargs):
+                """Mock Wine startup and run a hanging Python fixture for the probe case."""
                 if kwargs["label"] == "wine-version":
                     return subprocess.CompletedProcess(command, 0, "wine-test", "")
                 if kwargs["label"] == "help":
@@ -122,6 +126,7 @@ class XEditProbeTests(unittest.TestCase):
                         pass
 
     def test_v157_runner_provenance_paths_use_posix_separators(self):
+        """Verify Windows provenance paths serialize with POSIX separators."""
         path = PureWindowsPath(r"C:\repo\tools\schema_validation\run_xedit_p0.py")
         root = PureWindowsPath(r"C:\repo")
         self.assertEqual(
@@ -130,6 +135,7 @@ class XEditProbeTests(unittest.TestCase):
         )
 
     def test_v158_xedit_text_artifacts_use_utf8_for_non_cp1252_output(self):
+        """Verify every probe text artifact explicitly uses UTF-8 for Unicode output."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tool = root / "tools" / "xDump64.exe"
@@ -150,6 +156,7 @@ class XEditProbeTests(unittest.TestCase):
             encodings = []
 
             def inspect_encoding(path, data, *args, **kwargs):
+                """Record the chosen text encoding and delegate to the real file writer."""
                 encodings.append(kwargs.get("encoding", args[0] if args else None))
                 return original_write_text(path, data, *args, **kwargs)
 
@@ -173,6 +180,7 @@ class XEditProbeTests(unittest.TestCase):
             )
 
     def test_v147_custom_wine_directory_cannot_receive_artifacts(self):
+        """Verify the resolved Wine directory cannot contain probe artifacts."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tool = root / "source" / "xDump64.exe"
@@ -194,6 +202,7 @@ class XEditProbeTests(unittest.TestCase):
             self.assertFalse(artifact.exists())
 
     def test_v144_zero_exit_after_wine_crash_is_incomplete(self):
+        """Verify crashes and missing completion markers remain incomplete at exit zero."""
         for stdout, stderr in [
             ("WineDbg attached", "<00:00:00.050> All Done.\n"),
             ("", "wine: Unhandled page fault\n<00:00:00.050> All Done.\n"),
@@ -204,16 +213,19 @@ class XEditProbeTests(unittest.TestCase):
             self.assertFalse(result["completed_verdict_saved"])
 
     def test_v144_malformed_dump_diagnostics_do_not_prove_structural_rejection(self):
+        """Verify malformed dump diagnostics cannot establish qualified rejection."""
         for name in ("p0-truncated-tail.esp", "p0-truncated-header.esp", "p0-bad-tes4-length.esp"):
             result = probe.classify_dump(name, 0, "[ERROR: invalid data]", "<00:00:00.050> All Done.\n")
             self.assertEqual(result["status"], "unqualified_negative")
             self.assertFalse(result["completed_verdict_saved"])
 
     def test_v144_completion_without_expected_records_fails(self):
+        """Verify dump completion without expected identities fails observation checks."""
         result = probe.classify_dump("p0-hand-full.esp", 0, "", "<00:00:00.050> All Done.\n")
         self.assertEqual(result["status"], "failed_observation")
 
     def test_v144_clean_selected_values_do_not_claim_full_fixture_validation(self):
+        """Verify matching selected values leaves full fixture validation unproven."""
         stdout = """  Signature: TES4
   FormID: NULL [00000000]
   Signature: GLOB
@@ -228,6 +240,7 @@ FLTV - Value: 2.500000
         self.assertFalse(result["fixture_schema_validated"])
 
     def test_v144_localized_id_and_schema_errors_stay_distinct(self):
+        """Verify localized IDs and schema diagnostics do not imply translated text."""
         stdout = """  Signature: TES4
   FormID: NULL [00000000]
   Signature: ARMO
@@ -244,6 +257,7 @@ FULL - Name: <Error: No strings file for lstring ID 12345678>
         self.assertIn("memory addresses", result["physical_offsets"])
 
     def test_v147_protected_destination_rejected_before_read_or_write(self):
+        """Verify repository destinations are rejected before tool reads or writes."""
         artifact = p0_tools.REPO_ROOT / "xedit-test-no-write"
         args = SimpleNamespace(xdump="/nonexistent/xDump64.exe", artifact_dir=str(artifact), wine="wine")
         with mock.patch.object(probe, "_read_verified_bytes") as read:
@@ -253,6 +267,7 @@ FULL - Name: <Error: No strings file for lstring ID 12345678>
         self.assertFalse(artifact.exists())
 
     def test_v147_input_tool_directory_cannot_be_artifact_destination(self):
+        """Verify probe artifacts cannot overwrite their input tool directory."""
         with tempfile.TemporaryDirectory() as directory:
             args = SimpleNamespace(xdump=str(Path(directory) / "xDump64.exe"), artifact_dir=directory, wine="wine")
             with self.assertRaisesRegex(probe.QualificationError, "protected path"):
@@ -260,6 +275,7 @@ FULL - Name: <Error: No strings file for lstring ID 12345678>
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_v147_every_registered_checkout_is_protected_before_tool_read(self):
+        """Verify every registered worktree rejects artifacts before tool reads."""
         roots = p0_tools._repository_worktree_roots()
         self.assertIn(p0_tools.REPO_ROOT, roots)
         for root in roots:
@@ -272,11 +288,13 @@ FULL - Name: <Error: No strings file for lstring ID 12345678>
                 self.assertFalse(candidate.exists())
 
     def test_v147_worktree_discovery_failure_cannot_permit_artifact_writes(self):
+        """Verify failed worktree discovery prevents artifact destination approval."""
         with mock.patch.object(p0_tools.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 5)):
             with self.assertRaisesRegex(probe.QualificationError, "cannot verify protected repository"):
                 p0_tools.validate_artifact_destination(Path("/tmp/p0-no-artifact-write"), Path("/tmp/source"))
 
     def test_v148_supervisor_terminates_a_real_timed_out_process(self):
+        """Verify the supervisor terminates a real hanging child and retains its output."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             ready = root / "ready"
@@ -293,6 +311,7 @@ FULL - Name: <Error: No strings file for lstring ID 12345678>
         self.assertIn("started", caught.exception.stdout)
 
     def test_v156_supervisor_rejects_undecodable_output_without_lossy_text(self):
+        """Verify strict decoding preserves invalid bytes in a decode error."""
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             p0_tools, "_output_encoding", return_value="utf-8"
         ):
@@ -307,6 +326,7 @@ FULL - Name: <Error: No strings file for lstring ID 12345678>
         self.assertEqual(caught.exception.failure_record()["raw_stdout_size_bytes"], 1)
 
     def test_v156_undecodable_timeout_output_stays_incomplete_with_raw_evidence(self):
+        """Verify undecodable timeout output retains raw bytes and timeout context."""
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             p0_tools, "_output_encoding", return_value="utf-8"
         ):
@@ -329,6 +349,7 @@ FULL - Name: <Error: No strings file for lstring ID 12345678>
 
     @unittest.skipUnless(os.name == "posix", "requires a detached POSIX process group")
     def test_v148_detached_descendant_cannot_hold_timeout_pipes_open(self):
+        """Verify a detached pipe holder cannot indefinitely delay timeout reporting."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             child_pid = root / "child.pid"
@@ -370,6 +391,7 @@ FULL - Name: <Error: No strings file for lstring ID 12345678>
                             pass
 
     def test_v144_startup_failures_save_a_discoverable_incomplete_report(self):
+        """Verify startup failures save incomplete reports, provenance and isolated temp paths."""
         for failure in (subprocess.CompletedProcess([], 1, "", "help failed"), OSError("launch failed")):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -398,6 +420,7 @@ FULL - Name: <Error: No strings file for lstring ID 12345678>
                     self.assertEqual(decision_files[path]["sha256"], hashlib.sha256((p0_tools.REPO_ROOT / path).read_bytes()).hexdigest())
 
     def test_v156_undecodable_xedit_case_keeps_report_and_raw_output_without_verdict(self):
+        """Verify undecodable case output saves raw streams and an incomplete observation."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tool = root / "tools" / "xDump64.exe"
@@ -442,6 +465,7 @@ FULL - Name: <Error: No strings file for lstring ID 12345678>
             self.assertEqual(saved["cases"][0]["status"], "incomplete")
 
     def test_v156_undecodable_xedit_startup_keeps_report_and_raw_output(self):
+        """Verify undecodable startup output saves raw streams and a failure report."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tool = root / "tools" / "xDump64.exe"
@@ -474,6 +498,7 @@ FULL - Name: <Error: No strings file for lstring ID 12345678>
             self.assertIn("startup_output_decode_failure", saved)
 
     def test_v147_capture_limit_rejects_oversized_pinned_input_before_hashing(self):
+        """Verify pinned sources exceeding the capture limit are rejected before hashing."""
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "input"
             source.write_bytes(b"12345")

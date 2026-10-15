@@ -21,13 +21,16 @@ supervisor = importlib.import_module(run_mutagen_p0._run_supervised.__module__)
 class ProcessSupervisorTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
     def test_timeout_writer_retains_detached_child_output_and_signal_error(self):
+        """Verify timeout artifacts retain detached-child output and escalation errors."""
         self._check_real_timeout_writer(detached=True, fail_escalation=True)
 
     @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
     def test_timeout_writer_kills_same_group_survivor_after_reaping_leader(self):
+        """Verify timeout escalation signals surviving children after reaping their leader."""
         self._check_real_timeout_writer(detached=False, fail_escalation=False)
 
     def _check_real_timeout_writer(self, *, detached, fail_escalation):
+        """Exercise timeout logging with a real child and optional escalation failure."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             child_code = (
@@ -49,6 +52,7 @@ class ProcessSupervisorTests(unittest.TestCase):
             escalation_leader_status = []
 
             def ready_popen(argv, **kwargs):
+                """Start the real parent and wait until its child has written a ready marker."""
                 process = real_popen(argv, **kwargs)
                 parents.append(process)
                 deadline = time.monotonic() + 5
@@ -59,6 +63,7 @@ class ProcessSupervisorTests(unittest.TestCase):
                 return process
 
             def signal_group(pid, sig):
+                """Record escalation state and optionally simulate a group-signal failure."""
                 if sig == 9:
                     escalation_leader_status.append(parents[0].returncode)
                     if fail_escalation:
@@ -97,6 +102,7 @@ class ProcessSupervisorTests(unittest.TestCase):
                     process.communicate(timeout=2)
 
     def test_v148_partial_multibyte_timeout_preserves_raw_evidence(self):
+        """Verify truncated multibyte output survives timeout handling as exact raw bytes."""
         root = Path.cwd()
         process = mock.Mock(pid=1234)
         process.stdout.encoding = process.stderr.encoding = "utf-8"
@@ -150,6 +156,7 @@ class ProcessSupervisorTests(unittest.TestCase):
                 self.assertEqual(metadata["raw_stdout_sha256"], hashlib.sha256(b"\xf0\x9f").hexdigest())
 
     def test_v148_real_descendant_cannot_keep_timeout_open(self):
+        """Verify inherited pipes from a real descendant cannot block timeout reporting."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             child_pid = root / "child.pid"
@@ -170,6 +177,7 @@ class ProcessSupervisorTests(unittest.TestCase):
             ready_at = []
 
             def popen_after_readiness(argv, **kwargs):
+                """Wait for the synthetic parent's readiness before starting its timeout clock."""
                 process = real_popen(argv, **kwargs)
                 if argv != command:
                     return process
@@ -211,6 +219,7 @@ class ProcessSupervisorTests(unittest.TestCase):
                     process.communicate(timeout=2)
 
     def test_v148_windows_tree_kill_and_pipe_cleanup_remain_bounded(self):
+        """Verify mocked Windows cleanup remains bounded when taskkill fails or stalls."""
         root = Path.cwd()
         for cleanup_failure in (None, OSError("taskkill unavailable"), subprocess.TimeoutExpired("taskkill", 2)):
             with self.subTest(cleanup_failure=cleanup_failure):
@@ -243,6 +252,7 @@ class ProcessSupervisorTests(unittest.TestCase):
                 process.stderr.close.assert_not_called()
 
     def test_v148_posix_escaped_pipe_holder_has_bounded_final_drain(self):
+        """Verify POSIX timeout cleanup closes pipes after bounded output-drain attempts."""
         root = Path.cwd()
         process = mock.Mock(pid=1234)
         process.stdout.encoding = process.stderr.encoding = "utf-8"

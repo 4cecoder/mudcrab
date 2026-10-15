@@ -30,6 +30,7 @@ COMMAND_TIMEOUT = 60
 
 
 def windows_path(path: Path) -> str:
+    """Express an absolute host path through Wine's Z: drive mapping."""
     return "Z:" + str(path.absolute()).replace("/", "\\")
 
 
@@ -88,6 +89,7 @@ def classify_dump(filename: str, returncode: int, stdout: str, stderr: str) -> d
 
 
 def _retain_undecodable_output(logs: Path, label: str, error: ProcessOutputDecodeError) -> dict:
+    """Save raw streams and return decode diagnostics with artifact-relative paths."""
     raw_files = {}
     for stream, raw in (("stdout", error.stdout_bytes), ("stderr", error.stderr_bytes)):
         name = f"{label}.{stream}.raw.bin"
@@ -97,6 +99,7 @@ def _retain_undecodable_output(logs: Path, label: str, error: ProcessOutputDecod
 
 
 def run_probe(args: argparse.Namespace) -> tuple[dict, Path]:
+    """Probe pinned xDump on synthetic inputs and retain an unqualified report."""
     tool = Path(args.xdump).expanduser().absolute()
     artifact = Path(args.artifact_dir).expanduser().resolve() if args.artifact_dir else (
         Path(os.environ.get("TMPDIR", "/tmp")) / f"mudcrab-p0-xedit-{uuid.uuid4().hex}"
@@ -214,6 +217,7 @@ def run_probe(args: argparse.Namespace) -> tuple[dict, Path]:
 
 
 def main() -> int:
+    """Run the xEdit CLI and return 2 for failures or an unqualified report."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--xdump", required=True, help="xDump64.exe from the pinned official release")
     parser.add_argument("--wine", default="wine", help="local Wine executable")

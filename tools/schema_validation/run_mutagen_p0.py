@@ -39,6 +39,7 @@ CLI_TIMEOUT_SECONDS = 15
 
 
 def _sha256(raw: bytes) -> str:
+    """Return the lowercase SHA-256 hex digest of source or fixture bytes."""
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -70,6 +71,7 @@ def default_artifact_destination(env: dict[str, str] | None = None) -> Path:
 
 
 def apply_inspect_extension(program: bytes, extension: bytes) -> bytes:
+    """Insert inspect dispatch at the unique oracle anchor and append its code."""
     marker = ORACLE_ENTRY.encode("utf-8")
     if program.count(marker) != 1:
         raise QualificationError("pinned oracle source no longer has the unique placed-lo insertion point")
@@ -80,6 +82,7 @@ def apply_inspect_extension(program: bytes, extension: bytes) -> bytes:
 
 
 def _resolve_dotnet(explicit: str | None) -> Path:
+    """Resolve an explicit, environment or PATH SDK executable to a regular file."""
     candidate = explicit or os.environ.get("DOTNET") or shutil.which("dotnet")
     if not candidate:
         raise QualificationError(
@@ -103,6 +106,7 @@ def _run_checked(
     log_dir: Path,
     timeout: float,
 ):
+    """Run a deadline-bound command, save diagnostics and require a zero exit."""
     _save_json(log_dir / f"{label}.command.json", command)
     try:
         result = _run_supervised(command, cwd=cwd, env=env, label=label, timeout=timeout)
@@ -130,6 +134,7 @@ def _run_checked(
 
 
 def _record_map(report: dict) -> dict[tuple[str, str], dict]:
+    """Index typed observations by signature and FormKey, rejecting duplicates."""
     records = {}
     raw_records = report.get("records")
     if not isinstance(raw_records, list):
@@ -162,6 +167,7 @@ def _expect_record(
     printed_contains: str | None = None,
     link_form_keys: tuple[str, ...] = (),
 ) -> dict:
+    """Check expected typed values and require physical observations to stay unavailable."""
     marker = (signature, form_key)
     if marker not in records:
         raise QualificationError(f"expected typed record was not observed: {marker}")
@@ -249,6 +255,7 @@ def _localized_name_observation(record: dict) -> dict:
 
 
 def validate_report(report: dict, filename: str, input_bytes: bytes) -> dict:
+    """Validate a synthetic fixture report without granting corpus acceptance."""
     if not isinstance(report, dict):
         raise QualificationError("Mutagen stdout JSON root must be an object")
     if report.get("execution_status") != "completed":
@@ -455,6 +462,7 @@ def classify_negative_run(
 
 
 def _save_json(path: Path, value: object) -> None:
+    """Write indented, sorted UTF-8 JSON with a trailing newline."""
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -469,6 +477,7 @@ def _case_run(
     env: dict[str, str],
     expect_failure: bool = False,
 ) -> tuple[dict, dict | None]:
+    """Inspect one fixture, retaining raw evidence and saving only validated reports."""
     plugin_path = fixtures_dir / filename
     plugin_path.write_bytes(input_bytes)
     command = [str(dotnet), str(assembly), "inspect", str(plugin_path)]
@@ -570,6 +579,7 @@ def _run_legacy_command(
     label: str,
     observations_dir: Path,
 ) -> subprocess.CompletedProcess:
+    """Run a legacy oracle command with bounded cleanup and retained diagnostics."""
     _save_json((observations_dir / label).with_suffix(".command.json"), command)
     try:
         result = _run_supervised(
@@ -610,6 +620,7 @@ def _run_legacy_command(
 
 
 def _run_legacy_smokes(dotnet: Path, assembly: Path, fixtures_dir: Path, env: dict[str, str], observations_dir: Path) -> dict:
+    """Check legacy placed-record and load-order winners against synthetic values."""
     hand = fixtures_dir / "p0-hand-full.esp"
     placed = _run_legacy_command(
         [str(dotnet), str(assembly), "placed", str(hand)],
@@ -670,6 +681,7 @@ def _run_legacy_smokes(dotnet: Path, assembly: Path, fixtures_dir: Path, env: di
 
 
 def run_suite(args: argparse.Namespace) -> tuple[dict, Path]:
+    """Build a pinned oracle copy and run synthetic checks in guarded artifacts."""
     artifact_dir = (
         Path(args.artifact_dir).expanduser().resolve()
         if args.artifact_dir
@@ -949,6 +961,7 @@ def run_suite(args: argparse.Namespace) -> tuple[dict, Path]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the guarded Mutagen pilot, returning 1 and saving owned failure evidence."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dotnet", help="path to the pinned .NET SDK executable")
     parser.add_argument(

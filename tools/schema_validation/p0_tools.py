@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _sha256(raw: bytes) -> str:
+    """Return the lowercase SHA-256 hex digest of raw evidence bytes."""
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -25,6 +26,7 @@ class QualificationError(RuntimeError):
 
 class ProcessTimeout(QualificationError):
     def __init__(self, label: str, timeout: float, stdout: str, stderr: str):
+        """Retain the deadline, partial text output and cleanup diagnostics."""
         super().__init__(f"{label} timed out after {timeout:g} seconds")
         self.label = label
         self.timeout = timeout
@@ -47,6 +49,7 @@ class ProcessOutputDecodeError(QualificationError):
         error: UnicodeDecodeError,
         timeout: float | None = None,
     ):
+        """Retain raw streams, decode error details and any timeout context."""
         outcome = f"{label} output has undecodable {stream} bytes"
         if timeout is not None:
             outcome = f"{label} timed out after {timeout:g} seconds and produced undecodable {stream} bytes"
@@ -65,6 +68,7 @@ class ProcessOutputDecodeError(QualificationError):
         self.cleanup_errors: list[dict] = []
 
     def failure_record(self) -> dict:
+        """Return serializable decode diagnostics and hashes of the retained streams."""
         return {
             "encoding": self.encoding,
             "stream": self.stream,
@@ -81,6 +85,7 @@ class ProcessOutputDecodeError(QualificationError):
 
 
 def _read_verified_bytes(path: Path, *, max_bytes: int = 32 * 1024 * 1024) -> tuple[str, int, bytes]:
+    """Capture a complete bounded source, verifying its size and digest."""
     try:
         requested = path.lstat().st_size
     except OSError as exc:
@@ -125,6 +130,7 @@ def validate_artifact_destination(
     *,
     additional_protected: tuple[Path, ...] = (),
 ) -> None:
+    """Reject resolved artifacts overlapping worktrees, source or protected roots."""
     candidate = candidate.expanduser().resolve()
     protected = _repository_worktree_roots() + _configured_protected_roots() + (oracle_source.expanduser().resolve(),) + tuple(
         path.expanduser().resolve() for path in additional_protected
@@ -171,6 +177,7 @@ def _repository_worktree_roots() -> tuple[Path, ...]:
 
 
 def _contains(parent: Path, child: Path) -> bool:
+    """Return whether the child path equals or lies beneath the parent path."""
     try:
         child.relative_to(parent)
         return True
@@ -195,6 +202,7 @@ def _signal_owned_group(process, sig: int, cleanup_errors: list[dict]) -> None:
 def _run_supervised(
     command: list[str], *, cwd: Path, env: dict[str, str], label: str, timeout: float
 ) -> subprocess.CompletedProcess:
+    """Run with a deadline, bounded timeout cleanup and strict output decoding."""
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -262,6 +270,7 @@ def _run_supervised(
 
 
 def _output_encoding() -> str:
+    """Select UTF-8 mode or the locale encoding for child output."""
     if sys.flags.utf8_mode:
         return "utf-8"
     getencoding = getattr(locale, "getencoding", None)
@@ -271,6 +280,7 @@ def _output_encoding() -> str:
 def _decode_process_output(
     label: str, stdout: bytes, stderr: bytes, *, timeout: float | None = None
 ) -> tuple[str, str]:
+    """Decode both streams strictly, retaining raw bytes in decode errors."""
     encoding = _output_encoding()
     decoded: list[str] = []
     for stream, raw in (("stdout", stdout), ("stderr", stderr)):

@@ -17,6 +17,7 @@ import run_mutagen_p0
 
 class P0WireFixtureTests(unittest.TestCase):
     def test_hand_fixture_matches_reviewed_golden_and_expected_values(self):
+        """Verify hand-encoded bytes match the golden digest and expected field values."""
         raw = p0_fixtures.hand_encoded_full()
         self.assertEqual(len(raw), 595)
         self.assertEqual(p0_fixtures.sha256(raw), p0_fixtures.HAND_ENCODED_GOLDEN_SHA256)
@@ -42,15 +43,18 @@ class P0WireFixtureTests(unittest.TestCase):
         )
 
     def test_hand_fixture_has_interior_persistent_cell_hierarchy(self):
+        """Verify the fixture's CELL groups enclose the expected persistent REFR."""
         raw = p0_fixtures.hand_encoded_full()
 
         def group_at(offset):
+            """Check a GRUP header and return its label, type and child boundaries."""
             signature, size, label, group_type, *_ = p0_fixtures.GROUP_HEADER.unpack_from(raw, offset)
             self.assertEqual(signature, b"GRUP")
             self.assertGreaterEqual(size, p0_fixtures.GROUP_HEADER_SIZE)
             return label, group_type, offset + size, offset + p0_fixtures.GROUP_HEADER_SIZE
 
         def record_at(offset):
+            """Return a fixture record's signature, flags, FormID and end offset."""
             signature, data_size, flags, form_id, *_ = p0_fixtures.RECORD_HEADER.unpack_from(raw, offset)
             return signature, flags, form_id, offset + p0_fixtures.RECORD_HEADER_SIZE + data_size
 
@@ -93,6 +97,7 @@ class P0WireFixtureTests(unittest.TestCase):
         self.assertEqual(group_types, [0, 0, 0, 0, 2, 3, 6, 8])
 
     def test_unknown_repeat_and_negative_probes_are_raw_byte_mutations(self):
+        """Verify opaque and malformed fixtures preserve their intended byte mutations."""
         cases = p0_fixtures.hand_encoded_cases()
         full = cases["p0-hand-full.esp"][0]
         unknown = cases["p0-unknown-repeated.esp"][0]
@@ -123,6 +128,7 @@ class P0WireFixtureTests(unittest.TestCase):
         )
 
     def test_hedr_record_count_matches_physical_major_and_group_headers_for_positive_fixtures(self):
+        """Verify HEDR counts equal physical major records plus group headers."""
         cases = p0_fixtures.hand_encoded_cases()
         expected_counts = {
             "p0-hand-full.esp": (5, 8, 13),
@@ -134,6 +140,7 @@ class P0WireFixtureTests(unittest.TestCase):
         }
 
         def count_physical_headers(raw):
+            """Return the declared HEDR count and observed record and group counts."""
             tes4_size = struct.unpack_from("<I", raw, 4)[0]
             hedr_offset = p0_fixtures.RECORD_HEADER_SIZE
             hedr_signature, hedr_size = p0_fixtures.SUBRECORD_HEADER.unpack_from(raw, hedr_offset)
@@ -144,6 +151,7 @@ class P0WireFixtureTests(unittest.TestCase):
             )
 
             def count_region(start, end):
+                """Count nested records and groups while checking their enclosing boundaries."""
                 major_records = 0
                 groups = 0
                 offset = start
@@ -182,6 +190,7 @@ class P0WireFixtureTests(unittest.TestCase):
             self.assertEqual(declared, records + groups, filename)
 
     def test_localized_fixture_uses_typed_armor_name_id_without_string_table(self):
+        """Verify the localized armor fixture contains the expected raw name ID."""
         raw, provenance = p0_fixtures.hand_encoded_cases()["p0-localized.esp"]
         self.assertEqual(provenance, "hand-encoded-localized-id-no-string-table")
         self.assertEqual(raw.count(b"ARMO"), 2)
@@ -191,6 +200,7 @@ class P0WireFixtureTests(unittest.TestCase):
 
 class P0RunnerContractTests(unittest.TestCase):
     def test_v156_mutagen_decode_failures_save_raw_checked_case_and_legacy_evidence(self):
+        """Verify all Mutagen command paths retain undecodable streams as raw evidence."""
         for timeout in (None, 45):
             for command_kind in ("checked", "case", "legacy"):
                 with self.subTest(timeout=timeout, command_kind=command_kind), tempfile.TemporaryDirectory() as directory:
@@ -236,6 +246,7 @@ class P0RunnerContractTests(unittest.TestCase):
                     self.assertTrue(base.with_suffix(".command.json").is_file())
 
     def test_v156_sdk_version_decode_failure_saves_raw_startup_evidence(self):
+        """Verify undecodable SDK startup output is saved before case execution."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             artifact = root / "artifacts"
@@ -268,6 +279,7 @@ class P0RunnerContractTests(unittest.TestCase):
             self.assertEqual(list((artifact / "observations").iterdir()), [])
 
     def test_v147_custom_sdk_directory_rejected_by_runner_and_cli_before_writes(self):
+        """Verify both Mutagen entry points protect the supplied SDK directory."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk = root / "sdk"
@@ -291,6 +303,7 @@ class P0RunnerContractTests(unittest.TestCase):
             self.assertFalse(artifact.exists())
 
     def test_dispatch_patch_anchors_before_commands_and_preserves_legacy_body(self):
+        """Verify inspect dispatch is inserted once without altering legacy commands."""
         original = (
             "using System.Text.Json;\n"
             "using Mutagen.Bethesda.Skyrim;\n"
@@ -313,6 +326,7 @@ class P0RunnerContractTests(unittest.TestCase):
         self.assertEqual(patched.count(run_mutagen_p0.ORACLE_ENTRY), 1)
 
     def test_v148_managed_negative_rejection_requires_nonzero_error_and_no_stdout(self):
+        """Verify malformed inputs qualify only through the managed error path."""
         accepted = run_mutagen_p0.classify_negative_run(
             "bad.esp", b"bad", 2, "", "Mutagen inspect failed: malformed plugin\n"
         )
@@ -331,6 +345,7 @@ class P0RunnerContractTests(unittest.TestCase):
         self.assertFalse(unhandled["completed_verdict_saved"])
 
     def test_v144_unavailable_physical_observations_do_not_collapse_to_empty(self):
+        """Verify unavailable physical evidence cannot be represented as an empty result."""
         record = {
             "signature": {"value": "STAT"},
             "form_key": "000800:test.esp",
@@ -362,6 +377,7 @@ class P0RunnerContractTests(unittest.TestCase):
             )
 
     def test_v145_typed_model_path_matches_wire_value_after_separator_normalization(self):
+        """Verify typed model paths compare correctly across slash conventions."""
         record = {
             "signature": {"value": "STAT"},
             "form_key": "000800:test.esp",
@@ -387,6 +403,7 @@ class P0RunnerContractTests(unittest.TestCase):
         )
 
     def test_v145_localized_id_and_translated_text_remain_separate_observations(self):
+        """Verify localized wire IDs, typed IDs and absent translations stay distinct."""
         filename = "p0-localized.esp"
         input_bytes = b"localized fixture input"
         record = {
@@ -439,6 +456,7 @@ class P0RunnerContractTests(unittest.TestCase):
             run_mutagen_p0.validate_report(report, filename, input_bytes)
 
     def test_v147_default_artifact_under_protected_tmp_is_rejected_before_write(self):
+        """Verify temporary-directory settings cannot place artifacts inside the repo."""
         args = SimpleNamespace(artifact_dir=None, oracle_source="/tmp/not-the-oracle")
         candidate = run_mutagen_p0.REPO_ROOT / "mudcrab-p0-mutagen-test-no-write"
         with mock.patch.dict(
@@ -450,6 +468,7 @@ class P0RunnerContractTests(unittest.TestCase):
         self.assertFalse(candidate.exists())
 
     def test_v147_explicit_artifact_ancestor_of_oracle_is_rejected_without_write(self):
+        """Verify an artifact destination cannot contain the oracle source directory."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             oracle = root / "oracle"
@@ -459,6 +478,7 @@ class P0RunnerContractTests(unittest.TestCase):
             self.assertEqual(list(root.iterdir()), [])
 
     def test_v148_case_timeout_preserves_incomplete_evidence_without_verdict(self):
+        """Verify timed-out cases retain partial logs without saving a completed report."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fixtures = root / "fixtures"
@@ -487,6 +507,7 @@ class P0RunnerContractTests(unittest.TestCase):
             self.assertFalse((observations / "p0-timeout.json").exists())
 
     def test_v148_legacy_timeout_preserves_incomplete_evidence(self):
+        """Verify legacy timeouts save partial streams and incomplete metadata."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fixtures = root / "fixtures"
@@ -510,6 +531,7 @@ class P0RunnerContractTests(unittest.TestCase):
             )
 
     def test_v148_wrong_shaped_json_is_raw_evidence_not_completed_observation(self):
+        """Verify malformed report shapes retain raw output without a completed verdict."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fixtures = root / "fixtures"
