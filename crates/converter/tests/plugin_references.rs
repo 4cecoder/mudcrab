@@ -75,6 +75,136 @@ fn texture_layer(id: u32, quadrant: u8, index: u16) -> Vec<u8> {
     .concat()
 }
 
+/// Independent field cases: do not derive expectations from the remapper's allowlist.
+#[test]
+fn every_single_form_id_field_remaps_relocated_full_and_light_plugins() {
+    let cases: &[(&[u8; 4], &[u8; 4], usize)] = &[
+        (b"TREE", b"SNAM", 4),
+        (b"TREE", b"PFIG", 4),
+        (b"LTEX", b"TNAM", 4),
+        (b"LTEX", b"GNAM", 4),
+        (b"LTEX", b"MNAM", 4),
+        (b"CELL", b"XCWT", 4),
+        (b"WRLD", b"NAM2", 4),
+        (b"WRLD", b"NAM3", 4),
+        (b"WRLD", b"WNAM", 4),
+        (b"WRLD", b"CNAM", 4),
+        (b"NPC_", b"RNAM", 4),
+        (b"NPC_", b"CNAM", 4),
+        (b"NPC_", b"INAM", 4),
+        // xEdit 9fb016884bec: wbDefinitionsCommon.pas:8801 and TES5 NPC_:8351.
+        // Faction FormID, signed rank, then three unused bytes.
+        (b"NPC_", b"SNAM", 8),
+        (b"RACE", b"WKMV", 4),
+        (b"RACE", b"RNMV", 4),
+    ];
+    for (light, expected_prefix) in [(false, 0x0500_0000u32), (true, 0xFE00_2000)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = vec![plugin(dir.path(), "Base.esm", &[], 0, vec![])];
+        for i in 0..4 {
+            paths.push(plugin(
+                dir.path(),
+                &format!("Filler{i}.esm"),
+                &[],
+                0,
+                vec![],
+            ));
+        }
+        if light {
+            for i in 0..2 {
+                paths.push(plugin(
+                    dir.path(),
+                    &format!("Light{i}.esl"),
+                    &[],
+                    0x200,
+                    vec![],
+                ));
+            }
+        }
+        let mut records = Vec::new();
+        let mut all_cases = cases.to_vec();
+        for record_type in [
+            b"CELL", b"REFR", b"ACHR", b"ACRE", b"PGRE", b"PMIS", b"PHZD", b"PARW", b"PBAR",
+            b"PBEA", b"PCON", b"PFLA",
+        ] {
+            for tag in [b"XOWN", b"XGLB", b"XEZN", b"XLCN", b"XLRL"] {
+                all_cases.push((record_type, tag, 4));
+            }
+            if record_type != b"CELL" {
+                all_cases.push((record_type, b"NAME", 4));
+            }
+        }
+        for (i, (kind, tag, len)) in all_cases.iter().enumerate() {
+            let mut data = vec![0xAB; *len];
+            data[..4].copy_from_slice(&0x0100_0801u32.to_le_bytes());
+            records.extend(record(kind, 0x0100_0900 + i as u32, 0, sub(tag, &data)));
+        }
+        paths.push(plugin(
+            dir.path(),
+            if light { "Patch.esl" } else { "Patch.esp" },
+            &["Base.esm"],
+            if light { 0x200 } else { 0 },
+            records,
+        ));
+        let merged = EsmParser::merge_plugins(&paths).unwrap();
+        for (i, (kind, tag, len)) in all_cases.iter().enumerate() {
+            let data = &merged[&(expected_prefix | (0x900 + i as u32))].subrecords[0].1;
+            let mut expected = vec![0xAB; *len];
+            expected[..4].copy_from_slice(&(expected_prefix | 0x801).to_le_bytes());
+            assert_eq!(data, &expected, "light={light}, {kind:?}.{tag:?}");
+        }
+    }
+}
+
+#[test]
+fn aliased_tags_and_wrong_length_factions_keep_their_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 0, vec![]);
+    let filler = plugin(dir.path(), "Filler.esm", &[], 0, vec![]);
+    let cases: &[(&[u8; 4], &[u8; 4], usize)] = &[
+        (b"TES4", b"SNAM", 4),
+        (b"CLFM", b"CNAM", 4),
+        (b"AACT", b"CNAM", 4),
+        (b"TREE", b"CNAM", 4),
+        // Pinned xEdit TES5Edit source at 9fb016884bec138ea6c7b872cec831537d464c3e:
+        // `wbWorldLargeRefs` defines WRLD.RNAM as rows with Y/X i16 cell coordinates
+        // (Core/wbDefinitionsCommon.pas:10011-10038), included by WRLD at
+        // Core/wbDefinitionsTES5.pas:10645-10651. WRLD.TNAM is `wbString` at
+        // Core/wbDefinitionsTES5.pas:10708. Keep these four-byte payloads unchanged;
+        // nested RNAM references require separate layout-aware remapping.
+        // https://github.com/TES5Edit/TES5Edit/blob/9fb016884bec138ea6c7b872cec831537d464c3e/Core/wbDefinitionsCommon.pas#L10011-L10038
+        // https://github.com/TES5Edit/TES5Edit/blob/9fb016884bec138ea6c7b872cec831537d464c3e/Core/wbDefinitionsTES5.pas#L10645-L10651
+        // https://github.com/TES5Edit/TES5Edit/blob/9fb016884bec138ea6c7b872cec831537d464c3e/Core/wbDefinitionsTES5.pas#L10708
+        (b"WRLD", b"RNAM", 4),
+        (b"WRLD", b"TNAM", 4),
+        (b"NPC_", b"SNAM", 0),
+        (b"NPC_", b"SNAM", 3),
+        (b"NPC_", b"SNAM", 4),
+        (b"NPC_", b"SNAM", 5),
+        (b"NPC_", b"SNAM", 9),
+    ];
+    let payload = cases
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (kind, tag, len))| {
+            let mut data = vec![0xAB; *len];
+            if *len >= 4 {
+                data[..4].copy_from_slice(&0x0100_0801u32.to_le_bytes());
+            }
+            record(kind, 0x0100_0900 + i as u32, 0, sub(tag, &data))
+        })
+        .collect();
+    let patch = plugin(dir.path(), "Patch.esp", &["Base.esm"], 0, payload);
+    let merged = EsmParser::merge_plugins(&[base, filler, patch]).unwrap();
+    for (i, (_, _, len)) in cases.iter().enumerate() {
+        let mut expected = vec![0xAB; *len];
+        if *len >= 4 {
+            expected[..4].copy_from_slice(&0x0100_0801u32.to_le_bytes());
+        }
+        assert_eq!(merged[&(0x0200_0900 + i as u32)].subrecords[0].1, expected);
+    }
+}
+
 #[test]
 fn remaps_reordered_masters_light_plugins_terrain_and_alternate_textures() {
     let dir = tempfile::tempdir().unwrap();
@@ -791,6 +921,10 @@ fn every_covered_reference_and_cell_field_is_remapped_at_its_offsets() {
         (b"CELL", b"XCAS", 4, &[0]),
         (b"CELL", b"XCCM", 4, &[0]),
         (b"CELL", b"XCLR", 12, &[0, 4, 8]),
+        (b"REFR", b"XPOD", 8, &[0, 4]),
+        (b"REFR", b"XLRM", 4, &[0]),
+        (b"REFR", b"LNAM", 4, &[0]),
+        (b"REFR", b"INAM", 4, &[0]),
     ];
     for &(record_type, tag, len, offsets) in fields {
         let label = format!(
@@ -825,6 +959,58 @@ fn every_covered_reference_and_cell_field_is_remapped_at_its_offsets() {
             expected[offset..offset + 4].copy_from_slice(&(0x0200_0900 + i as u32).to_le_bytes());
         }
         assert_eq!(data, &expected, "{label}");
+    }
+}
+
+/// `LNAM` and `INAM` are FormIDs only on room marker references. On other record types the
+/// same tags keep their old handling: `NPC_` `INAM` was always a FormID, and the room marker
+/// layouts must not touch `ACHR` or `CELL` fields.
+#[test]
+fn room_marker_tags_on_other_record_types_keep_their_handling() {
+    let cases: &[(&[u8; 4], &[u8; 4], bool)] = &[
+        (b"NPC_", b"INAM", true),
+        (b"ACHR", b"LNAM", false),
+        (b"ACHR", b"INAM", false),
+        (b"ACHR", b"XLRM", false),
+        (b"CELL", b"LNAM", false),
+        (b"CELL", b"INAM", false),
+        (b"CELL", b"XLRM", false),
+    ];
+    for &(record_type, tag, remapped) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+        let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+        let patch = plugin(
+            dir.path(),
+            "Patch.esm",
+            &["Base.esm"],
+            1,
+            record(
+                record_type,
+                0x0100_0800,
+                0,
+                sub(tag, &0x0100_0900u32.to_le_bytes()),
+            ),
+        );
+        let merged = EsmParser::merge_plugins(&[base, filler, patch]).unwrap();
+        let data = &merged[&0x0200_0800]
+            .subrecords
+            .iter()
+            .find(|(name, _)| name.as_slice() == tag)
+            .unwrap()
+            .1;
+        let expected = if remapped {
+            0x0200_0900u32
+        } else {
+            0x0100_0900
+        };
+        assert_eq!(
+            u32::from_le_bytes(data[..4].try_into().unwrap()),
+            expected,
+            "{} {}",
+            String::from_utf8_lossy(record_type),
+            String::from_utf8_lossy(tag)
+        );
     }
 }
 
@@ -1162,10 +1348,11 @@ async fn pipeline_publishes_and_rebuilds_reference_and_cell_links() {
             ),
         ),
     );
+    // Checked filler masters deliberately separate plugin-local master indices from full slots.
     let list = dir.path().join("plugins.txt");
     fs::write(
         &list,
-        "Skyrim.esm\nFiller.esm\nFiller2.esm\n*Light.esl\n*Links.esp\n*Override.esp\n",
+        "Skyrim.esm\n*Filler.esm\n*Filler2.esm\n*Light.esl\n*Links.esp\n*Override.esp\n",
     )
     .unwrap();
     let output = dir.path().join("modern");
@@ -1254,5 +1441,306 @@ async fn pipeline_publishes_and_rebuilds_reference_and_cell_links() {
             )
             .unwrap();
         }
+    }
+}
+
+/// The load-order export writes the room graph, with the marker FormIDs in load-order
+/// numbering: the plugin's own records sit in slot 2 here, its masters only name Base.esm.
+#[test]
+fn load_order_export_writes_the_room_graph_with_remapped_marker_ids() {
+    use rusqlite::Connection;
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+    let floats =
+        |values: [f32; 6]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let xprm = |half: [f32; 3], shape: u32| -> Vec<u8> {
+        let mut bytes: Vec<u8> = half.iter().flat_map(|v| v.to_le_bytes()).collect();
+        bytes.extend([0u8; 12]);
+        bytes.extend(0.2f32.to_le_bytes());
+        bytes.extend(shape.to_le_bytes());
+        bytes
+    };
+    let word = |value: u32| value.to_le_bytes().to_vec();
+    let marker = |id: u32, base: u32, position: [f32; 3], extra: Vec<u8>| {
+        record(
+            b"REFR",
+            id,
+            0,
+            [
+                sub(b"NAME", &word(base)),
+                sub(
+                    b"DATA",
+                    &floats([position[0], position[1], position[2], 0.0, 0.0, 0.0]),
+                ),
+                extra,
+            ]
+            .concat(),
+        )
+    };
+    let cell = 0x0100_0900;
+    let patch = plugin(
+        dir.path(),
+        "Patch.esm",
+        &["Base.esm"],
+        1,
+        [
+            // No XCLC and no worldspace: an interior cell.
+            record(b"CELL", cell, 0, sub(b"DATA", &[1, 0])),
+            group(
+                6,
+                cell,
+                group(
+                    9,
+                    cell,
+                    [
+                        marker(
+                            0x0100_0801,
+                            0x1F,
+                            [0.0; 3],
+                            sub(b"XPRM", &xprm([100.0; 3], 1)),
+                        ),
+                        marker(
+                            0x0100_0802,
+                            0x1F,
+                            [500.0, 0.0, 0.0],
+                            [
+                                sub(b"XPRM", &xprm([100.0; 3], 1)),
+                                sub(b"LNAM", &word(0x0100_0A00)),
+                                sub(b"INAM", &word(0x0100_0A01)),
+                                sub(b"XLRM", &word(0x0100_0801)),
+                            ]
+                            .concat(),
+                        ),
+                        marker(
+                            0x0100_0803,
+                            0x20,
+                            [250.0, 0.0, 0.0],
+                            [
+                                sub(b"XPRM", &xprm([40.0, 1.0, 60.0], 3)),
+                                sub(b"XPOD", &[word(0x0100_0801), word(0x0100_0802)].concat()),
+                            ]
+                            .concat(),
+                        ),
+                        marker(0x0100_0804, 0x99, [10.0, 20.0, 30.0], Vec::new()),
+                    ]
+                    .concat(),
+                ),
+            ),
+        ]
+        .concat(),
+    );
+    let db = dir.path().join("world.db");
+    EsmParser::convert_plugins(&[base, filler, patch], &db).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let ids = |sql: &str| -> Vec<(u32, u32)> {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        ids("SELECT ref_id, cell_id FROM room_bounds ORDER BY ref_id"),
+        vec![(0x0200_0801, 0x0200_0900), (0x0200_0802, 0x0200_0900)]
+    );
+    assert_eq!(
+        ids("SELECT lighting_template_id, image_space_id FROM room_bounds WHERE ref_id=0x02000802"),
+        vec![(0x0200_0A00, 0x0200_0A01)]
+    );
+    assert_eq!(
+        ids("SELECT room_a, room_b FROM room_portals"),
+        vec![(0x0200_0801, 0x0200_0802)]
+    );
+    assert_eq!(
+        ids("SELECT room_ref, linked_ref FROM room_links"),
+        vec![(0x0200_0802, 0x0200_0801)]
+    );
+    assert_eq!(
+        ids("SELECT reference_id, room_ref FROM reference_rooms WHERE contained=1"),
+        vec![(0x0200_0804, 0x0200_0801)]
+    );
+}
+
+/// `XPOD` is an array of (origin, destination) pairs (xEdit 4.1.5f defs): a mod's portal with
+/// two pairs has all four FormIDs remapped from a non-first plugin.
+#[test]
+fn a_two_pair_xpod_is_remapped_in_every_pair() {
+    let word = |value: u32| value.to_le_bytes().to_vec();
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+    let payload = [
+        word(0x0100_0801),
+        word(0x0100_0802),
+        word(0x0100_0803),
+        word(0x0100_0804),
+    ]
+    .concat();
+    assert_eq!(payload.len(), 16);
+    let patch = plugin(
+        dir.path(),
+        "Patch.esm",
+        &["Base.esm"],
+        1,
+        record(b"REFR", 0x0100_0900, 0, sub(b"XPOD", &payload)),
+    );
+    let merged = EsmParser::merge_plugins(&[base, filler, patch]).unwrap();
+    let data = &merged[&0x0200_0900]
+        .subrecords
+        .iter()
+        .find(|(name, _)| name.as_slice() == b"XPOD")
+        .expect("XPOD kept")
+        .1;
+    let expected = [
+        word(0x0200_0801),
+        word(0x0200_0802),
+        word(0x0200_0803),
+        word(0x0200_0804),
+    ]
+    .concat();
+    assert_eq!(data, &expected);
+
+    // A 12-byte XPOD (a pair and a half) is a whole number of FormIDs: kept, all three remapped.
+    // The old fixed 8-byte layout dropped it.
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+    let patch = plugin(
+        dir.path(),
+        "Patch.esm",
+        &["Base.esm"],
+        1,
+        record(b"REFR", 0x0100_0900, 0, sub(b"XPOD", &payload[..12])),
+    );
+    let merged = EsmParser::merge_plugins(&[base, filler, patch]).unwrap();
+    let data = &merged[&0x0200_0900]
+        .subrecords
+        .iter()
+        .find(|(name, _)| name.as_slice() == b"XPOD")
+        .expect("12-byte XPOD kept")
+        .1;
+    assert_eq!(
+        data,
+        &[word(0x0200_0801), word(0x0200_0802), word(0x0200_0803)].concat()
+    );
+
+    // A length that is not a multiple of four is dropped, like any other array.
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+    let patch = plugin(
+        dir.path(),
+        "Patch.esm",
+        &["Base.esm"],
+        1,
+        record(b"REFR", 0x0100_0900, 0, sub(b"XPOD", &payload[..14])),
+    );
+    let merged = EsmParser::merge_plugins(&[base, patch]).unwrap();
+    assert!(
+        merged[&0x0100_0900]
+            .subrecords
+            .iter()
+            .all(|(name, _)| name.as_slice() != b"XPOD")
+    );
+}
+
+/// Exterior cells are told apart in the real export by a grid position or a worldspace; markers
+/// in them write no room rows.
+#[test]
+fn load_order_export_ignores_markers_in_exterior_cells() {
+    use rusqlite::Connection;
+    let dir = tempfile::tempdir().unwrap();
+    let base = plugin(dir.path(), "Base.esm", &[], 1, Vec::new());
+    let filler = plugin(dir.path(), "Filler.esm", &["Base.esm"], 1, Vec::new());
+    let word = |value: u32| value.to_le_bytes().to_vec();
+    let xprm = |half: [f32; 3], shape: u32| -> Vec<u8> {
+        let mut bytes: Vec<u8> = half.iter().flat_map(|v| v.to_le_bytes()).collect();
+        bytes.extend([0u8; 12]);
+        bytes.extend(0.2f32.to_le_bytes());
+        bytes.extend(shape.to_le_bytes());
+        bytes
+    };
+    let marker = |id: u32, base: u32, extra: Vec<u8>| {
+        record(
+            b"REFR",
+            id,
+            0,
+            [sub(b"NAME", &word(base)), sub(b"DATA", &[0u8; 24]), extra].concat(),
+        )
+    };
+    // A cell with its children: one room marker, one portal marker and one object.
+    let cell_with_markers = |cell: u32, first: u32, cell_subs: Vec<u8>| {
+        [
+            record(b"CELL", cell, 0, cell_subs),
+            group(
+                6,
+                cell,
+                group(
+                    9,
+                    cell,
+                    [
+                        marker(first, 0x1F, sub(b"XPRM", &xprm([100.0; 3], 1))),
+                        marker(
+                            first + 1,
+                            0x20,
+                            [
+                                sub(b"XPRM", &xprm([40.0, 1.0, 60.0], 3)),
+                                sub(b"XPOD", &[word(first), word(first)].concat()),
+                            ]
+                            .concat(),
+                        ),
+                        marker(first + 2, 0x99, Vec::new()),
+                    ]
+                    .concat(),
+                ),
+            ),
+        ]
+        .concat()
+    };
+    let grid = sub(b"XCLC", &[0u8; 8]);
+    let patch = plugin(
+        dir.path(),
+        "Patch.esm",
+        &["Base.esm"],
+        1,
+        [
+            // A grid position, with no worldspace group.
+            cell_with_markers(0x0100_0900, 0x0100_0800, grid.clone()),
+            // A worldspace's persistent cell (a worldspace, no grid), and a gridded one.
+            record(b"WRLD", 0x0100_0A00, 0, Vec::new()),
+            group(
+                1,
+                0x0100_0A00,
+                [
+                    cell_with_markers(0x0100_0910, 0x0100_0810, Vec::new()),
+                    cell_with_markers(0x0100_0920, 0x0100_0820, grid),
+                ]
+                .concat(),
+            ),
+        ]
+        .concat(),
+    );
+    let db = dir.path().join("world.db");
+    EsmParser::convert_plugins(&[base, filler, patch], &db).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+    // The markers were parsed as references of those cells...
+    assert_eq!(
+        count("SELECT count(*) FROM \"references\" WHERE base_form_id IN (31, 32)"),
+        6
+    );
+    // ...and none of them became room data.
+    for table in [
+        "room_bounds",
+        "room_portals",
+        "room_links",
+        "reference_rooms",
+    ] {
+        assert_eq!(
+            count(&format!("SELECT count(*) FROM {table}")),
+            0,
+            "{table}"
+        );
     }
 }

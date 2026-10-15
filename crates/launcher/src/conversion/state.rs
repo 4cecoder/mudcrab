@@ -65,7 +65,12 @@ impl RunReport {
             converted: report.converted,
             cache_hits: report.cache_hits,
             skipped: report.skipped,
-            warnings: report.warnings.clone(),
+            warnings: report
+                .warnings
+                .iter()
+                .cloned()
+                .chain(report.selection_warnings.iter().map(ToString::to_string))
+                .collect(),
             lod_chunks: report.lod_chunks,
             lod_warnings: report.lod_warnings.clone(),
             artifacts: report.artifacts.len(),
@@ -302,7 +307,7 @@ pub enum Effect {
     /// Nothing to do: the press was not legal in this state.
     None,
     /// Start a conversion with this configuration on its own thread.
-    Begin(PipelineConfig),
+    Begin(Box<PipelineConfig>),
     /// Ask the running conversion to stop.
     Cancel,
     /// End the process now, as the command line's second Ctrl+C does.
@@ -326,9 +331,10 @@ pub fn apply(state: ConversionState, input: Input) -> (ConversionState, Effect) 
         // Start always converts from scratch, whichever state it is pressed in: a run that kept a
         // staging folder is only picked up again by Resume.
         Input::Start { data, output } => match state {
-            Idle | Finished(_) | Stopped { .. } => {
-                (Running, Effect::Begin(PipelineConfig::new(data, output)))
-            }
+            Idle | Finished(_) | Stopped { .. } => (
+                Running,
+                Effect::Begin(Box::new(PipelineConfig::new(data, output))),
+            ),
             Running | Stopping | Checking { .. } | Deleting { .. } => (state, Effect::None),
         },
         Input::Stop => match state {
@@ -349,7 +355,7 @@ pub fn apply(state: ConversionState, input: Input) -> (ConversionState, Effect) 
             } => {
                 let mut config = PipelineConfig::new(data, output);
                 config.resume_staging = Some(staging);
-                (Running, Effect::Begin(config))
+                (Running, Effect::Begin(Box::new(config)))
             }
             other => (other, Effect::None),
         },
@@ -1348,6 +1354,9 @@ mod tests {
             skipped: 3,
             warnings: vec!["a.nif".into()],
             notices: Vec::new(),
+            skipped_plugins: Vec::new(),
+            load_order: Vec::new(),
+            selection_warnings: Vec::new(),
             artifacts: vec![PathBuf::from("a.glb"), PathBuf::from("b.ktx2")],
             inputs_by_kind: Default::default(),
             pruned_texture_references: 0,
@@ -1384,5 +1393,23 @@ mod tests {
             report.lod_line(),
             "No terrain LOD generated; 0 worldspace warning(s)."
         );
+    }
+
+    #[test]
+    fn creation_fallback_is_displayed_as_a_warning_without_an_asset_failure() {
+        let warning = shared::plugin_selection::CreationFallbackWarning {
+            ccc_path: PathBuf::from("Game/Skyrim.ccc"),
+            reason: "file missing".into(),
+        };
+        let pipeline = PipelineReport {
+            complete: true,
+            selection_warnings: vec![warning.clone()],
+            ..Default::default()
+        };
+        let report = RunReport::from_pipeline(&pipeline);
+        assert_eq!(report.warnings, vec![warning.to_string()]);
+        assert_eq!(report.skipped, 0);
+        assert!(report.headline().contains("Conversion complete"));
+        assert!(report.lines().contains(&format!("Warning: {warning}")));
     }
 }

@@ -22,17 +22,57 @@ use tokio::sync::mpsc;
 struct Cli {
     data: PathBuf,
     output: PathBuf,
+    mo2: Option<mo2::Selection>,
     resume_staging: Option<PathBuf>,
+    plugins_file: Option<PathBuf>,
+    skyrim_ccc_file: Option<PathBuf>,
+    skyrim_ini_file: Option<PathBuf>,
     reuse_assets: Option<PathBuf>,
     report_json: Option<PathBuf>,
     cpu_jobs: Option<usize>,
     io_jobs: Option<usize>,
     texture_encoder: TextureEncoder,
+    texture_fallback_quality: Option<u8>,
+    texture_uastc_level: Option<u8>,
+    texture_zstd_level: Option<i32>,
     fail_fast: bool,
     invalidate_cache: bool,
     verify_cache: bool,
     no_lod: bool,
     verbose: bool,
+}
+
+impl Cli {
+    /// Preserve conversion and profile selection when constructing the pipeline.
+    fn pipeline_config(&self) -> PipelineConfig {
+        let mut config = PipelineConfig::new(self.data.clone(), self.output.clone());
+        config.resume_staging = self.resume_staging.clone();
+        config.mo2 = self.mo2.clone();
+        config.plugins_file = self.plugins_file.clone();
+        config.skyrim_ccc_file = self.skyrim_ccc_file.clone();
+        config.skyrim_ini_file = self.skyrim_ini_file.clone();
+        config.fail_fast = self.fail_fast;
+        config.invalidate_cache = self.invalidate_cache;
+        config.verify_cache = self.verify_cache;
+        config.no_lod = self.no_lod;
+        config.texture_encoder = self.texture_encoder;
+        if let Some(value) = self.texture_fallback_quality {
+            config.texture_fallback_quality = value;
+        }
+        if let Some(value) = self.texture_uastc_level {
+            config.texture_uastc_level = value;
+        }
+        if let Some(value) = self.texture_zstd_level {
+            config.texture_zstd_level = value;
+        }
+        if let Some(value) = self.cpu_jobs {
+            config.cpu_jobs = value;
+        }
+        if let Some(value) = self.io_jobs {
+            config.io_jobs = value;
+        }
+        config
+    }
 }
 
 #[derive(Debug)]
@@ -43,8 +83,9 @@ struct CheckCli {
 
 #[derive(Debug)]
 enum Command {
-    Convert(Cli),
+    Convert(Box<Cli>),
     Check(CheckCli),
+    Repair(Box<Cli>, bool),
 }
 
 /// Problem lines printed before "and N more".
@@ -149,24 +190,42 @@ async fn main() -> Result<()> {
         println!("{}", usage());
         return Ok(());
     }
-    let cli = match parse_command(args)? {
+    let command = parse_command(args)?;
+    if let Command::Convert(cli) | Command::Repair(cli, _) = &command
+        && let Some(selection) = &cli.mo2
+    {
+        eprintln!(
+            "MO2 profile: {:?} (instance: {})",
+            selection.profile,
+            selection.instance_path.display()
+        );
+    }
+    let cli = match command {
         Command::Convert(cli) => cli,
         Command::Check(check) => std::process::exit(run_check(&check)),
+        Command::Repair(cli, apply) => {
+            let config = cli.pipeline_config();
+            let report = converter::repair::repair_failed(&config, apply)?;
+            println!(
+                "Repair {}: {} converted, {} classified/excluded, {} failures. Files/report: {}",
+                if report.published {
+                    "published"
+                } else {
+                    "staged (original pack unchanged)"
+                },
+                report.converted,
+                report.excluded,
+                report.failures.len(),
+                report.directory.display()
+            );
+            if !report.failures.is_empty() {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
     };
     validate_metadata_report_path(&cli)?;
-    let mut config = PipelineConfig::new(cli.data.clone(), cli.output.clone());
-    config.resume_staging = cli.resume_staging.clone();
-    config.fail_fast = cli.fail_fast;
-    config.invalidate_cache = cli.invalidate_cache;
-    config.verify_cache = cli.verify_cache;
-    config.no_lod = cli.no_lod;
-    config.texture_encoder = cli.texture_encoder;
-    if let Some(cpu_jobs) = cli.cpu_jobs {
-        config.cpu_jobs = cpu_jobs;
-    }
-    if let Some(io_jobs) = cli.io_jobs {
-        config.io_jobs = io_jobs;
-    }
+    let config = cli.pipeline_config();
     let started = Instant::now();
     let last_progress = Arc::new(Mutex::new(None::<ProgressEvent>));
     let printer_progress = Arc::clone(&last_progress);
@@ -304,6 +363,9 @@ fn print_summary(cli: &Cli, report: &PipelineReport, clock: &StageClock) {
     for notice in &report.notices {
         println!("  note: {notice}");
     }
+    for warning in &report.selection_warnings {
+        println!("  warning: {warning}");
+    }
     let (bytes, files) = artifact_size(&cli.output, &report.artifacts);
     println!(
         "  output: {} in {} artifacts ({})",
@@ -438,12 +500,37 @@ fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
         cli.output.display(),
         staging.display()
     );
+    if let Some(selection) = &cli.mo2 {
+        command.push_str(&format!(
+            " --mo2-instance \"{}\" --mo2-profile \"{}\"",
+            selection.instance_path.display(),
+            selection.profile
+        ));
+    }
+    if let Some(value) = cli.texture_fallback_quality {
+        command.push_str(&format!(" --texture-fallback-quality {value}"));
+    }
+    if let Some(value) = cli.texture_uastc_level {
+        command.push_str(&format!(" --texture-uastc-level {value}"));
+    }
+    if let Some(value) = cli.texture_zstd_level {
+        command.push_str(&format!(" --texture-zstd-level {value}"));
+    }
     // A resumed run must keep the texture encoder: GPU-encoded textures are cached under their
     // own label, so resuming on the CPU would convert them again.
     if let TextureEncoder::Gpu { quality, batch_mb } = cli.texture_encoder {
         command.push_str(&format!(
             " --texture-encoder gpu --gpu-quality {quality} --gpu-batch-mb {batch_mb}"
         ));
+    }
+    for (flag, path) in [
+        ("--plugins-file", &cli.plugins_file),
+        ("--skyrim-ccc-file", &cli.skyrim_ccc_file),
+        ("--skyrim-ini-file", &cli.skyrim_ini_file),
+    ] {
+        if let Some(path) = path {
+            command.push_str(&format!(" {flag} \"{}\"", path.display()));
+        }
     }
     if cli.no_lod {
         command.push_str(" --no-lod");
@@ -619,11 +706,39 @@ fn format_check_report(report: &converter::CheckReport) -> String {
     text
 }
 
+/// Parses conversion, check, or repair arguments and rejects options unsupported by repair.
 fn parse_command(args: Vec<OsString>) -> Result<Command> {
     if args.first().and_then(|argument| argument.to_str()) == Some("check") {
         return parse_check(args.into_iter().skip(1)).map(Command::Check);
     }
-    parse_cli(args).map(Command::Convert)
+    if args.first().and_then(|argument| argument.to_str()) == Some("repair-failed") {
+        let apply = args.iter().any(|argument| argument == "--apply");
+        let cli = parse_cli(
+            args.into_iter()
+                .skip(1)
+                .filter(|argument| argument != "--apply")
+                .collect(),
+        )?;
+        if cli.resume_staging.is_some()
+            || cli.plugins_file.is_some()
+            || cli.skyrim_ccc_file.is_some()
+            || cli.skyrim_ini_file.is_some()
+            || cli.reuse_assets.is_some()
+            || cli.invalidate_cache
+            || cli.fail_fast
+            || cli.report_json.is_some()
+            || cli.cpu_jobs.is_some()
+            || cli.io_jobs.is_some()
+            || !cli.verify_cache
+            || cli.verbose
+        {
+            bail!(
+                "repair-failed accepts Data/output, MO2 selection, encoding options, --no-lod and --apply only"
+            );
+        }
+        return Ok(Command::Repair(Box::new(cli), apply));
+    }
+    parse_cli(args).map(|cli| Command::Convert(Box::new(cli)))
 }
 
 fn parse_check(args: impl Iterator<Item = OsString>) -> Result<CheckCli> {
@@ -646,17 +761,25 @@ fn parse_check(args: impl Iterator<Item = OsString>) -> Result<CheckCli> {
     })
 }
 
-/// Parses the arguments of a conversion run.
+/// Parse conversion options, preserving explicit selection inputs for resumed runs.
 fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut positional = Vec::new();
+    let mut mo2_instance = None;
+    let mut mo2_profile = None;
     let mut report_json = None;
     let mut resume_staging = None;
     let mut reuse_assets = None;
+    let mut plugins_file = None;
+    let mut skyrim_ccc_file = None;
+    let mut skyrim_ini_file = None;
     let mut cpu_jobs = None;
     let mut io_jobs = None;
     let mut use_gpu = false;
     let mut gpu_quality = None;
     let mut gpu_batch_mb = None;
+    let mut texture_fallback_quality = None;
+    let mut texture_uastc_level = None;
+    let mut texture_zstd_level = None;
     let mut fail_fast = false;
     let mut invalidate_cache = false;
     let mut verify_cache = true;
@@ -665,11 +788,30 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         match argument.to_str() {
+            Some("--mo2-instance") => {
+                mo2_instance = Some(PathBuf::from(next_value(&mut args, "--mo2-instance")?));
+            }
+            Some("--mo2-profile") => {
+                mo2_profile = Some(
+                    next_value(&mut args, "--mo2-profile")?
+                        .into_string()
+                        .map_err(|_| color_eyre::eyre::eyre!("--mo2-profile must be UTF-8"))?,
+                );
+            }
             Some("--report-json") => {
                 report_json = Some(PathBuf::from(next_value(&mut args, "--report-json")?))
             }
             Some("--resume-staging") => {
                 resume_staging = Some(PathBuf::from(next_value(&mut args, "--resume-staging")?))
+            }
+            Some("--plugins-file") => {
+                plugins_file = Some(next_path_value(&mut args, "--plugins-file")?)
+            }
+            Some("--skyrim-ccc-file") => {
+                skyrim_ccc_file = Some(next_path_value(&mut args, "--skyrim-ccc-file")?)
+            }
+            Some("--skyrim-ini-file") => {
+                skyrim_ini_file = Some(next_path_value(&mut args, "--skyrim-ini-file")?)
             }
             Some("--reuse-assets") => {
                 reuse_assets = Some(PathBuf::from(next_value(&mut args, "--reuse-assets")?))
@@ -706,6 +848,22 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
                     "--gpu-batch-mb",
                 )?);
             }
+            Some(option @ ("--texture-fallback-quality" | "--texture-etc1s-quality")) => {
+                texture_fallback_quality =
+                    Some(
+                        parse_encoding_value(next_value(&mut args, option)?, option, 1, 255)? as u8,
+                    );
+            }
+            Some(option @ "--texture-uastc-level") => {
+                texture_uastc_level =
+                    Some(parse_encoding_value(next_value(&mut args, option)?, option, 0, 4)? as u8);
+            }
+            Some(option @ "--texture-zstd-level") => {
+                texture_zstd_level =
+                    Some(
+                        parse_encoding_value(next_value(&mut args, option)?, option, 0, 22)? as i32,
+                    );
+            }
             Some("--fail-fast") => fail_fast = true,
             Some("--invalidate-cache") => invalidate_cache = true,
             Some("--no-verify-cache") => verify_cache = false,
@@ -719,6 +877,15 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     if positional.is_empty() || positional.len() > 2 {
         bail!(usage());
     }
+    if (skyrim_ccc_file.is_some() || skyrim_ini_file.is_some()) && plugins_file.is_none() {
+        bail!("--skyrim-ccc-file and --skyrim-ini-file require --plugins-file");
+    }
+    if reuse_assets.is_some() && plugins_file.is_some() {
+        bail!("--reuse-assets uses recorded plugin order and cannot use --plugins-file");
+    }
+    if mo2_instance.is_some() && plugins_file.is_some() {
+        bail!("--mo2-instance cannot be combined with --plugins-file");
+    }
     let texture_encoder = if use_gpu {
         TextureEncoder::Gpu {
             quality: gpu_quality.unwrap_or(converter::texture_gpu::DEFAULT_QUALITY),
@@ -730,23 +897,70 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         }
         TextureEncoder::Cpu
     };
+    let mo2 = match mo2_instance {
+        Some(instance_path) => {
+            let instance = mo2::Instance::open(&instance_path)?;
+            let profile = mo2_profile.unwrap_or_else(|| {
+                instance
+                    .selected_profile
+                    .clone()
+                    .unwrap_or_else(|| instance.profiles[0].clone())
+            });
+            instance.profile_dir(&profile)?;
+            Some(mo2::Selection {
+                instance_path: instance.instance_path,
+                profile,
+            })
+        }
+        None => {
+            if mo2_profile.is_some() {
+                bail!("--mo2-profile requires --mo2-instance");
+            }
+            None
+        }
+    };
     Ok(Cli {
+        mo2,
         data: positional.remove(0),
         output: positional
             .pop()
             .unwrap_or_else(|| PathBuf::from("modern_assets")),
         resume_staging,
+        plugins_file,
+        skyrim_ccc_file,
+        skyrim_ini_file,
         reuse_assets,
         report_json,
         cpu_jobs,
         io_jobs,
         texture_encoder,
+        texture_fallback_quality,
+        texture_uastc_level,
+        texture_zstd_level,
         fail_fast,
         invalidate_cache,
         verify_cache,
         no_lod,
         verbose,
     })
+}
+
+/// Validate an encoding setting against its supported range.
+fn parse_encoding_value(value: OsString, option: &str, min: u32, max: u32) -> Result<u32> {
+    let value = parse_u32(value, option)?;
+    if !(min..=max).contains(&value) {
+        bail!("{option} must be between {min} and {max}");
+    }
+    Ok(value)
+}
+
+/// Require an explicit path without swallowing the next CLI flag.
+fn next_path_value(args: &mut impl Iterator<Item = OsString>, option: &str) -> Result<PathBuf> {
+    let value = next_value(args, option)?;
+    if value.to_string_lossy().starts_with('-') {
+        bail!("{option} requires a path value before the next option");
+    }
+    Ok(PathBuf::from(value))
 }
 
 fn next_value(args: &mut impl Iterator<Item = OsString>, option: &str) -> Result<OsString> {
@@ -784,11 +998,43 @@ fn parse_u64(value: OsString, option: &str) -> Result<u64> {
 fn usage() -> &'static str {
     "usage: converter <Skyrim Data> [output directory] [--cpu-jobs N] [--io-jobs N] [--fail-fast]
                  [--texture-encoder cpu|gpu] [--gpu-quality N] [--gpu-batch-mb N]
+                 [--texture-fallback-quality 1..255] [--texture-uastc-level 0..4]
+                 [--texture-zstd-level 0..22]
                  [--invalidate-cache] [--no-verify-cache] [--resume-staging DIR]
                  [--report-json FILE] [--verbose] [--reuse-assets DIR] [--no-lod]
+                 [--mo2-instance DIR] [--mo2-profile NAME]
+                 [--plugins-file FILE] [--skyrim-ccc-file FILE] [--skyrim-ini-file FILE]
        converter check <output directory> [--full]
+       converter repair-failed <Skyrim Data> <output directory> [--mo2-instance DIR]
+                 [--mo2-profile NAME] [--no-lod] [--apply]
+                 [--texture-encoder cpu|gpu] [--gpu-quality N] [--gpu-batch-mb N]
+                 [--texture-fallback-quality 1..255] [--texture-uastc-level 0..4]
+                 [--texture-zstd-level 0..22]
+
+repair-failed stages only manifest failures and missing dependencies in a sibling repair directory.
+It never rebuilds the database or cell cache. --apply validates the pack's existing hashes,
+publishes validated repairs with backups, and updates the manifest last.
+Use the original conversion's encoding settings. --texture-etc1s-quality is an alias for
+--texture-fallback-quality; it does not select ETC1S encoding.
 
 Converts a Skyrim Data directory into runtime assets.
+--mo2-instance overlays enabled MO2 mods and overwrite over physical Data, using the profile's
+active plugins and loadorder.txt. --mo2-profile defaults to ModOrganizer.ini's selected_profile,
+or the first sorted profile if that selection is absent or stale.
+MO2 files are read only. Native SKSE DLLs and arbitrary mod compatibility are not supported.
+
+--plugins-file reads Windows-1252 player selection. Installed official masters and
+readable Skyrim.ccc Creations are always active. Missing or unreadable CCC activates
+installed Fish, Survival Mode, Rare Curios, Saints and Seducers and _ResourcePack,
+in that order, with a report warning. Readable CCC, including an empty file, wins.
+--skyrim-ccc-file overrides the game-folder CCC path. --skyrim-ini-file explicitly supplies General sTestFile settings; no
+ambient profile is read. Without --plugins-file, automatic discovery orders plugins
+by dependency and skips unusable or ambiguously named plugins with bounded notices.
+The JSON report lists every recovery exclusion in skipped_plugins and surviving filenames
+in load_order; selection_warnings contains Creation fallback warnings separately from
+failed asset conversions. Archive companions match an exact plugin stem or a following
+space, dash or underscore. The longest installed owner must survive selection; unowned
+archives are admitted outside MO2 and excluded in MO2.
 
 --no-lod skips terrain LOD compilation in conversion and metadata rebuilds. Full-detail
 terrain and ordinary assets remain available. Omit it on a later run to build LOD.
@@ -816,6 +1062,104 @@ changing those source assets. This route cannot resume or cooperatively cancel."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verifies MO2 profile defaults, invalid selections, and selection retention in resume commands.
+    #[test]
+    fn mo2_cli_defaults_validates_and_preserves_selection_on_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        for folder in ["mods", "profiles/Zed", "profiles/Alpha", "overwrite"] {
+            fs::create_dir_all(dir.path().join(folder)).unwrap();
+        }
+        fs::write(
+            dir.path().join("ModOrganizer.ini"),
+            "[General]\ngameName=Skyrim\n",
+        )
+        .unwrap();
+        let instance = dir.path().to_str().unwrap();
+        let cli = parse_cli(args(&["Data", "out", "--mo2-instance", instance])).unwrap();
+        assert_eq!(cli.mo2.as_ref().unwrap().profile, "Alpha");
+        fs::write(
+            dir.path().join("ModOrganizer.ini"),
+            "[General]\ngameName=Skyrim\n[Settings]\nselected_profile=zed\n",
+        )
+        .unwrap();
+        let cli = parse_cli(args(&["Data", "out", "--mo2-instance", instance])).unwrap();
+        assert_eq!(cli.mo2.as_ref().unwrap().profile, "Zed");
+        let Command::Repair(repair, _) = parse_command(args(&[
+            "repair-failed",
+            "Data",
+            "out",
+            "--mo2-instance",
+            instance,
+        ]))
+        .unwrap() else {
+            panic!("expected repair");
+        };
+        assert_eq!(repair.pipeline_config().mo2.unwrap().profile, "Zed");
+        let explicit = parse_cli(args(&[
+            "Data",
+            "out",
+            "--mo2-instance",
+            instance,
+            "--mo2-profile",
+            "Alpha",
+        ]))
+        .unwrap();
+        assert_eq!(explicit.mo2.unwrap().profile, "Alpha");
+        let cli = parse_cli(args(&[
+            "Data",
+            "out",
+            "--mo2-instance",
+            instance,
+            "--mo2-profile",
+            "Zed",
+        ]))
+        .unwrap();
+        let resume = resume_command("converter", &cli, Path::new("out.staging-1-2"));
+        assert!(resume.contains("--mo2-instance"));
+        assert!(resume.ends_with("--mo2-profile \"Zed\""));
+        assert!(parse_cli(args(&["Data", "--mo2-profile", "Zed"])).is_err());
+        assert!(
+            parse_cli(args(&[
+                "Data",
+                "--mo2-instance",
+                instance,
+                "--mo2-profile",
+                "Missing"
+            ]))
+            .is_err()
+        );
+        assert!(parse_cli(args(&["Data", "--mo2-instance"])).is_err());
+        assert!(parse_cli(args(&["Data", "--mo2-profile"])).is_err());
+        fs::write(
+            dir.path().join("ModOrganizer.ini"),
+            "[General]\ngameName=Skyrim\n[Settings]\nselected_profile=Missing\n",
+        )
+        .unwrap();
+        let cli = parse_cli(args(&["Data", "--mo2-instance", instance])).unwrap();
+        assert_eq!(cli.mo2.unwrap().profile, "Alpha");
+    }
+
+    #[test]
+    fn repair_rejects_metadata_rebuild_options() {
+        let error = parse_command(args(&[
+            "repair-failed",
+            "Data",
+            "out",
+            "--reuse-assets",
+            "original",
+        ]))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("repair-failed accepts Data/output, MO2 selection, encoding options, --no-lod and --apply only")
+        );
+        assert!(matches!(
+            parse_command(args(&["repair-failed", "Data", "out", "--apply"])).unwrap(),
+            Command::Repair(_, true)
+        ));
+    }
 
     #[test]
     fn parses_metadata_rebuild_source() {
@@ -946,6 +1290,123 @@ mod tests {
     }
 
     #[test]
+    fn repair_preserves_conversion_encoding_config_and_resume_flags() {
+        for encoder in ["cpu", "gpu"] {
+            let mut options = vec![
+                "Data",
+                "output",
+                "--no-lod",
+                "--texture-fallback-quality",
+                "123",
+                "--texture-uastc-level",
+                "4",
+                "--texture-zstd-level",
+                "0",
+                "--texture-encoder",
+                encoder,
+            ];
+            if encoder == "gpu" {
+                options.extend(["--gpu-quality", "7", "--gpu-batch-mb", "64"]);
+            }
+            let conversion = parse_cli(args(&options)).unwrap();
+            let mut repair_args = vec!["repair-failed"];
+            repair_args.extend(options);
+            repair_args.push("--apply");
+            let Command::Repair(repair, apply) = parse_command(args(&repair_args)).unwrap() else {
+                panic!("repair was not parsed as a subcommand");
+            };
+            assert!(apply);
+            let config = repair.pipeline_config();
+            assert!(config.no_lod);
+            assert!(conversion.pipeline_config().no_lod);
+            assert!(config.lod_origins.is_empty());
+            assert_eq!(config.texture_fallback_quality, 123);
+            assert_eq!(config.texture_uastc_level, 4);
+            assert_eq!(config.texture_zstd_level, 0);
+            assert_eq!(
+                config.texture_encoder,
+                if encoder == "gpu" {
+                    TextureEncoder::Gpu {
+                        quality: 7,
+                        batch_mb: 64,
+                    }
+                } else {
+                    TextureEncoder::Cpu
+                }
+            );
+            assert_eq!(
+                converter::cache::configuration_hash(&config).unwrap(),
+                converter::cache::configuration_hash(&conversion.pipeline_config()).unwrap(),
+            );
+            let resume = resume_command("converter", &conversion, Path::new("staging"));
+            assert!(resume.contains("--texture-fallback-quality 123"));
+            assert!(resume.contains("--texture-uastc-level 4"));
+            assert!(resume.contains("--texture-zstd-level 0"));
+            assert!(resume.contains("--no-lod"));
+            let mut lod_config = config.clone();
+            lod_config.no_lod = false;
+            lod_config
+                .lod_origins
+                .insert("CustomWorld".into(), [-4, 12]);
+            assert_eq!(
+                converter::cache::configuration_hash(&config).unwrap(),
+                converter::cache::configuration_hash(&lod_config).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn encoding_defaults_alias_and_validation_apply_to_repair() {
+        let cli = parse_cli(args(&["Data"])).unwrap();
+        let expected = PipelineConfig::new("Data", "modern_assets");
+        let config = cli.pipeline_config();
+        assert_eq!(
+            config.texture_fallback_quality,
+            expected.texture_fallback_quality
+        );
+        assert_eq!(config.texture_uastc_level, expected.texture_uastc_level);
+        assert_eq!(config.texture_zstd_level, expected.texture_zstd_level);
+        let Command::Repair(cli, apply) = parse_command(args(&[
+            "repair-failed",
+            "Data",
+            "out",
+            "--texture-etc1s-quality",
+            "255",
+            "--texture-uastc-level",
+            "0",
+            "--texture-zstd-level",
+            "22",
+        ]))
+        .unwrap() else {
+            panic!("expected repair");
+        };
+        assert!(!apply);
+        assert_eq!(cli.pipeline_config().texture_fallback_quality, 255);
+        for (flag, value) in [
+            ("--texture-fallback-quality", "0"),
+            ("--texture-fallback-quality", "256"),
+            ("--texture-uastc-level", "5"),
+            ("--texture-zstd-level", "23"),
+            ("--texture-zstd-level", "-1"),
+            ("--texture-uastc-level", "bad"),
+            ("--gpu-quality", "2"),
+            ("--resume-staging", "staging"),
+            ("--cpu-jobs", "2"),
+        ] {
+            assert!(parse_command(args(&["repair-failed", "Data", "out", flag, value])).is_err());
+        }
+        for flag in [
+            "--texture-fallback-quality",
+            "--texture-uastc-level",
+            "--texture-zstd-level",
+            "--fail-fast",
+            "--invalidate-cache",
+        ] {
+            assert!(parse_command(args(&["repair-failed", "Data", "out", flag])).is_err());
+        }
+    }
+
+    #[test]
     fn parses_the_check_subcommand() {
         let Command::Check(check) = parse_command(args(&["check", "converted"])).unwrap() else {
             panic!("check was not parsed as a subcommand");
@@ -1024,18 +1485,100 @@ mod tests {
         );
     }
 
+    /// Selection inputs survive parsing and the command printed after interruption.
+    #[test]
+    fn explicit_plugin_paths_are_preserved_in_resume_commands() {
+        let cli = parse_cli(vec![
+            "Data".into(),
+            "--plugins-file".into(),
+            "player list.txt".into(),
+            "--skyrim-ccc-file".into(),
+            "game list.ccc".into(),
+            "--skyrim-ini-file".into(),
+            "test settings.ini".into(),
+        ])
+        .unwrap();
+        assert_eq!(cli.plugins_file, Some(PathBuf::from("player list.txt")));
+        assert_eq!(cli.skyrim_ccc_file, Some(PathBuf::from("game list.ccc")));
+        assert_eq!(
+            cli.skyrim_ini_file,
+            Some(PathBuf::from("test settings.ini"))
+        );
+        let config = cli.pipeline_config();
+        assert_eq!(config.plugins_file, cli.plugins_file);
+        assert_eq!(config.skyrim_ccc_file, cli.skyrim_ccc_file);
+        assert_eq!(config.skyrim_ini_file, cli.skyrim_ini_file);
+        let resumed = resume_command("converter", &cli, Path::new("modern_assets.staging-1"));
+        for pair in [
+            "--plugins-file \"player list.txt\"",
+            "--skyrim-ccc-file \"game list.ccc\"",
+            "--skyrim-ini-file \"test settings.ini\"",
+        ] {
+            assert!(resumed.contains(pair), "{resumed}");
+        }
+        for flag in ["--plugins-file", "--skyrim-ccc-file", "--skyrim-ini-file"] {
+            assert!(parse_cli(vec!["Data".into(), flag.into()]).is_err());
+            assert!(parse_cli(vec!["Data".into(), flag.into(), "--no-lod".into()]).is_err());
+        }
+        assert!(
+            parse_cli(args(&[
+                "Data",
+                "--plugins-file",
+                "plugins.txt",
+                "--mo2-instance",
+                "instance"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_command(args(&[
+                "repair-failed",
+                "Data",
+                "out",
+                "--plugins-file",
+                "plugins.txt"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_cli(vec![
+                "Data".into(),
+                "--skyrim-ini-file".into(),
+                "settings.ini".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_cli(vec![
+                "Data".into(),
+                "--plugins-file".into(),
+                "plugins.txt".into(),
+                "--reuse-assets".into(),
+                "old_assets".into()
+            ])
+            .is_err()
+        );
+    }
+
     /// The resume command repeats the paths, quotes them, and keeps the GPU encoder flags.
     #[test]
     fn names_the_exact_command_that_resumes_a_kept_staging_folder() {
         let cli = Cli {
+            mo2: None,
             data: PathBuf::from("C:/Games/Skyrim/Data"),
             output: PathBuf::from("C:/Modding/SkyrimConverted"),
             resume_staging: None,
+            plugins_file: None,
+            skyrim_ccc_file: None,
+            skyrim_ini_file: None,
             reuse_assets: None,
             report_json: None,
             cpu_jobs: None,
             io_jobs: None,
             texture_encoder: TextureEncoder::Cpu,
+            texture_fallback_quality: None,
+            texture_uastc_level: None,
+            texture_zstd_level: None,
             fail_fast: false,
             invalidate_cache: false,
             verify_cache: true,

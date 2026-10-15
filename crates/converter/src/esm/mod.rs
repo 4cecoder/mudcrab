@@ -18,8 +18,13 @@ pub mod extractors;
 pub mod load_order;
 pub mod lodsettings;
 pub mod mmap_reader;
+pub mod plugins_txt;
 pub mod records;
+pub mod rooms;
 pub mod types;
+pub use plugins_txt::{
+    OFFICIAL_MASTERS, read_plugins_txt, read_plugins_txt_with_options, read_skyrim_ccc,
+};
 
 pub struct EsmParser;
 
@@ -248,53 +253,6 @@ impl GameSettingIdentities {
     }
 }
 
-/// Read selected plugins from `data_dir`, normalizing master priority before merging.
-pub fn read_plugins_txt(path: &Path, data_dir: &Path) -> Result<Vec<PathBuf>> {
-    let contents = std::fs::read_to_string(path)?;
-    let mut plugins = Vec::new();
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        let enabled = line.starts_with('*');
-        let name = line.strip_prefix('*').unwrap_or(line).trim();
-        if !matches!(
-            Path::new(name)
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.to_ascii_lowercase())
-                .as_deref(),
-            Some("esm" | "esp" | "esl")
-        ) {
-            continue;
-        }
-        if !enabled && !name.to_ascii_lowercase().ends_with(".esm") {
-            continue;
-        }
-        let exact = data_dir.join(name);
-        if exact.is_file() {
-            plugins.push(exact);
-            continue;
-        }
-        if let Some(found) = std::fs::read_dir(data_dir)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|candidate| {
-                candidate
-                    .file_name()
-                    .is_some_and(|file| file.to_string_lossy().eq_ignore_ascii_case(name))
-            })
-        {
-            plugins.push(found);
-        } else {
-            color_eyre::eyre::bail!("active plugin not found: {name}");
-        }
-    }
-    // Normalize master priority before consumers assign slots or merge overrides (#108).
-    load_order::order_explicit_plugins(plugins)
-}
-
 /// Determines whether a subrecord within a given parent record type represents
 /// a 32-bit FormID that requires load-order remapping.
 ///
@@ -303,28 +261,37 @@ pub fn read_plugins_txt(path: &Path, data_dir: &Path) -> Result<Vec<PathBuf>> {
 /// physics arrays (`TREE` trunk flexibility), or RGBA color structures (`CLFM`/`AACT`)
 /// are not inadvertently overwritten as 4-byte FormIDs.
 fn is_form_id_subrecord(record_type: &[u8; 4], tag: &[u8], len: usize) -> bool {
-    if len != 4 || tag.len() < 4 {
+    let Ok(tag_4) = <&[u8; 4]>::try_from(tag) else {
+        return false;
+    };
+    // xEdit wbFaction: FormID, signed rank, three unused bytes. Only the
+    // leading FormID changes; the same SNAM tag on TES4/TREE has another layout.
+    if record_type == b"NPC_" && tag_4 == b"SNAM" {
+        return len == 8;
+    }
+    if len != 4 {
         return false;
     }
-    let tag_4: &[u8; 4] = tag[..4].try_into().unwrap();
     match (record_type, tag_4) {
         (b"TES4" | b"CLFM" | b"AACT", _) => false,
-        (b"TREE", b"CNAM") => false,
-        (b"TREE", b"SNAM" | b"PFIG") if len == 4 => true,
+        (b"TREE", b"SNAM" | b"PFIG") => true,
         (b"LTEX", b"TNAM" | b"GNAM" | b"MNAM") => true,
         (b"CELL", b"XCWT") => true,
         (b"WRLD", b"NAM2" | b"NAM3") => true,
-        (b"WRLD", b"WNAM" | b"CNAM" | b"RNAM" | b"TNAM") if len == 4 => true,
-        (b"CELL", b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL") if len == 4 => true,
-        (b"NPC_", b"RNAM" | b"CNAM" | b"INAM") if len == 4 => true,
-        (b"RACE", b"WKMV" | b"RNMV") if len == 4 => true,
-        (b"NPC_", b"SNAM") if len >= 4 => true,
+        // xEdit TES5Edit @ 9fb016884bec138ea6c7b872cec831537d464c3e defines
+        // WRLD.RNAM as mixed coordinate/reference rows (Common:10011-10038)
+        // and TNAM as a string (TES5:10708). Neither is a single FormID;
+        // nested RNAM reference remapping remains separate work.
+        (b"WRLD", b"WNAM" | b"CNAM") => true,
+        (b"CELL", b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL") => true,
+        (b"NPC_", b"RNAM" | b"CNAM" | b"INAM") => true,
+        (b"RACE", b"WKMV" | b"RNMV") => true,
         (
             b"REFR" | b"ACHR" | b"ACRE" | b"PGRE" | b"PMIS" | b"PHZD" | b"PARW" | b"PBAR" | b"PBEA"
             | b"PCON" | b"PFLA",
             b"NAME" | b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL",
-        ) if len == 4 => true,
-        (_, b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL") if len == 4 => true,
+        ) => true,
+        (_, b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL") => true,
         _ => false,
     }
 }
@@ -382,6 +349,15 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         // Image space, music, acoustic space, and the region a cell takes its sky and weather
         // from (`XCCM` names a REGN, not a climate).
         b"XCIM" | b"XCMO" | b"XCAS" | b"XCCM" if record_type == b"CELL" => Fixed(SINGLE),
+        // Room marker references (REFR only; `LNAM` and `INAM` mean other things on other
+        // record types): the rooms a portal joins, links between rooms, and a room's own
+        // lighting template and image space. `XPOD` is an array of (origin, destination)
+        // FormID pairs (xEdit 4.1.5f defs: `wbArray(XPOD, 'Portal Data', wbStruct('References',
+        // [wbFormIDCk('Origin'), wbFormIDCk('Destination')]))`), so every u32 is a FormID.
+        // The official masters only ever store one pair (8 bytes). Like every `Array`, a
+        // length that is not a multiple of the stride is dropped and reported.
+        b"XPOD" if record_type == b"REFR" => Array { stride: 4 },
+        b"XLRM" | b"LNAM" | b"INAM" if record_type == b"REFR" => Fixed(SINGLE),
         // Regions.
         b"XCLR" if record_type == b"CELL" => Array { stride: 4 },
         _ => return None,
@@ -424,7 +400,7 @@ fn remap_record_form_ids(
             warnings.out_of_range(plugin_name, form_id, record_type);
         }
         let owner = if local_index < masters.len() {
-            masters[local_index].to_ascii_lowercase()
+            shared::plugin_selection::normalize_plugin_name(&masters[local_index])
         } else {
             plugin_name.to_owned()
         };
