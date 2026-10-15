@@ -357,6 +357,8 @@ pub fn build_merged_terrain(
     for skipped in &mut array_report.skipped {
         skipped.source = relative_path(staging, Path::new(&skipped.source));
     }
+    // The source was chosen before the arrays were built; say what survived building them.
+    let default_texture_source = reconcile_default_source(default_texture_source, &array_report);
     let mut warnings = land_warnings;
     warnings.extend(array_report.warnings());
     for skipped in &pre_skipped {
@@ -757,6 +759,49 @@ fn default_source(
             normal: normal.take(),
         },
     ))
+}
+
+/// What the default texture really is once the arrays are built. [`default_source`] decides from
+/// the paths alone, before the array builder opens a file: a converted default that is missing or
+/// unreadable makes the builder fall back to the generated white texture, and an unreadable normal
+/// map is dropped. The report must say so, or it would claim a `skyrim-ini` default that is not in
+/// the arrays. `report` has its source paths relative to the staging folder, as the report's do.
+fn reconcile_default_source(
+    source: DefaultTextureSource,
+    report: &crate::terrain_arrays::ArrayReport,
+) -> DefaultTextureSource {
+    let DefaultTextureSource::SkyrimIni {
+        ini,
+        diffuse,
+        normal,
+    } = source
+    else {
+        return source;
+    };
+    let skipped_for = |path: &str| report.skipped.iter().find(|skipped| skipped.source == path);
+    if matches!(report.default_texture, DefaultTexture::White) {
+        let reason = skipped_for(&diffuse).map_or_else(
+            || "the converted default land texture could not be used".to_owned(),
+            |skipped| {
+                format!(
+                    "the default land texture was left out of the arrays: {}",
+                    skipped.reason
+                )
+            },
+        );
+        return DefaultTextureSource::SkyrimIniFallback {
+            ini,
+            diffuse,
+            normal,
+            reason,
+        };
+    }
+    let normal = normal.filter(|normal| skipped_for(normal).is_none());
+    DefaultTextureSource::SkyrimIni {
+        ini,
+        diffuse,
+        normal,
+    }
 }
 
 /// The `[Landscape]` defaults a `skyrim-ini` run resolved, still as Bethesda DDS paths.
@@ -1460,6 +1505,97 @@ mod tests {
             )
             .unwrap(),
             "a master list change moves every FormID the record means"
+        );
+    }
+
+    fn report_with(
+        default_texture: DefaultTexture,
+        skipped: Vec<SkippedTexture>,
+    ) -> crate::terrain_arrays::ArrayReport {
+        crate::terrain_arrays::ArrayReport {
+            default_texture,
+            arrays: Vec::new(),
+            textures: Vec::new(),
+            skipped,
+        }
+    }
+
+    fn skyrim_ini_source() -> DefaultTextureSource {
+        DefaultTextureSource::SkyrimIni {
+            ini: None,
+            diffuse: "textures/landscape/dirt02.ktx2".to_owned(),
+            normal: Some("textures/landscape/dirt02_n.ktx2".to_owned()),
+        }
+    }
+
+    fn skipped_default(
+        path: &str,
+        usage: shared::terrain_mesh::LandTextureUsage,
+    ) -> SkippedTexture {
+        SkippedTexture {
+            ltex_form_id: 0,
+            usage,
+            source: path.to_owned(),
+            reason: "unreadable".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_default_the_builder_used_keeps_its_skyrim_ini_source() {
+        let report = report_with(DefaultTexture::Provided { ltex_form_id: 0 }, Vec::new());
+        assert_eq!(
+            reconcile_default_source(skyrim_ini_source(), &report),
+            skyrim_ini_source()
+        );
+    }
+
+    #[test]
+    fn a_default_diffuse_the_builder_dropped_is_reported_as_the_white_fallback() {
+        use shared::terrain_mesh::LandTextureUsage;
+        let report = report_with(
+            DefaultTexture::White,
+            vec![skipped_default(
+                "textures/landscape/dirt02.ktx2",
+                LandTextureUsage::DiffuseSrgb,
+            )],
+        );
+        match reconcile_default_source(skyrim_ini_source(), &report) {
+            DefaultTextureSource::SkyrimIniFallback {
+                reason, diffuse, ..
+            } => {
+                assert!(reason.contains("unreadable"), "{reason}");
+                assert_eq!(diffuse, "textures/landscape/dirt02.ktx2");
+            }
+            other => panic!("expected the white fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_default_normal_the_builder_dropped_is_cleared_from_the_source() {
+        use shared::terrain_mesh::LandTextureUsage;
+        let report = report_with(
+            DefaultTexture::Provided { ltex_form_id: 0 },
+            vec![skipped_default(
+                "textures/landscape/dirt02_n.ktx2",
+                LandTextureUsage::NormalLinear,
+            )],
+        );
+        assert_eq!(
+            reconcile_default_source(skyrim_ini_source(), &report),
+            DefaultTextureSource::SkyrimIni {
+                ini: None,
+                diffuse: "textures/landscape/dirt02.ktx2".to_owned(),
+                normal: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_white_default_source_needs_no_reconciling() {
+        let report = report_with(DefaultTexture::White, Vec::new());
+        assert_eq!(
+            reconcile_default_source(DefaultTextureSource::White, &report),
+            DefaultTextureSource::White
         );
     }
 }

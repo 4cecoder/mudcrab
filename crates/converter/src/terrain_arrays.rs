@@ -95,8 +95,6 @@ const ZSTD_LEVEL: i32 = 6;
 const WHITE_SIDE: u32 = 4;
 /// The largest mip depth a KTX2 level index can address.
 const MAX_MIP_DEPTH: u32 = u32::BITS;
-/// Alignment of each level's data in an array file.
-const LEVEL_ALIGNMENT: u64 = 16;
 
 /// One land texture of the mod list: an LTEX record's diffuse file and, if the texture set has
 /// one, its normal map. Both are converted `.ktx2` files under the output root.
@@ -1515,8 +1513,10 @@ impl ArrayWriter {
         // Smallest level first in the file, so the last level gets the lowest offset.
         let mut offsets = vec![0u64; finished.len()];
         let mut cursor = dfd_offset as u64 + u64::from(dfd_length);
+        // The levels are Zstandard-supercompressed, and KTX2 requires an alignment of 1 for
+        // supercompressed data: each level starts exactly where the previous one ends, with no
+        // padding between payloads.
         for level in (0..finished.len()).rev() {
-            cursor = cursor.next_multiple_of(LEVEL_ALIGNMENT);
             offsets[level] = cursor;
             cursor += finished[level].compressed;
         }
@@ -2830,21 +2830,27 @@ mod tests {
         assert!(entries[0].2 > entries[4].2);
         // The offsets increase from the last level to level 0: the smallest mip comes first in
         // the file, and the first level data starts after the descriptor.
+        // Supercompressed levels are packed with no gaps (KTX2 alignment 1): each starts exactly
+        // where the previous one ends, and the first starts right after the descriptor.
         for level in (0..5).rev() {
             let (offset, length, _) = entries[level + 1];
-            assert!(
-                entries[level].0 >= offset + length,
-                "level {level} starts at {}, before level {} ends at {}",
+            assert_eq!(
                 entries[level].0,
-                level + 1,
-                offset + length
+                offset + length,
+                "level {level} must start where level {} ends",
+                level + 1
             );
         }
-        assert!(entries[5].0 >= dfd_end);
+        assert_eq!(entries[5].0, dfd_end);
         for (offset, length, _) in &entries {
-            assert!(offset.is_multiple_of(LEVEL_ALIGNMENT));
             assert!(offset + length <= bytes.len() as u64);
         }
+        let (last_offset, last_length, _) = entries[0];
+        assert_eq!(
+            last_offset + last_length,
+            bytes.len() as u64,
+            "no trailing bytes"
+        );
         // And the reader still pairs every index entry with its own data.
         let (_, levels) = read_ktx2(&dir.path().join(&table.arrays[0].path));
         assert_eq!(
