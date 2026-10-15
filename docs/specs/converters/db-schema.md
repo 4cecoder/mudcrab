@@ -38,7 +38,8 @@ from TX04 and `environment_path` from TX05. TX00 and TX01 provide diffuse and
 normal paths. Both frontends project TX06 into `detail_path` and TX07 into
 `specular_path`, as documented above. Schema 9 also
 projects only XESP byte 4 into `enable_parent_flags`. Separate candidate fixes
-used producer 25/world 8 for different contracts; combined output uses 26/9.
+used producer 25/world 8 for different contracts; the combined output first shipped
+as 26/9, and producer 27 keeps world schema 9.
 The engine, `world-inspect` and launcher accept world schemas **3 through 9**, using
 `shared::supports_runtime_world_database_schema`. Complete converter packages
 support schemas **15 through 27**. Legacy worlds render full detail without
