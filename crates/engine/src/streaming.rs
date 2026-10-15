@@ -766,6 +766,7 @@ fn despawn_subtree(world: &mut World, root: Entity) -> usize {
     entities
 }
 
+/// Collect database responses, reject stale generations and commit cells within the shared budget.
 #[allow(clippy::too_many_arguments)]
 fn collect_cells(
     mut commands: Commands,
@@ -815,9 +816,13 @@ fn collect_cells(
         metrics.total_rows_loaded = metrics
             .total_rows_loaded
             .saturating_add(response.row_count as u64);
-        profiler.record_micros("streaming/db_queue_wait", response.queue_wait_micros);
-        profiler.record_micros("streaming/db_query", response.query_micros);
-        profiler.record_micros("streaming/db_request_total", response.total_request_micros);
+        profiler
+            .record_completed_latency_micros("streaming/db_queue_wait", response.queue_wait_micros);
+        profiler.record_completed_latency_micros("streaming/db_query", response.query_micros);
+        profiler.record_completed_latency_micros(
+            "streaming/db_request_total",
+            response.total_request_micros,
+        );
         let Some(CellStatus::Loading { generation }) = streaming.cells.get(&response.key) else {
             metrics.stale_responses += 1;
             profiler.event(format!("{:?}", response.key), "stale_discarded", None);
@@ -992,6 +997,7 @@ fn cell_within_unload_radius(key: CellKey, center: IVec2, radius: i32) -> bool {
     }
 }
 
+/// Build a cell hierarchy and request its model scenes, recording their IDs for optional tracing.
 #[allow(clippy::too_many_arguments)]
 fn spawn_cell(
     commands: &mut Commands,
@@ -1232,13 +1238,11 @@ fn spawn_cell(
                 model_loads += 1;
                 let sequence = *model_sequence;
                 *model_sequence = model_sequence.saturating_add(1);
+                let handle = asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.clone()));
+                profiler.observe_scene(handle.id(), asset_server);
                 entity.insert((
                     MeshHandle(path.clone()),
-                    PendingModel {
-                        handle: asset_server
-                            .load(GltfAssetLabel::Scene(0).from_asset(path.clone())),
-                        sequence,
-                    },
+                    PendingModel { handle, sequence },
                     PendingAssetProfile {
                         started: Instant::now(),
                         scene_spawned: false,
@@ -1792,6 +1796,7 @@ fn mark_world_instance_ready(
     }
 }
 
+/// Validate spawned model instances, account for failures and record completed readiness latency.
 #[allow(clippy::too_many_arguments)]
 fn track_asset_readiness(
     mut commands: Commands,
@@ -2026,7 +2031,7 @@ fn track_asset_readiness(
                 .saturating_add(transform_summary.nodes as u64);
             metrics.bounds_validated = metrics.bounds_validated.saturating_add(1);
             metrics.max_asset_ready_micros = metrics.max_asset_ready_micros.max(micros);
-            profiler.record_micros("assets/model_ready", micros);
+            profiler.record_completed_latency_micros("assets/model_ready", micros);
             profiler.event(&pending.path, "asset_ready", Some(micros as f64 / 1000.0));
             commands.entity(entity).remove::<PendingAssetProfile>();
             completed_this_scan += 1;
