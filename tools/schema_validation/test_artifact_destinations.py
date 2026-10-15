@@ -1,7 +1,7 @@
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +12,16 @@ import run_mutagen_p0
 import run_xedit_p0
 
 
+@contextmanager
+def configured_environment(values):
+    # Keep PATH and Windows process-launch variables while isolating root config.
+    with mock.patch.dict(os.environ):
+        for name in p0_tools.PROTECTED_ROOT_ENVIRONMENT:
+            os.environ.pop(name, None)
+        os.environ.update(values)
+        yield
+
+
 class ConfiguredArtifactDestinationTests(unittest.TestCase):
     def test_configured_external_roots_reject_descendants_and_ancestors(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -19,7 +29,7 @@ class ConfiguredArtifactDestinationTests(unittest.TestCase):
             for name in p0_tools.PROTECTED_ROOT_ENVIRONMENT:
                 protected = root / name / "source"
                 protected.mkdir(parents=True)
-                with self.subTest(name=name), mock.patch.dict(os.environ, {name: str(protected)}, clear=True):
+                with self.subTest(name=name), configured_environment({name: str(protected)}):
                     for candidate in (protected, protected / "artifacts", protected.parent):
                         with self.subTest(candidate=candidate), self.assertRaisesRegex(
                             p0_tools.QualificationError, "protected path"
@@ -38,7 +48,7 @@ class ConfiguredArtifactDestinationTests(unittest.TestCase):
                 alias.symlink_to(protected, target_is_directory=True)
             except OSError as exc:
                 self.skipTest(f"directory symlinks unavailable: {exc}")
-            with mock.patch.dict(os.environ, {"MCRAB_STORE": str(alias)}, clear=True):
+            with configured_environment({"MCRAB_STORE": str(alias)}):
                 with self.assertRaisesRegex(p0_tools.QualificationError, "protected path"):
                     p0_tools.validate_artifact_destination(protected / "artifacts", root / "oracle")
             self.assertFalse((protected / "artifacts").exists())
@@ -46,9 +56,7 @@ class ConfiguredArtifactDestinationTests(unittest.TestCase):
     def test_empty_or_relative_configuration_fails_closed(self):
         for name in p0_tools.PROTECTED_ROOT_ENVIRONMENT:
             for value in ("", " ", "relative/store"):
-                with self.subTest(name=name, value=value), mock.patch.dict(
-                    os.environ, {name: value}, clear=True
-                ):
+                with self.subTest(name=name, value=value), configured_environment({name: value}):
                     with self.assertRaisesRegex(p0_tools.QualificationError, "absolute protected directory"):
                         p0_tools.validate_artifact_destination(Path("/unused/artifacts"), Path("/unused/oracle"))
 
