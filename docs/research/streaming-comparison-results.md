@@ -2,7 +2,7 @@
 
 Keep **static 64** for the current Mac test app. Adaptive mode consistently delayed complete CPU settlement and nearby streaming work. It reduced long-frame excess during rapid travel, but did not demonstrate a normal-travel benefit. It fails the default-selection rules fixed before the campaign.
 
-The launcher's current settings already use static 64, with spatial priority enabled. Adaptive pacing remains available for experiments. The primary comparison uses static ceilings of 64 scene jobs, 32 activations and 16 MiB uploads per frame, versus adaptive ceilings of 128, 96 and 32 MiB with the safeguard package enabled. Actual adaptive budgets can be smaller.
+Static 64 with spatial priority enabled is the recommendation from the measured Mac configuration. The repository launcher passes only `--assets`; the engine defaults remain `max_scene_loads: 0` (unlimited) and `prioritize_streaming: false`. This PR does not change those defaults. Adaptive pacing remains opt-in. The primary comparison uses static ceilings of 64 scene jobs, 32 activations and 16 MiB uploads per frame, versus adaptive ceilings of 128, 96 and 32 MiB with the safeguard package enabled. Actual adaptive budgets can be smaller.
 
 We completed 32 main native launches. The analysis uses five matched normal-route pairs, five fast-route pairs and three clean three-mode control blocks. Three original control runs remain visible but excluded because another Cargo build overlapped one arm. Four earlier smoke launches are separate. See the [protocol](streaming-comparison-protocol.md), [analysis notes](streaming-comparison-analysis-notes.md), [per-run data](streaming-comparison-runs-20261010.csv) and [interactive results](streaming-comparison-results-20261010.html).
 
@@ -90,38 +90,53 @@ Independent validation covered all 110,799 trace frames: matching binary/input i
 
 ## Reproduce and inspect
 
-The measured native binary has SHA-256 `f79b1db0eb14e25155c9812759c705b03366cf822e4dd9a3281212de327227a7`. Its receipt records base commit `5ac1bc92b7018f8f627c1ff8c4d2d27a5e24d697`, source overlays and the native sampler patch. Raw logs, reports, full traces, RSS, host snapshots, the frozen protocol/runner and the preserved original manifest remain in `/private/tmp/mudcrab-streaming-comparison-main-20261010`. A verified copy of the main and smoke artifacts, native build sources and binary, cost catalog and thermal-probe source is saved locally at `target/streaming-comparison/evidence-20261010.tar.gz`. The archive is ignored by Git; its SHA-256 is `9c0592b34fb0e17836de12dbc0b2bbaba107562d6d465eeaaa0058ba64dd9e59`. The report, selected CSV and interactive results are versioned separately.
+The measured native binary has SHA-256 `f79b1db0eb14e25155c9812759c705b03366cf822e4dd9a3281212de327227a7`. Its receipt records base commit `5ac1bc92b7018f8f627c1ff8c4d2d27a5e24d697`, source overlays and the native sampler patch. At capture time, raw logs, reports, full traces, RSS, host snapshots, the frozen protocol/runner and the original manifest were stored in `/private/tmp/mudcrab-streaming-comparison-main-20261010`. A verified copy of the main and smoke artifacts, native build sources and binary, cost catalog and thermal-probe source was archived locally at `target/streaming-comparison/evidence-20261010.tar.gz`. Its SHA-256 is `9c0592b34fb0e17836de12dbc0b2bbaba107562d6d465eeaaa0058ba64dd9e59`. These paths record historical provenance, not locations supplied by a checkout.
 
-Build cleanup removes the temporary compiler caches, staged app copies and `/private/tmp/mudcrab-streaming-comparison-build-20261010`; it preserves the installed app and evidence archive. To restore the measured binary, extract that archive member into its original directory. The retained run manifests use absolute paths. If the raw bundles, cost catalog or probe source are also absent, restore their corresponding members first.
+The archive is ignored by Git and has no published download in this PR. A checkout supplies the report, selected CSV, analysis notes and interactive results, but not the measured binary, converted pack, cost catalog, probe source or full raw bundles. Reproducing the historical analysis requires access to the retained evidence; the versioned summaries alone are insufficient. A new campaign requires a compatible binary and matching pack/catalog, and measures that configuration rather than reproducing the historical binary's results.
+
+The recorded cleanup plan removes temporary compiler caches, staged app copies and `/private/tmp/mudcrab-streaming-comparison-build-20261010`, while preserving the installed app and evidence archive. If the archive is available, set its location and an existing extraction directory before restoring the measured build:
 
 ```sh
-tar -xzf target/streaming-comparison/evidence-20261010.tar.gz \
-  -C /private/tmp mudcrab-streaming-comparison-build-20261010
+EVIDENCE_ARCHIVE=/absolute/path/to/evidence-20261010.tar.gz
+RESTORE_ROOT=/absolute/path/to/existing/restore-directory
 
-swiftc /private/tmp/mudcrab-thermal-state.swift \
-  -o /private/tmp/mudcrab-thermal-state
+tar -xzf "$EVIDENCE_ARCHIVE" \
+  -C "$RESTORE_ROOT" mudcrab-streaming-comparison-build-20261010
 ```
 
-The archive includes the thermal probe's source, not its compiled executable. The results describe the archived binary; subsequent parent integrations and documentation changes are checked separately and were not benchmarked again.
+Restore raw bundles, the cost catalog and probe source from their corresponding archive members if needed. Retained run manifests use absolute paths; historical analysis requires their original layout. Extracting the build alone does not restore those inputs. The archive includes the thermal probe's source, not its compiled executable. The results describe the archived binary; subsequent parent integrations and documentation changes are checked separately and were not benchmarked again.
 
-To repeat on this Mac, use a new output directory and the matching pack/catalog:
+The native runner requires macOS: host monitoring uses `pmset`, `sysctl`, `ps` and POSIX process groups. On a Mac, replace every path placeholder below with an absolute path. Use the measured binary and matching inputs when available, or record the source commit and build receipt for the binary being tested. The runner's fixed startup counts must match the pack specified by the protocol. Choose an output directory that does not yet exist. Compile the optional thermal probe from retained source. If that source is unavailable, omit both the `swiftc` command and `--thermal-probe`:
 
 ```sh
+ENGINE=/absolute/path/to/engine
+ASSETS=/absolute/path/to/matching/modern_assets
+COSTS=/absolute/path/to/matching/streaming-costs.json
+OUTPUT=/absolute/path/to/new/comparison-output
+SOURCE_COMMIT='<source-commit-from-build-receipt>'
+THERMAL_SOURCE=/absolute/path/to/mudcrab-thermal-state.swift
+THERMAL_PROBE=/absolute/path/to/mudcrab-thermal-state
+
+swiftc "$THERMAL_SOURCE" -o "$THERMAL_PROBE"
+
 python3 -B scripts/compare-streaming-modes.py \
-  --engine /private/tmp/mudcrab-streaming-comparison-build-20261010/engine \
-  --assets /Users/taylor/Projects/mudcrab/modern_assets \
-  --costs /private/tmp/mudcrab-streaming-costs-20261010-02.json \
-  --output /private/tmp/mudcrab-streaming-comparison-repeat \
-  --commit 5ac1bc92b7018f8f627c1ff8c4d2d27a5e24d697 \
-  --thermal-probe /private/tmp/mudcrab-thermal-state
+  --engine "$ENGINE" \
+  --assets "$ASSETS" \
+  --costs "$COSTS" \
+  --output "$OUTPUT" \
+  --commit "$SOURCE_COMMIT" \
+  --thermal-probe "$THERMAL_PROBE"
 ```
 
-To regenerate the analysis:
+To regenerate analysis from a complete campaign, set the experiment path and analysis output directory. For a newly completed campaign, `EXPERIMENT` is `$OUTPUT/experiment.json`:
 
 ```sh
+EXPERIMENT=/absolute/path/to/campaign/experiment.json
+ANALYSIS_OUTPUT=/absolute/path/to/analysis-output
+
 python3 -B scripts/analyze-streaming-comparison.py \
-  --experiment /private/tmp/mudcrab-streaming-comparison-main-20261010/experiment.json \
-  --output-dir /private/tmp/mudcrab-streaming-comparison-main-20261010/analysis \
+  --experiment "$EXPERIMENT" \
+  --output-dir "$ANALYSIS_OUTPUT" \
   --bootstrap-samples 10000 --seed 20261010
 ```
 

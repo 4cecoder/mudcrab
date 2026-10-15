@@ -70,6 +70,7 @@ runner.run_one(args, {{'cache_policy': 'test'}}, run, lambda: {{}})
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 start_new_session=True)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_sigterm_cleans_owned_game_and_preserves_other_process(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "run"
@@ -99,6 +100,7 @@ runner.run_one(args, {{'cache_policy': 'test'}}, run, lambda: {{}})
                 RUNNER.stop_owned_process(controller)
                 RUNNER.stop_owned_process(other)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_timeout_is_retained_and_owned_child_is_reaped(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "run"
