@@ -1371,6 +1371,8 @@ mod world_startup_tests {
         ))
         .init_resource::<ProfilingState>()
         .init_resource::<StreamingMetrics>()
+        // Rapier's debug-render system validates Gizmos even when disabled.
+        .add_plugins(bevy::gizmos::GizmoPlugin)
         .add_plugins((WorldPlayerPlugin, crate::console::ConsolePlugin))
         .add_systems(Startup, |mut commands: Commands| {
             commands.spawn((
