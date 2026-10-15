@@ -72,7 +72,7 @@ fn hash(root: &[u8], extension: &[u8]) -> u64 {
         b".nif" => 0x8000,
         b".dds" => 0x8080,
         b".wav" => 0x8000_0000,
-        b".adp" => 0x0000_3000,
+        b".adp" => 0x8000_8000,
         _ => 0,
     };
     let high = middle.wrapping_add(crc(extension));
@@ -124,6 +124,16 @@ mod tests {
         assert_eq!(file_hash(b"keyboard_english.txt"), 0x1fdc_44b0_6b10_7368);
         assert_eq!(file_hash(b"gamepad.txt"), 0x6cf7_7259_6707_6164);
         assert_eq!(file_hash(b"controlmap.txt"), 0xafb8_af35_630a_6170);
+    }
+
+    /// The `.adp` extension adds 0x8000_8000 (extension index 5 sets the top bit of the first
+    /// byte and bit 15), worked out by hand from the published extension-index transform. The
+    /// low word of `voice.adp` is the stem word for `voice` (0x7605_6365) with that added.
+    #[test]
+    fn adp_files_use_the_extension_index_bits() {
+        assert_eq!(file_hash(b"voice.adp") as u32, 0xf605_e365);
+        assert_eq!(file_hash(b"voice.wav") as u32, 0xf605_6365);
+        assert_eq!(file_hash(b"voice.nif") as u32, 0x7605_e365);
     }
 
     #[test]

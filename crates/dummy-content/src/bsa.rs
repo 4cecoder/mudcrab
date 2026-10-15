@@ -242,7 +242,7 @@ fn name_hash(name: &str, split_extension: bool) -> u64 {
         b".nif" => 0x8000,
         b".dds" => 0x8080,
         b".wav" => 0x8000_0000,
-        b".adp" => 0x0000_3000,
+        b".adp" => 0x8000_8000,
         _ => 0,
     };
     u64::from(middle.wrapping_add(crc(extension))) << 32 | u64::from(low)
