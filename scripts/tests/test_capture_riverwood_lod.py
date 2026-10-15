@@ -71,7 +71,7 @@ def make_package(package):
         package / "assets/lod-manifest.json",
         {
             "converter_schema": 27,
-            "world_database_schema": 7,
+            "world_database_schema": 9,
             "build_identity": identity,
             "chunks": 1,
         },
@@ -82,11 +82,11 @@ def make_package(package):
     )
     write_json(
         package / "assets/integration-report.json",
-        {"schema_version": 7, "passed": True},
+        {"schema_version": 9, "passed": True},
     )
     with sqlite3.connect(package / "assets/skyrim_world.db") as database:
         database.execute("CREATE TABLE schema_info(version INTEGER NOT NULL)")
-        database.execute("INSERT INTO schema_info(version) VALUES (7)")
+        database.execute("INSERT INTO schema_info(version) VALUES (9)")
         database.execute(
             "CREATE TABLE lod_build(id INTEGER PRIMARY KEY, build_identity TEXT NOT NULL)"
         )
