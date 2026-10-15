@@ -1096,6 +1096,7 @@ type TeleportBodyQuery<'w, 's> = Query<
 /// Applies [`TeleportPlayer`]: places the body, zeroes its velocity and walk state (so a fall in
 /// progress does not carry over), and sets the camera and look yaw. In NOCLIP the body is
 /// disabled and left alone: only the camera moves.
+#[allow(clippy::too_many_arguments)]
 fn apply_teleport_player(
     mut teleports: MessageReader<TeleportPlayer>,
     mut hold: ResMut<WalkSpawnHold>,
