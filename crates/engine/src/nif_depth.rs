@@ -13,6 +13,8 @@ pub const DEPTH_TEST: u32 = 1 << 31;
 pub const DEPTH_WRITE: u32 = 1;
 pub const DECAL: u32 = 1 << 26;
 pub const DYNAMIC_DECAL: u32 = 1 << 27;
+// SkyrimShaderPropertyFlags1, vendor/project-wormhole-nif/src/nif_flags.rs.
+pub const CAST_SHADOWS: u32 = 1 << 9;
 
 // A small raster offset in reversed-Z depth units, scoped to authored decals. This is a
 // renderer policy tested on the GPU, not a recovered Skyrim numeric bias or a mesh offset.
@@ -20,6 +22,8 @@ pub const DECAL_DEPTH_BIAS: i32 = 4;
 // Skyrim SE 1.7.104.0 raster modes 6/8 use -0.65 in forward Z. Reverse the sign
 // for Bevy's reversed Z. Native viewport offsets and constant units depend on
 // its camera/depth convention; those are not copied as numeric parity here.
+// The native -100 clamp is not ported either: preserve the pipeline's clamp
+// (normally 0, unclamped). Grazing-angle occlusion remains a validation gate.
 pub const DECAL_SLOPE_BIAS: f32 = 0.65;
 
 pub type NifDepthMaterial = ExtendedMaterial<StandardMaterial, NifDepthExtension>;
@@ -30,6 +34,7 @@ pub struct NifDepthState {
     pub depth_write: bool,
     pub decal: bool,
     pub alpha_mask: bool,
+    pub cast_shadows: bool,
 }
 
 impl NifDepthState {
@@ -47,6 +52,7 @@ impl NifDepthState {
             depth_write,
             decal,
             alpha_mask: matches!(alpha_mode, AlphaMode::Mask(_)),
+            cast_shadows: flags_1 & CAST_SHADOWS != 0,
         })
     }
 
@@ -64,7 +70,7 @@ impl NifDepthState {
     }
 
     pub fn excludes_shadow(&self) -> bool {
-        self.decal || !self.depth_test
+        !self.cast_shadows
     }
 }
 
@@ -98,8 +104,8 @@ impl MaterialExtension for NifDepthExtension {
         _layout: &MeshVertexBufferLayoutRef,
         key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
-        // Shadow depth belongs to the light, not the authored camera depth state. Decals and
-        // depth-disabled effects are excluded as casters on their spawned mesh entities.
+        // Shadow depth belongs to the light, not the authored camera depth state.
+        // Spawned mesh entities exclude casters only when Cast_Shadows is unset.
         let color_pass = descriptor
             .fragment
             .as_ref()
@@ -133,6 +139,61 @@ pub(crate) struct NifDepthMaterialSource(pub Handle<StandardMaterial>);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sorted_color_pass_keeps_authored_alpha_uniform_flags() {
+        use bevy::{
+            pbr::{Material, StandardMaterialFlags, StandardMaterialUniform},
+            render::{render_asset::RenderAssets, render_resource::AsBindGroupShaderType},
+        };
+        for (alpha_mode, expected) in [
+            (AlphaMode::Opaque, StandardMaterialFlags::ALPHA_MODE_OPAQUE),
+            (AlphaMode::Mask(0.4), StandardMaterialFlags::ALPHA_MODE_MASK),
+            (AlphaMode::Blend, StandardMaterialFlags::ALPHA_MODE_BLEND),
+        ] {
+            let state = NifDepthState::from_flags(DEPTH_TEST | DECAL, 0, alpha_mode).unwrap();
+            let material = depth_material(
+                StandardMaterial {
+                    base_color: Color::linear_rgba(0.0, 1.0, 0.0, 0.5),
+                    alpha_mode,
+                    ..default()
+                },
+                state,
+            );
+            assert_eq!(Material::alpha_mode(&material), AlphaMode::Blend);
+            let uniform: StandardMaterialUniform = material
+                .base
+                .as_bind_group_shader_type(&RenderAssets::default());
+            assert_eq!(uniform.base_color.w, 0.5);
+            assert_eq!(
+                uniform.flags & StandardMaterialFlags::ALPHA_MODE_RESERVED_BITS.bits(),
+                expected.bits()
+            );
+            if matches!(alpha_mode, AlphaMode::Mask(_)) {
+                assert_eq!(uniform.alpha_cutoff, 0.4);
+                assert!(state.alpha_mask);
+            }
+        }
+    }
+
+    #[test]
+    fn shadow_casting_uses_authored_flag_independently_of_camera_depth() {
+        // SkyrimShaderPropertyFlags1::Cast_Shadows is bit 9 in the vendored NIF table.
+        for decal in [0, DECAL, DYNAMIC_DECAL, DECAL | DYNAMIC_DECAL] {
+            for depth_test in [0, DEPTH_TEST] {
+                for depth_write in [0, DEPTH_WRITE] {
+                    for casts in [false, true] {
+                        let flags = decal | depth_test | if casts { 0x200 } else { 0 };
+                        if let Some(state) =
+                            NifDepthState::from_flags(flags, depth_write, AlphaMode::Opaque)
+                        {
+                            assert_eq!(state.excludes_shadow(), !casts, "{flags:#x}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn nondecal_depth_override_preserves_existing_raster_bias() {
@@ -233,7 +294,7 @@ mod tests {
         }
         let state = NifDepthState::from_flags(DEPTH_TEST, 0, AlphaMode::Opaque).unwrap();
         assert!(!state.decal);
-        assert!(!state.excludes_shadow());
+        assert!(state.excludes_shadow());
         assert_eq!(
             depth_material(StandardMaterial::default(), state)
                 .base

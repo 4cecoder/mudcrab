@@ -5,6 +5,7 @@ import importlib.util
 import json
 import math
 from pathlib import Path
+import re
 import sqlite3
 import struct
 import subprocess
@@ -145,6 +146,26 @@ class OverlapTests(unittest.TestCase):
 
 
 class InputTests(unittest.TestCase):
+    def test_depth_masks_match_rust_material_path(self):
+        source = (Path(__file__).resolve().parents[2] /
+                  "crates/engine/src/nif_depth.rs").read_text()
+        for name in ("DECAL", "DYNAMIC_DECAL", "DEPTH_TEST", "DEPTH_WRITE"):
+            with self.subTest(mask=name):
+                declaration = re.search(
+                    rf"pub const {name}: u32 = (0x[0-9a-fA-F_]+|[0-9_]+)"
+                    r"(?:\s*<<\s*([0-9_]+))?;", source)
+                self.assertIsNotNone(declaration, f"unrecognized Rust mask: {name}")
+                value, shift = declaration.groups()
+                rust_mask = int(value.replace("_", ""), 0) << int(shift or "0")
+                self.assertEqual(getattr(AUDIT, name), rust_mask)
+
+    def test_literal_depth_flags_report_authored_requirements(self):
+        self.assertEqual(AUDIT.material_requirements(material(0x84000000, 0)),
+                         ["authored_decal", "opaque_or_mask_depth_write_disabled"])
+        self.assertEqual(AUDIT.material_requirements(material(0x88000000, 0, alphaMode="MASK")),
+                         ["authored_dynamic_decal", "opaque_or_mask_depth_write_disabled"])
+        self.assertEqual(AUDIT.material_requirements(material(0x80000000, 1)), [])
+
     def test_cli_translated_duplicate_triangles_remain_overlap_risks(self):
         for jobs in (1, 2):
             with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:

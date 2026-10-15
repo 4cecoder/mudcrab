@@ -195,7 +195,36 @@ impl GltfExtensionHandler for NativeMaterialHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nif_depth::{DECAL, DEPTH_TEST, DEPTH_WRITE, DYNAMIC_DECAL};
+    use crate::nif_depth::{CAST_SHADOWS, DECAL, DEPTH_TEST, DEPTH_WRITE, DYNAMIC_DECAL};
+
+    #[test]
+    fn native_depth_reads_authored_shadow_flag_for_decals_and_depth_overrides() {
+        for flags in [
+            0,
+            DEPTH_TEST,
+            DEPTH_TEST | DECAL,
+            DEPTH_TEST | DYNAMIC_DECAL,
+        ] {
+            for casts in [false, true] {
+                let document = gltf::Gltf::from_slice(
+                    &serde_json::to_vec(&serde_json::json!({
+                        "asset":{"version":"2.0"},"materials":[{
+                            "extras":{"openSkyrim":{
+                                "shaderFlags1":flags | if casts { CAST_SHADOWS } else { 0 },
+                                "shaderFlags2":0
+                            }}
+                        }]
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let source = document.materials().next().unwrap();
+                let state = native_depth_state(&source, AlphaMode::Opaque).unwrap();
+                assert_eq!(state.cast_shadows, casts);
+                assert_eq!(state.excludes_shadow(), !casts);
+            }
+        }
+    }
 
     #[test]
     fn ordinary_blend_without_depth_write_keeps_loaded_material() {

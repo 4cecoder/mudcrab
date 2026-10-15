@@ -235,8 +235,9 @@ depth-disabled materials, and opaque/cutout materials without depth writes:
 - Apply a positive constant raster bias of four reversed-Z depth units only
   to authored decals. This is a tested renderer policy; the native numeric
   bias had not been recovered at this stage. Geometry and source asset files are unchanged.
-- Exclude these surfaces from the camera depth prepass. Exclude decals and
-  depth-disabled effects from shadow casting. Other materials that disable
+- Exclude these surfaces from the camera depth prepass. The initial policy excluded decals and
+  depth-disabled effects from shadow casting; the review repair below replaces that policy.
+  Other materials that disable
   camera depth writes retain the stock shadow-depth pipeline.
 - Retain the native base material for asset validation and collision
   classification. Retain the stock source dependency when cloning scenes.
@@ -445,7 +446,60 @@ The static investigation did not change assets or placements. This branch now
 includes the detector, the renderer fix above, synthetic regressions, and this
 evidence and acceptance specification.
 
-## Validation
+## Review repairs on PR head 56672e9 (2026-10-14)
+
+The local review patch starts at `56672e930ea1fe62c0f4a2dad25b02d6c91175b3`,
+targeting `main` at `268f9884f7acaaa0302425331064f7268aac9d3c`.
+The records below describe earlier revisions; their counts and rendering evidence
+do not validate this patch. The PR description's 42-test count also predates this head.
+
+- **Alpha semantics:** Bevy 0.19's `ExtendedMaterial::alpha_mode` selects the sorted
+  color pass, while `StandardMaterial::as_bind_group_shader_type` encodes the base
+  material's authored alpha mode. `pbr.wgsl` calls `alpha_discard` unconditionally;
+  that function forces opaque alpha to one, and forces surviving mask fragments
+  to one when `MAY_DISCARD` is enabled. This extension already enables that define
+  for mask materials. The focused regression checks alpha 0.5, the GPU uniform's
+  opaque/mask/blend bits, and the retained mask threshold. No alpha behavior change
+  is needed from this source finding. A separate temporary Metal probe with a
+  generated RGBA texture (alpha `128/255`, approximately 0.5) also passes four
+  cases: opaque, mask above/below cutoff, and blend. Opaque and surviving mask
+  samples match; blend samples mix the green decal with its red receiver.
+  These bounded synthetic checks do not establish retail texture coverage.
+- **Shadow casting:** the extension now reads `Cast_Shadows` from `shaderFlags1`
+  bit 9 (`0x200`), as documented in the vendored
+  [SkyrimShaderPropertyFlags1 table](../../vendor/project-wormhole-nif/src/nif_flags.rs).
+  The converter preserves the raw flags in `openSkyrim` extras. Extended surfaces
+  exclude shadow casting only when this bit is unset, including decals and
+  camera-depth-disabled surfaces. Ordinary materials retain their existing path;
+  this patch does not implement shadow flags for all native materials. Light depth
+  state remains independent of the camera-depth override. Tests cover both bit
+  values across decal/depth combinations and decoding from material extras.
+- **Bias policy:** constant `4`, reversed-Z slope `+0.65`, and the pipeline's
+  existing clamp remain unchanged. The constant is the first fix's bounded-probe
+  renderer policy. The slope adapts the recovered native sign. Native constant
+  `-1`, clamp `-100`, and viewport offsets are not mapped numerically to Bevy.
+  The usual pipeline clamp is zero (unclamped); retaining it is not native parity.
+  The receiving-triangle wall comparison does not establish foreground occlusion
+  at grazing angles. That remains open, including for blended decals.
+- **Audit masks:** two regressions compare all four Python masks with the Rust
+  declarations and check literal flag words. The audit now has 48 tests, up from
+  46 at the PR head. SQLite connections already use `contextlib.closing` in both
+  the script and fixtures; the Windows cleanup fix was not reapplied.
+
+Focused validation passes 15 Rust tests for the two material/depth modules and
+48 Python audit tests on macOS. All four isolated Python-mask mutations are
+rejected. Both depth examples typecheck. The Rust checks compile the current
+modules directly with cached registry Bevy 0.19 dependencies; they are not a
+locked Cargo build or a full engine test run. The Metal probe uses the same
+focused library. Rendered shadows, Windows rendering and full-scene flicker
+causality remain unverified.
+
+Terrain sampler split versus retention remains an owner decision. The wall
+probe's reference/model arguments remain a separate usability improvement.
+The direct `gltf` dependency supplies `gltf::material::AlphaMode`, which Bevy
+0.19's selective `bevy::gltf::gltf` re-export does not expose.
+
+## Historical validation
 
 The new detector has 25 synthetic tests covering partial overlap, shared edges,
 nonparallel planes, opposing faces, transforms including mirrors, index stride,
@@ -460,7 +514,7 @@ TMPDIR=/private/tmp python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 The existing shell tests also require GNU `realpath` on PATH. Repeating the full
 suite in the default macOS environment fails on the `/var` temporary-directory
 symlink and BSD `realpath`; this is not the environment used for the initial
-pass. The current detector-only run passes all 25 tests with `TMPDIR=/private/tmp`.
+pass. That detector-only run passed all 25 tests with `TMPDIR=/private/tmp`.
 The detector itself needs Python 3.9 or later and no additional packages.
 
 The renderer fix passes 331 engine tests and all engine examples compile.
@@ -472,7 +526,7 @@ close-view captures settled, but surrounding geometry obscures the selected
 triangle pair; those images do not verify its visual stability. Retail gameplay
 and a whole-game zero-artifact acceptance result remain unverified.
 
-### PR validation on current main (2026-10-09)
+### PR validation on the then-current main (2026-10-09)
 
 The PR branch was rebased onto main at `c39449b`. Workspace compilation,
 formatting and strict Clippy pass. The detector's 25 tests pass. The Rust
