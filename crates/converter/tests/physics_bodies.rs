@@ -398,8 +398,10 @@ fn unknown_body_fields_are_ignored() {
 
 /// Producer 23 predates body dynamics even though #118 retained its schema number.
 /// Matching source/configuration/output proof must not hide the changed mesh contract.
+/// Producer 27 also changed the collision data, so producer-24 and producer-26 GLBs rebuild too;
+/// only a current-producer GLB with matching proof is reused.
 #[tokio::test]
-async fn schema23_cached_mesh_rebuilds_body_dynamics_and_current24_reuses() {
+async fn earlier_producer_cached_meshes_rebuild_and_only_current_meshes_reuse() {
     use converter::{
         cache::{ConversionManifest, configuration_hash_for_schema, hash_bytes},
         config::PipelineConfig,
@@ -416,6 +418,7 @@ async fn schema23_cached_mesh_rebuilds_body_dynamics_and_current24_reuses() {
     )
     .unwrap();
     let config = PipelineConfig::new(&data, &output);
+    /// Runs the pipeline while draining progress events.
     async fn run(config: PipelineConfig) -> converter::pipeline::PipelineReport {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -452,6 +455,7 @@ async fn schema23_cached_mesh_rebuilds_body_dynamics_and_current24_reuses() {
     let mut manifest: ConversionManifest =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
     manifest.schema_version = 23;
+    manifest.asset_configuration_hashes.clear();
     manifest.configuration_hash = configuration_hash_for_schema(&config, 23).unwrap();
     let entry = manifest.entries.get_mut("meshes/bodies.nif").unwrap();
     entry.output_size = old_bytes.len() as u64;
@@ -464,8 +468,22 @@ async fn schema23_cached_mesh_rebuilds_body_dynamics_and_current24_reuses() {
     );
     assert_eq!(read_glb(&mesh).1.bodies.len(), 1);
     assert_eq!(fs::read(&mesh).unwrap(), current_bytes);
-    let reused = run(config).await;
-    assert_eq!(reused.converted, 0);
-    assert_eq!(reused.cache_hits, 1);
-    assert_eq!(fs::read(&mesh).unwrap(), current_bytes);
+    for producer in [24, 26] {
+        let mut earlier: ConversionManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        earlier.schema_version = producer;
+        earlier.asset_configuration_hashes.clear();
+        earlier.configuration_hash = configuration_hash_for_schema(&config, producer).unwrap();
+        earlier.save(&manifest_path).unwrap();
+        let rebuilt = run(config.clone()).await;
+        assert_eq!(
+            rebuilt.converted, 1,
+            "producer {producer} must rebuild even with verified GLB bytes"
+        );
+        assert_eq!(rebuilt.cache_hits, 0);
+        assert_eq!(fs::read(&mesh).unwrap(), current_bytes);
+    }
+    let current = run(config).await;
+    assert_eq!(current.converted, 0);
+    assert_eq!(current.cache_hits, 1);
 }
