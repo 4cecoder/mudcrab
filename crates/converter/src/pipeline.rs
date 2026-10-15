@@ -6459,6 +6459,7 @@ mod tests {
                     size: 4,
                     hash: live.clone(),
                 }],
+                reader_version: 0,
             },
         );
         prune_stale_ingestion_blobs(
