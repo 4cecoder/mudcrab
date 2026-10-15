@@ -136,7 +136,7 @@ impl Census {
     }
 }
 
-/// Walks `dir` without following symlinked folders. Every folder or entry that cannot be read
+/// Walks `dir` without following symlinks. Every folder or entry that cannot be read
 /// is pushed to `errors`, so the caller can say the census is incomplete.
 fn collect(dir: &Path, out: &mut Vec<PathBuf>, errors: &mut Vec<String>) {
     let entries = match fs::read_dir(dir) {
@@ -156,8 +156,10 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, errors: &mut Vec<String>) {
         };
         let path = entry.path();
         match entry.file_type() {
+            Ok(file_type) if file_type.is_symlink() => {}
             Ok(file_type) if file_type.is_dir() => collect(&path, out, errors),
-            Ok(_) => out.push(path),
+            Ok(file_type) if file_type.is_file() => out.push(path),
+            Ok(_) => {}
             Err(err) => errors.push(format!("{}: {err}", path.display())),
         }
     }
@@ -310,5 +312,28 @@ mod tests {
         let (bodies, samples) = &census.per_layer[&4];
         assert_eq!(*bodies, 7);
         assert_eq!(samples, &["meshes/a.nif", "meshes/b.nif"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_skips_symlinked_files_and_directory_loops() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.nif");
+        fs::write(&source, b"Gamebryo File Format").unwrap();
+        symlink(&source, directory.path().join("alias.nif")).unwrap();
+        symlink(directory.path(), directory.path().join("loop")).unwrap();
+        symlink(
+            directory.path().join("missing"),
+            directory.path().join("broken"),
+        )
+        .unwrap();
+
+        let mut files = Vec::new();
+        let mut errors = Vec::new();
+        collect(directory.path(), &mut files, &mut errors);
+        assert_eq!(files, vec![source]);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

@@ -2,7 +2,8 @@
 set -euo pipefail
 
 package=$(realpath -- "${1:?usage: capture-riverwood-lod.sh PACKAGE [OUTPUT]}")
-output=$(realpath -m -- "${2:-"$(dirname -- "$package")/riverwood-lod-capture-$(date -u +%Y%m%dT%H%M%SZ)"}")
+output=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' \
+    "${2:-"$(dirname -- "$package")/riverwood-lod-capture-$(date -u +%Y%m%dT%H%M%SZ)"}")
 [[ "$output" != "$package" && "$output" != "$package/"* ]] || {
     printf 'Capture output must be outside the package: %s\n' "$output" >&2; exit 2;
 }

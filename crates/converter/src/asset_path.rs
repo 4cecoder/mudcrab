@@ -328,10 +328,11 @@ mod tests {
                 .starts_with(modded)
         );
 
-        if !cfg!(windows) {
-            fs::write(base.join("Landscape/ROCK.dds"), b"collision").unwrap();
-            assert!(AssetSourceIndex::build(&[base], AssetKind::Texture).is_err());
-        }
+        // Distinct paths that normalize to the same key also work on case-insensitive disks.
+        fs::create_dir_all(base.join("textures/landscape")).unwrap();
+        fs::write(base.join("textures/landscape/ROCK.dds"), b"collision").unwrap();
+        let error = AssetSourceIndex::build(&[base], AssetKind::Texture).unwrap_err();
+        assert!(error.to_string().contains("normalized asset collision"));
     }
 
     #[test]
