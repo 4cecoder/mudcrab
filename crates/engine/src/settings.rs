@@ -69,8 +69,9 @@ pub struct RenderingSettings {
     pub exposure_ev100: f32,
     pub tone_map: usize,
     pub fov_degrees: f32,
-    /// `SceneGradeMode` index: 0 off, 1 saturation only, 2 full.
+    /// Stable mode index: off, saturation, full, approved sRGB, snapshot linear.
     pub color_grade: usize,
+    pub visual_preset: usize,
     pub grade_saturation: f32,
     pub grade_brightness: f32,
     pub grade_contrast: f32,
@@ -100,6 +101,9 @@ impl Default for RenderingSettings {
     fn default() -> Self {
         let config = EngineConfig::default();
         let grade = crate::color_pipeline::SceneGradeTuning::default();
+        let weather = crate::sky::WeatherLighting::default();
+        let sun = weather.sunlight.to_srgba();
+        let ambient = weather.mean_ambient().to_srgba();
         Self {
             version: 1,
             point_lights: false,
@@ -107,10 +111,10 @@ impl Default for RenderingSettings {
             point_light_shadows: false,
             point_shadow_size: 1,
             sun: true,
-            sun_illuminance: 12_000.0,
-            sun_color: [1.0; 3],
+            sun_illuminance: crate::lights::SUN_ILLUMINANCE,
+            sun_color: [sun.red, sun.green, sun.blue],
             ambient_brightness: crate::lights::AMBIENT_ILLUMINANCE,
-            ambient_color: [0.48, 0.55, 0.7],
+            ambient_color: [ambient.red, ambient.green, ambient.blue],
             shadows: true,
             shadow_size: 2,
             shadow_cascades: 4,
@@ -134,7 +138,8 @@ impl Default for RenderingSettings {
             exposure_ev100: crate::color_pipeline::DEFAULT_SCENE_EV100,
             tone_map: 6,
             fov_degrees: PerspectiveProjection::default().fov.to_degrees(),
-            color_grade: crate::color_pipeline::SceneGradeMode::default().index(),
+            color_grade: crate::color_pipeline::SceneGradeMode::SnapshotSrgb.index(),
+            visual_preset: 1,
             grade_saturation: grade.grade.saturation,
             grade_brightness: grade.grade.brightness,
             grade_contrast: grade.grade.contrast,
@@ -295,28 +300,29 @@ pub static SETTING_SPECS: &[SettingSpec] = &[
         ]
     ),
     number!(Graphics, "Image", "Vertical field of view (degrees)", fov_degrees; 30.0, 110.0, 5.0),
+    choice!("Color grading", "Sky and fog preset", visual_preset, &["Vivid", "Cool Gray"]),
     choice!(
         "Color grading",
         "Color grade",
         color_grade,
-        &["Off", "Saturation only", "Full"]
+        &["Off", "Saturation only", "Full (legacy)", "Approved sRGB", "Snapshot linear"]
     ),
     number!(Graphics, "Color grading", "Grade saturation", grade_saturation; 0.0, 3.0, 0.05)
         .when(|s| s.color_grade != 0),
     number!(Graphics, "Color grading", "Grade brightness", grade_brightness; 0.5, 2.0, 0.025)
-        .when(|s| s.color_grade == 2),
+        .when(|s| s.color_grade >= 2),
     number!(Graphics, "Color grading", "Grade contrast", grade_contrast; 0.5, 2.5, 0.05)
-        .when(|s| s.color_grade == 2),
+        .when(|s| s.color_grade >= 2),
     number!(Graphics, "Color grading", "Grade pivot (display brightness)", grade_pivot; 0.02, 0.5, 0.01)
-        .when(|s| s.color_grade == 2),
+        .when(|s| s.color_grade >= 2),
     number!(Graphics, "Color grading", "Grade tint amount", grade_tint_amount; 0.0, 1.0, 0.02)
-        .when(|s| s.color_grade == 2),
+        .when(|s| s.color_grade >= 2),
     number!(Graphics, "Color grading", "Grade tint red", grade_tint[0]; 0.0, 1.0, 0.05)
-        .when(|s| s.color_grade == 2),
+        .when(|s| s.color_grade >= 2),
     number!(Graphics, "Color grading", "Grade tint green", grade_tint[1]; 0.0, 1.0, 0.05)
-        .when(|s| s.color_grade == 2),
+        .when(|s| s.color_grade >= 2),
     number!(Graphics, "Color grading", "Grade tint blue", grade_tint[2]; 0.0, 1.0, 0.05)
-        .when(|s| s.color_grade == 2),
+        .when(|s| s.color_grade >= 2),
     toggle!("Window", "VSync", vsync),
     choice!(
         "Window",
@@ -444,6 +450,10 @@ impl RenderingSettings {
     }
 
     fn take_launch_values(&mut self, config: &EngineConfig) {
+        self.color_grade = config.color_grade.index();
+        self.visual_preset =
+            usize::from(config.visual_preset == crate::color_pipeline::SceneVisualPreset::CoolGray);
+        self.set_grade(config.color_grade.grade(config.visual_preset));
         self.point_lights = config.lights;
         self.stream_radius = config.stream_radius;
         self.unload_radius = config.unload_radius;
@@ -463,6 +473,15 @@ impl RenderingSettings {
     fn retain_explicit_launch_values(&mut self, config: &EngineConfig) {
         for flag in &config.settings_overrides {
             match flag.as_str() {
+                "--color-grade" => {
+                    self.color_grade = config.color_grade.index();
+                    self.set_grade(config.color_grade.grade(config.visual_preset));
+                }
+                "--visual-preset" => {
+                    self.visual_preset = usize::from(
+                        config.visual_preset == crate::color_pipeline::SceneVisualPreset::CoolGray,
+                    );
+                }
                 "--lights" => self.point_lights = config.lights,
                 "--stream-radius" => {
                     self.stream_radius = config.stream_radius;
@@ -507,7 +526,22 @@ impl RenderingSettings {
         }
     }
 
+    pub(crate) fn set_grade(&mut self, grade: crate::color_pipeline::SkyrimCinematicGrade) {
+        self.grade_saturation = grade.saturation;
+        self.grade_brightness = grade.brightness;
+        self.grade_contrast = grade.contrast;
+        self.grade_tint_amount = grade.tint_amount;
+        self.grade_tint = grade.tint_rgb;
+        self.grade_pivot = crate::color_pipeline::CINEMATIC_PIVOT;
+    }
+
     pub(crate) fn apply_config(&self, config: &mut EngineConfig) {
+        config.color_grade = crate::color_pipeline::SceneGradeMode::from_index(self.color_grade);
+        config.visual_preset = if self.visual_preset == 0 {
+            crate::color_pipeline::SceneVisualPreset::Vivid
+        } else {
+            crate::color_pipeline::SceneVisualPreset::CoolGray
+        };
         config.lights = self.point_lights;
         config.stream_radius = self.stream_radius;
         config.unload_radius = self.unload_radius;
@@ -648,6 +682,8 @@ fn save_settings(path: &Path, settings: &RenderingSettings) -> Result<(), String
 /// The color-grade resources the menu drives; absent in apps without the cinematic post plugin.
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct SceneGradeTargets<'w> {
+    preset: Option<ResMut<'w, crate::color_pipeline::SceneVisualPreset>>,
+    palette: Option<ResMut<'w, crate::sky::SkyPalette>>,
     mode: Option<ResMut<'w, crate::color_pipeline::SceneGradeMode>>,
     tuning: Option<ResMut<'w, crate::color_pipeline::SceneGradeTuning>>,
 }
@@ -757,6 +793,19 @@ pub(crate) fn apply_render_settings(
     if let Some(shadow_map) = point_shadow_map.as_deref_mut() {
         shadow_map.size = SHADOW_SIZES[settings.point_shadow_size];
     }
+    if let Some(preset) = grade.preset.as_mut() {
+        let next = if settings.visual_preset == 0 {
+            crate::color_pipeline::SceneVisualPreset::Vivid
+        } else {
+            crate::color_pipeline::SceneVisualPreset::CoolGray
+        };
+        if **preset != next {
+            **preset = next;
+            if let Some(palette) = grade.palette.as_mut() {
+                **palette = next.sky_palette();
+            }
+        }
+    }
     if let Some(mode) = grade.mode.as_mut() {
         mode.set_if_neq(crate::color_pipeline::SceneGradeMode::from_index(
             settings.color_grade,
@@ -846,6 +895,73 @@ mod tests {
         match EngineConfig::from_args(args.iter().cloned()).unwrap() {
             ConfigAction::Run(config) => *config,
             ConfigAction::Help => panic!("expected a run"),
+        }
+    }
+
+    #[test]
+    fn default_menu_lighting_retains_the_approved_weather_colors() {
+        let settings = RenderingSettings::default();
+        let weather = crate::sky::WeatherLighting::default();
+        let sun = weather.sunlight.to_srgba();
+        let ambient = weather.mean_ambient().to_srgba();
+        assert_eq!(settings.sun_color, [sun.red, sun.green, sun.blue]);
+        assert_eq!(
+            settings.ambient_color,
+            [ambient.red, ambient.green, ambient.blue]
+        );
+        assert_eq!(settings.sun_illuminance, crate::lights::SUN_ILLUMINANCE);
+        assert_eq!(
+            settings.ambient_brightness,
+            crate::lights::AMBIENT_ILLUMINANCE
+        );
+    }
+
+    #[test]
+    fn grading_round_trips_and_explicit_capture_mode_wins() {
+        use crate::color_pipeline::{SceneGradeMode, SceneVisualPreset};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        for mode in 0..5 {
+            let settings = RenderingSettings {
+                color_grade: mode,
+                visual_preset: 0,
+                grade_saturation: 1.2,
+                grade_brightness: 1.7,
+                grade_contrast: 1.1,
+                grade_tint_amount: 0.3,
+                grade_tint: [0.8, 0.9, 1.0],
+                grade_pivot: 0.25,
+                ..default()
+            };
+            save_settings(&path, &settings).unwrap();
+            let (loaded, _) = prepare_settings_at(&mut EngineConfig::default(), Some(path.clone()));
+            assert_eq!(loaded, settings);
+        }
+        let mut config = EngineConfig {
+            color_grade: SceneGradeMode::SnapshotSrgb,
+            visual_preset: SceneVisualPreset::CoolGray,
+            settings_overrides: vec!["--color-grade".into(), "--visual-preset".into()],
+            ..default()
+        };
+        let (loaded, _) = prepare_settings_at(&mut config, Some(path));
+        assert_eq!(loaded.color_grade, SceneGradeMode::SnapshotSrgb.index());
+        assert_eq!(loaded.visual_preset, 1);
+        assert!((loaded.grade_brightness - 1.38).abs() < 1e-6);
+        for config in [
+            EngineConfig {
+                hidden_window: true,
+                ..default()
+            },
+            EngineConfig {
+                shots: Some("shots.json".into()),
+                ..default()
+            },
+            EngineConfig {
+                acceptance_screenshot: Some("capture.png".into()),
+                ..default()
+            },
+        ] {
+            assert!(!config.interactive_world_physics());
         }
     }
 
@@ -981,25 +1097,25 @@ mod tests {
     }
 
     #[test]
-    fn grade_settings_drive_the_scene_grade_and_default_to_the_reported_values() {
+    fn grade_settings_drive_the_scene_grade_and_default_to_the_approved_values() {
         use crate::color_pipeline::{
             SceneGradeMode, SceneGradeTuning, SkyrimCinematicGrade, SkyrimCinematicPost,
             apply_scene_grade_mode,
         };
         use bevy::render::view::ColorGrading;
         let defaults = RenderingSettings::default();
-        assert_eq!(defaults.color_grade, SceneGradeMode::Full.index());
-        assert_eq!(defaults.grade_saturation, 1.5);
-        assert_eq!(defaults.grade_brightness, 1.135);
-        assert_eq!(defaults.grade_contrast, 1.4);
-        assert_eq!(defaults.grade_tint_amount, 0.42);
+        assert_eq!(defaults.color_grade, SceneGradeMode::SnapshotSrgb.index());
+        assert_eq!(defaults.grade_saturation, 1.66);
+        assert!((defaults.grade_brightness - 1.38).abs() < 1e-6);
+        assert_eq!(defaults.grade_contrast, 1.5);
+        assert_eq!(defaults.grade_tint_amount, 0.56);
         let spec = |label| {
             SETTING_SPECS
                 .iter()
                 .find(|spec| spec.label == label)
                 .unwrap()
         };
-        assert_eq!(spec("Grade brightness").value_label(&defaults), "1.135");
+        assert_eq!(spec("Grade brightness").value_label(&defaults), "1.380");
 
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
@@ -1007,6 +1123,7 @@ mod tests {
             .insert_resource(RenderingSettings::default())
             .init_resource::<SceneGradeMode>()
             .init_resource::<SceneGradeTuning>()
+            .init_resource::<crate::color_pipeline::SceneVisualPreset>()
             .add_systems(Update, apply_render_settings)
             .add_systems(PostUpdate, apply_scene_grade_mode);
         let camera = app
@@ -1054,7 +1171,7 @@ mod tests {
             SkyrimCinematicGrade {
                 saturation: 1.2,
                 brightness: 1.3,
-                ..SkyrimCinematicGrade::SKYRIM_CLEAR_DAY
+                ..SceneGradeTuning::default().grade
             }
         );
 

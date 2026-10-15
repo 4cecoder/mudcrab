@@ -6,6 +6,9 @@
 // adapted pivot, tone curve and final transfer remain unverified.
 // Negative input and out-of-gamut results are clipped. Alpha passes unchanged;
 // retail bloom-feed and alpha grading are not reproduced here.
+// Snapshot modes instead evaluate saturation and tint together in the selected
+// domain, with the screenshot's rounded values. They retain Bevy's tone curve
+// and the fixed artistic pivot; neither mode is a calibrated Skyrim renderer.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
@@ -19,6 +22,8 @@ struct SkyrimCinematicPost {
     pivot: f32,
     tint_rgb: vec3<f32>,
     enabled: f32,
+    saturation: f32,
+    linear_domain: u32,
 }
 
 @group(0) @binding(2) var<uniform> settings: SkyrimCinematicPost;
@@ -45,11 +50,22 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     if settings.enabled < 0.5 {
         return color;
     }
-    var rgb = linear_to_srgb(color.rgb);
+    var rgb = color.rgb;
+    if settings.linear_domain == 0u {
+        rgb = linear_to_srgb(rgb);
+    }
     let luma = dot(rgb, LUMA);
+    // Keep legacy arithmetic unchanged when Bevy owns saturation. In snapshot
+    // modes the original luminance feeds both saturation and the tint blend.
+    if settings.saturation != 1.0 {
+        rgb = mix(vec3<f32>(luma), rgb, settings.saturation);
+    }
     rgb = mix(rgb, vec3<f32>(luma) * settings.tint_rgb, settings.tint_amount);
     rgb = settings.contrast * (settings.brightness * rgb - vec3<f32>(settings.pivot))
         + vec3<f32>(settings.pivot);
     rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(srgb_to_linear(rgb), color.a);
+    if settings.linear_domain == 0u {
+        rgb = srgb_to_linear(rgb);
+    }
+    return vec4<f32>(rgb, color.a);
 }

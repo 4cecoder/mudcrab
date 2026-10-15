@@ -45,6 +45,7 @@ fn main() {
         .insert_resource(EngineConfig::default())
         .insert_resource(RenderingSettings::default())
         .init_resource::<ProfilingState>()
+        .init_resource::<engine::color_pipeline::SceneGradeTuning>()
         .insert_resource(PreviewCapture {
             directory,
             stage: 0,

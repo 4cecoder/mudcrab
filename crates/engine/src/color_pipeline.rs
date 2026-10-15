@@ -6,6 +6,7 @@
 //! Its appearance was approved in Riverwood; its mapping is not verified retail parity.
 
 use crate::console::{AppConsoleExt, ConsoleCommand};
+use crate::sky::SkyPalette;
 use bevy::{
     asset::embedded_asset,
     camera::{CompositingSpace, Exposure, Hdr},
@@ -31,6 +32,8 @@ pub enum SceneGradeMode {
     Saturation,
     #[default]
     Full,
+    SnapshotSrgb,
+    SnapshotLinear,
 }
 
 impl SceneGradeMode {
@@ -39,6 +42,8 @@ impl SceneGradeMode {
             "off" => Some(Self::Off),
             "saturation" => Some(Self::Saturation),
             "full" => Some(Self::Full),
+            "snapshot-srgb" => Some(Self::SnapshotSrgb),
+            "snapshot-linear" => Some(Self::SnapshotLinear),
             _ => None,
         }
     }
@@ -48,15 +53,18 @@ impl SceneGradeMode {
             Self::Off => "off",
             Self::Saturation => "saturation",
             Self::Full => "full",
+            Self::SnapshotSrgb => "snapshot-srgb",
+            Self::SnapshotLinear => "snapshot-linear",
         }
     }
 
-    /// Position in the settings menu's choice list: off, saturation, full.
     pub fn index(self) -> usize {
         match self {
             Self::Off => 0,
             Self::Saturation => 1,
             Self::Full => 2,
+            Self::SnapshotSrgb => 3,
+            Self::SnapshotLinear => 4,
         }
     }
 
@@ -64,25 +72,62 @@ impl SceneGradeMode {
         match index {
             0 => Self::Off,
             1 => Self::Saturation,
-            _ => Self::Full,
+            2 => Self::Full,
+            4 => Self::SnapshotLinear,
+            _ => Self::SnapshotSrgb,
         }
+    }
+
+    /// Resolve the screenshot's grade independently of the selected sky preset.
+    pub fn grade(self, preset: SceneVisualPreset) -> SkyrimCinematicGrade {
+        match self {
+            Self::SnapshotSrgb => SkyrimCinematicGrade {
+                // User-tuned 20% brightness lift; preserve the original Photo Mode snapshot.
+                brightness: SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT.brightness * 1.2,
+                ..SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT
+            },
+            Self::SnapshotLinear => SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT,
+            _ => preset.grade(),
+        }
+    }
+
+    pub fn bevy_saturation(self, preset: SceneVisualPreset) -> f32 {
+        match self {
+            Self::Off | Self::SnapshotSrgb | Self::SnapshotLinear => 1.0,
+            Self::Saturation | Self::Full => preset.grade().saturation,
+        }
+    }
+
+    pub fn post(self, preset: SceneVisualPreset) -> SkyrimCinematicPost {
+        let grade = self.grade(preset);
+        let mut post = grade.post();
+        match self {
+            Self::Off | Self::Saturation => post.enabled = 0.0,
+            Self::Full => {}
+            Self::SnapshotSrgb | Self::SnapshotLinear => {
+                post.saturation = grade.saturation;
+                post.linear_domain = u32::from(self == Self::SnapshotLinear);
+            }
+        }
+        post
     }
 }
 
-/// The grade the scene cameras carry while the mode is not `Off`. Defaults to the reported
-/// clear-day values; the settings menu adjusts it live. Mode selection stays separate so the
-/// console and automation can switch stages without touching the tuned values.
+pub const SCENE_GRADE_VALUES: &str = "off, saturation, full, snapshot-srgb or snapshot-linear";
+const SCENE_GRADE_USAGE: &str = "SceneGrade [off|saturation|full|snapshot-srgb|snapshot-linear]";
+
+/// Interactive overrides only. Capture runs leave this resource absent and use the
+/// exact mode/preset resolution recorded by the capture receipts.
 #[derive(Resource, Debug, Clone, Copy, PartialEq)]
 pub struct SceneGradeTuning {
     pub grade: SkyrimCinematicGrade,
-    /// Display-range pivot for brightness and contrast; see [`CINEMATIC_PIVOT`].
     pub pivot: f32,
 }
 
 impl Default for SceneGradeTuning {
     fn default() -> Self {
         Self {
-            grade: SkyrimCinematicGrade::SKYRIM_CLEAR_DAY,
+            grade: SceneGradeMode::SnapshotSrgb.grade(SceneVisualPreset::CoolGray),
             pivot: CINEMATIC_PIVOT,
         }
     }
@@ -95,27 +140,128 @@ pub enum SceneGradeTarget {
     Reflection,
 }
 
+/// Named artistic looks. Vivid preserves the approved clear-day configuration.
+/// Exposure, tone mapping, lights and shadows are shared.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SceneVisualPreset {
+    #[default]
+    Vivid,
+    CoolGray,
+}
+
+impl SceneVisualPreset {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "vivid" => Some(Self::Vivid),
+            "cool-gray" => Some(Self::CoolGray),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Vivid => "vivid",
+            Self::CoolGray => "cool-gray",
+        }
+    }
+
+    pub fn grade(self) -> SkyrimCinematicGrade {
+        match self {
+            Self::Vivid => SkyrimCinematicGrade::SKYRIM_CLEAR_DAY,
+            Self::CoolGray => SkyrimCinematicGrade {
+                saturation: 1.25,
+                ..SkyrimCinematicGrade::SKYRIM_CLEAR_DAY
+            },
+        }
+    }
+
+    /// Authored sky and fog settings, before tone mapping and grading.
+    pub fn sky_palette(self) -> SkyPalette {
+        match self {
+            Self::Vivid => SkyPalette::SKYRIM_CLEAR_DAY,
+            Self::CoolGray => SkyPalette {
+                upper: Color::srgb_u8(178, 187, 198),
+                lower: Color::srgb_u8(194, 202, 209),
+                horizon: Color::srgb_u8(207, 214, 220),
+                fog_far: Color::srgb_u8(210, 222, 235),
+                fog_density_scale: 0.25,
+                ..SkyPalette::SKYRIM_CLEAR_DAY
+            },
+        }
+    }
+}
+
+fn sync_console_grade(world: &mut World) {
+    let mode = *world.resource::<SceneGradeMode>();
+    let preset = *world.resource::<SceneVisualPreset>();
+    let resolved = mode.grade(preset);
+    if let Some(mut tuning) = world.get_resource_mut::<SceneGradeTuning>() {
+        *tuning = SceneGradeTuning {
+            grade: resolved,
+            pivot: CINEMATIC_PIVOT,
+        };
+    }
+    if let Some(mut settings) = world.get_resource_mut::<crate::settings::RenderingSettings>() {
+        settings.color_grade = mode.index();
+        settings.visual_preset = usize::from(preset == SceneVisualPreset::CoolGray);
+        settings.set_grade(resolved);
+    }
+}
+
+fn scene_preset_command() -> ConsoleCommand {
+    ConsoleCommand {
+        name: "ScenePreset",
+        short: None,
+        usage: "ScenePreset [vivid|cool-gray|toggle]",
+        help: "inspect or switch the sky, fog and color grading preset",
+        handler: Box::new(|world, args| {
+            let current = *world.resource::<SceneVisualPreset>();
+            let next = match args {
+                [] => None,
+                [value] if value.eq_ignore_ascii_case("toggle") => Some(match current {
+                    SceneVisualPreset::Vivid => SceneVisualPreset::CoolGray,
+                    SceneVisualPreset::CoolGray => SceneVisualPreset::Vivid,
+                }),
+                [value] => Some(
+                    SceneVisualPreset::parse(value)
+                        .ok_or("usage: ScenePreset [vivid|cool-gray|toggle]")?,
+                ),
+                _ => return Err("usage: ScenePreset [vivid|cool-gray|toggle]".into()),
+            };
+            if let Some(next) = next {
+                *world.resource_mut::<SceneVisualPreset>() = next;
+                if let Some(mut palette) = world.get_resource_mut::<SkyPalette>() {
+                    *palette = next.sky_palette();
+                }
+            }
+            if next.is_some() {
+                sync_console_grade(world);
+            }
+            Ok(format!(
+                "scene preset: {} (grade: {})",
+                world.resource::<SceneVisualPreset>().name(),
+                world.resource::<SceneGradeMode>().name()
+            ))
+        }),
+    }
+}
+
 fn scene_grade_command() -> ConsoleCommand {
     ConsoleCommand {
         name: "SceneGrade",
         short: None,
-        usage: "SceneGrade [off|saturation|full]",
+        usage: SCENE_GRADE_USAGE,
         help: "inspect or change color grading without changing exposure, lighting or fog",
         handler: Box::new(|world, args| {
             match args {
                 [] => {}
                 [value] => {
                     let mode = SceneGradeMode::parse(value)
-                        .ok_or("usage: SceneGrade [off|saturation|full]")?;
+                        .ok_or_else(|| format!("usage: {SCENE_GRADE_USAGE}"))?;
                     *world.resource_mut::<SceneGradeMode>() = mode;
-                    // Keep the settings menu showing the mode that is in effect.
-                    if let Some(mut settings) =
-                        world.get_resource_mut::<crate::settings::RenderingSettings>()
-                    {
-                        settings.color_grade = mode.index();
-                    }
+                    sync_console_grade(world);
                 }
-                _ => return Err("usage: SceneGrade [off|saturation|full]".into()),
+                _ => return Err(format!("usage: {SCENE_GRADE_USAGE}")),
             }
             Ok(format!(
                 "scene grade: {}",
@@ -127,7 +273,8 @@ fn scene_grade_command() -> ConsoleCommand {
 
 pub(crate) fn apply_scene_grade_mode(
     mode: Res<SceneGradeMode>,
-    tuning: Res<SceneGradeTuning>,
+    preset: Res<SceneVisualPreset>,
+    tuning: Option<Res<SceneGradeTuning>>,
     mut cameras: Query<(
         Ref<SceneGradeTarget>,
         &mut ColorGrading,
@@ -135,24 +282,39 @@ pub(crate) fn apply_scene_grade_mode(
     )>,
 ) {
     for (target, mut grading, mut post) in &mut cameras {
-        let stale = mode.is_changed() || tuning.is_changed() || target.is_added();
-        if *target == SceneGradeTarget::Reflection || !stale {
+        if *target == SceneGradeTarget::Reflection
+            || !(mode.is_changed()
+                || preset.is_changed()
+                || tuning.as_ref().is_some_and(|t| t.is_changed())
+                || target.is_added())
+        {
             continue;
         }
-        grading.global.post_saturation = if *mode == SceneGradeMode::Off {
-            1.0
-        } else {
-            tuning.grade.saturation
-        };
-        *post = SkyrimCinematicPost {
-            pivot: tuning.pivot,
-            enabled: if *mode == SceneGradeMode::Full {
-                1.0
-            } else {
-                0.0
-            },
-            ..tuning.grade.post()
-        };
+        grading.global.post_saturation = mode.bevy_saturation(*preset);
+        *post = mode.post(*preset);
+        if let Some(tuning) = tuning.as_ref() {
+            let mut tuned_post = tuning.grade.post();
+            tuned_post.pivot = tuning.pivot;
+            match *mode {
+                SceneGradeMode::Off => {
+                    tuned_post.enabled = 0.0;
+                    grading.global.post_saturation = 1.0;
+                }
+                SceneGradeMode::Saturation => {
+                    tuned_post.enabled = 0.0;
+                    grading.global.post_saturation = tuning.grade.saturation;
+                }
+                SceneGradeMode::Full => {
+                    grading.global.post_saturation = tuning.grade.saturation;
+                }
+                SceneGradeMode::SnapshotSrgb | SceneGradeMode::SnapshotLinear => {
+                    grading.global.post_saturation = 1.0;
+                    tuned_post.saturation = tuning.grade.saturation;
+                    tuned_post.linear_domain = u32::from(*mode == SceneGradeMode::SnapshotLinear);
+                }
+            }
+            *post = tuned_post;
+        }
     }
 }
 
@@ -202,6 +364,17 @@ impl SkyrimCinematicGrade {
         tint_rgb: [0.894_118, 0.839_216, 0.772_549],
     };
 
+    /// Rounded Photo Mode UI values supplied at the Sleeping Giant Inn on 2026-10-13.
+    /// This is one active base-grade snapshot, not universal Skyrim defaults.
+    /// Photo Mode lists RGB controls as Red, Blue, Green; these are stored as RGB.
+    pub const SLEEPING_GIANT_SNAPSHOT: Self = Self {
+        saturation: 1.66,
+        brightness: 1.15,
+        contrast: 1.50,
+        tint_amount: 0.56,
+        tint_rgb: [0.88, 0.81, 0.72],
+    };
+
     /// The post-tonemap pass settings for this grade: brightness, contrast and
     /// tint, applied by [`SkyrimCinematicPost`] after the tone curve.
     pub fn post(&self) -> SkyrimCinematicPost {
@@ -212,6 +385,8 @@ impl SkyrimCinematicGrade {
             pivot: CINEMATIC_PIVOT,
             tint_rgb: Vec3::from_array(self.tint_rgb),
             enabled: 1.0,
+            saturation: 1.0,
+            linear_domain: 0,
         }
     }
 
@@ -257,6 +432,10 @@ pub struct SkyrimCinematicPost {
     pub tint_rgb: Vec3,
     /// 1.0 applies the grade; 0.0 passes the input through untouched.
     pub enabled: f32,
+    /// Saturation evaluated in this pass; 1.0 leaves legacy Bevy saturation unchanged.
+    pub saturation: f32,
+    /// 0 grades sRGB-encoded values; 1 grades linear values, including saturation and tint.
+    pub linear_domain: u32,
 }
 
 impl Default for SkyrimCinematicPost {
@@ -269,6 +448,8 @@ impl Default for SkyrimCinematicPost {
             pivot: CINEMATIC_PIVOT,
             tint_rgb: Vec3::ONE,
             enabled: 0.0,
+            saturation: 1.0,
+            linear_domain: 0,
         }
     }
 }
@@ -282,6 +463,7 @@ impl FullscreenMaterial for SkyrimCinematicPost {
     /// The shader expects linear RGB storage and grades its sRGB encoding.
     /// Cameras using this experiment must retain `CompositingSpace::Linear`.
     /// Ordering relative to AA and CAS has not been validated.
+    /// The linear snapshot mode grades that storage directly and skips sRGB conversion.
     fn schedule_configs(system: ScheduleConfigs<BoxedSystem>) -> ScheduleConfigs<BoxedSystem> {
         system
             .in_set(Core3dSystems::PostProcess)
@@ -296,8 +478,9 @@ impl Plugin for SkyrimCinematicPostPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/cinematic_post.wgsl");
         app.init_resource::<SceneGradeMode>()
-            .init_resource::<SceneGradeTuning>()
+            .init_resource::<SceneVisualPreset>()
             .add_console_command(scene_grade_command())
+            .add_console_command(scene_preset_command())
             .add_systems(PostUpdate, apply_scene_grade_mode)
             .add_plugins(FullscreenMaterialPlugin::<SkyrimCinematicPost>::default());
     }
@@ -393,10 +576,359 @@ mod tests {
     use super::*;
 
     #[test]
+    fn menu_console_sync_preserves_approved_default_and_excludes_reflections() {
+        use crate::settings::{RenderingSettings, apply_render_settings};
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(crate::config::EngineConfig::default())
+            .init_resource::<RenderingSettings>()
+            .insert_resource(SceneGradeMode::SnapshotSrgb)
+            .insert_resource(SceneVisualPreset::CoolGray)
+            .insert_resource(SceneVisualPreset::CoolGray.sky_palette())
+            .init_resource::<SceneGradeTuning>()
+            .init_resource::<crate::console::ConsoleState>()
+            .add_console_command(scene_grade_command())
+            .add_console_command(scene_preset_command())
+            .add_systems(Update, apply_render_settings)
+            .add_systems(PostUpdate, apply_scene_grade_mode);
+        let scene = app.world_mut().spawn(SceneColorPipeline::default()).id();
+        let reflection = app.world_mut().spawn(SceneColorPipeline::reflection()).id();
+        app.update();
+        let approved = SceneGradeMode::SnapshotSrgb.post(SceneVisualPreset::CoolGray);
+        assert_eq!(
+            *app.world().get::<SkyrimCinematicPost>(scene).unwrap(),
+            approved
+        );
+        for mode in [
+            SceneGradeMode::Off,
+            SceneGradeMode::Saturation,
+            SceneGradeMode::Full,
+            SceneGradeMode::SnapshotSrgb,
+            SceneGradeMode::SnapshotLinear,
+        ] {
+            crate::console::execute_line(app.world_mut(), &format!("SceneGrade {}", mode.name()));
+            app.update();
+            assert_eq!(
+                app.world().resource::<RenderingSettings>().color_grade,
+                mode.index()
+            );
+            assert_eq!(*app.world().resource::<SceneGradeMode>(), mode);
+            assert_eq!(
+                *app.world().get::<SkyrimCinematicPost>(scene).unwrap(),
+                mode.post(SceneVisualPreset::CoolGray),
+            );
+            assert_eq!(
+                *app.world().get::<SkyrimCinematicPost>(reflection).unwrap(),
+                SkyrimCinematicPost::default(),
+            );
+        }
+        crate::console::execute_line(app.world_mut(), "SceneGrade invalid");
+        app.update();
+        assert_eq!(
+            *app.world().resource::<SceneGradeMode>(),
+            SceneGradeMode::SnapshotLinear
+        );
+        crate::console::execute_line(app.world_mut(), "ScenePreset vivid");
+        crate::console::execute_line(app.world_mut(), "SceneGrade full");
+        app.update();
+        assert_eq!(
+            *app.world().get::<SkyrimCinematicPost>(scene).unwrap(),
+            SceneGradeMode::Full.post(SceneVisualPreset::Vivid),
+        );
+        *app.world_mut().resource_mut::<RenderingSettings>() = RenderingSettings::default();
+        app.update();
+        assert_eq!(
+            *app.world().get::<SkyrimCinematicPost>(scene).unwrap(),
+            approved
+        );
+        assert_eq!(
+            *app.world().resource::<SkyPalette>(),
+            SceneVisualPreset::CoolGray.sky_palette()
+        );
+        let later = app.world_mut().spawn(SceneColorPipeline::reflection()).id();
+        app.world_mut()
+            .resource_mut::<RenderingSettings>()
+            .grade_brightness = 1.7;
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<SkyrimCinematicPost>(scene)
+                .unwrap()
+                .brightness,
+            1.7
+        );
+        assert_eq!(
+            *app.world().get::<SkyrimCinematicPost>(later).unwrap(),
+            SkyrimCinematicPost::default()
+        );
+    }
+
+    #[test]
+    fn snapshot_modes_grade_once_restore_presets_and_leave_sky_and_reflections_alone() {
+        let mut app = App::new();
+        app.init_resource::<SceneGradeMode>()
+            .insert_resource(SceneVisualPreset::CoolGray)
+            .insert_resource(SceneVisualPreset::CoolGray.sky_palette())
+            .init_resource::<crate::console::ConsoleState>()
+            .add_console_command(scene_grade_command())
+            .add_console_command(scene_preset_command())
+            .add_systems(PostUpdate, apply_scene_grade_mode);
+        let main = app.world_mut().spawn(SceneColorPipeline::default()).id();
+        let reflection = app.world_mut().spawn(SceneColorPipeline::reflection()).id();
+        let snapshot = SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT;
+        assert_eq!(
+            (snapshot.saturation, snapshot.brightness, snapshot.contrast),
+            (1.66, 1.15, 1.50)
+        );
+        assert_eq!(snapshot.tint_amount, 0.56);
+        assert_eq!(snapshot.tint_rgb, [0.88, 0.81, 0.72]);
+        for (command, domain, brightness) in [
+            ("SceneGrade SNAPSHOT-SRGB", 0, snapshot.brightness * 1.2),
+            ("SceneGrade snapshot-linear", 1, snapshot.brightness),
+        ] {
+            crate::console::execute_line(app.world_mut(), command);
+            app.update();
+            let world = app.world();
+            let post = world.get::<SkyrimCinematicPost>(main).unwrap();
+            assert_eq!(
+                *post,
+                SkyrimCinematicPost {
+                    saturation: 1.66,
+                    brightness,
+                    linear_domain: domain,
+                    ..snapshot.post()
+                }
+            );
+            if domain == 0 {
+                assert!((post.brightness - 1.38).abs() < 1e-6);
+            }
+            assert_eq!(
+                world
+                    .get::<ColorGrading>(main)
+                    .unwrap()
+                    .global
+                    .post_saturation,
+                1.0
+            );
+            assert_eq!(
+                *world.resource::<SkyPalette>(),
+                SceneVisualPreset::CoolGray.sky_palette()
+            );
+            assert_eq!(
+                *world.get::<SkyrimCinematicPost>(reflection).unwrap(),
+                SkyrimCinematicPost::default()
+            );
+            assert_eq!(
+                world
+                    .get::<ColorGrading>(reflection)
+                    .unwrap()
+                    .global
+                    .post_saturation,
+                1.0
+            );
+        }
+        let later = app.world_mut().spawn(SceneColorPipeline::default()).id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<SkyrimCinematicPost>(later)
+                .unwrap()
+                .linear_domain,
+            1
+        );
+        assert_eq!(
+            app.world()
+                .get::<SkyrimCinematicPost>(later)
+                .unwrap()
+                .saturation,
+            1.66
+        );
+        crate::console::execute_line(app.world_mut(), "SceneGrade off");
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<SkyrimCinematicPost>(main)
+                .unwrap()
+                .enabled,
+            0.0
+        );
+        for (preset, saturation) in [("cool-gray", 1.25), ("vivid", 1.5)] {
+            crate::console::execute_line(app.world_mut(), &format!("ScenePreset {preset}"));
+            crate::console::execute_line(app.world_mut(), "SceneGrade full");
+            app.update();
+            let world = app.world();
+            assert_eq!(
+                world
+                    .get::<ColorGrading>(main)
+                    .unwrap()
+                    .global
+                    .post_saturation,
+                saturation
+            );
+            assert_eq!(
+                world.get::<SkyrimCinematicPost>(main).unwrap().saturation,
+                1.0
+            );
+            assert_eq!(
+                world
+                    .get::<SkyrimCinematicPost>(main)
+                    .unwrap()
+                    .linear_domain,
+                0
+            );
+            assert_eq!(
+                *world.get::<SkyrimCinematicPost>(main).unwrap(),
+                world.resource::<SceneVisualPreset>().grade().post()
+            );
+        }
+    }
+
+    fn assert_fog_matches(actual: &bevy::pbr::DistanceFog, expected: &bevy::pbr::DistanceFog) {
+        assert_eq!(actual.color, expected.color);
+        assert_eq!(
+            actual.directional_light_color,
+            expected.directional_light_color
+        );
+        assert_eq!(
+            actual.directional_light_exponent,
+            expected.directional_light_exponent
+        );
+        let bevy::pbr::FogFalloff::Atmospheric {
+            extinction,
+            inscattering,
+        } = actual.falloff
+        else {
+            panic!("expected atmospheric fog");
+        };
+        let bevy::pbr::FogFalloff::Atmospheric {
+            extinction: wanted_extinction,
+            inscattering: wanted_inscattering,
+        } = expected.falloff
+        else {
+            panic!("expected atmospheric fog");
+        };
+        assert_eq!(extinction, wanted_extinction);
+        assert_eq!(inscattering, wanted_inscattering);
+    }
+
+    #[test]
+    fn presets_restore_vivid_and_keep_camera_and_lighting_state() {
+        let mut app = App::new();
+        app.init_resource::<SceneGradeMode>()
+            .init_resource::<SceneVisualPreset>()
+            .init_resource::<SkyPalette>()
+            .init_resource::<crate::console::ConsoleState>()
+            .add_console_command(scene_grade_command())
+            .add_console_command(scene_preset_command())
+            .add_systems(PostUpdate, apply_scene_grade_mode);
+        let vivid = SceneColorPipeline::default();
+        let expected_post = vivid.cinematic_post;
+        let transform = Transform::from_xyz(7.0, 11.0, 13.0);
+        let fog = crate::sky::fog_for(&SkyPalette::default());
+        let main = app.world_mut().spawn((vivid, transform, fog.clone())).id();
+        let reflection = app.world_mut().spawn(SceneColorPipeline::reflection()).id();
+        app.update();
+
+        for command in [
+            "ScenePreset COOL-GRAY",
+            "ScenePreset vivid",
+            "ScenePreset toggle",
+        ] {
+            crate::console::execute_line(app.world_mut(), command);
+            app.update();
+            let world = app.world();
+            let preset = *world.resource::<SceneVisualPreset>();
+            assert_eq!(*world.resource::<SkyPalette>(), preset.sky_palette());
+            if preset == SceneVisualPreset::Vivid {
+                assert_fog_matches(&crate::sky::fog_for(world.resource::<SkyPalette>()), &fog);
+            }
+            assert_grading_matches(world.get::<ColorGrading>(main).unwrap(), &preset.grade());
+            assert_eq!(
+                *world.get::<SkyrimCinematicPost>(main).unwrap(),
+                expected_post
+            );
+            assert_eq!(*world.get::<Transform>(main).unwrap(), transform);
+            assert_fog_matches(world.get::<bevy::pbr::DistanceFog>(main).unwrap(), &fog);
+            assert_eq!(
+                world.get::<Exposure>(main).unwrap().ev100,
+                DEFAULT_SCENE_EV100
+            );
+            assert_eq!(
+                *world.get::<Tonemapping>(main).unwrap(),
+                Tonemapping::TonyMcMapface
+            );
+            assert_grading_matches(
+                world.get::<ColorGrading>(reflection).unwrap(),
+                &SkyrimCinematicGrade {
+                    saturation: 1.0,
+                    ..SkyrimCinematicGrade::SKYRIM_CLEAR_DAY
+                },
+            );
+            assert_eq!(
+                *world.get::<SkyrimCinematicPost>(reflection).unwrap(),
+                SkyrimCinematicPost::default()
+            );
+        }
+        let later = app.world_mut().spawn(SceneColorPipeline::default()).id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<ColorGrading>(later)
+                .unwrap()
+                .global
+                .post_saturation,
+            1.25
+        );
+        for invalid in ["ScenePreset unknown", "ScenePreset vivid extra"] {
+            crate::console::execute_line(app.world_mut(), invalid);
+            assert_eq!(
+                *app.world().resource::<SceneVisualPreset>(),
+                SceneVisualPreset::CoolGray
+            );
+            assert_eq!(
+                *app.world().resource::<SkyPalette>(),
+                SceneVisualPreset::CoolGray.sky_palette()
+            );
+        }
+        crate::console::execute_line(app.world_mut(), "SceneGrade off");
+        crate::console::execute_line(app.world_mut(), "ScenePreset toggle");
+        app.update();
+        assert_eq!(
+            *app.world().resource::<SceneVisualPreset>(),
+            SceneVisualPreset::Vivid
+        );
+        assert_eq!(
+            *app.world().resource::<SceneGradeMode>(),
+            SceneGradeMode::Off
+        );
+        assert_eq!(
+            app.world()
+                .get::<SkyrimCinematicPost>(main)
+                .unwrap()
+                .enabled,
+            0.0
+        );
+        crate::console::execute_line(app.world_mut(), "SceneGrade full");
+        app.update();
+        assert_grading_matches(
+            app.world().get::<ColorGrading>(main).unwrap(),
+            &SkyrimCinematicGrade::SKYRIM_CLEAR_DAY,
+        );
+        assert_eq!(
+            *app.world().get::<SkyrimCinematicPost>(main).unwrap(),
+            expected_post
+        );
+        assert_eq!(
+            *app.world().resource::<SkyPalette>(),
+            SkyPalette::SKYRIM_CLEAR_DAY
+        );
+    }
+
+    #[test]
     fn console_modes_preserve_scene_state_and_leave_reflection_ungraded() {
         let mut app = App::new();
         app.init_resource::<SceneGradeMode>()
-            .init_resource::<SceneGradeTuning>()
+            .init_resource::<SceneVisualPreset>()
             .init_resource::<crate::console::ConsoleState>()
             .add_console_command(scene_grade_command())
             .add_systems(PostUpdate, apply_scene_grade_mode);
@@ -494,81 +1026,6 @@ mod tests {
     }
 
     #[test]
-    fn console_mode_is_mirrored_into_the_settings_menu() {
-        let mut app = App::new();
-        app.init_resource::<SceneGradeMode>()
-            .init_resource::<SceneGradeTuning>()
-            .init_resource::<crate::console::ConsoleState>()
-            .init_resource::<crate::settings::RenderingSettings>()
-            .add_console_command(scene_grade_command());
-        crate::console::execute_line(app.world_mut(), "SceneGrade saturation");
-        assert_eq!(
-            app.world()
-                .resource::<crate::settings::RenderingSettings>()
-                .color_grade,
-            SceneGradeMode::Saturation.index()
-        );
-        // A rejected mode changes neither the resource nor the menu.
-        crate::console::execute_line(app.world_mut(), "SceneGrade sepia");
-        assert_eq!(
-            app.world()
-                .resource::<crate::settings::RenderingSettings>()
-                .color_grade,
-            SceneGradeMode::Saturation.index()
-        );
-    }
-
-    #[test]
-    fn tuning_reaches_the_scene_camera_and_not_the_reflection() {
-        let mut app = App::new();
-        app.init_resource::<SceneGradeMode>()
-            .init_resource::<SceneGradeTuning>()
-            .add_systems(PostUpdate, apply_scene_grade_mode);
-        let main = app.world_mut().spawn(SceneColorPipeline::default()).id();
-        let reflection = app.world_mut().spawn(SceneColorPipeline::reflection()).id();
-        app.update();
-        *app.world_mut().resource_mut::<SceneGradeTuning>() = SceneGradeTuning {
-            grade: SkyrimCinematicGrade {
-                saturation: 0.8,
-                brightness: 1.2,
-                contrast: 1.1,
-                tint_amount: 0.3,
-                tint_rgb: [1.0, 0.9, 0.8],
-            },
-            pivot: 0.25,
-        };
-        app.update();
-        let world = app.world();
-        assert_eq!(
-            world
-                .get::<ColorGrading>(main)
-                .unwrap()
-                .global
-                .post_saturation,
-            0.8
-        );
-        let post = world.get::<SkyrimCinematicPost>(main).unwrap();
-        assert_eq!(
-            (post.brightness, post.contrast, post.tint_amount, post.pivot),
-            (1.2, 1.1, 0.3, 0.25)
-        );
-        assert_eq!(post.tint_rgb, Vec3::new(1.0, 0.9, 0.8));
-        assert_eq!(post.enabled, 1.0);
-        assert_eq!(
-            *world.get::<SkyrimCinematicPost>(reflection).unwrap(),
-            SkyrimCinematicPost::default()
-        );
-        assert_eq!(
-            world
-                .get::<ColorGrading>(reflection)
-                .unwrap()
-                .global
-                .post_saturation,
-            1.0
-        );
-    }
-
-    #[test]
     fn cinematic_shader_validates_and_matches_uniform_layout() {
         // Supply only Bevy's imported vertex interface; validate the actual
         // embedded fragment source rather than a second copy of its formula.
@@ -602,7 +1059,7 @@ mod tests {
                 .iter()
                 .map(|member| member.offset)
                 .collect::<Vec<_>>(),
-            [0, 4, 8, 12, 16, 28]
+            [0, 4, 8, 12, 16, 28, 32, 36]
         );
     }
 
@@ -660,6 +1117,8 @@ mod tests {
                 pivot: CINEMATIC_PIVOT,
                 tint_rgb: Vec3::new(0.894_118, 0.839_216, 0.772_549),
                 enabled: 1.0,
+                saturation: 1.0,
+                linear_domain: 0,
             }
         );
     }

@@ -1,5 +1,7 @@
 //! Synthetic output-domain check; no Skyrim assets or retail parity claim.
-//! Headless GPU readback: --output <directory> [--interior] [--gray] [--legacy-output].
+//! Headless GPU readback: --output <directory> [--interior] [--gray] [--legacy-output]
+//! [--color-grade <off|saturation|full|snapshot-srgb|snapshot-linear>].
+//! Use --input-linear <r,g,b> for an unclipped colored composition probe.
 use bevy::{
     camera::{
         Hdr, RenderTarget, ScalingMode,
@@ -37,6 +39,7 @@ struct Probe {
     output: PathBuf,
     interior: bool,
     legacy_output: bool,
+    color_grade: SceneGradeMode,
     color: LinearRgba,
     started: Instant,
     requested: bool,
@@ -50,16 +53,49 @@ fn main() {
     let mut output = PathBuf::from("color-pipeline-probe");
     let mut interior = false;
     let mut gray = false;
+    let mut input_linear = None;
     let mut legacy_output = false;
+    let mut color_grade = SceneGradeMode::Full;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--output" => output = args.next().expect("--output requires a directory").into(),
             "--interior" => interior = true,
             "--gray" => gray = true,
+            "--input-linear" => {
+                let raw = args.next().expect("--input-linear requires r,g,b");
+                let values = raw
+                    .split(',')
+                    .map(|part| part.parse::<f32>().expect("invalid RGB component"))
+                    .collect::<Vec<_>>();
+                assert!(
+                    values.len() == 3
+                        && values
+                            .iter()
+                            .all(|value| value.is_finite() && *value >= 0.0),
+                    "--input-linear needs three finite nonnegative components"
+                );
+                input_linear = Some(LinearRgba::rgb(values[0], values[1], values[2]));
+            }
             "--legacy-output" => legacy_output = true,
+            "--color-grade" => {
+                color_grade =
+                    SceneGradeMode::parse(&args.next().expect("--color-grade requires a mode"))
+                        .expect("invalid --color-grade mode");
+            }
             _ => panic!("unknown probe option {arg:?}"),
         }
+    }
+    assert!(
+        !gray || input_linear.is_none(),
+        "--gray cannot be combined with --input-linear"
+    );
+    assert!(
+        !legacy_output || color_grade == SceneGradeMode::Full,
+        "--legacy-output cannot be combined with --color-grade"
+    );
+    if legacy_output {
+        color_grade = SceneGradeMode::Off;
     }
     std::fs::create_dir_all(&output).expect("create probe output directory");
     // Remove stale verdicts before rendering; a crash must not look like a successful new run.
@@ -70,20 +106,19 @@ fn main() {
         }
     }
     let result = App::new()
-        .insert_resource(if legacy_output {
-            SceneGradeMode::Off
-        } else {
-            SceneGradeMode::Full
-        })
+        .insert_resource(color_grade)
         .insert_resource(Probe {
             output,
             interior,
             legacy_output,
-            color: if gray {
-                LinearRgba::rgb(0.18, 0.18, 0.18)
-            } else {
-                LinearRgba::rgb(0.18, 0.4, 2.0)
-            },
+            color_grade,
+            color: input_linear.unwrap_or_else(|| {
+                if gray {
+                    LinearRgba::rgb(0.18, 0.18, 0.18)
+                } else {
+                    LinearRgba::rgb(0.18, 0.4, 2.0)
+                }
+            }),
             started: Instant::now(),
             requested: false,
             frames: 0,
@@ -365,14 +400,33 @@ fn evaluate(
         samples.insert(name.into(), serde_json::json!({"pixel": [x,y], "rgb": image.get_pixel(x,y).0, "max_error_u8": max_error}));
     }
     let passed = reference_unclipped && composition_consistent;
+    let preset = engine::color_pipeline::SceneVisualPreset::default();
+    let resolved = probe.color_grade.grade(preset);
+    let post = probe.color_grade.post(preset);
     let report = serde_json::json!({
         "kind": "synthetic-output-consistency", "retail_parity": false,
         "space": if probe.interior { "interior" } else { "exterior" },
         "input_linear": probe.color.to_f32_array(), "ev100": engine::color_pipeline::DEFAULT_SCENE_EV100,
         "tonemapping": "TonyMcMapface", "legacy_output": probe.legacy_output,
-        "cinematic_grade": if probe.legacy_output { "disabled" } else { "experimental-clear-day" },
-        "saturation_domain": if probe.legacy_output { None } else { Some("linear-post-tonemap") },
-        "post_grade_domain": if probe.legacy_output { None } else { Some("srgb") },
+        "cinematic_grade": probe.color_grade.name(),
+        "resolved_grade": {
+            "saturation": resolved.saturation, "brightness": resolved.brightness,
+            "contrast": resolved.contrast, "tint_amount": resolved.tint_amount,
+            "tint_rgb": resolved.tint_rgb,
+            "bevy_saturation": probe.color_grade.bevy_saturation(preset),
+            "post_saturation": post.saturation, "post_linear_domain": post.linear_domain,
+            "post_enabled": post.enabled,
+        },
+        "saturation_domain": match probe.color_grade {
+            SceneGradeMode::Off => None,
+            SceneGradeMode::SnapshotSrgb => Some("srgb-post-tonemap"),
+            _ => Some("linear-post-tonemap"),
+        },
+        "post_grade_domain": match probe.color_grade {
+            SceneGradeMode::Off | SceneGradeMode::Saturation => None,
+            SceneGradeMode::SnapshotLinear => Some("linear"),
+            _ => Some("srgb"),
+        },
         "artistic_pivot": engine::color_pipeline::CINEMATIC_PIVOT,
         "reflection_format": if probe.legacy_output { "Rgba8UnormSrgb" } else { "Rgba16Float" },
         "resolution": [800,600], "camera": {"position": [0,0,10], "projection": "orthographic", "vertical_size": 6},
