@@ -281,7 +281,8 @@ CREATE TABLE IF NOT EXISTS worldspaces (
     parent_world INTEGER,               -- Parent WorldSpace FormID (if child worldspace)
     flags INTEGER NOT NULL,
     lod_origin_x INTEGER,               -- Validated sidecar/explicit origin; NULL if unresolved
-    lod_origin_y INTEGER
+    lod_origin_y INTEGER,
+    full_name TEXT                      -- Display name (FULL, e.g. 'Skyrim'); see "Display names"
 );
 ```
 
@@ -299,9 +300,38 @@ CREATE TABLE IF NOT EXISTS cells (
     grid_y INTEGER,                     -- Exterior cell Grid Y (NULL if interior)
     interior_name TEXT,                 -- Interior cell name (NULL if exterior)
     flags INTEGER NOT NULL,
-    data BLOB                           -- Optional cell binary payload
+    data BLOB,                          -- Optional cell binary payload
+    full_name TEXT                      -- Display name (FULL); see "Display names" below
 );
 ```
+
+#### Display names (`full_name`)
+
+`worldspaces.full_name`, `cells.full_name` and `statics.full_name` hold the record's `FULL`, the
+name the game shows (door prompts, the crosshair label, container menus, the map). `npcs.full_name`
+follows the same rules. `cells.interior_name` is still the cell's Editor ID (`EDID`), not its
+name; it keeps its column name for compatibility.
+
+`FULL` is a localized string. In a plugin with the TES4 `Localized` flag (0x80) it is a four-byte
+ID into `Strings/<plugin>_english.STRINGS`, looked up in the table of the plugin that supplied the
+winning record: a loose `Data/Strings` file first, then the archives. Otherwise it is
+Windows-1252 text. Both record readers publish the same UTF-8 text:
+
+- The in-house reader resolves every field its schema types as `lstring`.
+- The legacy reader (`--record-reader legacy`) resolves the subrecords the in-house schema types
+  as `lstring` in every occurrence for that record type, using the same table lookup
+  (`crates/converter/src/esm/legacy_text.rs`). That covers `FULL` on every record type, and
+  `DESC`, `RNAM` and others where the subrecord is unambiguous. This changed the legacy
+  projection, so its reader identity is `projection_version` 4. Packages from versions 1-3 keep
+  their retained assets.
+
+A name whose ID is 0, missing from the table, or whose table cannot be read is NULL in these
+columns for both readers, with one warning per plugin. The canonical `records.data` payloads hold
+the same resolved text for both readers.
+
+The columns are additive and optional. They did not bump `shared::WORLD_DATABASE_SCHEMA_VERSION`:
+`create_tables` adds them to an older reused table, and a reader must probe for them. No engine
+code reads them yet.
 
 ---
 
