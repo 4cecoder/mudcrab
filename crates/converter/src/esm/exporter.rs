@@ -1244,10 +1244,16 @@ mod tests {
             conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN full_name;"))
                 .unwrap();
         }
-        for (column, _) in LIGHT_DETAIL_COLUMNS {
-            conn.execute_batch(&format!("ALTER TABLE lights DROP COLUMN {column};"))
-                .unwrap();
-        }
+        // Use the pre-extension table verbatim: SQLite cannot DROP its final commented column.
+        conn.execute_batch(
+            "DROP TABLE lights;
+             CREATE TABLE lights (
+                 id INTEGER PRIMARY KEY, editor_id TEXT, radius REAL NOT NULL,
+                 color_r INTEGER NOT NULL, color_g INTEGER NOT NULL, color_b INTEGER NOT NULL,
+                 flags INTEGER NOT NULL, falloff REAL NOT NULL, fade REAL
+             );",
+        )
+        .unwrap();
         conn.execute_batch("INSERT INTO statics(id, editor_id, flags) VALUES (1, 'retained', 0);")
             .unwrap();
         create_tables(&conn).unwrap();
