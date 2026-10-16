@@ -494,8 +494,8 @@ pub(crate) fn insert_cell(
         .insert(tx, "cell_environment")?;
     tx.prepare_cached("DELETE FROM cell_regions WHERE cell_id=?1")?
         .execute([cell_id])?;
-    for region in view.find(b"XCLR").unwrap_or_default().chunks_exact(4) {
-        let region = u32::from_le_bytes(region.try_into().expect("four-byte chunk"));
+    for region in view.find(b"XCLR").unwrap_or_default().as_chunks::<4>().0 {
+        let region = u32::from_le_bytes(*region);
         if let Some(region) = links.id(Some(region), &[b"REGN"]) {
             tx.prepare_cached(
                 "INSERT OR IGNORE INTO cell_regions(cell_id, region_id) VALUES (?1, ?2)",
@@ -720,9 +720,9 @@ fn insert_weather(
         .execute([id])?;
     for (colour_type, colours) in WEATHER_COLOUR_TYPES
         .iter()
-        .zip(sized(view, b"NAM0", NAM0_SIZES).chunks_exact(16))
+        .zip(sized(view, b"NAM0", NAM0_SIZES).as_chunks::<16>().0)
     {
-        for (time, rgb) in TIMES_OF_DAY.iter().zip(colours.chunks_exact(4)) {
+        for (time, rgb) in TIMES_OF_DAY.iter().zip(colours.as_chunks::<4>().0) {
             tx.prepare_cached(
                 "INSERT OR REPLACE INTO weather_colors(weather_id, color_type, time_of_day, r, g, b) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?
@@ -758,7 +758,7 @@ fn insert_weather_list<'a>(
 ) -> Result<()> {
     tx.prepare_cached(&format!("DELETE FROM {table} WHERE {owner}=?1"))?
         .execute([id])?;
-    let entries = lists.into_iter().flat_map(|list| list.chunks_exact(12));
+    let entries = lists.into_iter().flat_map(|list| list.as_chunks::<12>().0);
     for (position, entry) in entries.enumerate() {
         Row::default()
             .put(owner, id)
