@@ -69,7 +69,7 @@ metadata retention preserves the producer identity of the retained bytes.
 │  │   `plugins`              │   `records`          │ `worldspaces`       │  │
 │  │   (Active Plugin Order)  │   (Raw FormID Data)  │ (Worldspace EDIDs)  │  │
 │  ├──────────────────────────┼──────────────────────┼─────────────────────┤  │
-│  │   `cells`                │   `references`       │ `refs_rtree`        │  │
+│  │   `cells`                │   `references`       │ `exterior_spatial`  │  │
 │  │   (Cell Grid & Names)    │   (3D World Placements)│ (3D Spatial R-Tree) │  │
 │  ├──────────────────────────┼──────────────────────┼─────────────────────┤  │
 │  │   `land`                 │   `lod`              │ `scripts`           │  │
@@ -91,10 +91,10 @@ Stores loaded `.esm`/`.esp`/`.esl` plugin file metadata, load order priority, an
 
 ```sql
 CREATE TABLE IF NOT EXISTS plugins (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    priority INTEGER NOT NULL,
-    checksum BLOB NOT NULL
+    id INTEGER PRIMARY KEY,             -- load-order index; records.load_order refers to it
+    name TEXT NOT NULL UNIQUE,          -- plugin filename as installed
+    priority INTEGER NOT NULL,          -- same as id
+    checksum BLOB NOT NULL              -- SHA-256 of the plugin file
 );
 ```
 
@@ -117,14 +117,16 @@ earlier usable winner intact and are counted in per-plugin diagnostics. The pack
 
 ```sql
 CREATE TABLE IF NOT EXISTS records (
-    id INTEGER PRIMARY KEY,
-    form_id INTEGER NOT NULL,
-    record_type TEXT NOT NULL,          -- 'CELL', 'REFR', 'NPC_', 'WEAP', 'ARMOR', 'SPEL', etc.
-    data BLOB NOT NULL                  -- Serialized subrecords payload
+    form_id INTEGER PRIMARY KEY,        -- winning record, load-order numbering
+    record_type TEXT NOT NULL,          -- 'CELL', 'REFR', 'NPC_', 'WEAP', 'ARMO', 'SPEL', etc.
+    cell_id INTEGER,                    -- parent CELL of a placed reference or LAND; NULL otherwise
+    worldspace_id INTEGER,              -- parent WRLD of an exterior CELL or reference; NULL otherwise
+    load_order INTEGER NOT NULL,        -- plugins.id of the plugin that supplied the winning record
+    data BLOB NOT NULL                  -- rkyv ArchivedRecordData: the subrecord payloads
 );
 
-CREATE INDEX IF NOT EXISTS idx_records_formid ON records(form_id);
 CREATE INDEX IF NOT EXISTS idx_records_type ON records(record_type);
+CREATE INDEX IF NOT EXISTS idx_records_cell_id ON records(cell_id) WHERE cell_id IS NOT NULL;
 ```
 
 ---
@@ -289,15 +291,16 @@ CREATE TABLE IF NOT EXISTS worldspaces (
 
 ### 4. Cell Registry (`cells`)
 
-Stores exterior cell grid coordinates and interior cell names.
+Stores exterior cell grid coordinates and each cell's Editor ID.
 
 ```sql
 CREATE TABLE IF NOT EXISTS cells (
     id INTEGER PRIMARY KEY,             -- CELL FormID
-    worldspace_id INTEGER NOT NULL,     -- Parent WorldSpace FormID
+    worldspace_id INTEGER,              -- Parent WorldSpace FormID; NULL for an interior
     grid_x INTEGER,                     -- Exterior cell Grid X (NULL if interior)
     grid_y INTEGER,                     -- Exterior cell Grid Y (NULL if interior)
-    interior_name TEXT,                 -- Interior cell name (NULL if exterior)
+    interior_name TEXT,                 -- The cell's EDID (Editor ID) when it has one, exterior or
+                                        -- interior; not the display name
     flags INTEGER NOT NULL,
     data BLOB                           -- Optional cell binary payload
 );
@@ -313,10 +316,14 @@ Stores 3D positions, rotations, scales, and cell parentage for all placed world 
 CREATE TABLE IF NOT EXISTS references (
     id INTEGER PRIMARY KEY,
     cell_id INTEGER NOT NULL,           -- Parent CELL FormID
-    form_id INTEGER NOT NULL,           -- Base Object FormID
+    worldspace_id INTEGER,              -- Parent WorldSpace FormID; NULL in an interior
+    base_form_id INTEGER NOT NULL,      -- Base Object FormID (NAME)
+    is_exterior INTEGER NOT NULL,       -- 1 when the parent cell has a worldspace or a grid
     pos_x REAL NOT NULL,                -- 3D X Coordinate
     pos_y REAL NOT NULL,                -- 3D Y Coordinate
     pos_z REAL NOT NULL,                -- 3D Z Coordinate
+    local_x REAL,                       -- Exterior only: pos_x within its 4096-unit grid cell
+    local_y REAL,                       -- (from the position, not the owning CELL); NULL inside
     rot_x REAL NOT NULL,                -- Rotation X (Radians)
     rot_y REAL NOT NULL,                -- Rotation Y (Radians)
     rot_z REAL NOT NULL,                -- Rotation Z (Radians)
@@ -329,7 +336,7 @@ CREATE TABLE IF NOT EXISTS references (
 );
 
 -- Index for O(1) interior cell reference loading
-CREATE INDEX IF NOT EXISTS idx_references_cell_id ON references(cell_id);
+CREATE INDEX IF NOT EXISTS idx_references_cell ON "references"(cell_id);
 ```
 
 The reference flag and enable-parent columns preserve winning raw-record
@@ -370,14 +377,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS exterior_spatial USING rtree(
 
 ### 7. Terrain Heightmaps (`land`)
 
-Stores 33x33 terrain heightmap data, vertex textures (`vtex`), and vertex colors (`vclr`) extracted from `LAND` records.
+Stores 33x33 terrain heightmap data, vertex textures (`vtex`), vertex colors (`vclr`) and
+vertex normals extracted from the winning `LAND` record of each cell.
 
 ```sql
 CREATE TABLE IF NOT EXISTS land (
     cell_id INTEGER PRIMARY KEY,        -- Parent CELL FormID
-    heightmap BLOB NOT NULL,            -- 33x33 float/byte heightmap buffer
-    vtext BLOB,                         -- Land texture layers
-    vclr BLOB                           -- Land vertex colors
+    heightmap BLOB NOT NULL,            -- VHGT: 33x33 height deltas
+    vtex BLOB,                          -- VTEX: land texture FormIDs
+    vclr BLOB,                          -- VCLR: vertex colors
+    normals BLOB                        -- VNML: vertex normals
 );
 ```
 
@@ -676,6 +685,94 @@ grass definitions. The subset export used by movement annotation preserves unrel
 grass rows; if it includes an LTEX, only that texture's association list is replaced.
 Movement annotation continues to accept schema 4 through the current schema and
 preserves the existing database version; it does not perform a full reconversion.
+
+---
+
+### Other Runtime and In-House Tables
+
+These tables are written by `create_tables` / the export and had no DDL here before #269. Their
+DDL below is copied from `crates/converter/src/esm/exporter.rs` and
+`crates/converter/src/esm/inhouse*.rs`; `statics` is documented with `references` (§5) by #270.
+
+```sql
+CREATE TABLE IF NOT EXISTS npcs (               -- one row per NPC_
+    id INTEGER PRIMARY KEY, editor_id TEXT,
+    full_name TEXT,                             -- FULL
+    race_id INTEGER,                            -- RNAM
+    class_id INTEGER,                           -- CNAM
+    flags INTEGER NOT NULL                      -- record header flags
+);
+CREATE INDEX IF NOT EXISTS idx_npcs_editor_id ON npcs(editor_id);
+
+CREATE TABLE IF NOT EXISTS movement_types (     -- MOVT 0003580D (NPC_Default_MT) only, today
+    id INTEGER PRIMARY KEY,
+    editor_id TEXT NOT NULL,                    -- written as the literal 'NPC_Default_MT'
+    left_walk REAL NOT NULL, left_run REAL NOT NULL,       -- SPED, Creation units per second
+    right_walk REAL NOT NULL, right_run REAL NOT NULL,
+    forward_walk REAL NOT NULL, forward_run REAL NOT NULL,
+    back_walk REAL NOT NULL, back_run REAL NOT NULL,
+    load_order INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS race_movement_links (  -- one row per RACE
+    id INTEGER PRIMARY KEY,
+    walk_movt_id INTEGER,                       -- WKMV
+    run_movt_id INTEGER,                        -- RNMV
+    load_order INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS movement_game_settings ( -- fMoveCharWalkBase and fJumpHeightMin only
+    id INTEGER PRIMARY KEY, editor_id TEXT NOT NULL,
+    value REAL NOT NULL, load_order INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS texture_sets (       -- one row per TXST; slot roles in the preamble
+    id INTEGER PRIMARY KEY, editor_id TEXT,
+    diffuse_path TEXT,                          -- TX00
+    normal_path TEXT,                           -- TX01
+    glow_path TEXT,                             -- TX03
+    height_path TEXT,                           -- TX04
+    environment_path TEXT,                      -- TX05
+    mask_path TEXT,                             -- TX02
+    specular_path TEXT,                         -- TX07
+    detail_path TEXT                            -- TX06
+);
+CREATE TABLE IF NOT EXISTS landscape_textures ( -- one row per LTEX
+    id INTEGER PRIMARY KEY, editor_id TEXT,
+    texture_set_id INTEGER,                     -- TNAM -> TXST
+    material_type INTEGER,                      -- MNAM: the material type's FormID (MATT), not a number
+    friction REAL,                              -- HNAM byte 0
+    restitution REAL                            -- HNAM byte 1
+);
+```
+
+The in-house reader also writes these auxiliary tables (diagnostic and provenance data; the
+engine does not read them):
+
+```sql
+CREATE TABLE IF NOT EXISTS inhouse_source_records (     -- original decompressed source bytes
+    form_id INTEGER PRIMARY KEY, source_form_id INTEGER NOT NULL, load_order INTEGER NOT NULL,
+    record_type TEXT NOT NULL, flags INTEGER NOT NULL, payload BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS inhouse_localized_fields (   -- every localized string field it met
+    form_id INTEGER NOT NULL, field_index INTEGER NOT NULL,
+    signature TEXT NOT NULL, field_name TEXT NOT NULL,
+    string_table TEXT NOT NULL,                         -- strings, dlstrings or ilstrings
+    string_id INTEGER NOT NULL, load_order INTEGER NOT NULL,
+    resolved_text TEXT,
+    status TEXT NOT NULL CHECK(status IN ('resolved','null_id','missing')),
+    PRIMARY KEY(form_id, field_index)
+);
+CREATE TABLE IF NOT EXISTS inhouse_terrain_source_order (
+    form_id INTEGER PRIMARY KEY, source_record_offset INTEGER NOT NULL
+);
+CREATE TABLE inhouse_terrain_layers (                   -- recreated with every complete export
+    form_id INTEGER PRIMARY KEY, cell_id INTEGER NOT NULL,
+    load_order INTEGER NOT NULL, layer_data BLOB NOT NULL
+);
+CREATE TABLE inhouse_unresolved_terrain_textures (      -- LAND layer textures that do not resolve
+    form_id INTEGER NOT NULL, texture_form_id INTEGER NOT NULL,
+    PRIMARY KEY(form_id, texture_form_id)
+) WITHOUT ROWID;
+```
 
 ---
 
