@@ -1084,7 +1084,7 @@ fn race_base_movement_links_match_legacy_and_inhouse_publication() {
                     (if light { 0xFE00_0000 } else { 0x0200_0000 }) | (first_id + index as u32);
                 for records in [&inhouse, &legacy] {
                     let bytes = SubrecordView::new(&records[&0x900].subrecords);
-                    assert_eq!(word(bytes.find(*tag).unwrap()), expected);
+                    assert_eq!(word(bytes.find(tag).unwrap()), expected);
                 }
                 for stored in [&inhouse_stored, &legacy_stored] {
                     let field = stored
