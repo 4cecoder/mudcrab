@@ -32,6 +32,8 @@ pub use plugins_txt::{
     OFFICIAL_MASTERS, read_plugins_txt, read_plugins_txt_with_options, read_skyrim_ccc,
 };
 #[cfg(test)]
+mod base_model_parity_tests;
+#[cfg(test)]
 mod display_name_parity_tests;
 #[cfg(test)]
 mod plugin_table_tests;
