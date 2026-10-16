@@ -86,6 +86,13 @@ fn main() {
             _ => panic!("unknown probe option {arg:?}"),
         }
     }
+    if color_grade == SceneGradeMode::RecordSrgb {
+        eprintln!(
+            "record-srgb requires an image-space record from a world database; \
+             use the engine with --image-space instead of this synthetic probe"
+        );
+        std::process::exit(2);
+    }
     assert!(
         !gray || input_linear.is_none(),
         "--gray cannot be combined with --input-linear"

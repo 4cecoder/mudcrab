@@ -1,5 +1,5 @@
 use crate::{
-    color_pipeline::SkyrimCinematicPostPlugin,
+    color_pipeline::{SceneGradeSource, SkyrimCinematicPostPlugin},
     config::{EngineConfig, MAX_IO_THREADS},
     console::{ConsolePlugin, console_closed},
     metrics::AcceptanceMetricsPlugin,
@@ -17,6 +17,7 @@ use crate::{
         AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, StreamingWorld,
         build_terrain_quadrant_mesh, streaming_center, validate_standard_material,
     },
+    tone_mapping::SceneToneMapSource,
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
@@ -106,6 +107,7 @@ struct AssetDirectoryReadLock {
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
     validate_fixture_selection(&config)?;
+    config.image_space_selection()?;
     let start_camera = prepare_start_camera(&mut config)?;
     let shots = prepare_shots(&mut config)?;
     let shots_active = shots.is_some();
@@ -168,6 +170,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             InitialCameraGroundHeight(ground_height),
         ))
     };
+    let grade_source =
+        SceneGradeSource::load(&config, runtime_data.is_some() && !config.streaming_fixture)?;
+    let tone_map_source = SceneToneMapSource::load(&config, &grade_source)?;
+    let sky_palette = grade_source.sky_palette(config.visual_preset);
     let movement_tuning = (interactive_world_physics
         && runtime_data.is_some()
         && !config.streaming_fixture)
@@ -224,7 +230,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let render_asset_budget = upload_budget(&config);
     app.insert_resource(config.color_grade)
         .insert_resource(config.visual_preset)
-        .insert_resource(config.visual_preset.sky_palette())
+        .insert_resource(sky_palette)
+        .insert_resource(grade_source)
+        .insert_resource(tone_map_source)
         .insert_resource(config)
         .insert_resource(origin)
         .insert_resource(render_asset_budget)

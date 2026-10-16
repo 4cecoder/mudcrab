@@ -995,7 +995,7 @@ fn request_capture(
     run.capture = None;
     commands
         .spawn((Screenshot::image(output.clone()), ticket))
-        .observe(move |trigger: On<ScreenshotCaptured>, mut run: ResMut<ShotsRun>, grade: Res<crate::color_pipeline::SceneGradeMode>, preset: Res<crate::color_pipeline::SceneVisualPreset>| {
+        .observe(move |trigger: On<ScreenshotCaptured>, mut run: ResMut<ShotsRun>| {
             if run.shot != index
                 || run.transition_capture != transition
                 || run.phase != Phase::Capture
@@ -1020,9 +1020,8 @@ fn request_capture(
                     if !transition && !run.timed_out && !receipt.work.is_quiet() {
                         return Err("captured settled frame has pending or unavailable work".into());
                     }
+                    let grading = receipt.grading.as_ref().ok_or("captured frame has no grading source receipt")?;
                     write_shot(trigger.image.clone(), &path)?;
-                    let resolved_grade = grade.grade(*preset);
-                    let resolved_post = grade.post(*preset);
                     let line = serde_json::json!({
                         "capture": index,
                         "kind": if transition { "transition" } else { "settled" },
@@ -1035,21 +1034,11 @@ fn request_capture(
                         "timed_out": run.timed_out,
                         "image": path,
                         "dimensions": dimensions,
-                        "color_grade": grade.name(),
-                        "visual_preset": preset.name(),
-                        "preset_saturation": preset.grade().saturation,
-                        "resolved_grade": {
-                            "saturation": resolved_grade.saturation,
-                            "brightness": resolved_grade.brightness,
-                            "contrast": resolved_grade.contrast,
-                            "tint_amount": resolved_grade.tint_amount,
-                            "tint_rgb": resolved_grade.tint_rgb,
-                            "bevy_saturation": grade.bevy_saturation(*preset),
-                            "post_saturation": resolved_post.saturation,
-                            "post_linear_domain": resolved_post.linear_domain,
-                            "post_enabled": resolved_post.enabled,
-                            "pivot": resolved_post.pivot,
-                        },
+                        "color_grade": grading.color_grade,
+                        "visual_preset": grading.visual_preset,
+                        "preset_saturation": grading.preset_saturation,
+                        "grading_source": grading.source,
+                        "resolved_grade": grading.resolved_grade,
                         "water_time_seconds": if run.route_checkpoints.is_none() { Some(1.0) } else { None }
                     });
                     run.note(line.to_string());

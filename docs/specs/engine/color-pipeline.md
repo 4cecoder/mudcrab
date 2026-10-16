@@ -21,7 +21,7 @@ Code baseline: `a9f2310ccfc691eebb97fde18df1e8d334b7d744`; Bevy 0.19. The source
 | `DistanceFog` | Exposed surface RGB + linear fog palette → fogged linear RGB | Existing Bevy visibility-based atmospheric fog toward Fog Far stays explicit. Interior fog removal is current behavior, not complete Skyrim interior semantics. L2 owns the correction. |
 | `render.rs` reflection camera | Scene at main-view exposure → `Rgba16Float`, tone mapping disabled | Floating linear target preserves values above 1. Reflection gate copies exposure even while inactive. Existing reflected layers and geometry selection remain unchanged. |
 | `shaders/water.wgsl` | Exposed water lighting + exposed linear reflection → blend → surface fog | Reflection receives neither a second lighting evaluation nor a display transform. Existing Fresnel/waves and reflection coverage are approximations. |
-| `color_pipeline.rs` / scene cameras | HDR composition → `TonyMcMapface` → selected post-tonemap grade → display encoding | Runtime starts with Cool Gray sky and the Sleeping Giant sRGB snapshot described below. The saved `full` grade uses Bevy linear `post_saturation`, followed by sRGB brightness/contrast/tint from reported `ISSkyrimClearDAY` (0x00012F88, `Update.esm` winner) CNAM 1.5/1.135/1.4 and TNAM 0.42 toward 0.894/0.839/0.773. Contrast uses an artistic pivot of 0.18. Tone curve and EV100 remain pinned Bevy baselines; `HNAM` remains unapplied. L4 owns adaptation and record-driven behavior. |
+| `color_pipeline.rs` / scene cameras | HDR composition → `TonyMcMapface` → selected post-tonemap grade → display encoding | Runtime starts with Cool Gray sky and the Sleeping Giant sRGB snapshot described below. The saved `full` grade uses Bevy linear `post_saturation`, followed by sRGB brightness/contrast/tint from reported `ISSkyrimClearDAY` (0x00012F88, `Update.esm` winner) CNAM 1.5/1.135/1.4 and TNAM 0.42 toward 0.894/0.839/0.773. Contrast uses an artistic pivot of 0.18. The default tone curve and EV100 remain pinned Bevy baselines; `HNAM` stays unapplied on that path. The separate retail-curve experiment below uses White only. L4 owns adaptation and effective native state. |
 
 The previous non-HDR mesh path tone-mapped in each material shader. The custom sky shader bypassed that operation, and reflection RGB passed through tone mapping in both the reflection and water passes. HDR composition moves the tone transform after composition. The experimental cinematic grade adds a fullscreen shader pass. It changes images and consumes more render-target memory; target-hardware performance remains an acceptance requirement.
 
@@ -29,14 +29,23 @@ The previous non-HDR mesh path tone-mapped in each material shader. The custom s
 
 The sRGB-domain brightness/contrast/tint pass preserves the Riverwood appearance
 approved during local testing. It is an artistic interpretation, not verified
-Skyrim shader parity. Record-to-shader slot writers, adapted pivot, native tone
-curve, final transfer and retail pass order remain unresolved. Bevy saturation
+Skyrim shader parity. Native CPU curves, parameter packing and the final exponent
+producer are now traced, but this grade still lacks native adaptation, its sampled
+pivot, bloom and complete output transfer. One captured Skyrim frame now identifies
+group 26 and its inputs, with a five-pixel arithmetic check against GPU replay;
+this state is not yet reproduced in Mudcrab, and full retail pass order remains
+unverified. See [captured GPU state](../../../research_notes/Skyrim%20native%20tone%20mapping/gpu_state.md)
+and the [native packing trace](../../../research_notes/Skyrim%20native%20tone%20mapping/gpu_binding_trace.md).
+Bevy saturation
 runs in linear RGB with slightly different luminance weights from the custom tint
 pass. Negative input and out-of-gamut output are clipped; alpha is preserved and
-retail alpha/bloom-feed grading is omitted. `HNAM` is recorded but unapplied.
+retail alpha/bloom-feed grading is omitted. `HNAM` is recorded but unapplied with
+the default Tony transform. The explicit retail-curve experiment below uses
+White only.
 
-Scene cameras share the selected grade, including interiors; no weather/interior
-image-space selection exists yet. All apps using
+Scene cameras share the selected grade, including interiors. The experimental
+record mode can load a direct image space or an explicitly selected authored
+weather slot; it does not resolve effective runtime weather or interior state. All apps using
 these camera settings must register `SkyrimCinematicPostPlugin`. Cameras must keep
 `CompositingSpace::Linear`; overriding it with sRGB or Oklab is unsupported. Ordering
 relative to AA and CAS remains unvalidated. Reflection currently incurs a disabled
@@ -57,6 +66,13 @@ These are one scene's current base-grade values, not universal Skyrim defaults.
 The sRGB mode now applies a user-requested 20% brightness increase, from 1.15 to
 1.38. Saturation, contrast, tint, exposure, and fog remain unchanged by this tuning.
 The original snapshot values and the linear mode retain brightness 1.15.
+The approved look is named `approved-sleeping-giant` and stored in
+`crates/engine/src/presets/approved-snapshot.json`: original rounded snapshot,
+final grading values, sky colors, and fog overrides are separate data fields.
+`--grade-preset <json>` loads the same format at startup. Its grade applies only
+to `snapshot-srgb`; its sky/fog applies only to Cool Gray. It does not replace
+loaded Skyrim records, Vivid, or `full` mode. Brightness 1.38 is final and is not
+multiplied by 1.2 again.
 
 Both modes disable Bevy post-saturation and evaluate saturation followed by tint
 in the cinematic post pass. The original luminance feeds both operations; negative
@@ -82,6 +98,100 @@ uses the snapshot's saturation 1.66; Cool Gray's saved saturation 1.25 applies w
 which saturation stage is active, and the post-pass domain flag. For a small GPU
 composition check, run `color_pipeline_probe --gray --color-grade snapshot-srgb`
 or `snapshot-linear` with a fresh `--output` directory.
+
+### Authored image-space record experiment
+
+`--color-grade record-srgb --image-space 0x12F88` reads the winning IMGS record
+from the converted `skyrim_world.db`. Alternatively select a weather's authored
+slot with `--image-space-weather 0x81A --image-space-slot day`; available slots
+are `sunrise`, `day`, `sunset`, and `night`. FormIDs accept decimal or `0x` hex.
+Direct and weather selectors cannot be combined, and the weather/slot flags must
+be supplied together. No selector is guessed from the comparison screenshot.
+Older archives may retain plugin-relative IMSP links without normalization
+metadata. Weather lookup therefore accepts only verified identity cases:
+slot-zero base-plugin forms with matching origin metadata and weather winner
+priority 0 or 1. Later overrides and mod-owned weather links fail clearly; use a
+direct canonical IMGS selection for those archives.
+
+This mode sends raw CNAM saturation/brightness/contrast and TNAM tint into the
+existing sRGB post pass without the approved snapshot overrides. With the default
+tone-map selection it keeps TonyMcMapface, fixed EV100 9.7, the artistic 0.18 pivot, current lighting and the
+independently selected sky/fog. It is a calibration experiment, not Skyrim's
+native tone mapper. All nine HNAM values are retained in the loaded source and
+receipts. With Tony selected they remain explicitly unapplied; adaptation, native bloom, native tone
+curve, final transfer, and modifier composition are unresolved.
+
+Loading a record without choosing `record-srgb` is supported for console A/B:
+`SceneGrade record-srgb`, then `SceneGrade snapshot-srgb` restores the approved
+grade. Switching to record mode without a loaded record fails and keeps the
+previous mode. To restore the complete approved look after curve experiments,
+select `SceneToneMap tony` and `SceneGrade snapshot-srgb`. Missing/malformed selected records fail startup rather than
+substituting a preset. Fixtures and synthetic runs do not require retail data and
+reject record selectors instead of opening a world database.
+
+`SceneState` and automatic `shots.log` receipts include source selection, IMGS
+and optional WTHR identity, winning plugin/load order, raw CNAM/TNAM/HNAM values,
+approved override provenance, effective grade, and `hnam_applied: false` with
+Tony selected. Retail-curve receipts identify White as the only applied HNAM field.
+An authored weather slot is evidence of record data, not the reference frame's
+effective weather, blended modifiers, or GPU constants. The composition probe
+has no world database and rejects `record-srgb` explicitly.
+
+Local verification on 2026-10-15 used native Metal captures of the approved
+default, direct ClearDAY IMGS, and Cloudy weather's authored day slot. Source,
+grade, camera, readiness, and raw-HNAM receipts are in the ignored
+`data/visual-comparisons/record-loader-20261015/` directory. The default's
+resolved grading values match the approved capture exactly. PNG identity is
+reported separately: repeated captures with the unchanged executable also vary,
+so these results do not establish bitwise image reproducibility. The cause of
+that capture variation remains unverified.
+
+### Explicit retail-curve experiment
+
+`--tone-map retail-curve --tone-map-params <json> --image-space <FormID>`
+selects a separate scalar-luminance curve in the existing fullscreen pass.
+The approved default remains `--tone-map tony`. Grading stays independently
+selected; this experiment supports `snapshot-srgb`, `record-srgb`, and `off`.
+Legacy `full`/`saturation` and `snapshot-linear` are rejected for this path.
+
+The parameter file requires `name`, `source`, `curve` (`reinhard` or `filmic`),
+`reinhard_white_scale`, `filmic_white_scale`, `sampled_luminance`, and
+`target_luminance`. Every numeric value must be finite and positive. It has no
+implicit defaults. HNAM.White comes from the selected record, and the recovered
+CPU formulas derive its curve coefficient. Native static PE initializers show
+white scales 1.1/1.4 and filmic disabled. A later isolated Skyrim session also
+observed those values in process memory and console evidence. The parameter file
+still selects them explicitly; it does not inherit a running Skyrim session or
+establish the settings of the historical reference screenshot. See
+[the CPU evidence](../../../research_notes/Skyrim%20native%20tone%20mapping/next_step.md)
+and [runtime observations](../../../research_notes/Skyrim%20native%20tone%20mapping/runtime_state.md).
+
+The scene camera disables Bevy tonemapping so the scalar curve receives exposed
+HDR exactly once. Bevy's tone-stage color grading and deband dither are skipped.
+The existing sRGB grade, artistic contrast pivot, and display transfer remain.
+`SceneGrade off` disables grading while retaining the selected curve. Reflections
+keep their ungraded HDR output and never receive the curve independently.
+
+Only HNAM.White contributes to this experiment. Other HDR fields stay unapplied.
+Fixed sample/target luminance values stand in for P.x/P.y without adaptation
+history; they do not change the grade pivot. Native parameter packing is now
+traced, and the audited final exponent is `1 / fGamma`; this experiment does not
+apply that exponent. Bloom, adaptation/history, effective modifiers, the sampled
+numeric domain, and complete output transfer remain outside this reconstruction.
+The historical reference's selected shader and inputs remain unobserved. This
+path is a retail curve with Bevy inputs and sRGB grading, not a complete Skyrim
+tone mapper. See [packing](../../../research_notes/Skyrim%20native%20tone%20mapping/gpu_binding_trace.md)
+and [output evidence](../../../research_notes/Skyrim%20native%20tone%20mapping/output_transfer_trace.md).
+
+Preload the parameter file and record while keeping Tony selected, then use
+`SceneToneMap retail-curve` and `SceneToneMap tony` for console A/B. Invalid
+selections leave the previous state intact. Automatic and live screenshot
+receipts bind tone selection, coefficients, record source, and actual camera
+tonemapping/exposure to the captured render frame.
+
+Every tuning step uses the frozen approved and Skyrim references through
+[the comparison workflow](tonemap-tuning.md). Original PNGs and receipts remain
+separate from visual judgement. Screenshot byte identity is not a fidelity gate.
 
 ### Presets and diagnostic stages
 
@@ -133,7 +243,8 @@ Open the backtick console and run `SceneGrade off`, `SceneGrade saturation` or
 disables both grading stages; `saturation` enables only Bevy post-saturation;
 `full` enables the experimental sRGB brightness/contrast/tint pass too. Exposure,
 tone mapping, camera pose, lighting and fog remain fixed. Reflections stay ungraded,
-and newly spawned scene cameras inherit the current mode. The runtime default is `snapshot-srgb`.
+and newly spawned scene cameras inherit the current mode. The runtime default is
+`snapshot-srgb` with Cool Gray.
 
 Use `--color-grade off|saturation|full` for startup selection. For a repeatable
 three-mode capture, run:
@@ -468,4 +579,3 @@ B31|2026-10-03|Reference-shot prose omits existing failure counters from settle 
 B32|2026-10-03|Emission migration prose retained latest-only launcher requirement after shared compatibility range landed|Align prose with existing 15–19 readiness gate and schema-range tests; documentation-only, no new invariant
 
 Camera-mod research and remaining native calibration gates are recorded in [Skyrim camera comparison](skyrim-camera-comparison.md).
-

@@ -24,6 +24,7 @@ pub mod sky;
 pub mod skyrim_ini;
 pub mod streaming;
 pub mod terrain_upload;
+pub mod tone_mapping;
 pub mod visibility_optimization;
 pub mod world;
 

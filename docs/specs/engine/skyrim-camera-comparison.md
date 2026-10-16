@@ -54,4 +54,3 @@ The same mod exposes time freezing, time-of-day, and weather controls. For match
 The present evidence includes public documentation/source, Mudcrab captures, and the [isolated Skyrim session](../../../tools/skyrim-comparison/README.md): SKSE and five native plugins loaded, and Photo Mode wrote a native camera readback for the Riverwood overlook. No matched retail capture or retail color-grading parity was verified.
 
 Authenticated Nexus metadata checked on 2026-10-12 confirms FreeCamera Framework 1.1.0 (174046), AutoTest 1.2.0 (42520), and Photo Mode 3.0.4 (91701). Photo Mode also exposes time freezing, time-of-day, and weather controls; preserve the target game state and avoid its image filters when collecting vanilla references.
-

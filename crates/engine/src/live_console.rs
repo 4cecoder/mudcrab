@@ -1,10 +1,12 @@
 //! Opt-in process-local control for a visible developer tuning session.
 
 use crate::{
-    color_pipeline::{SceneGradeMode, SceneVisualPreset},
+    capture_frame::CaptureFrame,
+    color_pipeline::{SceneGradeMode, SceneGradeSource, SceneVisualPreset},
     console::{AppConsoleExt, ConsoleCommand, ConsoleState, execute_line},
     streaming::StreamingMetrics,
     terrain_upload::TerrainMeshUploadReadiness,
+    tone_mapping::SceneToneMapSource,
 };
 use bevy::{
     prelude::*,
@@ -68,10 +70,7 @@ impl Plugin for StdinConsolePlugin {
                         let result = (|| -> Result<(), String> {
                             let frame = ticket.receipt().ok_or("missing live capture-frame receipt")?;
                             let image = event.image.clone().try_into_dynamic().map_err(|e| e.to_string())?;
-                            let mut receipt = state.clone();
-                            receipt["dimensions"] = serde_json::json!([image.width(), image.height()]);
-                            receipt["capture_frame"] = serde_json::to_value(frame).map_err(|e| e.to_string())?;
-                            receipt["classification"] = "live screenshot; grading state recorded at request, camera and readiness bound to captured render frame".into();
+                            let receipt = build_live_capture_receipt(&state, &frame, [image.width(), image.height()])?;
                             image.save(&destination).map_err(|e| e.to_string())?;
                             std::fs::write(destination.with_extension("json"), serde_json::to_string_pretty(&receipt).unwrap()).map_err(|e| e.to_string())?;
                             Ok(())
@@ -86,6 +85,45 @@ impl Plugin for StdinConsolePlugin {
             })
             .add_systems(Update, dispatch_stdin);
     }
+}
+
+fn build_live_capture_receipt(
+    requested_state: &serde_json::Value,
+    frame: &CaptureFrame,
+    dimensions: [u32; 2],
+) -> Result<serde_json::Value, String> {
+    let grading = frame
+        .grading
+        .as_ref()
+        .ok_or("live captured frame has no validated grading evidence")?;
+    if !frame.work.is_quiet() {
+        return Err(format!(
+            "live captured frame is not settled: {}",
+            frame.work.describe()
+        ));
+    }
+    let tone_map = grading.source["tone_map_mode"]
+        .as_str()
+        .ok_or("live captured frame has no tone-map mode evidence")?;
+    Ok(serde_json::json!({
+        "ready": true,
+        "grade": grading.color_grade,
+        "preset": grading.visual_preset,
+        "tone_map": tone_map,
+        "preset_saturation": grading.preset_saturation,
+        "saturation": grading.resolved_grade["saturation"],
+        "brightness": grading.resolved_grade["brightness"],
+        "contrast": grading.resolved_grade["contrast"],
+        "tint_amount": grading.resolved_grade["tint_amount"],
+        "tint_rgb": grading.resolved_grade["tint_rgb"],
+        "resolved_grade": grading.resolved_grade,
+        "grading_source": grading.source,
+        "work": frame.work,
+        "dimensions": dimensions,
+        "capture_frame": frame,
+        "requested_state": requested_state,
+        "classification": "live screenshot; grading, camera and readiness bound to captured render frame; request-time state retained separately",
+    }))
 }
 
 fn dispatch_stdin(world: &mut World) {
@@ -142,11 +180,24 @@ fn scene_state(world: &World) -> serde_json::Value {
         && pending_specializations == Some(0)
         && pending_transfers == Some(0)
         && pending_batches == 0.0;
-    let grade = mode.grade(preset);
+    let source = world
+        .get_resource::<SceneGradeSource>()
+        .cloned()
+        .unwrap_or_default();
+    let tone = world
+        .get_resource::<SceneToneMapSource>()
+        .cloned()
+        .unwrap_or_default();
+    let resolved = tone
+        .resolve(&source, mode, preset)
+        .expect("validated scene grade source");
+    let grade = resolved.grade;
     serde_json::json!({
         "ready": ready, "grade": mode.name(), "preset": preset.name(),
         "saturation": grade.saturation, "brightness": grade.brightness, "contrast": grade.contrast,
         "tint_amount": grade.tint_amount, "tint_rgb": grade.tint_rgb,
+        "tone_map": tone.mode.name(),
+        "grading_source": tone.evidence(&source, mode, preset),
         "pending_terrain_uploads": pending_terrain,
         "pending_specializations": pending_specializations,
         "pending_render_transfers": pending_transfers,
@@ -167,6 +218,122 @@ fn scene_state(world: &World) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{capture_frame::CaptureGrade, shots::SettleCounts};
+
+    fn captured_frame() -> CaptureFrame {
+        CaptureFrame {
+            main_frame: 42,
+            render_frame: 41,
+            camera_creation: [21750.0, -44530.0, 140.0],
+            rotation_runtime_xyzw: [0.0, 0.0, 0.0, 1.0],
+            vertical_fov_radians: Some(std::f32::consts::FRAC_PI_4),
+            render_origin: [5, -11],
+            pending_specializations: Some(0),
+            work: SettleCounts {
+                renderer_ready: true,
+                pending_specializations: Some(0),
+                pending_render_transfers: Some(0),
+                ..default()
+            },
+            terrain_coverage: default(),
+            terrain_gauges: default(),
+            grading: Some(CaptureGrade {
+                color_grade: "snapshot-srgb".into(),
+                visual_preset: "cool-gray".into(),
+                preset_saturation: 1.25,
+                resolved_grade: serde_json::json!({
+                    "saturation": 1.66,
+                    "brightness": 1.38,
+                    "contrast": 1.5,
+                    "tint_amount": 0.56,
+                    "tint_rgb": [0.88, 0.81, 0.72],
+                }),
+                source: serde_json::json!({
+                    "tone_map_mode": "tony",
+                    "source_kind": "approved-artistic-override",
+                    "approved_override": {"path": "original-approved.json"},
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn live_receipt_uses_captured_grading_after_request_state_changes() {
+        let ticket = crate::capture_frame::CaptureTicket::default();
+        *ticket.0.lock().unwrap() = Some(captured_frame());
+        // The console can select another grade/source while GPU readback is pending.
+        let requested_state = serde_json::json!({
+            "ready": true,
+            "grade": "record-srgb",
+            "preset": "vivid",
+            "tone_map": "retail-curve",
+            "saturation": 1.6,
+            "brightness": 1.15,
+            "grading_source": {
+                "tone_map_mode": "retail-curve",
+                "source_kind": "authored-image-space-record",
+                "loaded_record": {"form_id": 77703},
+            },
+        });
+        let frame = ticket.receipt().unwrap();
+        let receipt = build_live_capture_receipt(&requested_state, &frame, [1920, 1080]).unwrap();
+        assert_eq!(receipt["grade"], "snapshot-srgb");
+        assert_eq!(receipt["preset"], "cool-gray");
+        assert_eq!(receipt["tone_map"], "tony");
+        assert_eq!(receipt["saturation"], 1.66);
+        assert_eq!(receipt["brightness"], 1.38);
+        assert_eq!(
+            receipt["grading_source"]["approved_override"]["path"],
+            "original-approved.json"
+        );
+        assert_eq!(
+            receipt["grading_source"]["loaded_record"],
+            serde_json::Value::Null
+        );
+        assert_eq!(receipt["requested_state"], requested_state);
+        assert_eq!(
+            receipt["grading_source"],
+            receipt["capture_frame"]["grading"]["source"]
+        );
+        assert_eq!(
+            receipt["resolved_grade"],
+            receipt["capture_frame"]["grading"]["resolved_grade"]
+        );
+        assert_eq!(receipt["work"], receipt["capture_frame"]["work"]);
+        assert_eq!(receipt["dimensions"], serde_json::json!([1920, 1080]));
+    }
+
+    #[test]
+    fn live_receipt_rejects_missing_frame_grading_or_unsettled_rendering() {
+        let request = serde_json::json!({"ready": true});
+        let mut frame = captured_frame();
+        frame.grading = None;
+        assert!(
+            build_live_capture_receipt(&request, &frame, [1920, 1080])
+                .unwrap_err()
+                .contains("no validated grading")
+        );
+        let mut frame = captured_frame();
+        frame.work.pending_asset_instances = 1;
+        assert!(
+            build_live_capture_receipt(&request, &frame, [1920, 1080])
+                .unwrap_err()
+                .contains("not settled")
+        );
+        frame.work.pending_asset_instances = 0;
+        frame.work.pending_specializations = None;
+        assert!(build_live_capture_receipt(&request, &frame, [1920, 1080]).is_err());
+        frame.work.pending_specializations = Some(0);
+        frame.work.renderer_ready = false;
+        assert!(build_live_capture_receipt(&request, &frame, [1920, 1080]).is_err());
+        let mut frame = captured_frame();
+        frame.grading.as_mut().unwrap().source["tone_map_mode"] = serde_json::Value::Null;
+        assert!(
+            build_live_capture_receipt(&request, &frame, [1920, 1080])
+                .unwrap_err()
+                .contains("no tone-map mode")
+        );
+    }
 
     #[test]
     fn stdin_commands_use_the_registered_console_and_bound_work_per_update() {
@@ -198,4 +365,3 @@ mod tests {
         assert_eq!(app.world().resource::<ConsoleState>().scrollback.len(), 34);
     }
 }
-

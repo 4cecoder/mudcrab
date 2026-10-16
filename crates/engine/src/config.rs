@@ -1,7 +1,9 @@
 use crate::{
     color_pipeline::{SCENE_GRADE_VALUES, SceneGradeMode, SceneVisualPreset},
     skyrim_ini::SkyrimIni,
+    tone_mapping::SceneToneMapMode,
     world::components::CELL_SIZE,
+    world::imagespace::{ImageSpaceSelection, ImageSpaceSlot},
 };
 use bevy::prelude::Resource;
 use shared::lod::LodTier;
@@ -102,6 +104,14 @@ pub struct EngineConfig {
     pub color_grade: SceneGradeMode,
     /// Named sky, fog and grading look; Vivid preserves the approved configuration.
     pub visual_preset: SceneVisualPreset,
+    /// Optional approved-look JSON override; authored records are retained separately.
+    pub grade_preset: Option<PathBuf>,
+    /// Display transform selection; native-curve experiments require explicit parameters.
+    pub tone_map: SceneToneMapMode,
+    pub tone_map_params: Option<PathBuf>,
+    pub image_space: Option<u32>,
+    pub image_space_weather: Option<u32>,
+    pub image_space_slot: Option<ImageSpaceSlot>,
     /// Seed a live world camera from a validated one-pose shots file.
     pub start_shot: Option<PathBuf>,
     /// Accept developer console commands on this process's stdin.
@@ -190,6 +200,12 @@ impl Default for EngineConfig {
             hidden_window: false,
             color_grade: SceneGradeMode::SnapshotSrgb,
             visual_preset: SceneVisualPreset::CoolGray,
+            grade_preset: None,
+            tone_map: SceneToneMapMode::Tony,
+            tone_map_params: None,
+            image_space: None,
+            image_space_weather: None,
+            image_space_slot: None,
             start_shot: None,
             stdin_console: false,
             no_render_diagnostics: false,
@@ -281,7 +297,13 @@ Benchmark and profiling:
   --acceptance-screenshot <file>        write a screenshot when the run ends
   --screenshot-camera-offset <x,y,z>    camera offset for the acceptance screenshot
   --matched-route <file>                execute exact route steps with transition and settled checkpoints
-  --color-grade <mode>                 off|saturation|full|snapshot-srgb|snapshot-linear (default: snapshot-srgb)
+  --color-grade <mode>                 off|saturation|full|snapshot-srgb|snapshot-linear|record-srgb (default: snapshot-srgb)
+  --grade-preset <json>                approved-look JSON override (snapshot-srgb and Cool Gray sky)
+  --tone-map <tony|retail-curve>       display transform (default: tony); retail curve is experimental
+  --tone-map-params <json>             explicit curve/scales and fixed luminance samples; requires selected IMGS
+  --image-space <FormID>               load an authored IMGS record for record-srgb experiments
+  --image-space-weather <FormID>       select an authored WTHR image-space slot, not live weather
+  --image-space-slot <slot>            sunrise|day|sunset|night; requires --image-space-weather
   --visual-preset <vivid|cool-gray>      select sky and grading look (default: cool-gray)
   --sun-position <azimuth,elevation>     sun bearing clockwise from north and elevation above horizon, degrees
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
@@ -424,6 +446,37 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl EngineConfig {
+    /// Select only explicitly authored data; this does not simulate effective weather.
+    pub fn image_space_selection(&self) -> color_eyre::Result<Option<ImageSpaceSelection>> {
+        use color_eyre::eyre::ensure;
+        ensure!(
+            self.image_space.is_none()
+                || (self.image_space_weather.is_none() && self.image_space_slot.is_none()),
+            "--image-space cannot be combined with --image-space-weather or --image-space-slot"
+        );
+        ensure!(
+            self.image_space_weather.is_some() == self.image_space_slot.is_some(),
+            "--image-space-weather and --image-space-slot must be supplied together"
+        );
+        let selection = self
+            .image_space
+            .map(ImageSpaceSelection::Direct)
+            .or_else(|| {
+                self.image_space_weather
+                    .zip(self.image_space_slot)
+                    .map(|(form_id, slot)| ImageSpaceSelection::Weather { form_id, slot })
+            });
+        ensure!(
+            self.color_grade != SceneGradeMode::RecordSrgb || selection.is_some(),
+            "record-srgb requires an explicit --image-space or --image-space-weather with --image-space-slot"
+        );
+        ensure!(
+            self.tone_map != SceneToneMapMode::RetailCurve || selection.is_some(),
+            "retail-curve requires an explicit --image-space or --image-space-weather with --image-space-slot"
+        );
+        Ok(selection)
+    }
+
     /// The per-frame render-asset upload budget in bytes, or `None` when
     /// uploads are unlimited (`--max-upload-mib-per-frame 0`).
     pub fn max_upload_bytes_per_frame(&self) -> Option<usize> {
@@ -745,6 +798,60 @@ impl EngineConfig {
                     config.color_grade = SceneGradeMode::parse(&raw).ok_or_else(|| {
                         ConfigError::invalid_value("--color-grade", Some(raw), SCENE_GRADE_VALUES)
                     })?;
+                }
+                "--grade-preset" => {
+                    config.grade_preset =
+                        Some(take_value("--grade-preset", "a JSON file", args.next())?);
+                }
+                "--tone-map" => {
+                    let raw = take_raw("--tone-map", "tony or retail-curve", args.next())?;
+                    config.tone_map = SceneToneMapMode::parse(&raw).ok_or_else(|| {
+                        ConfigError::invalid_value("--tone-map", Some(raw), "tony or retail-curve")
+                    })?;
+                }
+                "--tone-map-params" => {
+                    config.tone_map_params =
+                        Some(take_value("--tone-map-params", "a JSON file", args.next())?);
+                }
+                "--image-space" => {
+                    let raw =
+                        take_raw("--image-space", "a FormID, decimal or 0x-hex", args.next())?;
+                    config.image_space = Some(parse_u32(&raw).ok_or_else(|| {
+                        ConfigError::invalid_value(
+                            "--image-space",
+                            Some(raw),
+                            "a FormID, decimal or 0x-hex",
+                        )
+                    })?);
+                }
+                "--image-space-weather" => {
+                    let raw = take_raw(
+                        "--image-space-weather",
+                        "a FormID, decimal or 0x-hex",
+                        args.next(),
+                    )?;
+                    config.image_space_weather = Some(parse_u32(&raw).ok_or_else(|| {
+                        ConfigError::invalid_value(
+                            "--image-space-weather",
+                            Some(raw),
+                            "a FormID, decimal or 0x-hex",
+                        )
+                    })?);
+                }
+                "--image-space-slot" => {
+                    let raw = take_raw(
+                        "--image-space-slot",
+                        "sunrise, day, sunset or night",
+                        args.next(),
+                    )?;
+                    config.image_space_slot =
+                        Some(ImageSpaceSlot::parse(&raw).ok_or_else(|| {
+                            ConfigError::invalid_value(
+                                "--image-space-slot",
+                                Some(raw),
+                                "sunrise, day, sunset or night",
+                            )
+                        })?);
                 }
                 "--visual-preset" => {
                     let raw = take_raw("--visual-preset", "vivid or cool-gray", args.next())?;
@@ -1088,6 +1195,30 @@ mod tests {
         "--timeout",             // repeat-terrain-startup.py
         "--launch-prefix",       // repeat-terrain-startup.py
         "--commit",              // repeat-terrain-startup.py
+        "--config",              // capture_tonemap_tuning.py
+        "--validate-only",       // capture_tonemap_tuning.py
+        "--clearmodifiers",      // xdotool
+        "--delay",               // xdotool
+        "--console-open",        // capture_skyrim_tonemap_state.py
+        "--event",               // inspect_skyrim_gpu_capture.py, sample_skyrim_tonemap_gpu.py
+        "--max-actions",         // inspect_skyrim_gpu_capture.py
+        "--max-resource-mib",    // inspect_skyrim_gpu_capture.py
+        "--max-resources",       // inspect_skyrim_gpu_capture.py
+        "--max-total-mib",       // inspect_skyrim_gpu_capture.py
+        "--previews",            // inspect_skyrim_gpu_capture.py
+        "--tail",                // inspect_skyrim_gpu_capture.py
+        "--exe",                 // inspect_skyrim_tonemap_memory.py
+        "--pid",                 // inspect_skyrim_tonemap_memory.py
+        "--atol",                // replay_skyrim_tonemap.py
+        "--dot-mode",            // replay_skyrim_tonemap.py
+        "--input",               // replay_skyrim_tonemap.py
+        "--mad-mode",            // replay_skyrim_tonemap.py
+        "--rtol",                // replay_skyrim_tonemap.py
+        "--capture-sha256",      // sample_skyrim_tonemap_gpu.py
+        "--output-id",           // sample_skyrim_tonemap_gpu.py
+        "--pixel",               // sample_skyrim_tonemap_gpu.py
+        "--shader-id",           // sample_skyrim_tonemap_gpu.py
+        "--source-shader",       // sample_skyrim_tonemap_gpu.py
     ];
 
     fn run_config(arguments: &[&str]) -> EngineConfig {
@@ -1183,6 +1314,81 @@ mod tests {
         ] {
             assert!(parse_error(args).to_string().contains("--visual-preset"));
         }
+    }
+
+    #[test]
+    fn parses_explicit_image_space_sources_and_rejects_ambiguous_selections() {
+        let direct = run_config(&[
+            "--color-grade",
+            "record-srgb",
+            "--image-space",
+            "0x12F88",
+            "--grade-preset",
+            "look.json",
+        ]);
+        assert_eq!(
+            direct.image_space_selection().unwrap(),
+            Some(ImageSpaceSelection::Direct(0x12F88))
+        );
+        assert_eq!(direct.grade_preset, Some(PathBuf::from("look.json")));
+        let weather = run_config(&["--image-space-weather", "2074", "--image-space-slot", "DAY"]);
+        assert_eq!(
+            weather.image_space_selection().unwrap(),
+            Some(ImageSpaceSelection::Weather {
+                form_id: 0x81A,
+                slot: ImageSpaceSlot::Day
+            })
+        );
+        for args in [
+            &["--color-grade", "record-srgb"][..],
+            &[
+                "--image-space",
+                "100",
+                "--image-space-weather",
+                "2074",
+                "--image-space-slot",
+                "day",
+            ][..],
+            &["--image-space-weather", "2074"][..],
+            &["--image-space-slot", "day"][..],
+        ] {
+            assert!(run_config(args).image_space_selection().is_err());
+        }
+        for args in [
+            &["--image-space", "0xZZ"][..],
+            &["--image-space-slot", "noon"][..],
+            &["--grade-preset"][..],
+        ] {
+            assert!(EngineConfig::from_args(args.iter().map(|v| (*v).into())).is_err());
+        }
+    }
+
+    #[test]
+    fn tone_map_selection_is_explicit_and_keeps_the_approved_default() {
+        let default = EngineConfig::default();
+        assert_eq!(default.tone_map, SceneToneMapMode::Tony);
+        assert!(default.tone_map_params.is_none());
+        assert_eq!(default.color_grade, SceneGradeMode::SnapshotSrgb);
+        let experiment = run_config(&[
+            "--tone-map",
+            "retail-curve",
+            "--tone-map-params",
+            "curve.json",
+            "--image-space",
+            "0x12F87",
+        ]);
+        assert_eq!(experiment.tone_map, SceneToneMapMode::RetailCurve);
+        assert_eq!(
+            experiment.tone_map_params,
+            Some(PathBuf::from("curve.json"))
+        );
+        assert!(experiment.image_space_selection().unwrap().is_some());
+        assert!(
+            run_config(&["--tone-map", "retail-curve"])
+                .image_space_selection()
+                .is_err()
+        );
+        assert!(EngineConfig::from_args(["--tone-map".into(), "native".into()]).is_err());
     }
 
     #[test]
@@ -2030,7 +2236,7 @@ mod tests {
         for path in script_paths(&scripts) {
             let script = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
-            for flag in option_tokens(&script) {
+            for flag in script_cli_options(&script) {
                 if NON_ENGINE_FLAGS.contains(&flag) {
                     continue;
                 }
@@ -2046,6 +2252,27 @@ mod tests {
             checked >= 20,
             "the script scan found {checked} engine flags; the scripts moved or changed shape"
         );
+    }
+
+    fn script_cli_options(script: &str) -> Vec<&str> {
+        option_tokens(script)
+            .into_iter()
+            .filter(|flag| {
+                // HTML-producing utilities use CSS custom properties. Keep an
+                // identically named CLI argument visible to the parser check.
+                let offset = flag.as_ptr() as usize - script.as_ptr() as usize;
+                let prefix = &script[..offset];
+                !(prefix.trim_end().ends_with("var(")
+                    || prefix.ends_with(".setProperty('")
+                    || prefix.ends_with(".setProperty(\""))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn script_scan_ignores_css_references_but_keeps_identically_named_cli_arguments() {
+        let script = "color:var(--foreground); x.style.setProperty('--aspect','16/9'); args=['--foreground','--assets','pack'];";
+        assert_eq!(script_cli_options(script), ["--foreground", "--assets"]);
     }
 
     /// The numbers a script writes after an engine option still parse. Values a

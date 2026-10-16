@@ -817,7 +817,10 @@ mod tests {
             help: "test errors",
             handler: Box::new(|_, _| Err("first\nsecond".into())),
         });
-        assert_eq!(execute_line(app.world_mut(), "Failure"), "error: first\nsecond");
+        assert_eq!(
+            execute_line(app.world_mut(), "Failure"),
+            "error: first\nsecond"
+        );
         assert!(execute_line(app.world_mut(), "Unknown").contains("unknown command"));
     }
 
@@ -1140,4 +1143,3 @@ mod tests {
         );
     }
 }
-

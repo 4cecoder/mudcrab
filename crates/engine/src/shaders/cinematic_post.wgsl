@@ -9,6 +9,11 @@
 // Snapshot modes instead evaluate saturation and tint together in the selected
 // domain, with the screenshot's rounded values. They retain Bevy's tone curve
 // and the fixed artistic pivot; neither mode is a calibrated Skyrim renderer.
+// An explicit retail-curve experiment instead disables Bevy tonemapping and
+// applies the audited scalar-luminance curve to exposed HDR before the same
+// sRGB grade. White-derived CPU coefficients and fixed P.x/P.y overrides are
+// supplied separately. Native adaptation, bloom, final power and input-domain
+// parity remain unverified; the approved default never enters this branch.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
@@ -24,6 +29,10 @@ struct SkyrimCinematicPost {
     enabled: f32,
     saturation: f32,
     linear_domain: u32,
+    tone_operator: u32,
+    tone_coefficient: f32,
+    sampled_luminance: f32,
+    target_luminance: f32,
 }
 
 @group(0) @binding(2) var<uniform> settings: SkyrimCinematicPost;
@@ -44,9 +53,26 @@ fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, color <= vec3<f32>(0.04045));
 }
 
+fn retail_scalar_curve(rgb: vec3<f32>) -> vec3<f32> {
+    let y = max(dot(rgb, LUMA), 0.00001);
+    let z = y * (settings.target_luminance / settings.sampled_luminance);
+    var q: f32;
+    if settings.tone_operator == 2u {
+        let x = max(z - 0.004, 0.0);
+        let h = (x * (6.2 * x + 0.5)) / (x * (6.2 * x + 1.7) + 0.06);
+        q = settings.tone_coefficient * pow(h, 2.2);
+    } else {
+        q = z * (1.0 + settings.tone_coefficient * z) / (1.0 + z);
+    }
+    return rgb * (q / y);
+}
+
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
-    let color = textureSample(screen_texture, texture_sampler, in.uv);
+    var color = textureSample(screen_texture, texture_sampler, in.uv);
+    if settings.tone_operator != 0u {
+        color = vec4<f32>(retail_scalar_curve(color.rgb), color.a);
+    }
     if settings.enabled < 0.5 {
         return color;
     }

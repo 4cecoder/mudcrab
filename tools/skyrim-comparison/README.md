@@ -6,6 +6,54 @@ The dedicated session lives at `/home/taylor/Games/MudcrabComparison` on Fiji. I
 
 The initial stack uses SKSE64 2.3.1, Address Library 13 for Skyrim 1.7.104, Photo Mode 3.0.4, powerofthree's Tweaks 1.17.1, MCM Helper 1.6.3, SkyUI 6.11, ImGui Icons 1.2.0, KreatE 1.5.2, and Start On Save 2.8.0. Photo Mode, Tweaks, and Start On Save use their FOMOD `SSE/AE v1.7.99+` option. MCM Helper uses Skyrim Special Edition, ESL, and loose files. FreeCamera Framework 1.1.0 is staged disabled: timeline playback needs a framework client, whereas Photo Mode provides a camera interface directly.
 
+## Read live tone-map state
+
+The native packing and output investigations now have separate evidence notes:
+[CPU parameters to shader constants](../../research_notes/Skyrim%20native%20tone%20mapping/gpu_binding_trace.md),
+[reciprocal-gamma exponent](../../research_notes/Skyrim%20native%20tone%20mapping/output_transfer_trace.md),
+and [runtime observations](../../research_notes/Skyrim%20native%20tone%20mapping/runtime_state.md).
+The approved Mudcrab preset remains unchanged.
+
+`scripts/inspect_skyrim_tonemap_memory.py` reads an already-running Linux/Wine
+process. Deploy the script to this isolated session's `bin/` directory, identify
+the game window's PID, and use a fresh output directory:
+
+```sh
+python3 /home/taylor/Games/MudcrabComparison/bin/inspect_skyrim_tonemap_memory.py \
+  --pid PID \
+  --exe /home/taylor/Games/MudcrabComparison/SkyrimSE/SkyrimSE.exe \
+  --output /home/taylor/Games/MudcrabComparison/artifacts/FRESH-memory-run
+```
+
+The collector pins the executable hash, identifies the relocated image, checks
+native code bytes and setting names, and reads bounded manager/parameter fields.
+It retains two sequential samples, raw bytes, mapping and process-identity checks,
+and failure receipts. It never attaches, pauses, writes target memory, launches
+a game, or changes access policy. If process-memory access fails, retain the
+failure; do not change system policy to make the collector succeed.
+
+For independent console evidence, visually verify an open console with an empty
+input line, then run:
+
+```sh
+python3 /home/taylor/Games/MudcrabComparison/bin/capture_skyrim_tonemap_state.py \
+  --output /home/taylor/Games/MudcrabComparison/artifacts/FRESH-console-run \
+  --console-open
+```
+
+This collector sends a fixed list of read-only queries. Each query gets a fresh,
+CRC-checked Gamescope PNG, raw OCR, and hashes. It leaves values unparsed because
+console history can contain older output. Review the echoed command and its
+result together. Input-event completion alone does not establish execution.
+Typing uses 60 ms between characters; Return is held for 200 ms and released
+even if an error interrupts the hold. Use deliberate key holds for manual
+navigation too; short control-key pulses were missed in the observed session.
+
+Process samples and console frames do not synchronize GPU execution. Keep their
+timestamps and claims separate from a screenshot's exact shader inputs. Neither
+collector establishes the settings of an older reference image.
+
+
 ## Camera inputs
 
 Save one native Photo Mode camera preset from the target scene. Its directory is beneath the dedicated prefix's Skyrim Documents directory at `Saves/PhotoMode/CameraPositions`. Keep its cell and player metadata. Record calibration in a separate JSON document:

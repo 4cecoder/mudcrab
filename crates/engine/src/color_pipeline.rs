@@ -7,6 +7,8 @@
 
 use crate::console::{AppConsoleExt, ConsoleCommand};
 use crate::sky::SkyPalette;
+use crate::tone_mapping::{SceneToneMapMode, SceneToneMapSource};
+use crate::world::imagespace::{LoadedImageSpace, load_image_space};
 use bevy::{
     asset::embedded_asset,
     camera::{CompositingSpace, Exposure, Hdr},
@@ -24,6 +26,8 @@ use bevy::{
     },
     shader::ShaderRef,
 };
+use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 /// Diagnostic selection; exposure, tone mapping, lighting and fog stay fixed.
 #[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -34,6 +38,7 @@ pub enum SceneGradeMode {
     Full,
     SnapshotSrgb,
     SnapshotLinear,
+    RecordSrgb,
 }
 
 impl SceneGradeMode {
@@ -44,6 +49,7 @@ impl SceneGradeMode {
             "full" => Some(Self::Full),
             "snapshot-srgb" => Some(Self::SnapshotSrgb),
             "snapshot-linear" => Some(Self::SnapshotLinear),
+            "record-srgb" => Some(Self::RecordSrgb),
             _ => None,
         }
     }
@@ -55,25 +61,25 @@ impl SceneGradeMode {
             Self::Full => "full",
             Self::SnapshotSrgb => "snapshot-srgb",
             Self::SnapshotLinear => "snapshot-linear",
+            Self::RecordSrgb => "record-srgb",
         }
     }
 
     /// Resolve the screenshot's grade independently of the selected sky preset.
     pub fn grade(self, preset: SceneVisualPreset) -> SkyrimCinematicGrade {
         match self {
-            Self::SnapshotSrgb => SkyrimCinematicGrade {
-                // User-tuned 20% brightness lift; preserve the original Photo Mode snapshot.
-                brightness: SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT.brightness * 1.2,
-                ..SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT
-            },
+            Self::SnapshotSrgb => ApprovedLook::builtin().grade,
             Self::SnapshotLinear => SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT,
+            Self::RecordSrgb => {
+                panic!("record-srgb requires a loaded image space; use SceneGradeSource::resolve")
+            }
             _ => preset.grade(),
         }
     }
 
     pub fn bevy_saturation(self, preset: SceneVisualPreset) -> f32 {
         match self {
-            Self::Off | Self::SnapshotSrgb | Self::SnapshotLinear => 1.0,
+            Self::Off | Self::SnapshotSrgb | Self::SnapshotLinear | Self::RecordSrgb => 1.0,
             Self::Saturation | Self::Full => preset.grade().saturation,
         }
     }
@@ -84,7 +90,7 @@ impl SceneGradeMode {
         match self {
             Self::Off | Self::Saturation => post.enabled = 0.0,
             Self::Full => {}
-            Self::SnapshotSrgb | Self::SnapshotLinear => {
+            Self::SnapshotSrgb | Self::SnapshotLinear | Self::RecordSrgb => {
                 post.saturation = grade.saturation;
                 post.linear_domain = u32::from(self == Self::SnapshotLinear);
             }
@@ -93,8 +99,197 @@ impl SceneGradeMode {
     }
 }
 
-pub const SCENE_GRADE_VALUES: &str = "off, saturation, full, snapshot-srgb or snapshot-linear";
-const SCENE_GRADE_USAGE: &str = "SceneGrade [off|saturation|full|snapshot-srgb|snapshot-linear]";
+pub const SCENE_GRADE_VALUES: &str =
+    "off, saturation, full, snapshot-srgb, snapshot-linear or record-srgb";
+const SCENE_GRADE_USAGE: &str =
+    "SceneGrade [off|saturation|full|snapshot-srgb|snapshot-linear|record-srgb]";
+
+/// Explicit artistic override kept separate from authored database records.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedLook {
+    name: String,
+    source: String,
+    raw_snapshot: SkyrimCinematicGrade,
+    grade: SkyrimCinematicGrade,
+    sky: ApprovedSky,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovedSky {
+    upper_srgb_u8: [u8; 3],
+    lower_srgb_u8: [u8; 3],
+    horizon_srgb_u8: [u8; 3],
+    fog_far_srgb_u8: [u8; 3],
+    fog_density_scale: f32,
+}
+
+impl ApprovedLook {
+    fn parse(json: &str) -> color_eyre::Result<Self> {
+        let look: Self = serde_json::from_str(json)?;
+        color_eyre::eyre::ensure!(!look.name.trim().is_empty(), "grade preset needs a name");
+        for grade in [look.raw_snapshot, look.grade] {
+            color_eyre::eyre::ensure!(
+                [grade.saturation, grade.brightness, grade.contrast]
+                    .into_iter()
+                    .all(|v| v.is_finite() && v >= 0.0)
+                    && grade.tint_amount.is_finite()
+                    && (0.0..=1.0).contains(&grade.tint_amount)
+                    && grade
+                        .tint_rgb
+                        .into_iter()
+                        .all(|v| v.is_finite() && (0.0..=1.0).contains(&v)),
+                "grade preset values must be finite, nonnegative, with tint in 0..1"
+            );
+        }
+        color_eyre::eyre::ensure!(
+            look.sky.fog_density_scale.is_finite() && look.sky.fog_density_scale > 0.0,
+            "fog density scale must be finite and positive"
+        );
+        Ok(look)
+    }
+
+    fn builtin() -> &'static Self {
+        static LOOK: OnceLock<ApprovedLook> = OnceLock::new();
+        LOOK.get_or_init(|| {
+            Self::parse(include_str!("presets/approved-snapshot.json"))
+                .expect("valid built-in approved look")
+        })
+    }
+
+    fn sky_palette(&self) -> SkyPalette {
+        let rgb = |[r, g, b]: [u8; 3]| Color::srgb_u8(r, g, b);
+        SkyPalette {
+            upper: rgb(self.sky.upper_srgb_u8),
+            lower: rgb(self.sky.lower_srgb_u8),
+            horizon: rgb(self.sky.horizon_srgb_u8),
+            fog_far: rgb(self.sky.fog_far_srgb_u8),
+            fog_density_scale: self.sky.fog_density_scale,
+            ..SkyPalette::SKYRIM_CLEAR_DAY
+        }
+    }
+}
+
+/// Loaded source data and its provenance; never substitutes a guessed image space.
+#[derive(Resource, Clone, Debug)]
+pub struct SceneGradeSource {
+    approved: ApprovedLook,
+    approved_path: String,
+    pub record: Option<LoadedImageSpace>,
+}
+
+impl Default for SceneGradeSource {
+    fn default() -> Self {
+        Self {
+            approved: ApprovedLook::builtin().clone(),
+            approved_path: "builtin:presets/approved-snapshot.json".into(),
+            record: None,
+        }
+    }
+}
+
+pub struct ResolvedSceneGrade {
+    pub grade: SkyrimCinematicGrade,
+    pub post: SkyrimCinematicPost,
+    pub bevy_saturation: f32,
+    pub tonemapping: Tonemapping,
+}
+
+impl SceneGradeSource {
+    pub fn load(
+        config: &crate::config::EngineConfig,
+        retail_world: bool,
+    ) -> color_eyre::Result<Self> {
+        let mut source = Self::default();
+        if let Some(path) = &config.grade_preset {
+            source.approved = ApprovedLook::parse(&std::fs::read_to_string(path)?)?;
+            source.approved_path = path.display().to_string();
+        }
+        if let Some(selection) = config.image_space_selection()? {
+            color_eyre::eyre::ensure!(
+                retail_world,
+                "image-space selection requires a converted world database; fixture and synthetic runs stay independent"
+            );
+            source.record = Some(load_image_space(
+                &config.assets_dir.join("skyrim_world.db"),
+                selection,
+            )?);
+        }
+        source
+            .resolve(config.color_grade, config.visual_preset)
+            .map_err(color_eyre::eyre::Error::msg)?;
+        Ok(source)
+    }
+
+    pub fn sky_palette(&self, preset: SceneVisualPreset) -> SkyPalette {
+        match preset {
+            SceneVisualPreset::CoolGray => self.approved.sky_palette(),
+            SceneVisualPreset::Vivid => SkyPalette::SKYRIM_CLEAR_DAY,
+        }
+    }
+
+    pub fn resolve(
+        &self,
+        mode: SceneGradeMode,
+        preset: SceneVisualPreset,
+    ) -> Result<ResolvedSceneGrade, String> {
+        let grade = match mode {
+            SceneGradeMode::SnapshotSrgb => self.approved.grade,
+            SceneGradeMode::RecordSrgb => {
+                let record = self.record.as_ref().ok_or("record-srgb requires --image-space <FormID> or --image-space-weather <FormID> with --image-space-slot <slot>")?;
+                SkyrimCinematicGrade {
+                    saturation: record.cinematic.saturation,
+                    brightness: record.cinematic.brightness,
+                    contrast: record.cinematic.contrast,
+                    tint_amount: record.tint.amount,
+                    tint_rgb: record.tint.rgb,
+                }
+            }
+            _ => mode.grade(preset),
+        };
+        let mut post = grade.post();
+        match mode {
+            SceneGradeMode::Off | SceneGradeMode::Saturation => post.enabled = 0.0,
+            SceneGradeMode::SnapshotSrgb
+            | SceneGradeMode::SnapshotLinear
+            | SceneGradeMode::RecordSrgb => {
+                post.saturation = grade.saturation;
+                post.linear_domain = u32::from(mode == SceneGradeMode::SnapshotLinear);
+            }
+            SceneGradeMode::Full => {}
+        }
+        Ok(ResolvedSceneGrade {
+            grade,
+            post,
+            bevy_saturation: mode.bevy_saturation(preset),
+            tonemapping: Tonemapping::TonyMcMapface,
+        })
+    }
+
+    pub fn evidence(&self, mode: SceneGradeMode, preset: SceneVisualPreset) -> serde_json::Value {
+        let resolved = self.resolve(mode, preset);
+        serde_json::json!({
+            "mode": mode.name(),
+            "source_kind": if mode == SceneGradeMode::RecordSrgb { "authored-image-space-record" } else if mode == SceneGradeMode::SnapshotSrgb { "approved-artistic-override" } else { "legacy-preset" },
+            "approved_override": { "path": self.approved_path, "data": self.approved, "applied_to_grade": mode == SceneGradeMode::SnapshotSrgb, "applied_to_sky": preset == SceneVisualPreset::CoolGray },
+            "loaded_record": self.record,
+            "hnam_applied": false,
+            "effective_grade": resolved.as_ref().ok().map(|r| r.grade),
+            "effective_stages": resolved.as_ref().ok().map(|r| serde_json::json!({
+                "bevy_post_saturation": r.bevy_saturation,
+                "post_enabled": r.post.enabled,
+                "post_saturation": r.post.saturation,
+                "post_linear_domain": r.post.linear_domain,
+                "pivot": r.post.pivot,
+            })),
+            "resolution_error": resolved.err(),
+            "tonemapping": "TonyMcMapface", "exposure_ev100": DEFAULT_SCENE_EV100,
+            "pivot": CINEMATIC_PIVOT,
+            "limits": "CNAM/TNAM experiment only; authored slot is not effective runtime weather; HNAM, adaptation, native tone curve, bloom and modifier composition remain unapplied"
+        })
+    }
+}
 
 /// Identifies shared scene cameras without treating reflections as graded views.
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
@@ -142,14 +337,7 @@ impl SceneVisualPreset {
     pub fn sky_palette(self) -> SkyPalette {
         match self {
             Self::Vivid => SkyPalette::SKYRIM_CLEAR_DAY,
-            Self::CoolGray => SkyPalette {
-                upper: Color::srgb_u8(178, 187, 198),
-                lower: Color::srgb_u8(194, 202, 209),
-                horizon: Color::srgb_u8(207, 214, 220),
-                fog_far: Color::srgb_u8(210, 222, 235),
-                fog_density_scale: 0.25,
-                ..SkyPalette::SKYRIM_CLEAR_DAY
-            },
+            Self::CoolGray => ApprovedLook::builtin().sky_palette(),
         }
     }
 }
@@ -176,8 +364,11 @@ fn scene_preset_command() -> ConsoleCommand {
             };
             if let Some(next) = next {
                 *world.resource_mut::<SceneVisualPreset>() = next;
+                let next_palette = world
+                    .get_resource::<SceneGradeSource>()
+                    .map_or_else(|| next.sky_palette(), |source| source.sky_palette(next));
                 if let Some(mut palette) = world.get_resource_mut::<SkyPalette>() {
-                    *palette = next.sky_palette();
+                    *palette = next_palette;
                 }
             }
             Ok(format!(
@@ -201,6 +392,15 @@ fn scene_grade_command() -> ConsoleCommand {
                 [value] => {
                     let mode = SceneGradeMode::parse(value)
                         .ok_or_else(|| format!("usage: {SCENE_GRADE_USAGE}"))?;
+                    let source = world
+                        .get_resource::<SceneGradeSource>()
+                        .cloned()
+                        .unwrap_or_default();
+                    world
+                        .get_resource::<SceneToneMapSource>()
+                        .cloned()
+                        .unwrap_or_default()
+                        .resolve(&source, mode, *world.resource::<SceneVisualPreset>())?;
                     *world.resource_mut::<SceneGradeMode>() = mode;
                 }
                 _ => return Err(format!("usage: {SCENE_GRADE_USAGE}")),
@@ -213,23 +413,76 @@ fn scene_grade_command() -> ConsoleCommand {
     }
 }
 
+fn scene_tone_map_command() -> ConsoleCommand {
+    ConsoleCommand {
+        name: "SceneToneMap",
+        short: None,
+        usage: "SceneToneMap [tony|retail-curve]",
+        help: "inspect or select the approved tone mapper or explicit retail-curve experiment",
+        handler: Box::new(|world, args| {
+            let mut candidate = world
+                .get_resource::<SceneToneMapSource>()
+                .cloned()
+                .unwrap_or_default();
+            match args {
+                [] => {}
+                [value] => {
+                    candidate.mode = SceneToneMapMode::parse(value)
+                        .ok_or("usage: SceneToneMap [tony|retail-curve]")?;
+                    let source = world
+                        .get_resource::<SceneGradeSource>()
+                        .cloned()
+                        .unwrap_or_default();
+                    candidate.resolve(
+                        &source,
+                        *world.resource::<SceneGradeMode>(),
+                        *world.resource::<SceneVisualPreset>(),
+                    )?;
+                    world.insert_resource(candidate.clone());
+                }
+                _ => return Err("usage: SceneToneMap [tony|retail-curve]".into()),
+            }
+            Ok(format!("scene tone map: {}", candidate.mode.name()))
+        }),
+    }
+}
+
 fn apply_scene_grade_mode(
     mode: Res<SceneGradeMode>,
     preset: Res<SceneVisualPreset>,
+    source: Option<Res<SceneGradeSource>>,
+    fallback: Local<SceneGradeSource>,
+    tone_source: Option<Res<SceneToneMapSource>>,
+    tone_fallback: Local<SceneToneMapSource>,
     mut cameras: Query<(
         Ref<SceneGradeTarget>,
         &mut ColorGrading,
         &mut SkyrimCinematicPost,
+        &mut Tonemapping,
     )>,
 ) {
-    for (target, mut grading, mut post) in &mut cameras {
+    let source_changed = source.as_ref().is_some_and(|source| source.is_changed());
+    let tone_changed = tone_source
+        .as_ref()
+        .is_some_and(|source| source.is_changed());
+    let source = source.as_deref().unwrap_or(&fallback);
+    let tone = tone_source.as_deref().unwrap_or(&tone_fallback);
+    let resolved = tone
+        .resolve(source, *mode, *preset)
+        .expect("validated scene grade source");
+    for (target, mut grading, mut post, mut tonemapping) in &mut cameras {
         if *target == SceneGradeTarget::Reflection
-            || !(mode.is_changed() || preset.is_changed() || target.is_added())
+            || !(mode.is_changed()
+                || preset.is_changed()
+                || source_changed
+                || tone_changed
+                || target.is_added())
         {
             continue;
         }
-        grading.global.post_saturation = mode.bevy_saturation(*preset);
-        *post = mode.post(*preset);
+        grading.global.post_saturation = resolved.bevy_saturation;
+        *post = resolved.post;
+        *tonemapping = resolved.tonemapping;
     }
 }
 
@@ -251,7 +504,8 @@ pub const CINEMATIC_PIVOT: f32 = 0.18;
 /// White, Sunlight Scale, Sky Scale, Eye Adapt Strength). The `HNAM` block is not
 /// carried here; see [`SkyrimCinematicGrade::color_grading`] for what maps and what
 /// does not.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkyrimCinematicGrade {
     pub saturation: f32,
     pub brightness: f32,
@@ -302,6 +556,10 @@ impl SkyrimCinematicGrade {
             enabled: 1.0,
             saturation: 1.0,
             linear_domain: 0,
+            tone_operator: 0,
+            tone_coefficient: 0.0,
+            sampled_luminance: 1.0,
+            target_luminance: 1.0,
         }
     }
 
@@ -345,16 +603,23 @@ pub struct SkyrimCinematicPost {
     /// Display-range pivot for brightness/contrast; see [`CINEMATIC_PIVOT`].
     pub pivot: f32,
     pub tint_rgb: Vec3,
-    /// 1.0 applies the grade; 0.0 passes the input through untouched.
+    /// 1.0 applies grading; 0.0 skips grading after any explicitly selected curve.
     pub enabled: f32,
     /// Saturation evaluated in this pass; 1.0 leaves legacy Bevy saturation unchanged.
     pub saturation: f32,
     /// 0 grades sRGB-encoded values; 1 grades linear values, including saturation and tint.
     pub linear_domain: u32,
+    /// 0 keeps Bevy's selected mapper; 1/2 apply the explicit scalar curve here.
+    pub tone_operator: u32,
+    pub tone_coefficient: f32,
+    /// Fixed experimental stand-ins for native texture sample P.x/P.y.
+    /// They are independent of the artistic grade pivot and have no history.
+    pub sampled_luminance: f32,
+    pub target_luminance: f32,
 }
 
 impl Default for SkyrimCinematicPost {
-    /// Disabled: pass the input through untouched.
+    /// No grading or curve: pass the input through untouched.
     fn default() -> Self {
         Self {
             brightness: 1.0,
@@ -365,6 +630,10 @@ impl Default for SkyrimCinematicPost {
             enabled: 0.0,
             saturation: 1.0,
             linear_domain: 0,
+            tone_operator: 0,
+            tone_coefficient: 0.0,
+            sampled_luminance: 1.0,
+            target_luminance: 1.0,
         }
     }
 }
@@ -394,8 +663,11 @@ impl Plugin for SkyrimCinematicPostPlugin {
         embedded_asset!(app, "shaders/cinematic_post.wgsl");
         app.init_resource::<SceneGradeMode>()
             .init_resource::<SceneVisualPreset>()
+            .init_resource::<SceneGradeSource>()
+            .init_resource::<SceneToneMapSource>()
             .add_console_command(scene_grade_command())
             .add_console_command(scene_preset_command())
+            .add_console_command(scene_tone_map_command())
             .add_systems(PostUpdate, apply_scene_grade_mode)
             .add_plugins(FullscreenMaterialPlugin::<SkyrimCinematicPost>::default());
     }
@@ -489,6 +761,220 @@ pub(crate) fn assert_scene_camera_output(world: &mut World, expected_count: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approved_file_preserves_exact_default_and_runtime_override_is_separate() {
+        let source = SceneGradeSource::default();
+        assert_eq!(
+            source.approved.raw_snapshot,
+            SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT
+        );
+        let resolved = source
+            .resolve(SceneGradeMode::SnapshotSrgb, SceneVisualPreset::CoolGray)
+            .unwrap();
+        assert_eq!(
+            resolved.grade,
+            SkyrimCinematicGrade {
+                brightness: 1.15_f32 * 1.2,
+                ..SkyrimCinematicGrade::SLEEPING_GIANT_SNAPSHOT
+            }
+        );
+        assert_eq!(resolved.bevy_saturation, 1.0);
+        assert_eq!(resolved.post.saturation, 1.66);
+        assert_eq!(resolved.post.linear_domain, 0);
+        assert_eq!(
+            source.sky_palette(SceneVisualPreset::CoolGray),
+            SkyPalette {
+                upper: Color::srgb_u8(178, 187, 198),
+                lower: Color::srgb_u8(194, 202, 209),
+                horizon: Color::srgb_u8(207, 214, 220),
+                fog_far: Color::srgb_u8(210, 222, 235),
+                fog_density_scale: 0.25,
+                ..SkyPalette::SKYRIM_CLEAR_DAY
+            }
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("custom-look.json");
+        let mut changed = serde_json::to_value(&source.approved).unwrap();
+        changed["grade"]["brightness"] = 1.07.into();
+        std::fs::write(&path, changed.to_string()).unwrap();
+        let config = crate::config::EngineConfig {
+            grade_preset: Some(path),
+            ..default()
+        };
+        let custom = SceneGradeSource::load(&config, false).unwrap();
+        assert_eq!(
+            custom
+                .resolve(SceneGradeMode::SnapshotSrgb, SceneVisualPreset::CoolGray)
+                .unwrap()
+                .grade
+                .brightness,
+            1.07
+        );
+        assert_eq!(
+            custom
+                .resolve(SceneGradeMode::Full, SceneVisualPreset::Vivid)
+                .unwrap()
+                .grade,
+            SkyrimCinematicGrade::SKYRIM_CLEAR_DAY
+        );
+        assert_eq!(
+            source
+                .resolve(SceneGradeMode::SnapshotSrgb, SceneVisualPreset::CoolGray)
+                .unwrap()
+                .grade
+                .brightness,
+            1.38
+        );
+        changed["grade"]["tint_amount"] = 1.5.into();
+        assert!(ApprovedLook::parse(&changed.to_string()).is_err());
+    }
+
+    #[test]
+    fn changed_database_grade_drives_record_mode_and_console_restores_approved() {
+        use shared::records::{ArchivedRecordData, ArchivedSubRecord};
+        let directory = tempfile::tempdir().unwrap();
+        let connection =
+            rusqlite::Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        connection.execute_batch("CREATE TABLE schema_info(version INTEGER); INSERT INTO schema_info VALUES(9); CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT,load_order INTEGER,data BLOB); CREATE TABLE plugins(id INTEGER PRIMARY KEY,name TEXT,priority INTEGER); INSERT INTO plugins VALUES(1,'Winner.esm',7); CREATE TABLE formid_map(form_id INTEGER PRIMARY KEY,plugin_name TEXT);").unwrap();
+        let write_record = |brightness: f32| {
+            let bytes = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let record = ArchivedRecordData {
+                subrecords: vec![
+                    ArchivedSubRecord {
+                        tag: *b"CNAM",
+                        data: bytes(&[1.23, brightness, 1.49]),
+                    },
+                    ArchivedSubRecord {
+                        tag: *b"TNAM",
+                        data: bytes(&[0.23, 0.31, 0.47, 0.59]),
+                    },
+                    ArchivedSubRecord {
+                        tag: *b"HNAM",
+                        data: bytes(&[11., 12., 13., 14., 15., 16., 17., 18., 19.]),
+                    },
+                ],
+            };
+            let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&record).unwrap();
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO records VALUES(100,'IMGS',7,?1)",
+                    [encoded.as_slice()],
+                )
+                .unwrap();
+        };
+        let config = crate::config::EngineConfig {
+            assets_dir: directory.path().into(),
+            color_grade: SceneGradeMode::RecordSrgb,
+            image_space: Some(100),
+            ..default()
+        };
+        write_record(1.17);
+        let first = SceneGradeSource::load(&config, true).unwrap();
+        write_record(1.29);
+        let changed = SceneGradeSource::load(&config, true).unwrap();
+        let resolved = changed
+            .resolve(SceneGradeMode::RecordSrgb, SceneVisualPreset::CoolGray)
+            .unwrap();
+        assert_eq!(
+            first
+                .resolve(SceneGradeMode::RecordSrgb, SceneVisualPreset::CoolGray)
+                .unwrap()
+                .grade
+                .brightness,
+            1.17
+        );
+        assert_eq!(
+            resolved.grade,
+            SkyrimCinematicGrade {
+                saturation: 1.23,
+                brightness: 1.29,
+                contrast: 1.49,
+                tint_amount: 0.23,
+                tint_rgb: [0.31, 0.47, 0.59]
+            }
+        );
+        assert_eq!(resolved.post.pivot, 0.18);
+        assert_eq!(resolved.bevy_saturation, 1.0);
+        let evidence = changed.evidence(SceneGradeMode::RecordSrgb, SceneVisualPreset::CoolGray);
+        assert_eq!(evidence["loaded_record"]["winner_plugin"], "Winner.esm");
+        assert_eq!(evidence["loaded_record"]["hdr"]["sky_scale"], 18.0);
+        assert_eq!(evidence["hnam_applied"], false);
+        assert_eq!(evidence["approved_override"]["applied_to_grade"], false);
+        let mut app = App::new();
+        app.insert_resource(changed)
+            .insert_resource(SceneGradeMode::SnapshotSrgb)
+            .insert_resource(SceneVisualPreset::CoolGray)
+            .init_resource::<crate::console::ConsoleState>()
+            .add_console_command(scene_grade_command())
+            .add_systems(PostUpdate, apply_scene_grade_mode);
+        let camera = app.world_mut().spawn(SceneColorPipeline::default()).id();
+        crate::console::execute_line(app.world_mut(), "SceneGrade record-srgb");
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<SkyrimCinematicPost>(camera)
+                .unwrap()
+                .brightness,
+            1.29
+        );
+        crate::console::execute_line(app.world_mut(), "SceneGrade snapshot-srgb");
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<SkyrimCinematicPost>(camera)
+                .unwrap()
+                .brightness,
+            1.38
+        );
+        assert_eq!(app.world().get::<Exposure>(camera).unwrap().ev100, 9.7);
+        assert_eq!(
+            *app.world().get::<Tonemapping>(camera).unwrap(),
+            Tonemapping::TonyMcMapface
+        );
+    }
+
+    #[test]
+    fn record_mode_requires_loaded_data_and_preserves_previous_console_mode_on_error() {
+        let config = crate::config::EngineConfig {
+            color_grade: SceneGradeMode::RecordSrgb,
+            ..default()
+        };
+        assert!(
+            SceneGradeSource::load(&config, false)
+                .unwrap_err()
+                .to_string()
+                .contains("explicit")
+        );
+        let config = crate::config::EngineConfig {
+            image_space: Some(100),
+            ..config
+        };
+        assert!(
+            SceneGradeSource::load(&config, false)
+                .unwrap_err()
+                .to_string()
+                .contains("fixture")
+        );
+        let mut app = App::new();
+        app.insert_resource(SceneGradeMode::SnapshotSrgb)
+            .insert_resource(SceneVisualPreset::CoolGray)
+            .init_resource::<crate::console::ConsoleState>()
+            .add_console_command(scene_grade_command());
+        crate::console::execute_line(app.world_mut(), "SceneGrade record-srgb");
+        assert_eq!(
+            *app.world().resource::<SceneGradeMode>(),
+            SceneGradeMode::SnapshotSrgb
+        );
+        assert!(
+            app.world()
+                .resource::<crate::console::ConsoleState>()
+                .scrollback
+                .last()
+                .unwrap()
+                .contains("requires")
+        );
+    }
 
     #[test]
     fn snapshot_modes_grade_once_restore_presets_and_leave_sky_and_reflections_alone() {
@@ -886,7 +1372,7 @@ mod tests {
                 .iter()
                 .map(|member| member.offset)
                 .collect::<Vec<_>>(),
-            [0, 4, 8, 12, 16, 28, 32, 36]
+            [0, 4, 8, 12, 16, 28, 32, 36, 40, 44, 48, 52]
         );
     }
 
@@ -946,6 +1432,7 @@ mod tests {
                 enabled: 1.0,
                 saturation: 1.0,
                 linear_domain: 0,
+                ..SkyrimCinematicPost::default()
             }
         );
     }
