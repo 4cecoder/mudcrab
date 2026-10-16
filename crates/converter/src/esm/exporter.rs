@@ -268,6 +268,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     // here, and an older-shaped `room_portals` (no `pair_index`) is migrated in place.
     crate::esm::rooms::migrate_room_portals(conn)?;
     conn.execute_batch(crate::esm::rooms::ROOM_TABLES_SQL)?;
+    // Optional environment, weather and image-space tables (db-schema.md, #269 gaps 1 and 2).
+    conn.execute_batch(&crate::esm::environment::tables_sql())?;
     conn.prepare_cached(
         "INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_info)",
     )?
@@ -432,6 +434,9 @@ fn replace_complete_snapshot(tx: &Transaction<'_>) -> Result<()> {
         DROP TABLE IF EXISTS lod_build;
         DROP TABLE IF EXISTS lod;"#,
     )?;
+    for table in crate::esm::environment::ENVIRONMENT_TABLES {
+        tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
+    }
     create_tables(tx)?;
     // Every complete snapshot owns these derived rows, including archive-only exports
     // that deliberately defer all runtime projections.
@@ -557,6 +562,12 @@ fn export_records(
             let projection = runtime_projection(record, unresolved_fields);
             let projected = projection.as_ref().unwrap_or(record);
             let (grid_x, grid_y, interior_name) = extract_cell_info(&projected.subrecords);
+            crate::esm::environment::insert_cell(
+                &tx,
+                &crate::esm::environment::Links { master },
+                form_id,
+                &SubrecordView::new(&projected.subrecords),
+            )?;
             let data = serialize_subrecords(&record.subrecords);
             insert_cell(
                 &tx,
@@ -651,6 +662,14 @@ fn export_records(
         }
 
         match type_str {
+            "LGTM" | "WTHR" | "CLMT" | "REGN" | "IMGS" => {
+                crate::esm::environment::insert_record(
+                    &tx,
+                    &crate::esm::environment::Links { master },
+                    record,
+                    &view,
+                )?;
+            }
             "GRAS" => {
                 insert_grass(&tx, form_id, &view, record.load_order)?;
             }
@@ -662,6 +681,12 @@ fn export_records(
                 tx.prepare_cached(
                     "INSERT OR REPLACE INTO worldspaces(id, editor_id, parent_world, flags) VALUES (?1, ?2, ?3, ?4)")?.execute(
                     params![form_id, editor_id, view.get_form_id(b"WNAM"), record.flags],
+                )?;
+                crate::esm::environment::insert_worldspace(
+                    &tx,
+                    &crate::esm::environment::Links { master },
+                    form_id,
+                    &view,
                 )?;
             }
             "REFR" | "ACHR" | "ACRE" | "PGRE" | "PMIS" => {

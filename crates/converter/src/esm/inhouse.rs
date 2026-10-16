@@ -86,6 +86,18 @@ const DEFERRED_RUNTIME_TABLES: &[&str] = &[
     "room_links",
     "reference_rooms",
     "room_graph_stats",
+    "cell_environment",
+    "cell_regions",
+    "cell_lighting",
+    "worldspace_environment",
+    "lighting_templates",
+    "weathers",
+    "weather_colors",
+    "weather_directional_ambient",
+    "climates",
+    "climate_weathers",
+    "region_weathers",
+    "image_spaces",
 ];
 
 /// Identity binds decoder behavior and schema bytes so stale output cannot prove reuse.

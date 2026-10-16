@@ -15,6 +15,7 @@ use std::{
 };
 pub mod binary;
 pub mod cell_cache;
+mod environment;
 pub mod exporter;
 pub mod extractors;
 pub mod inhouse;
@@ -30,6 +31,8 @@ pub mod types;
 pub use plugins_txt::{
     OFFICIAL_MASTERS, read_plugins_txt, read_plugins_txt_with_options, read_skyrim_ccc,
 };
+#[cfg(test)]
+mod environment_parity_tests;
 #[cfg(test)]
 mod plugin_table_tests;
 #[cfg(test)]
@@ -466,8 +469,11 @@ fn is_required_form_id_subrecord(record_type: &[u8; 4], tag: &[u8]) -> bool {
 enum FormIdLayout {
     /// A fixed-size structure: each accepted byte length with its FormID offsets.
     Fixed(&'static [(usize, &'static [usize])]),
-    /// A packed array of `stride`-byte entries, each starting with a FormID.
-    Array { stride: usize },
+    /// A packed array of `stride`-byte entries, with a FormID at each of `form_ids` in every entry.
+    Array {
+        stride: usize,
+        form_ids: &'static [usize],
+    },
 }
 
 /// Field layouts per xEdit's TES5 definitions
@@ -502,7 +508,8 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         b"XCWT" if record_type == b"CELL" => Fixed(SINGLE),
         // RNAM is a compound large-reference payload and TNAM is a texture path;
         // preserve those bytes under the existing unsupported-layout policy.
-        b"NAM2" | b"NAM3" | b"WNAM" | b"CNAM" if record_type == b"WRLD" => Fixed(SINGLE),
+        // Music (`ZNAM`) as well, which the in-house schema remaps too.
+        b"NAM2" | b"NAM3" | b"WNAM" | b"CNAM" | b"ZNAM" if record_type == b"WRLD" => Fixed(SINGLE),
         b"RNAM" | b"CNAM" | b"INAM" if record_type == b"NPC_" => Fixed(SINGLE),
         b"WKMV" | b"RNMV" if record_type == b"RACE" => Fixed(SINGLE),
         b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL" => Fixed(SINGLE),
@@ -520,7 +527,10 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         // Each activate parent is a separate subrecord: reference plus f32 delay.
         b"XAPR" if placed => Fixed(&[(8, &[0])]),
         // Location reference types.
-        b"XLRT" if placed => Array { stride: 4 },
+        b"XLRT" if placed => Array {
+            stride: 4,
+            form_ids: &[0],
+        },
         // A rider's horse.
         b"XHOR" if record_type == b"ACHR" => Fixed(SINGLE),
         // Lighting template, on cells and on worldspaces.
@@ -535,10 +545,32 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         // [wbFormIDCk('Origin'), wbFormIDCk('Destination')]))`), so every u32 is a FormID.
         // The official masters only ever store one pair (8 bytes). Like every `Array`, a
         // length that is not a multiple of the stride is dropped and reported.
-        b"XPOD" if record_type == b"REFR" => Array { stride: 4 },
+        b"XPOD" if record_type == b"REFR" => Array {
+            stride: 4,
+            form_ids: &[0],
+        },
         b"XLRM" | b"LNAM" | b"INAM" if record_type == b"REFR" => Fixed(SINGLE),
         // Regions.
-        b"XCLR" if record_type == b"CELL" => Array { stride: 4 },
+        b"XCLR" if record_type == b"CELL" => Array {
+            stride: 4,
+            form_ids: &[0],
+        },
+        // A region's weathers: the weather, its chance, then an optional global.
+        b"RDWT" if record_type == b"REGN" => Array {
+            stride: 12,
+            form_ids: &[0, 8],
+        },
+        // A climate's weathers, laid out like a region's.
+        b"WLST" if record_type == b"CLMT" => Array {
+            stride: 12,
+            form_ids: &[0, 8],
+        },
+        // A weather's precipitation, visual effect, sky static and sun glare lens.
+        b"MNAM" | b"NNAM" | b"TNAM" | b"GNAM" if record_type == b"WTHR" => Fixed(SINGLE),
+        // Its image spaces and volumetric lighting at sunrise, day, sunset and night.
+        b"IMSP" | b"HNAM" if record_type == b"WTHR" => Fixed(&[(16, &[0, 4, 8, 12])]),
+        // Each sound is its own subrecord: descriptor, then a u32 kind.
+        b"SNAM" if record_type == b"WTHR" => Fixed(&[(8, &[0])]),
         _ => return None,
     })
 }
@@ -684,9 +716,12 @@ fn remap_record_form_ids(
                             data.len()
                         )
                     }),
-                FormIdLayout::Array { stride } => {
+                FormIdLayout::Array { stride, form_ids } => {
                     if data.len().is_multiple_of(stride) {
-                        Ok((0..data.len()).step_by(stride).collect())
+                        Ok((0..data.len())
+                            .step_by(stride)
+                            .flat_map(|entry| form_ids.iter().map(move |offset| entry + offset))
+                            .collect())
                     } else {
                         Err(format!(
                             "{name} length {} is not a multiple of {stride}",
