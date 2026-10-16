@@ -184,7 +184,12 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              color_r INTEGER NOT NULL, color_g INTEGER NOT NULL, color_b INTEGER NOT NULL,
              flags INTEGER NOT NULL,        -- DATA flags (dynamic, can carry, negative, flicker, off by default, ...)
              falloff REAL NOT NULL,
-             fade REAL                      -- FNAM, if present
+             fade REAL,                     -- FNAM, if present
+             time INTEGER, field_of_view REAL, near_clip REAL,
+             flicker_period REAL, flicker_intensity_amplitude REAL, flicker_movement_amplitude REAL,
+             value INTEGER, weight REAL,
+             sound_id INTEGER,              -- SNAM -> SNDR
+             lens_id INTEGER                -- LNAM -> LENS
          );
          CREATE TABLE IF NOT EXISTS npcs (
              id INTEGER PRIMARY KEY, editor_id TEXT, full_name TEXT,
@@ -268,12 +273,47 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     // here, and an older-shaped `room_portals` (no `pair_index`) is migrated in place.
     crate::esm::rooms::migrate_room_portals(conn)?;
     conn.execute_batch(crate::esm::rooms::ROOM_TABLES_SQL)?;
+    // `CREATE TABLE IF NOT EXISTS` leaves a reused older table as it was; give it the columns
+    // later exports added, so a subset export can still insert into it.
+    add_missing_columns(conn, "lights", LIGHT_DETAIL_COLUMNS)?;
     conn.prepare_cached(
         "INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_info)",
     )?
     .execute([shared::WORLD_DATABASE_SCHEMA_VERSION])?;
     Ok(())
 }
+
+/// Adds each `(name, declaration)` column `table` lacks.
+fn add_missing_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
+    for (name, declaration) in columns {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            [table, name],
+            |row| row.get(0),
+        )?;
+        if !present {
+            conn.execute(
+                &format!("ALTER TABLE \"{table}\" ADD COLUMN {name} {declaration}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The `lights` columns #269 added after the first light export.
+const LIGHT_DETAIL_COLUMNS: &[(&str, &str)] = &[
+    ("time", "INTEGER"),
+    ("field_of_view", "REAL"),
+    ("near_clip", "REAL"),
+    ("flicker_period", "REAL"),
+    ("flicker_intensity_amplitude", "REAL"),
+    ("flicker_movement_amplitude", "REAL"),
+    ("value", "INTEGER"),
+    ("weight", "REAL"),
+    ("sound_id", "INTEGER"),
+    ("lens_id", "INTEGER"),
+];
 
 type CellMetadata = (Option<i32>, Option<i32>, Option<u32>);
 
@@ -688,7 +728,7 @@ fn export_records(
                 let view = SubrecordView::new(&record.subrecords);
                 // Every `LIGH` lights the space whether or not it has
                 // geometry, so it gets a `lights` row regardless.
-                insert_light(&tx, form_id, &view)?;
+                insert_light(&tx, master, form_id, &view)?;
                 // Most `LIGH` records carry no model: they light the space with
                 // nothing to draw. Storing one row per invisible light would put
                 // a meshless entry in `statics` for every candle in the game, so
@@ -939,8 +979,15 @@ fn parse_water_dnam(dnam: &[u8]) -> Option<WaterDnam> {
 /// a warning rather than guessed at. A shorter `DATA` is accepted because the
 /// leading fields are the same ones Oblivion-era light data has.
 const LIGHT_DATA_MIN: usize = 20;
+/// The full `LIGH` `DATA` in Skyrim SE.
+const LIGHT_DATA_FULL: usize = 48;
 
-fn insert_light(tx: &Transaction<'_>, form_id: u32, view: &SubrecordView<'_>) -> Result<()> {
+fn insert_light(
+    tx: &Transaction<'_>,
+    master: &HashMap<u32, RawRecord>,
+    form_id: u32,
+    view: &SubrecordView<'_>,
+) -> Result<()> {
     let Some(data) = view.find(b"DATA") else {
         eprintln!("warning: LIGH {form_id:08X} has no DATA; no lights row");
         return Ok(());
@@ -961,9 +1008,32 @@ fn insert_light(tx: &Transaction<'_>, form_id: u32, view: &SubrecordView<'_>) ->
         .find(b"FNAM")
         .filter(|bytes| bytes.len() >= 4)
         .map(|bytes| f32::from_le_bytes(bytes[..4].try_into().expect("four-byte light fade")));
+    // The rest of the 48-byte DATA (xEdit 4.1.5f `wbDefinitionsTES5.pas`, LIGH): time, FOV, near
+    // clip, the flicker period and amplitudes, value and weight. The in-house schema accepts only
+    // the full 48 bytes, so a shorter DATA leaves them NULL for both readers.
+    let full = (data.len() == LIGHT_DATA_FULL).then_some(data);
+    let real = |offset: usize| {
+        full.map(|data| f32::from_le_bytes(data[offset..offset + 4].try_into().expect("f32")))
+            .filter(|value| value.is_finite())
+    };
+    let word = |offset: usize| {
+        full.map(|data| u32::from_le_bytes(data[offset..offset + 4].try_into().expect("u32")))
+    };
+    // Links keep a FormID only when the winning record exists with the allowed type: the
+    // in-house reader clears unresolved links and the legacy reader keeps them.
+    let link = |tag: &[u8; 4], target: &[u8; 4]| {
+        view.find(tag)
+            .filter(|bytes| bytes.len() == 4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte link")))
+            .filter(|id| {
+                master
+                    .get(id)
+                    .is_some_and(|record| !record.is_deleted() && record.record_type == *target)
+            })
+    };
     tx.prepare_cached(
-        "INSERT OR REPLACE INTO lights(id, editor_id, radius, color_r, color_g, color_b, flags, falloff, fade)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?.execute(
+        "INSERT OR REPLACE INTO lights(id, editor_id, radius, color_r, color_g, color_b, flags, falloff, fade, time, field_of_view, near_clip, flicker_period, flicker_intensity_amplitude, flicker_movement_amplitude, value, weight, sound_id, lens_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)")?.execute(
         params![
             form_id,
             view.get_string(b"EDID"),
@@ -974,6 +1044,16 @@ fn insert_light(tx: &Transaction<'_>, form_id: u32, view: &SubrecordView<'_>) ->
             flags,
             falloff,
             fade,
+            word(0).map(|time| time as i32),
+            real(20),
+            real(24),
+            real(28),
+            real(32),
+            real(36),
+            word(40),
+            real(44),
+            link(b"SNAM", b"SNDR"),
+            link(b"LNAM", b"LENS"),
         ],
     )?;
     Ok(())
