@@ -102,7 +102,8 @@ CREATE TABLE IF NOT EXISTS cells (
     grid_y INTEGER,                     -- Exterior cell Grid Y (NULL if interior)
     interior_name TEXT,                 -- The cell's EDID, not its display name
     flags INTEGER NOT NULL,             -- record header flags
-    data BLOB                           -- rkyv ArchivedRecordData
+    data BLOB,                          -- rkyv ArchivedRecordData
+    full_name TEXT                      -- Resolved FULL display name
 );
 ```
 
