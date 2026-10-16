@@ -25,6 +25,7 @@ pub mod lodsettings;
 pub mod mmap_reader;
 pub mod plugins_txt;
 pub mod records;
+mod reference_links;
 pub mod rooms;
 pub mod types;
 pub use plugins_txt::{
@@ -32,6 +33,8 @@ pub use plugins_txt::{
 };
 #[cfg(test)]
 mod plugin_table_tests;
+#[cfg(test)]
+mod reference_links_parity_tests;
 #[cfg(test)]
 mod report_warnings_official_tests;
 
@@ -517,6 +520,8 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         b"XNDP" if placed => Fixed(&[(8, &[0])]),
         // Emitted light or region.
         b"XEMI" if placed => Fixed(SINGLE),
+        // Attached reference, which the in-house schema remaps too.
+        b"XATR" if placed => Fixed(SINGLE),
         // Each activate parent is a separate subrecord: reference plus f32 delay.
         b"XAPR" if placed => Fixed(&[(8, &[0])]),
         // Location reference types.

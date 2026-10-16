@@ -345,6 +345,73 @@ projection. An invalid parent link is published as
 `enable_parent_id = 0` (no parent) with its flags kept; a malformed `XESP` is
 dropped, so both columns are NULL. See the remapped-field table below.
 
+#### Reference Links and Details (`reference_linked_refs`, `reference_activate_parents`, `reference_details`)
+
+What a placed reference is linked to, what activates it, who owns it, how it is locked and
+whether it is a map marker (#269 gap 3). Patrols, idle markers, traps, levers, pressure plates,
+stealing and locked doors need these; before they were only in `references.data`. Written for
+every exported placed reference (`REFR`, `ACHR`, `ACRE`, `PGRE`, `PMIS`). Layouts follow xEdit
+4.1.5f (`Core/wbDefinitionsTES5.pas`, `REFR`).
+
+```sql
+CREATE TABLE IF NOT EXISTS reference_linked_refs (       -- XLKR, one row per subrecord in file order
+    reference_id INTEGER NOT NULL,                       -- references.id
+    position INTEGER NOT NULL,
+    keyword_id INTEGER,                                  -- -> KYWD; NULL for the 4-byte form
+    linked_ref_id INTEGER,                               -- -> a placed reference
+    PRIMARY KEY (reference_id, position)
+);
+CREATE TABLE IF NOT EXISTS reference_activate_parents (  -- XAPR, one row per subrecord
+    reference_id INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    parent_ref_id INTEGER,                               -- -> a placed reference
+    delay REAL,                                          -- seconds; NULL if not finite
+    PRIMARY KEY (reference_id, position)
+);
+CREATE TABLE IF NOT EXISTS reference_details (           -- one row per reference with any of these
+    reference_id INTEGER PRIMARY KEY,
+    owner_id INTEGER,                    -- XOWN -> FACT, NPC_ or ACHR
+    owner_rank INTEGER,                  -- XRNK, the faction rank that owns it
+    activate_parent_flags INTEGER,       -- XAPD: 0x1 parent activate only
+    lock_level INTEGER,                  -- XLOC[0]: 1 novice, 25 apprentice, 50 adept, 75 expert,
+                                         -- 100 master, 255 requires key
+    lock_key_id INTEGER,                 -- XLOC[4..8] -> KEYM, remapped here (see below)
+    lock_flags INTEGER,                  -- XLOC[8]: 0x4 leveled lock
+    open_by_default INTEGER NOT NULL DEFAULT 0, -- ONAM present (doors)
+    map_marker INTEGER NOT NULL DEFAULT 0,      -- XMRK present
+    map_marker_flags INTEGER,            -- FNAM: 0x1 visible, 0x2 can travel to, 0x4 "show all" hidden
+    map_marker_type INTEGER,             -- TNAM[0], the marker icon enum
+    location_id INTEGER,                 -- XLCN -> LCTN (persistent location)
+    location_ref_type_id INTEGER,        -- XLRL -> LCRT or LCTN
+    encounter_zone_id INTEGER,           -- XEZN -> ECZN
+    attached_ref_id INTEGER              -- XATR -> a placed reference
+);
+```
+
+Rules:
+
+- Placed references are `REFR`, `ACHR`, `ACRE`, `PGRE`, `PMIS`, `PHZD`, `PARW`, `PBAR`, `PBEA`,
+  `PCON` and `PFLA`. Every link keeps its load-order FormID only when the winning record it names
+  exists with an allowed type; otherwise it is NULL (the row is kept, so `position` still counts
+  every subrecord). The in-house reader clears unresolved links and the legacy reader keeps them,
+  so this check is what makes both readers publish the same rows.
+- A field whose length the in-house schema rejects is skipped for both readers: `XLKR` must be 4
+  or 8 bytes, `XAPR` 8, `XAPD` 1, `XOWN`/`XRNK`/`XLCN`/`XLRL`/`XEZN`/`XATR` 4, `FNAM` 1 and `TNAM`
+  2.
+- `XLOC` is untyped bytes in the in-house schema, so neither reader remaps its key in
+  `references.data`. The projection remaps it through the supplying plugin's master list
+  (`records::source_identity::header_runtime_id`). A subset export without a load order leaves
+  `lock_key_id` NULL.
+- The map marker's name (`FULL`, a localized string) is not projected yet. Under
+  `--record-reader legacy` it is still a string ID until the legacy reader resolves localized
+  strings (#271).
+- Derived data like the other runtime views: a full load-order export recreates the tables, and
+  diagnostic archives leave them empty.
+
+**These tables are optional and did not bump `shared::WORLD_DATABASE_SCHEMA_VERSION`.**
+`create_tables` adds them to an older reused database. No engine code reads them yet; a reader
+must probe for them first.
+
 ---
 
 ### 6. Hybrid Spatial Indexing (`exterior_spatial` & Interior `cell_id` Index)
@@ -483,6 +550,7 @@ reference and cell fields, validated against their expected sizes:
 | `XLKR` | placed references | keyword and linked reference (8 bytes), or the linked reference alone (legacy 4 bytes) |
 | `XNDP` | placed references | navmesh (bytes 0-3 of 8) |
 | `XEMI` | placed references | emitted light or region |
+| `XATR` | placed references | attached reference (the in-house reader already remapped it; the legacy reader does since #269) |
 | `XAPR` | placed references | activate-parent reference (one 8-byte subrecord per parent) |
 | `XLRT` | placed references | location reference types (array) |
 | `XHOR` | ACHR | horse reference |
@@ -499,9 +567,9 @@ PARW, PBAR, PBEA, PCON and PFLA. This does not expand the record types exported
 to the `references` table; the six newly covered types retain their blobs in
 `records` without adding `references` rows.
 Fields not covered may still hold plugin-local FormIDs. In particular, do not
-consume `WRLD.RNAM` large-reference lists, `XLOC` lock keys, `XPWR` water
+consume `WRLD.RNAM` large-reference lists, `XLOC` lock keys (use `reference_details.lock_key_id`), `XPWR` water
 reflections as resolved IDs. Other
-unconverted fields include `XLIB`, `XMBR`, `XATR`, `XTNM`, `PDTO`, `CELL.XILL`
+unconverted fields include `XLIB`, `XMBR`, `XTNM`, `PDTO`, `CELL.XILL`
 and `WRLD.ZNAM`. Check the converter's field-specific handling before using
 these payloads; this list is not exhaustive.
 

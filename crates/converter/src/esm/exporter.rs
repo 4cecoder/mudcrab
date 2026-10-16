@@ -268,6 +268,8 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     // here, and an older-shaped `room_portals` (no `pair_index`) is migrated in place.
     crate::esm::rooms::migrate_room_portals(conn)?;
     conn.execute_batch(crate::esm::rooms::ROOM_TABLES_SQL)?;
+    // Optional reference link and detail tables (db-schema.md, #269 gap 3).
+    conn.execute_batch(crate::esm::reference_links::REFERENCE_LINK_TABLES_SQL)?;
     conn.prepare_cached(
         "INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_info)",
     )?
@@ -432,6 +434,9 @@ fn replace_complete_snapshot(tx: &Transaction<'_>) -> Result<()> {
         DROP TABLE IF EXISTS lod_build;
         DROP TABLE IF EXISTS lod;"#,
     )?;
+    for table in crate::esm::reference_links::REFERENCE_LINK_TABLES {
+        tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
+    }
     create_tables(tx)?;
     // Every complete snapshot owns these derived rows, including archive-only exports
     // that deliberately defer all runtime projections.
@@ -674,6 +679,12 @@ fn export_records(
                     record.flags,
                     &record.subrecords,
                     &canonical_record.subrecords,
+                )?;
+                crate::esm::reference_links::insert(
+                    &tx,
+                    &crate::esm::reference_links::Context { master, order },
+                    record,
+                    &SubrecordView::new(&record.subrecords),
                 )?;
             }
             "LAND" => {
