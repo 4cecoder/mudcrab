@@ -9,8 +9,9 @@ use bevy::{
     pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
     render::render_resource::{AsBindGroup, ShaderType},
-    shader::ShaderRef,
+    shader::{ShaderRef, load_shader_library},
 };
+use std::convert::Infallible;
 
 /// Register after `DefaultPlugins`; applies converter-tagged native material semantics.
 pub struct NifMaterialPlugin;
@@ -33,8 +34,11 @@ pub struct EffectPaletteMaterialPlugin;
 
 impl Plugin for EffectPaletteMaterialPlugin {
     fn build(&self, app: &mut App) {
+        load_shader_library!(app, "shaders/effect_palette_functions.wgsl");
         embedded_asset!(app, "shaders/effect_palette.wgsl");
-        app.add_plugins(MaterialPlugin::<EffectPaletteMaterial>::default());
+        embedded_asset!(app, "shaders/effect_palette_prepass.wgsl");
+        app.init_asset::<EffectPaletteImage>()
+            .add_plugins(MaterialPlugin::<EffectPaletteMaterial>::default());
     }
 }
 
@@ -86,6 +90,19 @@ impl MaterialExtension for EffectPalette {
     fn fragment_shader() -> ShaderRef {
         "embedded://engine/shaders/effect_palette.wgsl".into()
     }
+
+    fn prepass_fragment_shader() -> ShaderRef {
+        "embedded://engine/shaders/effect_palette_prepass.wgsl".into()
+    }
+}
+
+/// An effect palette's image, held under a label of its own. `ExtendedMaterial` reports none of
+/// its fields' handles to the asset system, so the palette material depends on this holder
+/// instead: a scene then counts as loaded only once its palettes are.
+#[derive(Asset, TypePath)]
+struct EffectPaletteImage {
+    #[dependency]
+    image: Handle<Image>,
 }
 
 /// `BSEffectShaderProperty` flags 1 bits 4 and 5 (`Greyscale_To_PaletteColor` and
@@ -293,10 +310,18 @@ impl GltfExtensionHandler for NativeMaterialHandler {
         let material = native_material(source, standard).unwrap_or_else(|| standard.clone());
         match palette {
             Some((lookup, image)) => {
+                let holder = format!("{label}/nif_palette_image");
                 context.add_labeled_asset(
-                    format!("{label}/nif_palette"),
-                    effect_palette_material(lookup, material, image),
+                    holder.clone(),
+                    EffectPaletteImage {
+                        image: image.clone(),
+                    },
                 );
+                let material = effect_palette_material(lookup, material, image);
+                let Ok(_) = context.labeled_asset_scope(format!("{label}/nif_palette"), |scope| {
+                    scope.get_label_handle::<EffectPaletteImage>(holder);
+                    Ok::<_, Infallible>(material)
+                });
             }
             None => {
                 context.add_labeled_asset(format!("{label}/nif"), material);
