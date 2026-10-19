@@ -158,7 +158,8 @@ fn effect_palette_material(
 }
 
 /// Per load, Bevy clones the registered handler, so `textures` holds this glTF's images by
-/// glTF texture index: Bevy reports every texture before any material.
+/// glTF texture index: Bevy reports every texture before any material. A slot Bevy never
+/// reported holds a default handle, which spawn validation reports as not loaded.
 #[derive(Clone, Default)]
 struct NativeMaterialHandler {
     textures: Vec<Handle<Image>>,
@@ -263,8 +264,12 @@ impl GltfExtensionHandler for NativeMaterialHandler {
         Box::new(self.clone())
     }
 
-    fn on_texture(&mut self, _texture: &gltf::Texture<'_>, handle: Handle<Image>) {
-        self.textures.push(handle);
+    fn on_texture(&mut self, texture: &gltf::Texture<'_>, handle: Handle<Image>) {
+        let index = texture.index();
+        if self.textures.len() <= index {
+            self.textures.resize(index + 1, Handle::default());
+        }
+        self.textures[index] = handle;
     }
 
     fn on_material(
@@ -481,18 +486,40 @@ mod tests {
 
     #[test]
     fn handler_hands_out_the_palette_by_gltf_texture_index() {
+        let document = gltf::Gltf::from_slice(
+            serde_json::to_string(&serde_json::json!({
+                "asset": {"version": "2.0"},
+                "images": [{"uri": "a.ktx2"}, {"uri": "b.ktx2"}, {"uri": "c.ktx2"}],
+                "textures": [{"source": 0}, {"source": 1}, {"source": 2}],
+                "materials": [{"extensions": {"OPEN_SKYRIM_material": {
+                    "shaderFamily": "effect", "shaderFlags1": 0x10,
+                    "textureSlots": [{"semantic": "greyscale", "slot": 1, "texture": 2}]
+                }}}]
+            }))
+            .unwrap()
+            .as_bytes(),
+        )
+        .unwrap();
         let mut images = Assets::<Image>::default();
-        let handler = NativeMaterialHandler {
-            textures: (0..3).map(|_| images.add(Image::default())).collect(),
-        };
-        let document = first_material(serde_json::json!({"extensions": {"OPEN_SKYRIM_material": {
-            "shaderFamily": "effect", "shaderFlags1": 0x10,
-            "textureSlots": [{"semantic": "greyscale", "slot": 1, "texture": 2}]
-        }}}));
+        let handles: Vec<_> = (0..3).map(|_| images.add(Image::default())).collect();
+        // Reported out of order, the palette still resolves by its own index.
+        let mut handler = NativeMaterialHandler::default();
+        for index in [2, 0, 1] {
+            let texture = document.textures().nth(index).unwrap();
+            GltfExtensionHandler::on_texture(&mut handler, &texture, handles[index].clone());
+        }
         let source = document.materials().next().unwrap();
         let (lookup, palette) = handler.palette(&source).unwrap();
         assert!(lookup.color && !lookup.alpha);
-        assert_eq!(palette, handler.textures[2]);
+        assert_eq!(palette, handles[2]);
+        // A slot below a reported texture that Bevy never reported stays unloadable.
+        let mut sparse = NativeMaterialHandler::default();
+        GltfExtensionHandler::on_texture(
+            &mut sparse,
+            &document.textures().nth(2).unwrap(),
+            handles[2].clone(),
+        );
+        assert_eq!(sparse.textures[0], Handle::default());
         let empty = NativeMaterialHandler::default();
         assert!(empty.palette(&source).is_none());
     }

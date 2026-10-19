@@ -158,8 +158,8 @@ The prepass keeps Bevy's alpha test, which matters only for an alpha-tested pale
 synthetic effect contracts → glTF/KTX2 → production palette material → GPU swatches beside unlit
 references computed on the CPU (bilinear filtering of the decoded 4×4 palette). Five cases: mid
 grey, HDR scale with the row from base red only, clamped corner, colour and alpha blended, alpha
-only. Palette view ! `Rgba8UnormSrgb`; tolerance 2/255; references ! visible. `--standard-material`
-draws the stock material the engine used before and ! fail with exit 1.
+only. The palette view must be `Rgba8UnormSrgb`; tolerance 2/255; references must be visible.
+`--standard-material` draws the stock material the engine used before and must fail with exit 1.
 
 Local Apple M4 Pro, Metal: both backgrounds match exactly (0/255). Negative control fails, maximum
 difference 112/255. In the full Riverwood pack, the forge's coals render as embers instead of the

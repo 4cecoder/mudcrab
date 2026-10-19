@@ -581,7 +581,12 @@ impl LandingAssets<'_, '_> {
                 self.check_material(
                     handle,
                     &self.palette,
-                    |this, m, report| this.check_dependencies(m, report),
+                    // `ExtendedMaterial` reports no dependencies itself: its fields carry
+                    // no `#[dependency]`, so each half is visited on its own.
+                    |this, m, report| {
+                        this.check_dependencies(&m.base, report);
+                        this.check_dependencies(&m.extension, report);
+                    },
                     &mut report,
                 );
             }
@@ -912,6 +917,7 @@ mod tests {
         app.init_asset::<Mesh>()
             .init_asset::<Image>()
             .init_asset::<StandardMaterial>()
+            .init_asset::<EffectPaletteMaterial>()
             .insert_resource(RenderAssetBytesPerFrame {
                 max_bytes: crate::config::EngineConfig::default().max_upload_bytes_per_frame(),
             });
@@ -1328,6 +1334,63 @@ mod tests {
         assert_eq!(budget(&app), configured_budget(), "the fade-in started");
         app.update();
         assert!(alpha(&mut app) < 1.0, "the fade shows");
+    }
+
+    #[test]
+    fn the_fade_in_waits_for_an_effect_palette_materials_source_texture_and_palette() {
+        let (mut app, _) = app_with(interior_door());
+        press_e(&mut app);
+        run_until_black(&mut app);
+        let source = app.world().resource::<Assets<Image>>().reserve_handle();
+        let palette = app.world().resource::<Assets<Image>>().reserve_handle();
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<EffectPaletteMaterial>>()
+            .add(EffectPaletteMaterial {
+                base: StandardMaterial {
+                    base_color_texture: Some(source.clone()),
+                    ..default()
+                },
+                extension: crate::nif_material::EffectPalette::new(
+                    palette.clone(),
+                    true,
+                    true,
+                    1.0,
+                ),
+            });
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Mesh::new(
+                bevy::mesh::PrimitiveTopology::TriangleList,
+                bevy::asset::RenderAssetUsages::default(),
+            ));
+        let root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .spawn((Mesh3d(mesh), MeshMaterial3d(material), ChildOf(root)));
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_resident_for_test(CellKey::Interior(77), root);
+        for (image, waiting) in [(source, "the palette"), (palette, "")] {
+            for _ in 0..20 {
+                app.update();
+            }
+            assert!(alpha(&mut app) >= 0.99, "an image is still loading");
+            app.world_mut()
+                .resource_mut::<Assets<Image>>()
+                .insert(image.id(), Image::default())
+                .unwrap();
+            if !waiting.is_empty() {
+                for _ in 0..20 {
+                    app.update();
+                }
+                assert!(alpha(&mut app) >= 0.99, "{waiting} is still loading");
+            }
+        }
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(budget(&app), configured_budget(), "the fade-in started");
     }
 
     #[test]
