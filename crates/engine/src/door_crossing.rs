@@ -25,6 +25,7 @@
 
 use crate::{
     doors::LoadDoor,
+    nif_material::EffectPaletteMaterial,
     physics::{
         CursorCapture, MovementTuning, PlayerBody, TeleportPlayer, body_and_camera_for_feet,
     },
@@ -436,6 +437,7 @@ struct LandingAssets<'w, 's> {
             Option<&'static MeshMaterial3d<StandardMaterial>>,
             Option<&'static MeshMaterial3d<TerrainMaterial>>,
             Option<&'static MeshMaterial3d<WaterMaterial>>,
+            Option<&'static MeshMaterial3d<EffectPaletteMaterial>>,
         ),
     >,
     meshes: Option<Res<'w, Assets<Mesh>>>,
@@ -443,6 +445,7 @@ struct LandingAssets<'w, 's> {
     standard: Option<Res<'w, Assets<StandardMaterial>>>,
     terrain: Option<Res<'w, Assets<TerrainMaterial>>>,
     water: Option<Res<'w, Assets<WaterMaterial>>>,
+    palette: Option<Res<'w, Assets<EffectPaletteMaterial>>>,
 }
 
 /// What the readiness check found under a landing root.
@@ -529,13 +532,14 @@ impl LandingAssets<'_, '_> {
     }
 
     /// Inspects every mesh, material and texture under `root`. Covered: `Mesh3d`,
-    /// `MeshMaterial3d<StandardMaterial>` with all its texture dependencies, and the terrain and
-    /// water materials with their base-material textures. The terrain and water extensions' own
-    /// layer and reflection images are private to `render.rs` and are not checked.
+    /// `MeshMaterial3d<StandardMaterial>` and the effect palette material with all their texture
+    /// dependencies, and the terrain and water materials with their base-material textures. The
+    /// terrain and water extensions' own layer and reflection images are private to `render.rs`
+    /// and are not checked.
     fn inspect_under(&self, root: Entity) -> LandingReport {
         let mut report = LandingReport::default();
         for entity in std::iter::once(root).chain(self.children.iter_descendants(root)) {
-            let Ok((mesh, standard, terrain, water)) = self.parts.get(entity) else {
+            let Ok((mesh, standard, terrain, water, palette)) = self.parts.get(entity) else {
                 continue;
             };
             if let Some(Mesh3d(handle)) = mesh {
@@ -570,6 +574,14 @@ impl LandingAssets<'_, '_> {
                     handle,
                     &self.water,
                     |this, m, report| this.check_dependencies(&m.base, report),
+                    &mut report,
+                );
+            }
+            if let Some(MeshMaterial3d(handle)) = palette {
+                self.check_material(
+                    handle,
+                    &self.palette,
+                    |this, m, report| this.check_dependencies(m, report),
                     &mut report,
                 );
             }

@@ -1,12 +1,15 @@
 //! Native construction of converted NIF materials using Bevy's glTF extension hooks.
 use bevy::{
-    asset::LoadContext,
+    asset::{LoadContext, embedded_asset},
     gltf::{
         GltfMaterial,
         extensions::{ErasedGltfExtensionHandler, GltfExtensionHandler, GltfExtensionHandlers},
         gltf,
     },
+    pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
+    render::render_resource::{AsBindGroup, ShaderType},
+    shader::ShaderRef,
 };
 
 /// Register after `DefaultPlugins`; applies converter-tagged native material semantics.
@@ -20,12 +23,153 @@ impl Plugin for NifMaterialPlugin {
             .resource_mut::<GltfExtensionHandlers>()
             .0
             .write_blocking()
-            .push(Box::new(NativeMaterialHandler));
+            .push(Box::new(NativeMaterialHandler::default()));
     }
 }
 
-#[derive(Clone)]
-struct NativeMaterialHandler;
+/// Registers the effect palette material and its shader. Separate from [`NifMaterialPlugin`]
+/// because it needs the asset and render plugins, which the material handler's tests leave out.
+pub struct EffectPaletteMaterialPlugin;
+
+impl Plugin for EffectPaletteMaterialPlugin {
+    fn build(&self, app: &mut App) {
+        embedded_asset!(app, "shaders/effect_palette.wgsl");
+        app.add_plugins(MaterialPlugin::<EffectPaletteMaterial>::default());
+    }
+}
+
+/// A converted effect surface coloured through its greyscale palette.
+pub type EffectPaletteMaterial = ExtendedMaterial<StandardMaterial, EffectPalette>;
+
+/// The palette half of an [`EffectPaletteMaterial`]; the standard half carries the source
+/// texture, base colour, UV transform and blending as for every other converted material.
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+pub struct EffectPalette {
+    #[uniform(100)]
+    settings: EffectPaletteSettings,
+    #[texture(101)]
+    #[sampler(102)]
+    #[dependency]
+    palette: Handle<Image>,
+}
+
+#[derive(ShaderType, Reflect, Debug, Clone, Copy, PartialEq)]
+struct EffectPaletteSettings {
+    /// x = 1 when the palette gives the colour, y = 1 when it gives the alpha,
+    /// z = the shader's base colour scale. w unused.
+    lookup: Vec4,
+}
+
+impl EffectPalette {
+    /// `color` and `alpha` say which channels the palette supplies; `scale` is the shader's base
+    /// colour scale.
+    pub fn new(palette: Handle<Image>, color: bool, alpha: bool, scale: f32) -> Self {
+        Self {
+            settings: EffectPaletteSettings {
+                lookup: Vec4::new(
+                    f32::from(u8::from(color)),
+                    f32::from(u8::from(alpha)),
+                    scale,
+                    0.0,
+                ),
+            },
+            palette,
+        }
+    }
+
+    pub fn palette(&self) -> &Handle<Image> {
+        &self.palette
+    }
+}
+
+impl MaterialExtension for EffectPalette {
+    fn fragment_shader() -> ShaderRef {
+        "embedded://engine/shaders/effect_palette.wgsl".into()
+    }
+}
+
+/// `BSEffectShaderProperty` flags 1 bits 4 and 5 (`Greyscale_To_PaletteColor` and
+/// `Greyscale_To_PaletteAlpha`). The same bits mean other things on lighting shaders.
+const EFFECT_PALETTE_COLOR: u64 = 1 << 4;
+const EFFECT_PALETTE_ALPHA: u64 = 1 << 5;
+
+/// What an effect material reads from its palette: the glTF texture index of the palette and
+/// which channels it supplies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaletteLookup {
+    texture: usize,
+    color: bool,
+    alpha: bool,
+}
+
+/// The palette lookup of a converted effect material, if its flags enable one and the converter
+/// published the palette as the `greyscale` slot of `OPEN_SKYRIM_material`.
+fn palette_lookup(material: &gltf::Material<'_>) -> Option<PaletteLookup> {
+    let extension = material.extensions()?.get("OPEN_SKYRIM_material")?;
+    if extension.get("shaderFamily")?.as_str()? != "effect" {
+        return None;
+    }
+    let flags = extension.get("shaderFlags1")?.as_u64()?;
+    let color = flags & EFFECT_PALETTE_COLOR != 0;
+    let alpha = flags & EFFECT_PALETTE_ALPHA != 0;
+    if !color && !alpha {
+        return None;
+    }
+    let texture = extension
+        .get("textureSlots")?
+        .as_array()?
+        .iter()
+        .find(|slot| slot.get("semantic").and_then(|value| value.as_str()) == Some("greyscale"))?
+        .get("texture")?
+        .as_u64()?;
+    Some(PaletteLookup {
+        texture: usize::try_from(texture).ok()?,
+        color,
+        alpha,
+    })
+}
+
+/// The effect shader's base colour scale. The converter publishes it as emission:
+/// `emissiveFactor × emissiveStrength` is the base colour times the scale, so dividing by the
+/// base colour's brightest channel recovers it. A black base colour publishes no emission, and
+/// the scale then cannot be recovered; 1 stands in.
+fn base_color_scale(material: &StandardMaterial) -> f32 {
+    let base = material.base_color.to_linear();
+    let peak = base.red.max(base.green).max(base.blue);
+    let emissive = material.emissive;
+    let scale = emissive.red.max(emissive.green).max(emissive.blue) / peak;
+    if peak > 0.0 && scale.is_finite() {
+        scale
+    } else {
+        1.0
+    }
+}
+
+fn effect_palette_material(
+    lookup: PaletteLookup,
+    base: StandardMaterial,
+    palette: Handle<Image>,
+) -> EffectPaletteMaterial {
+    let scale = base_color_scale(&base);
+    EffectPaletteMaterial {
+        base,
+        extension: EffectPalette::new(palette, lookup.color, lookup.alpha, scale),
+    }
+}
+
+/// Per load, Bevy clones the registered handler, so `textures` holds this glTF's images by
+/// glTF texture index: Bevy reports every texture before any material.
+#[derive(Clone, Default)]
+struct NativeMaterialHandler {
+    textures: Vec<Handle<Image>>,
+}
+
+impl NativeMaterialHandler {
+    fn palette(&self, material: &gltf::Material<'_>) -> Option<(PaletteLookup, Handle<Image>)> {
+        let lookup = palette_lookup(material)?;
+        Some((lookup, self.textures.get(lookup.texture)?.clone()))
+    }
+}
 
 /// The stock hook records this dependency before our hook replaces its render binding.
 /// Keep its strong handle in the scene so scene-only loads remain fully loaded.
@@ -119,6 +263,10 @@ impl GltfExtensionHandler for NativeMaterialHandler {
         Box::new(self.clone())
     }
 
+    fn on_texture(&mut self, _texture: &gltf::Texture<'_>, handle: Handle<Image>) {
+        self.textures.push(handle);
+    }
+
     fn on_material(
         &mut self,
         context: &mut LoadContext<'_>,
@@ -127,7 +275,8 @@ impl GltfExtensionHandler for NativeMaterialHandler {
         _loaded: &GltfMaterial,
         label: &str,
     ) {
-        if !needs_native_material(source) {
+        let palette = self.palette(source);
+        if !needs_native_material(source) && palette.is_none() {
             return;
         }
         // Reuse Bevy's fully constructed standard material instead of duplicating
@@ -136,8 +285,18 @@ impl GltfExtensionHandler for NativeMaterialHandler {
             .get_labeled(format!("{label}/std"))
             .and_then(|asset| asset.get::<StandardMaterial>())
             .expect("NifMaterialPlugin requires the stock PBR glTF handler before it");
-        let material = native_material(source, standard).unwrap();
-        context.add_labeled_asset(format!("{label}/nif"), material);
+        let material = native_material(source, standard).unwrap_or_else(|| standard.clone());
+        match palette {
+            Some((lookup, image)) => {
+                context.add_labeled_asset(
+                    format!("{label}/nif_palette"),
+                    effect_palette_material(lookup, material, image),
+                );
+            }
+            None => {
+                context.add_labeled_asset(format!("{label}/nif"), material);
+            }
+        }
     }
 
     fn on_spawn_mesh_and_material(
@@ -152,18 +311,28 @@ impl GltfExtensionHandler for NativeMaterialHandler {
         if has_external_emittance(material) {
             entity.insert(ExternalEmittance);
         }
-        if needs_native_material(material) {
+        let palette = self.palette(material).is_some();
+        if palette || needs_native_material(material) {
             let source = entity
                 .get::<MeshMaterial3d<StandardMaterial>>()
                 .expect("NifMaterialPlugin requires the stock PBR glTF handler before it")
                 .0
                 .clone();
-            entity.insert((
-                NifSourceMaterial(source),
-                MeshMaterial3d(
+            entity.insert(NifSourceMaterial(source));
+            if palette {
+                // A mesh draws once per material component, so the standard one has to go.
+                entity
+                    .remove::<MeshMaterial3d<StandardMaterial>>()
+                    .insert(MeshMaterial3d(
+                        context.get_label_handle::<EffectPaletteMaterial>(format!(
+                            "{label}/nif_palette"
+                        )),
+                    ));
+            } else {
+                entity.insert(MeshMaterial3d(
                     context.get_label_handle::<StandardMaterial>(format!("{label}/nif")),
-                ),
-            ));
+                ));
+            }
         }
     }
 }
@@ -250,6 +419,104 @@ mod tests {
         let (retained, rendered) = query.single(&cloned.world).unwrap();
         assert_eq!(retained.0, source);
         assert_eq!(rendered.0, native);
+    }
+
+    fn first_material(material: serde_json::Value) -> gltf::Gltf {
+        gltf::Gltf::from_slice(
+            serde_json::to_string(&serde_json::json!({
+                "asset": {"version": "2.0"}, "materials": [material]
+            }))
+            .unwrap()
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    /// The forge's `Flames` (both palette channels) and `JetBoost` (palette colour only) from
+    /// `furniture\blacksmithforgemarker.nif`, as the converter publishes them.
+    #[test]
+    fn palette_lookup_reads_effect_flags_and_the_greyscale_slot() {
+        let effect = |flags: u64, family: &str, slots: serde_json::Value| {
+            serde_json::json!({"extensions": {"OPEN_SKYRIM_material": {
+                "shaderFamily": family, "shaderFlags1": flags, "textureSlots": slots
+            }}})
+        };
+        let greyscale = serde_json::json!([{"semantic": "greyscale", "slot": 1, "texture": 2}]);
+        for (material, expected) in [
+            (
+                effect(0xC000_0078, "effect", greyscale.clone()),
+                Some(PaletteLookup {
+                    texture: 2,
+                    color: true,
+                    alpha: true,
+                }),
+            ),
+            (
+                effect(0x8000_0058, "effect", greyscale.clone()),
+                Some(PaletteLookup {
+                    texture: 2,
+                    color: true,
+                    alpha: false,
+                }),
+            ),
+            // The forge glow: an effect with no palette flag.
+            (effect(0xC000_0008, "effect", greyscale.clone()), None),
+            // Bits 4 and 5 mean other things on a lighting shader.
+            (effect(0xC000_0078, "lighting", greyscale.clone()), None),
+            (
+                effect(
+                    0xC000_0078,
+                    "effect",
+                    serde_json::json!([{"semantic": "detail", "slot": 1, "texture": 2}]),
+                ),
+                None,
+            ),
+            (serde_json::json!({}), None),
+        ] {
+            let document = first_material(material.clone());
+            let source = document.materials().next().unwrap();
+            assert_eq!(palette_lookup(&source), expected, "{material}");
+        }
+    }
+
+    #[test]
+    fn handler_hands_out_the_palette_by_gltf_texture_index() {
+        let mut images = Assets::<Image>::default();
+        let handler = NativeMaterialHandler {
+            textures: (0..3).map(|_| images.add(Image::default())).collect(),
+        };
+        let document = first_material(serde_json::json!({"extensions": {"OPEN_SKYRIM_material": {
+            "shaderFamily": "effect", "shaderFlags1": 0x10,
+            "textureSlots": [{"semantic": "greyscale", "slot": 1, "texture": 2}]
+        }}}));
+        let source = document.materials().next().unwrap();
+        let (lookup, palette) = handler.palette(&source).unwrap();
+        assert!(lookup.color && !lookup.alpha);
+        assert_eq!(palette, handler.textures[2]);
+        let empty = NativeMaterialHandler::default();
+        assert!(empty.palette(&source).is_none());
+    }
+
+    #[test]
+    fn base_color_scale_is_recovered_from_the_published_emission() {
+        for (base, scale) in [
+            (LinearRgba::rgb(1.0, 1.0, 1.0), 1.6),
+            (LinearRgba::rgb(0.706, 0.706, 0.706), 1.5),
+            (LinearRgba::rgb(1.0, 0.56, 0.24), 0.856),
+        ] {
+            let material = StandardMaterial {
+                base_color: base.into(),
+                emissive: base * scale,
+                ..default()
+            };
+            assert!((base_color_scale(&material) - scale).abs() < 1e-5);
+        }
+        let black = StandardMaterial {
+            base_color: Color::BLACK,
+            emissive: LinearRgba::BLACK,
+            ..default()
+        };
+        assert_eq!(base_color_scale(&black), 1.0);
     }
 
     /// The flags are those of `architecture\farmhouse\inn01.nif`: its window, then its walls.

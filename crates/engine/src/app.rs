@@ -209,6 +209,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             SkyPlugin,
             ConsolePlugin,
             crate::nif_material::NifMaterialPlugin,
+            crate::nif_material::EffectPaletteMaterialPlugin,
             crate::emittance::EmittancePlugin,
         ))
         // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
