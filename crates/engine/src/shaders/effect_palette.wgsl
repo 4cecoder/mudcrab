@@ -18,7 +18,13 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     var pbr_input = pbr_input_from_standard_material(in, is_front);
 
     var texel = vec4<f32>(1.0);
-#ifdef VERTEX_UVS_A
+#ifdef VERTEX_UVS_B
+#ifdef STANDARD_MATERIAL_BASE_COLOR_UV_B
+    texel = source_texel(in.uv_b);
+#else ifdef VERTEX_UVS_A
+    texel = source_texel(in.uv);
+#endif
+#else ifdef VERTEX_UVS_A
     texel = source_texel(in.uv);
 #endif
     var tint = pbr_bindings::material.base_color;

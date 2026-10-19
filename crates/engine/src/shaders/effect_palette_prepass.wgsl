@@ -15,11 +15,20 @@
 fn palette_alpha_discard(in: prepass_io::VertexOutput) {
 #ifdef MAY_DISCARD
     let alpha_mode = pbr_bindings::material.flags & pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_RESERVED_BITS;
-    if alpha_mode != pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_MASK {
+    // Alpha-to-coverage falls back to a cutoff test in the main pass when MSAA is off, and that is
+    // the only case that reaches this shader with MAY_DISCARD set.
+    if alpha_mode != pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_MASK &&
+            alpha_mode != pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_ALPHA_TO_COVERAGE {
         return;
     }
     var texel = vec4<f32>(1.0);
-#ifdef VERTEX_UVS_A
+#ifdef VERTEX_UVS_B
+#ifdef STANDARD_MATERIAL_BASE_COLOR_UV_B
+    texel = source_texel(in.uv_b);
+#else ifdef VERTEX_UVS_A
+    texel = source_texel(in.uv);
+#endif
+#else ifdef VERTEX_UVS_A
     texel = source_texel(in.uv);
 #endif
     var tint = pbr_bindings::material.base_color;
