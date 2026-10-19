@@ -998,6 +998,7 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
             "room_links",
             "reference_rooms",
             "room_graph_stats",
+            "door_links",
             "emittance",
         ];
         for (name, rows) in &full_tables {
