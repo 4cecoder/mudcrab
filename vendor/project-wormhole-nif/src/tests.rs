@@ -456,4 +456,87 @@ mod multi_bound {
         assert_eq!(root_node.children, vec![1]);
         assert!(root_node.mesh.is_none());
     }
+
+    fn ordered_node_bytes(name: u32, child: u32) -> Vec<u8> {
+        let mut bytes = node_bytes(name, child);
+        for value in [1.0f32, 2.0, 3.0, 4.0] {
+            bytes.extend_from_slice(&value.to_le_bytes()); // alpha sort bound
+        }
+        bytes.push(1); // static bound
+        bytes
+    }
+
+    fn billboard_node_bytes(name: u32, child: u32) -> Vec<u8> {
+        let mut bytes = node_bytes(name, child);
+        bytes.extend_from_slice(&3u16.to_le_bytes()); // billboard mode
+        bytes
+    }
+
+    fn value_node_bytes(name: u32, child: u32) -> Vec<u8> {
+        let mut bytes = node_bytes(name, child);
+        bytes.extend_from_slice(&(-7i32).to_le_bytes()); // value
+        bytes.push(2); // value node flags
+        bytes
+    }
+
+    #[test]
+    fn parses_ordered_billboard_and_value_nodes_with_their_trailing_fields() {
+        let bytes = ordered_node_bytes(1, 2);
+        let (rest, block) = NifBlock::parse(&bytes, "BSOrderedNode".to_string()).unwrap();
+        assert!(rest.is_empty());
+        let NifBlock::BSOrderedNode(ordered) = &block else {
+            panic!("expected BSOrderedNode, got {block:?}");
+        };
+        assert_eq!(ordered.alpha_sort_bound, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(ordered.static_bound, 1);
+        assert_eq!(block.as_node().unwrap().children, vec![2]);
+
+        let bytes = billboard_node_bytes(1, 2);
+        let (rest, block) = NifBlock::parse(&bytes, "NiBillboardNode".to_string()).unwrap();
+        assert!(rest.is_empty());
+        let NifBlock::NiBillboardNode(billboard) = &block else {
+            panic!("expected NiBillboardNode, got {block:?}");
+        };
+        assert_eq!(billboard.billboard_mode, 3);
+        assert_eq!(block.as_node().unwrap().children, vec![2]);
+
+        let bytes = value_node_bytes(1, 2);
+        let (rest, block) = NifBlock::parse(&bytes, "BSValueNode".to_string()).unwrap();
+        assert!(rest.is_empty());
+        let NifBlock::BSValueNode(value) = &block else {
+            panic!("expected BSValueNode, got {block:?}");
+        };
+        assert_eq!(value.value, -7);
+        assert_eq!(value.value_node_flags, 2);
+        assert_eq!(block.as_node().unwrap().children, vec![2]);
+    }
+
+    #[test]
+    fn shapes_under_ordered_billboard_and_value_nodes_keep_their_parents() {
+        // root -> ordered -> billboard -> value -> shape, as in the forge's fire and glow.
+        let nif = nif_file(
+            vec![
+                parse_block(&node_bytes(0, 1), "NiNode"),
+                parse_block(&ordered_node_bytes(1, 2), "BSOrderedNode"),
+                parse_block(&billboard_node_bytes(2, 3), "NiBillboardNode"),
+                parse_block(&value_node_bytes(3, 4), "BSValueNode"),
+                parse_block(&shape_bytes(0), "BSTriShape"),
+            ],
+            &["root", "ordered", "billboard", "value"],
+        );
+        let model = nif_to_static_model(&nif).unwrap();
+        let children = |block: u32| {
+            model
+                .static_nodes
+                .iter()
+                .find(|node| node.block_index == block)
+                .unwrap_or_else(|| panic!("block {block} is not in the static scene"))
+                .children
+                .clone()
+        };
+        assert_eq!(children(0), vec![1]);
+        assert_eq!(children(1), vec![2]);
+        assert_eq!(children(2), vec![3]);
+        assert_eq!(children(3), vec![4]);
+    }
 }
