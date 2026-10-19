@@ -38,9 +38,7 @@ pub struct ReferenceRow {
     /// Authoritative base record type; `statics` also contains movable clutter.
     pub base_record_type: Option<String>,
     /// Whether the base record carries the `Is Marker` header flag: an editor-only object, such as
-    /// a map marker or a furniture marker, that the game never draws. Its model filename is no
-    /// guide, because visible forges, smelters and map flags also have "marker" in theirs. `false`
-    /// in a database whose `statics` table predates the `flags` column.
+    /// a map or furniture marker, that the game never draws.
     pub base_is_marker: bool,
     pub model_path: Option<String>,
     pub position: [f32; 3],
@@ -815,10 +813,9 @@ const EMITTANCE_COLUMNS: &str = "e.day_r,e.day_g,e.day_b";
 const ABSENT_EMITTANCE_COLUMNS: &str = "NULL,NULL,NULL";
 const EMITTANCE_JOIN: &str = " LEFT JOIN emittance e ON e.id=r.emittance_id";
 
-/// The base record's header flags, which [`map_reference`] reads for [`MARKER_RECORD_FLAG`]. A
-/// fixture-style `statics` table without the column reads as `NULL`.
+/// The base record's header flags, which [`map_reference`] reads for [`MARKER_RECORD_FLAG`].
+/// `NULL` for a reference whose base has no `statics` row.
 const STATIC_FLAGS_COLUMN: &str = "s.flags";
-const ABSENT_STATIC_FLAGS_COLUMN: &str = "NULL";
 
 /// The record header flag Skyrim sets on editor-only base records (`0x00800000`, "Is Marker").
 const MARKER_RECORD_FLAG: u32 = 0x0080_0000;
@@ -903,16 +900,8 @@ fn has_emittance(connection: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
-/// Whether `statics` carries the base record's header flags.
-fn has_static_flags(connection: &Connection) -> Result<bool> {
-    let count: i64 = connection
-        .prepare_cached("SELECT COUNT(*) FROM pragma_table_info('statics') WHERE name='flags'")?
-        .query_row([], |row| row.get(0))?;
-    Ok(count > 0)
-}
-
 /// The reference query's column list and joins for one database: optional `records`, `lights`,
-/// `door_links`, `emittance` and `statics.flags` data read as `NULL` when absent, keeping [`map_reference`]'s
+/// `door_links`, and `emittance` data read as `NULL` when absent, keeping [`map_reference`]'s
 /// column indices stable across database versions.
 struct ReferenceQuery {
     columns: String,
@@ -947,11 +936,6 @@ impl ReferenceQuery {
         } else {
             ABSENT_EMITTANCE_COLUMNS
         };
-        let static_flags_column = if has_static_flags(connection)? {
-            STATIC_FLAGS_COLUMN
-        } else {
-            ABSENT_STATIC_FLAGS_COLUMN
-        };
         let mut joins = String::from(REFERENCE_JOIN);
         if has_records {
             joins.push_str(" LEFT JOIN records b ON b.form_id=r.base_form_id");
@@ -968,7 +952,7 @@ impl ReferenceQuery {
         Ok(Self {
             columns: format!(
                 "{REFERENCE_COLUMNS},{record_column},{light_columns},{override_column},\
-                 {door_columns},{emittance_columns},{static_flags_column}"
+                 {door_columns},{emittance_columns},{STATIC_FLAGS_COLUMN}"
             ),
             joins,
         })
@@ -1133,11 +1117,11 @@ mod tests {
                 INSERT INTO schema_info VALUES(6);
                 CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
                 CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
-                CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
+                CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL,flags INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER,base_form_id INTEGER,pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,scale REAL);
                 CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id);
                 INSERT INTO cells VALUES(10,60,2,-3);
-                INSERT INTO statics VALUES(20,'architecture/wall.nif',-1,-2,-3,1,2,3,1);
+                INSERT INTO statics VALUES(20,'architecture/wall.nif',-1,-2,-3,1,2,3,1,0);
                 INSERT INTO "references" VALUES(30,10,20,8200,-12200,50,0,0,0,1);
                 INSERT INTO exterior_spatial VALUES(30,8200,8200,-12200,-12200,50,50,10,60);
                 INSERT INTO "references" VALUES(31,99,20,8250,-12150,55,0,0,0,1);
@@ -1645,7 +1629,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE records(form_id INTEGER PRIMARY KEY,record_type TEXT NOT NULL);
                  INSERT INTO records VALUES(20,'STAT');
-                 INSERT INTO statics VALUES(22,'clutter/barrel.nif',-1,-1,-1,1,1,1,1);
+                 INSERT INTO statics VALUES(22,'clutter/barrel.nif',-1,-1,-1,1,1,1,1,0);
                  INSERT INTO records VALUES(22,'MISC');
                  INSERT INTO \"references\" VALUES(40,10,22,8250,-12150,55,0,0,0,1);
                  INSERT INTO exterior_spatial VALUES(40,8250,8250,-12150,-12150,55,55,10,60);",
@@ -1676,17 +1660,11 @@ mod tests {
             grid_x: 2,
             grid_y: -3,
         };
-        let without_flags = load_cell(&connection, 1, exterior).unwrap();
-        assert!(
-            without_flags.references.iter().all(|r| !r.base_is_marker),
-            "a statics table without flags marks nothing"
-        );
         // The map marker (STAT 0x10) carries the flag; the Civil War map flag (ACTI 0xF083A) has
         // "marker" in its filename but no flag, and the game draws it.
         connection
             .execute_batch(
-                "ALTER TABLE statics ADD COLUMN flags INTEGER NOT NULL DEFAULT 0;
-                 INSERT INTO statics VALUES(23,'marker_map.nif',-1,-1,-1,1,1,1,1,8388608);
+                "INSERT INTO statics VALUES(23,'marker_map.nif',-1,-1,-1,1,1,1,1,8388608);
                  INSERT INTO statics VALUES(24,'clutter/civilwar/cwmapmarkers01.nif',-1,-1,-1,1,1,1,1,0);
                  INSERT INTO \"references\" VALUES(41,10,23,8250,-12150,55,0,0,0,1);
                  INSERT INTO exterior_spatial VALUES(41,8250,8250,-12150,-12150,55,55,10,60);
@@ -1694,7 +1672,7 @@ mod tests {
                  INSERT INTO exterior_spatial VALUES(42,8250,8250,-12150,-12150,55,55,10,60);",
             )
             .unwrap();
-        let payload = load_cell(&connection, 2, exterior).unwrap();
+        let payload = load_cell(&connection, 1, exterior).unwrap();
         let marker = |form_id| {
             payload
                 .references

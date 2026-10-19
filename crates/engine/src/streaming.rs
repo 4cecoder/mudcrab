@@ -3329,10 +3329,10 @@ fn spawned_model_path(model_path: Option<String>, base_is_marker: bool) -> Optio
 fn converted_model_path(path: String) -> Option<String> {
     // Converted assets are published with lowercase canonical paths, so the
     // lookup must lowercase too (matching world-inspect's resolver).
-    // Markers outside `markers/` are not skipped by filename: forges, smelters
-    // and the Civil War map flags have "marker" in theirs and are drawn. The
-    // base record's `Is Marker` flag (see `spawned_model_path`) and the NIF's
-    // own `EditorMarker` shape, which the converter hides, cover the rest.
+    // The filename is no marker signal: forges and the Civil War map flags carry
+    // "marker" and must draw. Editor markers are excluded by the base record's
+    // `Is Marker` flag (`spawned_model_path`) and, inside a mesh, by the converter's
+    // `EditorMarker` shape rule; the folder rules below stay as path-convention guards.
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
     if normalized.starts_with("meshes/sky/")
         || normalized.starts_with("sky/")
@@ -7107,6 +7107,8 @@ mod tests {
             .init_asset::<Image>()
             .init_asset::<TerrainMaterial>()
             .init_asset::<WaterMaterial>()
+            // A reference with a model path asks the asset server for its converted scene.
+            .init_asset::<WorldAsset>()
             .insert_resource(config)
             .insert_resource(RenderOrigin(IVec2::ZERO))
             .init_resource::<ActiveSpace>()
@@ -7857,6 +7859,28 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    /// Two references to the same model, one whose base record carries `Is Marker`: only the
+    /// other loads a model, though both are still spawned as references.
+    #[test]
+    fn spawn_cell_loads_no_model_for_a_marker_base_record() {
+        let mut marker = lit_reference(0x120, None, None);
+        marker.model_path = Some("Marker_Map.nif".to_owned());
+        marker.base_is_marker = true;
+        let mut drawn = lit_reference(0x121, None, None);
+        drawn.model_path = Some("Marker_Map.nif".to_owned());
+        let app = spawn_reference_cell_app(vec![marker, drawn], false);
+
+        let marker = app.world().entity(reference_entity(&app, 0x120));
+        assert!(marker.get::<MeshHandle>().is_none());
+        assert!(marker.get::<PendingModel>().is_none());
+        let drawn = app.world().entity(reference_entity(&app, 0x121));
+        assert_eq!(
+            drawn.get::<MeshHandle>().map(|handle| handle.0.as_str()),
+            Some("meshes/marker_map.glb")
+        );
+        assert!(drawn.get::<PendingModel>().is_some());
     }
 
     /// One lit reference, one negative light, one flagged off by default and one plain reference:
