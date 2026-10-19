@@ -11,6 +11,8 @@ const KEY: u32 = 0x0802;
 const LOCATION: u32 = 0x0803;
 const ZONE: u32 = 0x0804;
 const CRATE: u32 = 0x0805;
+const DOOR_BASE: u32 = 0x0806;
+const DESTINATION: u32 = 0x0A04;
 const CELL: u32 = 0x0900;
 const CHEST: u32 = 0x0A00;
 const LEVER: u32 = 0x0A01;
@@ -92,7 +94,14 @@ fn reference(id: u32, extra: &[Vec<u8>]) -> Vec<u8> {
         b"REFR",
         id,
         &[
-            sub(b"NAME", &le(CRATE)),
+            sub(
+                b"NAME",
+                &le(if id == MOD_DOOR_AUTHORED || id == DESTINATION {
+                    DOOR_BASE
+                } else {
+                    CRATE
+                }),
+            ),
             extra.concat(),
             sub(b"DATA", &[0; 24]),
         ]
@@ -177,7 +186,17 @@ fn master_plugin() -> Vec<u8> {
                 &[sub(b"EDID", b"Crate\0"), sub(b"MODL", b"crate.nif\0")].concat(),
             ),
         ),
-        interior(&[chest, reference(LEVER, &[]), reference(TRAP, &[]), marker].concat()),
+        named(b"DOOR", DOOR_BASE),
+        interior(
+            &[
+                chest,
+                reference(LEVER, &[]),
+                reference(TRAP, &[]),
+                marker,
+                reference(DESTINATION, &[]),
+            ]
+            .concat(),
+        ),
     ]
     .concat()
 }
@@ -188,6 +207,23 @@ fn mod_plugin() -> Vec<u8> {
         MOD_DOOR_AUTHORED,
         &[
             sub(b"ONAM", &[]),
+            sub(
+                b"XTEL",
+                &[
+                    le(DESTINATION).to_vec(),
+                    [1.0f32, 2.0, 3.0, 0.0, 0.0, 0.5]
+                        .into_iter()
+                        .flat_map(f32::to_le_bytes)
+                        .collect(),
+                    le(0).to_vec(),
+                ]
+                .concat(),
+            ),
+            sub(b"XLKR", &le(LEVER)),
+            sub(
+                b"XAPR",
+                &[le(LEVER).to_vec(), 0.5f32.to_le_bytes().to_vec()].concat(),
+            ),
             sub(b"XLOC", &lock(255, MOD_KEY_AUTHORED, 0)),
         ],
     );
@@ -208,6 +244,7 @@ fn rows(conn: &Connection) -> Rows {
         ("reference_linked_refs", "reference_id, position"),
         ("reference_activate_parents", "reference_id, position"),
         ("reference_details", "reference_id"),
+        ("door_links", "ref_id"),
     ] {
         let mut statement = conn
             .prepare(&format!("SELECT * FROM {table} ORDER BY {key}"))
@@ -251,6 +288,28 @@ fn both_record_readers_publish_the_same_reference_links() {
     assert_eq!(rows(&legacy), rows(&inhouse));
 
     let conn = inhouse;
+    let destination: u32 = get(
+        &conn,
+        &format!("SELECT destination_ref_id FROM door_links WHERE ref_id={MOD_DOOR}"),
+    );
+    assert_eq!(destination, DESTINATION);
+    let arrival: f64 = get(
+        &conn,
+        &format!("SELECT pos_x FROM door_links WHERE ref_id={MOD_DOOR}"),
+    );
+    assert_eq!(arrival, 1.0);
+    let linked: u32 = get(
+        &conn,
+        &format!("SELECT linked_ref_id FROM reference_linked_refs WHERE reference_id={MOD_DOOR}"),
+    );
+    assert_eq!(linked, LEVER);
+    let parent: u32 = get(
+        &conn,
+        &format!(
+            "SELECT parent_ref_id FROM reference_activate_parents WHERE reference_id={MOD_DOOR}"
+        ),
+    );
+    assert_eq!(parent, LEVER);
     let links: Vec<(Option<i64>, Option<i64>)> = conn
         .prepare(&format!(
             "SELECT keyword_id, linked_ref_id FROM reference_linked_refs WHERE reference_id={CHEST} ORDER BY position"
