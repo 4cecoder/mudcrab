@@ -1418,7 +1418,7 @@ fn spawn_cell(
             {
                 entity.insert(door);
             }
-            if let Some(path) = reference.model_path.and_then(converted_model_path) {
+            if let Some(path) = spawned_model_path(reference.model_path, reference.base_is_marker) {
                 model_loads += 1;
                 let sequence = *model_sequence;
                 *model_sequence = model_sequence.saturating_add(1);
@@ -3318,18 +3318,28 @@ pub(crate) fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
     ))
 }
 
+/// The converted model a reference draws, or `None` when it draws nothing. A base record flagged
+/// `Is Marker` is editor-only and never drawn, whatever its model.
+fn spawned_model_path(model_path: Option<String>, base_is_marker: bool) -> Option<String> {
+    model_path
+        .filter(|_| !base_is_marker)
+        .and_then(converted_model_path)
+}
+
 fn converted_model_path(path: String) -> Option<String> {
     // Converted assets are published with lowercase canonical paths, so the
     // lookup must lowercase too (matching world-inspect's resolver).
+    // Markers outside `markers/` are not skipped by filename: forges, smelters
+    // and the Civil War map flags have "marker" in theirs and are drawn. The
+    // base record's `Is Marker` flag (see `spawned_model_path`) and the NIF's
+    // own `EditorMarker` shape, which the converter hides, cover the rest.
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    let filename = normalized.rsplit('/').next().unwrap_or_default();
     if normalized.starts_with("meshes/sky/")
         || normalized.starts_with("sky/")
         || normalized.starts_with("meshes/markers/")
         || normalized.starts_with("markers/")
         || normalized.starts_with("meshes/effects/")
         || normalized.starts_with("effects/")
-        || filename.contains("marker")
     {
         return None;
     }
@@ -4724,16 +4734,40 @@ mod tests {
             converted_model_path("meshes/Sky/CloudShape01.nif".into()),
             None
         );
-        assert_eq!(converted_model_path("meshes/Marker_Map.nif".into()), None);
+        assert_eq!(
+            converted_model_path("meshes/Markers/MapMarker.nif".into()),
+            None
+        );
         assert_eq!(
             converted_model_path("Markers/CivilWarMarkers/CWAttSpawn02.nif".into()),
             None
         );
         assert_eq!(converted_model_path("Effects/FXRapids.nif".into()), None);
+    }
+
+    #[test]
+    fn keeps_visible_models_whose_filename_contains_marker() {
         assert_eq!(
-            converted_model_path("meshes/Furniture/SitLedgeMarker.nif".into()),
+            converted_model_path(r"meshes\Clutter\CivilWar\CWMapMarkers01.nif".into()).as_deref(),
+            Some("meshes/clutter/civilwar/cwmapmarkers01.glb")
+        );
+        assert_eq!(
+            converted_model_path("meshes/Furniture/BlacksmithForgeMarker.nif".into()).as_deref(),
+            Some("meshes/furniture/blacksmithforgemarker.glb")
+        );
+    }
+
+    #[test]
+    fn a_marker_base_record_spawns_no_model() {
+        assert_eq!(
+            spawned_model_path(Some("Marker_Map.nif".into()), true),
             None
         );
+        assert_eq!(
+            spawned_model_path(Some("Marker_Map.nif".into()), false).as_deref(),
+            Some("meshes/marker_map.glb")
+        );
+        assert_eq!(spawned_model_path(None, false), None);
     }
 
     #[test]
@@ -6158,6 +6192,7 @@ mod tests {
                     cell_id: 0x02D4E0,
                     base_form_id: 0x00EF957,
                     base_record_type: None,
+                    base_is_marker: false,
                     model_path: Some("meshes\\furniture\\creatureexit\\wispambush.nif".to_owned()),
                     position: [0.0, 0.0, 0.0],
                     rotation: [0.0; 3],
@@ -6981,6 +7016,7 @@ mod tests {
             cell_id: 99,
             base_form_id: 0x200 + form_id,
             base_record_type: None,
+            base_is_marker: false,
             model_path: None,
             position: [100.0, 50.0, -200.0],
             rotation: [0.0; 3],

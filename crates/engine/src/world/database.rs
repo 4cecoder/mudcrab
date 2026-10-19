@@ -37,6 +37,11 @@ pub struct ReferenceRow {
     pub base_form_id: u32,
     /// Authoritative base record type; `statics` also contains movable clutter.
     pub base_record_type: Option<String>,
+    /// Whether the base record carries the `Is Marker` header flag: an editor-only object, such as
+    /// a map marker or a furniture marker, that the game never draws. Its model filename is no
+    /// guide, because visible forges, smelters and map flags also have "marker" in theirs. `false`
+    /// in a database whose `statics` table predates the `flags` column.
+    pub base_is_marker: bool,
     pub model_path: Option<String>,
     pub position: [f32; 3],
     pub rotation: [f32; 3],
@@ -810,6 +815,14 @@ const EMITTANCE_COLUMNS: &str = "e.day_r,e.day_g,e.day_b";
 const ABSENT_EMITTANCE_COLUMNS: &str = "NULL,NULL,NULL";
 const EMITTANCE_JOIN: &str = " LEFT JOIN emittance e ON e.id=r.emittance_id";
 
+/// The base record's header flags, which [`map_reference`] reads for [`MARKER_RECORD_FLAG`]. A
+/// fixture-style `statics` table without the column reads as `NULL`.
+const STATIC_FLAGS_COLUMN: &str = "s.flags";
+const ABSENT_STATIC_FLAGS_COLUMN: &str = "NULL";
+
+/// The record header flag Skyrim sets on editor-only base records (`0x00800000`, "Is Marker").
+const MARKER_RECORD_FLAG: u32 = 0x0080_0000;
+
 fn has_records(connection: &Connection) -> Result<bool> {
     let count: i64 = connection
         .prepare_cached("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='records'")?
@@ -890,8 +903,16 @@ fn has_emittance(connection: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// Whether `statics` carries the base record's header flags.
+fn has_static_flags(connection: &Connection) -> Result<bool> {
+    let count: i64 = connection
+        .prepare_cached("SELECT COUNT(*) FROM pragma_table_info('statics') WHERE name='flags'")?
+        .query_row([], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
 /// The reference query's column list and joins for one database: optional `records`, `lights`,
-/// `door_links`, and `emittance` data read as `NULL` when absent, keeping [`map_reference`]'s
+/// `door_links`, `emittance` and `statics.flags` data read as `NULL` when absent, keeping [`map_reference`]'s
 /// column indices stable across database versions.
 struct ReferenceQuery {
     columns: String,
@@ -926,6 +947,11 @@ impl ReferenceQuery {
         } else {
             ABSENT_EMITTANCE_COLUMNS
         };
+        let static_flags_column = if has_static_flags(connection)? {
+            STATIC_FLAGS_COLUMN
+        } else {
+            ABSENT_STATIC_FLAGS_COLUMN
+        };
         let mut joins = String::from(REFERENCE_JOIN);
         if has_records {
             joins.push_str(" LEFT JOIN records b ON b.form_id=r.base_form_id");
@@ -942,7 +968,7 @@ impl ReferenceQuery {
         Ok(Self {
             columns: format!(
                 "{REFERENCE_COLUMNS},{record_column},{light_columns},{override_column},\
-                 {door_columns},{emittance_columns}"
+                 {door_columns},{emittance_columns},{static_flags_column}"
             ),
             joins,
         })
@@ -1047,11 +1073,13 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
         Some(red) => Some([red, row.get(35)?, row.get(36)?]),
         None => None,
     };
+    let base_flags: Option<u32> = row.get(37)?;
     Ok(ReferenceRow {
         form_id: row.get(0)?,
         cell_id: row.get(1)?,
         base_form_id: row.get(2)?,
         base_record_type,
+        base_is_marker: base_flags.is_some_and(|flags| flags & MARKER_RECORD_FLAG != 0),
         model_path: row.get(3)?,
         position: [row.get(4)?, row.get(5)?, row.get(6)?],
         rotation: [row.get(7)?, row.get(8)?, row.get(9)?],
@@ -1637,6 +1665,47 @@ mod tests {
         let movable = payload.references.iter().find(|r| r.form_id == 40).unwrap();
         assert_eq!(fixed.base_record_type.as_deref(), Some("STAT"));
         assert_eq!(movable.base_record_type.as_deref(), Some("MISC"));
+    }
+
+    #[test]
+    fn base_is_marker_reads_the_records_marker_flag_not_its_model_name() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        let exterior = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 2,
+            grid_y: -3,
+        };
+        let without_flags = load_cell(&connection, 1, exterior).unwrap();
+        assert!(
+            without_flags.references.iter().all(|r| !r.base_is_marker),
+            "a statics table without flags marks nothing"
+        );
+        // The map marker (STAT 0x10) carries the flag; the Civil War map flag (ACTI 0xF083A) has
+        // "marker" in its filename but no flag, and the game draws it.
+        connection
+            .execute_batch(
+                "ALTER TABLE statics ADD COLUMN flags INTEGER NOT NULL DEFAULT 0;
+                 INSERT INTO statics VALUES(23,'marker_map.nif',-1,-1,-1,1,1,1,1,8388608);
+                 INSERT INTO statics VALUES(24,'clutter/civilwar/cwmapmarkers01.nif',-1,-1,-1,1,1,1,1,0);
+                 INSERT INTO \"references\" VALUES(41,10,23,8250,-12150,55,0,0,0,1);
+                 INSERT INTO exterior_spatial VALUES(41,8250,8250,-12150,-12150,55,55,10,60);
+                 INSERT INTO \"references\" VALUES(42,10,24,8250,-12150,55,0,0,0,1);
+                 INSERT INTO exterior_spatial VALUES(42,8250,8250,-12150,-12150,55,55,10,60);",
+            )
+            .unwrap();
+        let payload = load_cell(&connection, 2, exterior).unwrap();
+        let marker = |form_id| {
+            payload
+                .references
+                .iter()
+                .find(|r| r.form_id == form_id)
+                .unwrap()
+                .base_is_marker
+        };
+        assert!(marker(41));
+        assert!(!marker(42));
+        assert!(!marker(30));
     }
 
     #[test]
