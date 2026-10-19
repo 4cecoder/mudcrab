@@ -15,6 +15,8 @@ use std::{
 };
 pub mod binary;
 pub mod cell_cache;
+pub mod doors;
+pub mod emittance;
 mod environment;
 pub mod exporter;
 pub mod extractors;
@@ -37,6 +39,8 @@ pub use plugins_txt::{
 mod base_model_parity_tests;
 #[cfg(test)]
 mod display_name_parity_tests;
+#[cfg(test)]
+mod emittance_parity_tests;
 #[cfg(test)]
 mod environment_parity_tests;
 #[cfg(test)]
@@ -946,6 +950,53 @@ mod tests {
             assert!(warnings.out_of_range.borrow().is_empty());
             assert!(warnings.truncations.borrow().is_empty());
         }
+    }
+
+    /// Each `RDWT` entry names a weather and, optionally, a global; its chance is not a FormID.
+    #[test]
+    fn remaps_region_weathers_and_their_globals() {
+        let indices = HashMap::from([("base.esm".into(), 0), ("patch.esp".into(), 2)]);
+        let entry = |weather: u32, chance: u32, global: u32| {
+            [
+                weather.to_le_bytes(),
+                chance.to_le_bytes(),
+                global.to_le_bytes(),
+            ]
+            .concat()
+        };
+        let mut record = RawRecord {
+            form_id: 0x0100_0800,
+            record_type: *b"REGN",
+            flags: 0,
+            subrecords: vec![(
+                b"RDWT".to_vec(),
+                [
+                    entry(0x0000_0901, 60, 0),
+                    entry(0x0100_0902, 40, 0x0100_0903),
+                ]
+                .concat(),
+            )],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 0,
+        };
+        remap_record_form_ids(
+            &mut record,
+            "patch.esp",
+            &["base.esm".into()],
+            &indices,
+            &HashMap::new(),
+            &RemapWarnings::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.subrecords[0].1,
+            [
+                entry(0x0000_0901, 60, 0),
+                entry(0x0200_0902, 40, 0x0200_0903)
+            ]
+            .concat()
+        );
     }
 
     #[test]
