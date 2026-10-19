@@ -1010,6 +1010,8 @@ fn archive_only_preserves_complete_facts_and_caches_while_explicit_views_defer()
             "climate_weathers",
             "region_weathers",
             "image_spaces",
+            "door_links",
+            "emittance",
         ];
         for (name, rows) in &full_tables {
             if deferred.contains(&name.as_str()) {
