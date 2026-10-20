@@ -1562,13 +1562,15 @@ mod tests {
         let renamed = path.with_file_name("not-the-content-digest.pack");
         fs::rename(&path, &renamed).unwrap();
 
-        let error = read_pack(
+        let error = match read_pack(
             &renamed,
             &source,
             BSA_READER_VERSION,
             ArchiveSelection::ConverterInputsV1,
-        )
-        .unwrap_err();
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("stale reader pack unexpectedly restored"),
+        };
         assert!(
             format!("{error:#}").contains("different archive reader"),
             "{error:#}"
@@ -1584,13 +1586,15 @@ mod tests {
         *bytes.last_mut().unwrap() ^= 1;
         fs::write(&path, bytes).unwrap();
 
-        let error = read_pack(
+        let error = match read_pack(
             &path,
             &source,
             BSA_READER_VERSION,
             ArchiveSelection::ConverterInputsV1,
-        )
-        .unwrap_err();
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("corrupt pack unexpectedly restored"),
+        };
         assert!(format!("{error:#}").contains("digest mismatch"));
     }
 

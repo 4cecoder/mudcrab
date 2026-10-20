@@ -158,6 +158,12 @@ async fn repair_fails_closed_on_stale_bsa_reader_entry() {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("Data");
     fs::create_dir_all(data.join("textures")).unwrap();
+    dummy_content::layout::generate(
+        &data,
+        dummy_content::layout::DEFAULT_SEED,
+        dummy_content::layout::Formats::parse("esm").unwrap(),
+    )
+    .unwrap();
     let dds = data.join("textures/repair.dds");
     fs::write(&dds, b"invalid DDS before repair").unwrap();
     let script = dummy_content::pex::minimal("ArchiveScript").unwrap();
@@ -191,6 +197,8 @@ async fn repair_fails_closed_on_stale_bsa_reader_entry() {
     let output = root.path().join("pack");
     let mut config = PipelineConfig::new(&data, &output);
     config.no_lod = true;
+    config.texture_encoder = converter::config::TextureEncoder::Cpu;
+    config.lod_texture_encoder = converter::config::TextureEncoder::Cpu;
     config.cpu_jobs = 2;
     config.io_jobs = 1;
     let initial = run_fixture(&config).await;
