@@ -62,12 +62,6 @@ struct AssetDirectoryReadLock {
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
     validate_fixture_selection(&config)?;
-    crate::streaming::requests::validate_pack_identity(&config).wrap_err_with(|| {
-        format!(
-            "cannot read the converted pack manifest under {}",
-            config.assets_dir.display()
-        )
-    })?;
     let shots = prepare_shots(&mut config)?;
     let shots_active = shots.is_some();
     configure_io_task_pool(config.io_threads)?;
@@ -101,6 +95,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         None
     };
+    if reads_asset_tree {
+        crate::streaming::requests::validate_pack_identity(&config).wrap_err_with(|| {
+            format!(
+                "cannot read the converted pack manifest under {}",
+                config.assets_dir.display()
+            )
+        })?;
+    }
     let runtime_data = if config.streaming_fixture {
         let database_path = config.assets_dir.join("skyrim_world.db");
         Some((
