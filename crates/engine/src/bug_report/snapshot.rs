@@ -188,10 +188,10 @@ pub(super) fn capture(world: &mut World) -> Value {
                 "headless"
             } else if fixture {
                 "fixture"
-            } else if config.is_benchmark_run() || config.benchmark_only || config.shots.is_some() {
-                "automated"
-            } else {
+            } else if config.interactive_world_physics() {
                 "interactive"
+            } else {
+                "automated"
             },
         );
         session.set("launch_worldspace", config.worldspace_id);
@@ -907,6 +907,85 @@ mod tests {
             "non-finite position"
         );
         assert!(serde_json::to_string(&invalid).is_ok());
+    }
+
+    #[test]
+    fn session_mode_follows_world_ownership_without_renderer_state() {
+        let cases = [
+            ("ordinary play", EngineConfig::default(), "interactive"),
+            (
+                "route",
+                EngineConfig {
+                    route: Some("route.json".into()),
+                    ..default()
+                },
+                "automated",
+            ),
+            (
+                "matched route",
+                EngineConfig {
+                    matched_route: Some("matched.json".into()),
+                    ..default()
+                },
+                "automated",
+            ),
+            (
+                "auto fly",
+                EngineConfig {
+                    auto_fly_speed: 900.0,
+                    ..default()
+                },
+                "automated",
+            ),
+            (
+                "acceptance screenshot",
+                EngineConfig {
+                    acceptance_screenshot: Some("shot.png".into()),
+                    ..default()
+                },
+                "automated",
+            ),
+            (
+                "hidden window",
+                EngineConfig {
+                    hidden_window: true,
+                    ..default()
+                },
+                "automated",
+            ),
+            (
+                "benchmark jump",
+                EngineConfig {
+                    benchmark_jump: Some((3, 4)),
+                    ..default()
+                },
+                "automated",
+            ),
+            (
+                "fixture takes precedence over route",
+                EngineConfig {
+                    physics_fixture: true,
+                    route: Some("route.json".into()),
+                    ..default()
+                },
+                "fixture",
+            ),
+            (
+                "headless takes precedence over fixture",
+                EngineConfig {
+                    headless: true,
+                    physics_fixture: true,
+                    ..default()
+                },
+                "headless",
+            ),
+        ];
+
+        for (case, config, expected) in cases {
+            let mut world = World::new();
+            world.insert_resource(config);
+            assert_eq!(capture(&mut world)["session"]["mode"], expected, "{case}");
+        }
     }
 
     #[test]

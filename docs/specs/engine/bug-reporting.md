@@ -324,13 +324,14 @@ counters nonzero, pauses virtual time, collects a local report, verifies image/a
 and pause preservation, then exits. It never opens a browser or submits an issue. Its procedural
 scene checks native capture mechanics; it is not a full-pack visual or performance campaign.
 
-Verified on macOS / Apple M1 Pro / Metal:
+Historical evidence collected at original PR head
+`76048172882c837d0f7ad4ba211ce7c106cd6f7b` on macOS / Apple M1 Pro / Metal; these results were
+not rerun at later heads:
 
-- Engine library tests: 463 passed, 1 failed out of 464. The failure is
+- Engine library tests: 463 passed and 1 failed out of 464. The failure was
   `physics::simulation_tests::jump_launches_and_returns_to_ground`, with
   `jump apex 56.491875 too low above rest 50.825207`. An untouched archive of baseline
-  `268f9884f7acaaa0302425331064f7268aac9d3c` fails that exact test with the same values.
-  All reporting and changed input-ownership tests pass.
+  `268f9884f7acaaa0302425331064f7268aac9d3c` failed the same test with those values.
 - Native smoke capture produced an opaque game-window PNG with the console absent, despite the
   deliberate missing asset. Virtual time remained paused, console state stayed open, and capture
   suppression was restored after image collection. Actual physical dimensions were 1280 by 720
@@ -341,6 +342,15 @@ Verified on macOS / Apple M1 Pro / Metal:
 - Navigating the prefilled GitHub route reached GitHub sign-in with the intended destination and
   query preserved. The preview profile was not signed in, so authenticated field rendering and
   manual attachment/submission were not verified.
+
+CPU validation at commit `52dffdd64d2b187e07d8cfd02962095965ef9a09` on the merged PR head:
+
+- Locked engine all-targets/all-features check passed.
+- Bug-report library tests: 53 passed.
+- Engine library CPU tests: 979 passed and 1 ignored; the physics jump test passed.
+- Strict engine Clippy (`--all-targets --all-features -- -D warnings`) and formatter check passed.
+- This validation did not rerun the historical native smoke, Metal capture, archive inspection, or
+  GitHub sign-in flow. Those historical results are not current-head runtime acceptance evidence.
 
 Release checks still required: real-pack reporting, signed-in GitHub form prefilling, actual browser
 focus recovery, Linux/Vulkan and Windows/DX12 capture, and idle/collection performance measurements.
