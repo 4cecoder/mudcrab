@@ -335,12 +335,13 @@ pub(super) fn extract_with_session(
         BTreeMap::new()
     };
     let mut expected = BTreeMap::new();
-    if let Some(previous) = previous.filter(|entry| {
+    let reusable = previous.filter(|entry| {
         options.reuse_cache
             && entry.source_hash == source_hash
             && entry.reader_version == reader_version
             && entry.covers(options.selection)
-    }) {
+    });
+    if let Some(previous) = reusable {
         for file in &previous.files {
             let path = safe_relative_path(&file.path)?;
             if options.selection.includes(&path) {
@@ -355,7 +356,7 @@ pub(super) fn extract_with_session(
     // Missing/corrupt derived blobs fall through to reconstruction from packs.
     if observer.is_none()
         && expected.len() == selected.len()
-        && previous.is_some()
+        && reusable.is_some()
         && expected.iter().all(|(path, file)| {
             packed.get(path).is_some_and(|packed| {
                 packed.item.sha256 == file.hash && packed.item.size == file.size

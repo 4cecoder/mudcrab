@@ -2537,6 +2537,119 @@ mod tests {
     }
 
     #[test]
+    fn stale_entry_cannot_map_a_decoded_path_to_another_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("assets.bsa");
+        fs::write(
+            &archive,
+            dummy_content::bsa::v105(
+                &[dummy_content::Entry::new("textures/test.dds", b"DDS ")],
+                dummy_content::bsa::Compression::None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let first = ArchiveExtractor::extract_cached(
+            &archive,
+            &directory.path().join("first"),
+            &directory.path().join("none/.ingestion-cache"),
+            &directory.path().join("first/.ingestion-cache"),
+            None,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        // Valid blobs for the true payload and a same-size wrong one, but no packs: the entry
+        // alone decides which blob a path uses, as a lossy name mapping would.
+        let previous = directory.path().join("previous/.ingestion-cache");
+        for payload in [b"DDS ".as_slice(), b"DDX ".as_slice()] {
+            let blob = blob_path(&previous, &hash_bytes(payload)).unwrap();
+            fs::create_dir_all(blob.parent().unwrap()).unwrap();
+            fs::write(blob, payload).unwrap();
+        }
+        let mut stale = first.cache_entry.clone();
+        stale.files[0].hash = hash_bytes(b"DDX ");
+        stale.reader_version = 0;
+
+        let stale_outcome = ArchiveExtractor::extract_cached(
+            &archive,
+            &directory.path().join("stale"),
+            &previous,
+            &directory.path().join("stale/.ingestion-cache"),
+            Some(&stale),
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!stale_outcome.cache_hit);
+        assert_eq!(
+            fs::read(directory.path().join("stale/textures/test.dds")).unwrap(),
+            b"DDS "
+        );
+
+        let current = ArchiveExtractor::extract_cached(
+            &archive,
+            &directory.path().join("current"),
+            &previous,
+            &directory.path().join("current/.ingestion-cache"),
+            Some(&first.cache_entry),
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(current.cache_hit);
+        assert_eq!(
+            fs::read(directory.path().join("current/textures/test.dds")).unwrap(),
+            b"DDS "
+        );
+    }
+
+    #[test]
+    fn stale_entry_for_an_empty_archive_is_not_a_cache_hit() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("empty.bsa");
+        fs::write(
+            &archive,
+            dummy_content::bsa::v105(&[], dummy_content::bsa::Compression::None).unwrap(),
+        )
+        .unwrap();
+        let extract =
+            |output: &str, previous: &str, previous_entry: Option<&IngestionCacheEntry>| {
+                ArchiveExtractor::extract_cached(
+                    &archive,
+                    &directory.path().join(output),
+                    &directory.path().join(previous),
+                    &directory.path().join(format!("{output}/.ingestion-cache")),
+                    previous_entry,
+                    true,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+        let first = extract("first", "none/.ingestion-cache", None);
+        assert!(!first.cache_hit);
+        assert_eq!(first.cache_entry.reader_version, BSA_READER_VERSION);
+
+        // Nothing is selected, so no blob or pack can vouch for the entry; only its version
+        // separates a stale stamp from the current reader.
+        let mut stale = first.cache_entry.clone();
+        stale.reader_version = 0;
+        assert!(!extract("stale", "none/.ingestion-cache", Some(&stale)).cache_hit);
+        assert!(
+            extract(
+                "current",
+                "first/.ingestion-cache",
+                Some(&first.cache_entry)
+            )
+            .cache_hit
+        );
+    }
+
+    #[test]
     fn only_bsa_names_carry_a_reader_version() {
         assert_eq!(
             archive_reader_version(b"BSA\0\x68\0\0\0"),
