@@ -627,6 +627,37 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
+    #[test]
+    fn every_admission_or_pressure_switch_selects_the_request_path() {
+        // Generated terrain batches allocate outside the scene ledger, so each switch that
+        // selects this path must also keep those batches disabled.
+        assert!(!enabled(&EngineConfig::default()));
+        for config in [
+            EngineConfig {
+                prioritize_streaming: true,
+                ..default()
+            },
+            EngineConfig {
+                max_scene_loads: 1,
+                ..default()
+            },
+            EngineConfig {
+                adaptive_streaming: true,
+                ..default()
+            },
+            EngineConfig {
+                max_streaming_backlog: 1,
+                ..default()
+            },
+            EngineConfig {
+                streaming_memory_mib: 1,
+                ..default()
+            },
+        ] {
+            assert!(enabled(&config));
+        }
+    }
+
     #[derive(TypePath)]
     struct TestSceneLoader {
         gate: Arc<AtomicBool>,

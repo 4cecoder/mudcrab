@@ -1292,6 +1292,33 @@ fn missing_physical_memory_uses_fallback_and_explicit_memory_limit_takes_precede
 }
 
 #[test]
+fn physical_memory_parses_bevy_one_decimal_output_and_falls_back_when_unknown() {
+    // Bevy formats `SystemInfo::memory` as `{:.1} GiB`, and reports `Unknown` on unsupported
+    // platforms. Both must reach the same explicit adaptive fallback rules.
+    let mut world = World::new();
+    let config = EngineConfig {
+        adaptive_streaming: true,
+        ..default()
+    };
+    world.insert_resource(SystemInfo {
+        memory: "15.9 GiB".into(),
+        ..system_info(1)
+    });
+    let physical = physical_memory_bytes(&world).unwrap();
+    assert!(physical > 15 * 1024 * MIB && physical < 16 * 1024 * MIB);
+    assert_eq!(automatic_memory_limit(&config, &world), Some(physical / 2));
+    world.insert_resource(SystemInfo {
+        memory: "Unknown".into(),
+        ..system_info(1)
+    });
+    assert_eq!(physical_memory_bytes(&world), None);
+    assert_eq!(
+        automatic_memory_limit(&config, &world),
+        Some(8 * 1024 * MIB)
+    );
+}
+
+#[test]
 fn physical_ram_at_or_below_headroom_never_becomes_unlimited_and_blocks_intake() {
     let (mut app, _directory) = fixture(true);
     app.world_mut().insert_resource(system_info(8));

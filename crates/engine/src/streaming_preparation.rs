@@ -3,6 +3,10 @@
 //! IDs are weak observations. This bridge never keeps an asset alive or certifies
 //! successful drawing, collision readiness, or physical GPU memory reclamation.
 
+use crate::{
+    nif_depth::{NifDepthMaterial, NifDepthMaterialSource},
+    nif_material::NifSourceMaterial,
+};
 use bevy::{
     asset::{AssetId, UntypedAssetId, VisitAssetDependencies},
     pbr::{MaterialBindGroupAllocators, PreparedMaterial},
@@ -312,15 +316,27 @@ fn extract_demands(
 pub(crate) fn scene_dependencies_available(
     scene: &WorldAsset,
     materials: &Assets<StandardMaterial>,
+    depth_materials: Option<&Assets<NifDepthMaterial>>,
 ) -> bool {
     scene.world.iter_entities().all(|entity| {
-        match entity.get::<MeshMaterial3d<StandardMaterial>>() {
-            Some(material) => materials.contains(material.0.id()),
+        let standard = entity.get::<MeshMaterial3d<StandardMaterial>>();
+        let depth = entity.get::<MeshMaterial3d<NifDepthMaterial>>();
+        if standard.is_none() && depth.is_none() {
             // A mesh with an unrecognised binding is not an empty dependency
             // list. Its material and images need a typed observer before we
             // can release preparation or prove disposal.
-            None => !entity.contains::<Mesh3d>(),
+            return !entity.contains::<Mesh3d>();
         }
+        standard.is_none_or(|material| materials.contains(material.0.id()))
+            && depth.is_none_or(|material| {
+                depth_materials.is_some_and(|assets| assets.contains(material.0.id()))
+            })
+            && entity
+                .get::<NifSourceMaterial>()
+                .is_none_or(|source| materials.contains(source.0.id()))
+            && entity
+                .get::<NifDepthMaterialSource>()
+                .is_none_or(|source| materials.contains(source.0.id()))
     })
 }
 
@@ -329,6 +345,7 @@ pub(crate) fn scene_demand(
     key: PreparationKey,
     scene: &WorldAsset,
     materials: &Assets<StandardMaterial>,
+    depth_materials: Option<&Assets<NifDepthMaterial>>,
 ) -> PreparationDemand {
     let mut demand = PreparationDemand {
         key,
@@ -336,27 +353,55 @@ pub(crate) fn scene_demand(
         images: Vec::new(),
         materials: Vec::new(),
     };
+    let mut standard = Vec::new();
+    let mut depth = Vec::new();
     for entity in scene.world.iter_entities() {
         if let Some(mesh) = entity.get::<Mesh3d>() {
             demand.meshes.push(mesh.0.id());
         }
         if let Some(material) = entity.get::<MeshMaterial3d<StandardMaterial>>() {
-            demand.materials.push(material.0.id().into());
+            standard.push(material.0.id());
+        }
+        if let Some(material) = entity.get::<MeshMaterial3d<NifDepthMaterial>>() {
+            depth.push(material.0.id());
+        }
+        // Source and native base materials stay retained by the scene even when no
+        // mesh binds them. Duplicate IDs collapse below, so a shared base is one claim.
+        if let Some(source) = entity.get::<NifSourceMaterial>() {
+            standard.push(source.0.id());
+        }
+        if let Some(source) = entity.get::<NifDepthMaterialSource>() {
+            standard.push(source.0.id());
         }
     }
     normalize(&mut demand.meshes);
-    normalize(&mut demand.materials);
-    for id in &demand.materials {
-        if let Some(material) = materials.get(id.typed_debug_checked::<StandardMaterial>()) {
-            material.visit_dependencies(&mut |dependency| {
-                if dependency.type_id() == TypeId::of::<Image>() {
-                    demand.images.push(dependency.typed_debug_checked());
-                }
-            });
+    normalize(&mut standard);
+    normalize(&mut depth);
+    for id in &standard {
+        demand.materials.push((*id).into());
+        if let Some(material) = materials.get(*id) {
+            visit_material_images(material, &mut demand.images);
         }
     }
+    if let Some(depth_materials) = depth_materials {
+        for id in &depth {
+            demand.materials.push((*id).into());
+            if let Some(material) = depth_materials.get(*id) {
+                visit_material_images(material, &mut demand.images);
+            }
+        }
+    }
+    normalize(&mut demand.materials);
     normalize(&mut demand.images);
     demand
+}
+
+fn visit_material_images(material: &impl VisitAssetDependencies, images: &mut Vec<AssetId<Image>>) {
+    material.visit_dependencies(&mut |dependency| {
+        if dependency.type_id() == TypeId::of::<Image>() {
+            images.push(dependency.typed_debug_checked());
+        }
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -542,6 +587,7 @@ fn resident_ranges_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nif_depth::{DECAL, DEPTH_TEST, NifDepthState, depth_material};
 
     fn empty(key: PreparationKey) -> PreparationDemand {
         PreparationDemand {
@@ -674,15 +720,76 @@ mod tests {
             scene_world.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(material.clone())));
         }
         let scene = WorldAsset::new(scene_world);
-        assert!(scene_dependencies_available(&scene, &materials));
-        let demand = scene_demand(key(), &scene, &materials);
+        assert!(scene_dependencies_available(&scene, &materials, None));
+        let demand = scene_demand(key(), &scene, &materials, None);
         assert_eq!(demand.meshes, vec![mesh.id()]);
         assert_eq!(demand.materials, vec![material.id().untyped()]);
         assert_eq!(demand.images.len(), 2);
         assert!(demand.images.contains(&color.id()));
         assert!(demand.images.contains(&normal.id()));
         materials.remove(material.id());
-        assert!(!scene_dependencies_available(&scene, &materials));
+        assert!(!scene_dependencies_available(&scene, &materials, None));
+    }
+
+    #[test]
+    fn depth_material_scene_claims_each_base_source_and_depth_image_once() {
+        let mut meshes = Assets::<Mesh>::default();
+        let mut images = Assets::<Image>::default();
+        let mut materials = Assets::<StandardMaterial>::default();
+        let mut depth_materials = Assets::<NifDepthMaterial>::default();
+        let mesh = meshes.add(Cuboid::default());
+        let shared = images.add(Image::default());
+        let source_only = images.add(Image::default());
+        let base = materials.add(StandardMaterial {
+            base_color_texture: Some(shared.clone()),
+            ..default()
+        });
+        let source = materials.add(StandardMaterial {
+            base_color_texture: Some(source_only.clone()),
+            ..default()
+        });
+        let state = NifDepthState::from_flags(DEPTH_TEST | DECAL, 0, AlphaMode::Mask(0.5)).unwrap();
+        let depth = depth_materials.add(depth_material(
+            StandardMaterial {
+                base_color_texture: Some(shared.clone()),
+                ..default()
+            },
+            state,
+        ));
+        let mut scene_world = World::new();
+        scene_world.spawn((
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(depth.clone()),
+            NifSourceMaterial(source.clone()),
+            NifDepthMaterialSource(base.clone()),
+        ));
+        let scene = WorldAsset::new(scene_world);
+
+        // The depth material is a native dependency: without its asset the scene must wait.
+        assert!(!scene_dependencies_available(
+            &scene,
+            &materials,
+            Some(&Assets::<NifDepthMaterial>::default())
+        ));
+        assert!(!scene_dependencies_available(&scene, &materials, None));
+        assert!(scene_dependencies_available(
+            &scene,
+            &materials,
+            Some(&depth_materials)
+        ));
+
+        let demand = scene_demand(key(), &scene, &materials, Some(&depth_materials));
+        assert_eq!(demand.meshes, vec![mesh.id()]);
+        let mut expected_materials = vec![
+            base.id().untyped(),
+            source.id().untyped(),
+            depth.id().untyped(),
+        ];
+        expected_materials.sort_unstable();
+        assert_eq!(demand.materials, expected_materials);
+        let mut expected_images = vec![shared.id(), source_only.id()];
+        expected_images.sort_unstable();
+        assert_eq!(demand.images, expected_images);
     }
 
     #[test]

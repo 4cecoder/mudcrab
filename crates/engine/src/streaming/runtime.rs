@@ -11,6 +11,7 @@ use super::{
     requests::{self, SceneRequest, SceneRequestKey},
     reservations::{MemoryLedger, ResourceReservation},
 };
+use crate::nif_depth::NifDepthMaterial;
 use crate::{
     config::EngineConfig,
     profiling::ProfilingState,
@@ -1075,8 +1076,11 @@ pub(super) fn observe_streaming_ownership(world: &mut World) {
             && !scene.dependencies_cached
             && let Some(asset) = world.resource::<Assets<WorldAsset>>().get(id)
         {
-            let unavailable =
-                !scene_dependencies_available(asset, world.resource::<Assets<StandardMaterial>>());
+            let unavailable = !scene_dependencies_available(
+                asset,
+                world.resource::<Assets<StandardMaterial>>(),
+                world.get_resource::<Assets<NifDepthMaterial>>(),
+            );
             for resource in &scene.resources {
                 // Shared textures can have several source scenes. Discovering
                 // one scene must not clear another scene's unknown ownership.
@@ -1094,12 +1098,17 @@ pub(super) fn observe_streaming_ownership(world: &mut World) {
             && world
                 .resource::<AssetServer>()
                 .is_loaded_with_dependencies(id)
-            && scene_dependencies_available(asset, world.resource::<Assets<StandardMaterial>>())
+            && scene_dependencies_available(
+                asset,
+                world.resource::<Assets<StandardMaterial>>(),
+                world.get_resource::<Assets<NifDepthMaterial>>(),
+            )
         {
             let demand = scene_demand(
                 PreparationKey::Scene(id),
                 asset,
                 world.resource::<Assets<StandardMaterial>>(),
+                world.get_resource::<Assets<NifDepthMaterial>>(),
             );
             // Every material dependency must have an exact loader identity
             // before catalog entries can be proved unused. Embedded images
