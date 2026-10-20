@@ -46,7 +46,7 @@ impl Plugin for StdinConsolePlugin {
                 help: "report live grading and streaming readiness",
                 handler: Box::new(|world, args| {
                     if !args.is_empty() { return Err("usage: SceneState".into()) }
-                    Ok(scene_state(world).to_string())
+                    Ok(scene_state(world, crate::shots::Failures::default()).to_string())
                 }),
             })
             .add_console_command(ConsoleCommand {
@@ -58,14 +58,12 @@ impl Plugin for StdinConsolePlugin {
                     if path.extension().is_none_or(|ext| ext != "png") {
                         return Err("SceneShot requires a .png path".into());
                     }
-                    let state = scene_state(world);
-                    if state["ready"] != true { return Err(format!("scene is still loading: {state}")) }
+                    let (state, ticket) = prepare_scene_shot(world)?;
                     if path.exists() || path.with_extension("json").exists() {
                         return Err("SceneShot refuses to replace existing evidence".into());
                     }
                     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
                     let destination = path.clone();
-                    let ticket = crate::capture_frame::CaptureTicket::default();
                     world.spawn((Screenshot::primary_window(), ticket.clone())).observe(move |event: On<ScreenshotCaptured>| {
                         let result = (|| -> Result<(), String> {
                             let frame = ticket.receipt().ok_or("missing live capture-frame receipt")?;
@@ -139,7 +137,24 @@ fn dispatch_stdin(world: &mut World) {
     }
 }
 
-fn scene_state(world: &World) -> serde_json::Value {
+fn prepare_scene_shot(
+    world: &World,
+) -> Result<(serde_json::Value, crate::capture_frame::CaptureTicket), String> {
+    let baseline = match (
+        world.get_resource::<StreamingMetrics>(),
+        world.get_resource::<crate::render::RendererMetrics>(),
+    ) {
+        (Some(streaming), Some(renderer)) => crate::shots::Failures::read(&streaming, &renderer),
+        _ => crate::shots::Failures::default(),
+    };
+    let state = scene_state(world, baseline);
+    if state["ready"] != true {
+        return Err(format!("scene is still loading: {state}"));
+    }
+    Ok((state, crate::capture_frame::CaptureTicket::new(baseline)))
+}
+
+fn scene_state(world: &World, baseline: crate::shots::Failures) -> serde_json::Value {
     let mode = *world.resource::<SceneGradeMode>();
     let preset = *world.resource::<SceneVisualPreset>();
     let streaming = world.get_resource::<StreamingMetrics>();
@@ -171,10 +186,12 @@ fn scene_state(world: &World) -> serde_json::Value {
                 && s.loading_cells == 0
                 && s.pending_lod_queries == 0
                 && s.pending_lod_chunks == 0
-                && s.failed_cells == 0
-                && s.asset_load_failures == 0
-                && s.failed_lod_queries == 0
-                && s.failed_lod_chunks == 0
+                && s.failed_cells.saturating_sub(baseline.failed_cells) == 0
+                && s.asset_load_failures
+                    .saturating_sub(baseline.asset_load_failures)
+                    == 0
+                && s.unrecovered_lod_queries == 0
+                && s.unrecovered_lod_chunks == 0
         })
         && pending_terrain == 0
         && pending_specializations == Some(0)
@@ -208,6 +225,8 @@ fn scene_state(world: &World) -> serde_json::Value {
         "pending_surfaces": streaming.map(|s| s.pending_surface_instances),
         "pending_lod_queries": streaming.map(|s| s.pending_lod_queries),
         "pending_lod_chunks": streaming.map(|s| s.pending_lod_chunks),
+        "unrecovered_lod_queries": streaming.map(|s| s.unrecovered_lod_queries),
+        "unrecovered_lod_chunks": streaming.map(|s| s.unrecovered_lod_chunks),
         "failed_cells": streaming.map(|s| s.failed_cells),
         "asset_load_failures": streaming.map(|s| s.asset_load_failures),
         "failed_lod_queries": streaming.map(|s| s.failed_lod_queries),
@@ -219,6 +238,35 @@ fn scene_state(world: &World) -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::{capture_frame::CaptureGrade, shots::SettleCounts};
+
+    fn ready_scene_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(SceneGradeMode::Full);
+        world.insert_resource(SceneVisualPreset::CoolGray);
+        world.insert_resource(SceneGradeSource::default());
+        world.insert_resource(SceneToneMapSource::default());
+        world.insert_resource(StreamingMetrics::default());
+        world.insert_resource(crate::terrain_upload::TerrainMeshUploadReadiness::default());
+        world.insert_resource(crate::profiling::ProfilingState::default());
+        world.insert_resource(crate::render::RendererMetrics {
+            gpu_preprocessing_active: true,
+            gpu_culling_active: true,
+            indirect_drawing_active: true,
+            occlusion_culling_views: 1,
+            hzb_views: 1,
+            indirect_phase_buffers: 1,
+            indirect_batch_sets: 1,
+            proof_frames: 1,
+            ..default()
+        });
+        world.insert_resource(crate::capture_frame::RetryReadiness(std::sync::Arc::new(
+            std::sync::Mutex::new(Some(0)),
+        )));
+        world.insert_resource(crate::capture_frame::TransferReadiness(
+            std::sync::Arc::new(std::sync::Mutex::new(Some(0))),
+        ));
+        world
+    }
 
     fn captured_frame() -> CaptureFrame {
         CaptureFrame {
@@ -333,6 +381,116 @@ mod tests {
                 .unwrap_err()
                 .contains("no tone-map mode")
         );
+    }
+
+    #[test]
+    fn scene_shot_uses_request_baseline_and_keeps_cumulative_history_visible() {
+        let mut world = ready_scene_world();
+        *world.resource_mut::<StreamingMetrics>() = StreamingMetrics {
+            failed_cells: 3,
+            asset_load_failures: 2,
+            material_validation_failures: 1,
+            failed_lod_queries: 4,
+            failed_lod_chunks: 5,
+            ..default()
+        };
+
+        let (request_state, ticket) = prepare_scene_shot(&world).unwrap();
+        let baseline = crate::shots::Failures::read(
+            world.resource::<StreamingMetrics>(),
+            world.resource::<crate::render::RendererMetrics>(),
+        );
+
+        assert_eq!(request_state["ready"], true);
+        assert_eq!(request_state["failed_cells"], 3);
+        assert_eq!(request_state["asset_load_failures"], 2);
+        assert_eq!(request_state["failed_lod_queries"], 4);
+        assert_eq!(request_state["failed_lod_chunks"], 5);
+        assert_eq!(ticket.baseline(), baseline);
+
+        let cumulative_state = scene_state(&world, crate::shots::Failures::default());
+        assert_eq!(cumulative_state["ready"], false);
+        assert_eq!(cumulative_state["failed_cells"], 3);
+        assert_eq!(cumulative_state["asset_load_failures"], 2);
+        assert_eq!(cumulative_state["failed_lod_queries"], 4);
+        assert_eq!(cumulative_state["failed_lod_chunks"], 5);
+    }
+
+    #[test]
+    fn scene_shot_stays_blocked_for_unrecovered_lod_and_missing_resources() {
+        let mut world = ready_scene_world();
+        world
+            .resource_mut::<StreamingMetrics>()
+            .unrecovered_lod_chunks = 1;
+        let Err(error) = prepare_scene_shot(&world) else {
+            panic!("unrecovered LOD work must block SceneShot");
+        };
+        assert!(error.contains("scene is still loading"));
+
+        let mut world = ready_scene_world();
+        world.remove_resource::<StreamingMetrics>();
+        let Err(error) = prepare_scene_shot(&world) else {
+            panic!("missing streaming metrics must keep SceneShot unready");
+        };
+        assert!(error.contains("scene is still loading"));
+
+        let mut world = ready_scene_world();
+        world.remove_resource::<crate::render::RendererMetrics>();
+        let Err(error) = prepare_scene_shot(&world) else {
+            panic!("missing renderer metrics must keep SceneShot unready");
+        };
+        assert!(error.contains("scene is still loading"));
+    }
+
+    #[test]
+    fn failures_after_scene_shot_request_block_its_capture_receipt() {
+        for failure in ["cell", "asset", "validation", "lod"] {
+            let mut world = ready_scene_world();
+            *world.resource_mut::<StreamingMetrics>() = StreamingMetrics {
+                failed_cells: 1,
+                asset_load_failures: 2,
+                material_validation_failures: 3,
+                failed_lod_queries: 4,
+                failed_lod_chunks: 5,
+                ..default()
+            };
+            let (request_state, ticket) = prepare_scene_shot(&world).unwrap();
+            let baseline = ticket.baseline();
+
+            {
+                let mut current = world.resource_mut::<StreamingMetrics>();
+                match failure {
+                    "cell" => current.failed_cells += 1,
+                    "asset" => current.asset_load_failures += 1,
+                    "validation" => current.material_validation_failures += 1,
+                    "lod" => current.failed_lod_chunks += 1,
+                    _ => unreachable!(),
+                }
+            }
+
+            assert_eq!(
+                ticket.baseline(),
+                baseline,
+                "{failure} changed the snapshot"
+            );
+            let mut work = SettleCounts::read(
+                world.resource::<StreamingMetrics>(),
+                world.resource::<crate::render::RendererMetrics>(),
+                baseline,
+                true,
+                0,
+            );
+            work.pending_specializations = Some(0);
+            work.pending_render_transfers = Some(0);
+            let mut frame = captured_frame();
+            frame.work = work;
+            ticket.set_receipt(frame);
+
+            let frame = ticket.receipt().unwrap();
+            let error = build_live_capture_receipt(&request_state, &frame, [1920, 1080])
+                .expect_err("a new failure must reject this frame's receipt");
+            assert!(error.contains("not settled"), "{failure}: {error}");
+        }
     }
 
     #[test]
