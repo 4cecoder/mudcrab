@@ -7,6 +7,7 @@ pub mod lod;
 pub mod plugin_selection;
 pub mod streaming_costs;
 pub mod terrain_mesh;
+pub mod records;
 pub mod world_assets;
 
 use rkyv::{Archive, Deserialize, Serialize};
