@@ -74,11 +74,13 @@ fn write_dds(data: &Path, relative: &str, format: dds::Format) {
 }
 
 /// Stores an opaque entry whose extraction counts are independent of asset conversion.
+/// The entry is an opaque `.lod` input: `ConverterInputs` selects it and the
+/// extractor copies it unparsed, so each archive still yields one converted file.
 fn write_archive(data: &Path, name: &str, payload: &[u8]) {
     fs::write(
         data.join(name),
         ba2::general(
-            &[Entry::new("docs/review.txt", payload)],
+            &[Entry::new("lodsettings/review.lod", payload)],
             ba2::Compression::None,
         )
         .unwrap(),
@@ -88,13 +90,19 @@ fn write_archive(data: &Path, name: &str, payload: &[u8]) {
 
 /// Runs the complete conversion, validation and pack-publication path.
 async fn publish(config: PipelineConfig) -> PipelineReport {
+    let report = publish_report(config).await;
+    assert!(report.complete, "{:#?}", report.warnings);
+    report
+}
+
+/// Publish usable records while allowing a fixture's deliberate recovery warnings.
+async fn publish_report(config: PipelineConfig) -> PipelineReport {
     assert!(config.no_lod);
     let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
     let result = AssetPipeline::run_async(config, sender).await;
     drain.await.unwrap();
     let report = result.unwrap();
-    assert!(report.complete, "{:#?}", report.warnings);
     assert_eq!(report.skipped, 0);
     report
 }
@@ -210,7 +218,12 @@ async fn reader_switch_reuses_archives_and_assets_but_rebuilds_database_and_cell
     .unwrap();
 
     let inhouse = fixture.config(RecordReader::Inhouse);
-    let switched = publish(inhouse).await;
+    let switched = publish_report(inhouse).await;
+    assert!(!switched.complete);
+    assert_eq!(switched.warnings.len(), 1, "{:?}", switched.warnings);
+    assert!(switched.warnings[0].contains("skyrim.esm"));
+    assert!(switched.warnings[0].contains("OBND"));
+    assert!(!manifest(&fixture.output).complete);
     assert_eq!(
         switched.converted, 0,
         "reader identity must not re-encode unchanged assets or re-extract archives"
@@ -355,7 +368,7 @@ async fn known_legacy_full_hashes_reuse_assets_without_kind_keys() {
     }
 }
 
-/// Full-schema-only identity drift leaves existing per-kind asset and archive proofs usable.
+/// An earlier adapter rebuilds metadata while verified asset and archive proofs remain usable.
 #[tokio::test]
 async fn metadata_identity_drift_preserves_verified_assets_and_archives() {
     let fixture = Fixture::new(true);
@@ -364,6 +377,22 @@ async fn metadata_identity_drift_preserves_verified_assets_and_archives() {
     let expected = asset_bytes(&fixture.output);
     let original_archives = manifest(&fixture.output).archives;
     drift_metadata_identity(&fixture.output);
+    let mut prior_reader = json_artifact(&fixture.output, "record-reader.json");
+    prior_reader["adapter_version"] = serde_json::json!(11);
+    fs::write(
+        fixture.output.join("record-reader.json"),
+        serde_json::to_vec_pretty(&prior_reader).unwrap(),
+    )
+    .unwrap();
+    let database = Connection::open(fixture.output.join("skyrim_world.db")).unwrap();
+    database
+        .execute_batch("CREATE TABLE rv_b_previous_adapter(value INTEGER); INSERT INTO rv_b_previous_adapter VALUES(11);")
+        .unwrap();
+    drop(database);
+    let stale_cache = b"adapter-11 stale terrain cache";
+    for name in ["cell_cache.rkyv", "cell_cache_preserved.rkyv"] {
+        fs::write(fixture.output.join(name), stale_cache).unwrap();
+    }
 
     let rebuilt = publish(config).await;
     assert_eq!(
@@ -373,6 +402,22 @@ async fn metadata_identity_drift_preserves_verified_assets_and_archives() {
     assert_eq!(rebuilt.cache_hits, 6);
     assert_eq!(manifest(&fixture.output).archives, original_archives);
     assert_asset_bytes(&fixture.output, &expected);
+    assert_eq!(
+        json_artifact(&fixture.output, "record-reader.json"),
+        crate::esm::inhouse::reader_identity(RecordReader::Inhouse)
+    );
+    let database = Connection::open(fixture.output.join("skyrim_world.db")).unwrap();
+    let stale_tables: u32 = database
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='rv_b_previous_adapter'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale_tables, 0, "the database must be freshly rebuilt");
+    for name in ["cell_cache.rkyv", "cell_cache_preserved.rkyv"] {
+        assert_ne!(fs::read(fixture.output.join(name)).unwrap(), stale_cache);
+    }
 }
 
 /// Asset encoder settings do not alter the bytes an archive extractor must restore.
@@ -452,12 +497,21 @@ async fn corrupted_archive_blob_misses_while_unchanged_archive_survives_config_c
     config.texture_zstd_level = 0;
     assert!(config.verify_cache);
 
-    let rebuilt = publish(config).await;
+    let rebuilt = publish(config.clone()).await;
+    // Sealed packs are the authoritative archive copy. The damaged per-file blob
+    // fails hash verification and is never trusted, so the archive restores from
+    // its verified pack instead of being extracted again.
     assert_eq!(
-        rebuilt.converted, 1,
-        "hash verification must reject the corrupted blob"
+        rebuilt.converted, 0,
+        "a corrupted derived blob must not force an extraction"
     );
-    assert_eq!(rebuilt.cache_hits, 1, "the intact archive remains reusable");
+    assert_eq!(rebuilt.cache_hits, 2, "both archives remain reusable");
+    let entry = &manifest(&config.output_dir).archives[ARCHIVE_NAME].files[0];
+    assert_eq!(
+        hash_file(&archive_blob(&config, ARCHIVE_NAME)).unwrap(),
+        entry.hash,
+        "the damaged blob is repaired from the verified pack"
+    );
 }
 
 /// Explicit invalidation continues to force extraction even when the source is unchanged.
@@ -779,7 +833,7 @@ async fn unknown_retained_script_producer_does_not_gain_current_metadata_eligibi
         "the test isolates original producer policy"
     );
 
-    // Producer 25 is outside the existing known script set12..24/current26 but
+    // Producer 25 is outside the existing known script set 12..24 and 26 (current 27) but
     // below the metadata stamp, so rejecting producer>metadata cannot hide a
     // mistaken decision based only on the metadata producer. Preserve any new
     // kind map; its script ABI proof deliberately still matches.

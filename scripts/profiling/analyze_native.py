@@ -43,7 +43,7 @@ def main():
  frame_counts=collections.Counter();slim=[]
  for c in accepted:
   end=c['completed'];enc=c['enc'];unique={(e['object'],e['begin_ns'],e['end_ns']):e for e in enc};enc=list(unique.values())
-  name='empty' if not enc else (enc[0]['name'] or enc[0]['selector']) if len(enc)==1 else 'multiple: '+', '.join(e['name'] or e['selector'] for e in enc)
+  name='empty' if not enc else enc[0]['name'] or enc[0]['selector'] if len(enc)==1 else 'multiple: '+', '.join(e['name'] or e['selector'] for e in enc)
   gpu_ms=(end['gpu_end_s']-end['gpu_start_s'])*1000
   agg[name]['gpu_ms'].append(gpu_ms)
   start=c.get('commit_begin',{});finish=c.get('commit_end',{})

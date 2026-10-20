@@ -328,12 +328,34 @@ mod tests {
                 .starts_with(modded)
         );
 
-        // A repeated kind prefix normalizes to the same key on case-sensitive and
-        // case-insensitive filesystems alike; two names differing only in case would overwrite
-        // one another on the default macOS and Windows filesystems.
+        let collision = base.join("Landscape/ROCK.dds");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&collision)
+        {
+            Ok(_) => {
+                fs::write(collision, b"collision").unwrap();
+                assert!(
+                    AssetSourceIndex::build(std::slice::from_ref(&base), AssetKind::Texture)
+                        .is_err()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                assert!(
+                    AssetSourceIndex::build(std::slice::from_ref(&base), AssetKind::Texture)
+                        .is_ok()
+                );
+            }
+            Err(error) => panic!("create case-collision fixture: {error}"),
+        }
+
+        // Also create distinct files on case-insensitive volumes: canonicalization
+        // strips the redundant textures prefix and lowercases the asset path.
         fs::create_dir_all(base.join("textures/landscape")).unwrap();
         fs::write(base.join("textures/landscape/rock.dds"), b"collision").unwrap();
-        assert!(AssetSourceIndex::build(&[base], AssetKind::Texture).is_err());
+        let error = AssetSourceIndex::build(&[base], AssetKind::Texture).unwrap_err();
+        assert!(error.to_string().contains("normalized asset collision"));
     }
 
     #[test]

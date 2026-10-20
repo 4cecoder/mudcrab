@@ -5,6 +5,7 @@ changes diagnostics and camera automation, not renderer optimizations, dependenc
 ownership, PR bases or acceptance thresholds. PR #200 must remain draft.
 
 ```sh
+budget_mib=16
 "$engine" --assets "$MUDCRAB_PROFILE_ASSETS" \
   --worldspace 0x3c --stream-radius 2 \
   --max-model-spawns-per-frame 16 --max-upload-mib-per-frame "$budget_mib" \
@@ -15,7 +16,8 @@ ownership, PR bases or acceptance thresholds. PR #200 must remain draft.
 Use a fresh output directory for each process. The fixed capture frame is 1600×900.
 `--matched-route` rejects other shots, auto-flight, benchmark camera modes and
 fixtures. `--shots-out` names its output directory. Both comparison sides must
-contain the identical driver and diagnostics. Run both 16 MiB and 1 MiB budgets.
+contain the identical driver and diagnostics. Repeat with `budget_mib=1` and a fresh
+output directory to cover both 16 MiB and 1 MiB budgets.
 
 Leg offsets are destinations relative to the start. The fixture expands to 3,073
 poses, including step zero: exactly 3,072 movements of 64 Creation units. The route
@@ -65,8 +67,8 @@ or its automated tests.
 
 ## Verification limits for this follow-up
 
-On the Linux editing host, all 120 existing Python script tests passed (five tests
-requiring macOS frameworks were skipped), and `git diff --check` passed. New Rust
+On the Linux editing host, 120 existing Python script tests ran: 115 passed and five
+requiring macOS frameworks were skipped. `git diff --check` passed. New Rust
 regressions cover fixture interpretation/count validation, every fixed movement,
 checkpoint returns, rebasing while an image is delayed, transition-to-settle
 ordering, immutable frame receipts, missing readback and queue readiness resets.

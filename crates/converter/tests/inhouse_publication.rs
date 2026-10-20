@@ -255,7 +255,6 @@ async fn convert(data: &Path, output: &Path, reader: RecordReader) -> converter:
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let report = AssetPipeline::run_async(config, tx).await.unwrap();
     drain.await.unwrap();
-    assert!(report.complete, "{:?}", report.warnings);
     report
 }
 
@@ -266,8 +265,62 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
     let data = temp.path().join("Data");
     let output = temp.path().join("inhouse");
     generate(&data);
-    convert(&data, &output, RecordReader::Inhouse).await;
+    let report = convert(&data, &output, RecordReader::Inhouse).await;
+    assert!(!report.complete);
+    assert_eq!(report.skipped, 0);
+    assert!(
+        report.warnings.iter().any(|warning| {
+            warning.contains("skyrim.esm") && warning.contains("in-house reader skipped")
+        }),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        report.warnings.iter().any(|warning| {
+            warning.contains("names.esp") && warning.contains("inhouse adapter reported")
+        }),
+        "{:?}",
+        report.warnings
+    );
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
+    let profile: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("inhouse-database-profile.json")).unwrap())
+            .unwrap();
+    assert_eq!(profile["schema_version"], 1);
+    assert_eq!(profile["reader"], "inhouse");
+    for (count, sql) in [
+        (
+            "decoded_winners",
+            "SELECT count(*) FROM inhouse_source_records",
+        ),
+        ("runtime_winners", "SELECT count(*) FROM records"),
+        (
+            "localized_fields",
+            "SELECT count(*) FROM inhouse_localized_fields",
+        ),
+        (
+            "source_payload_bytes",
+            "SELECT coalesce(sum(length(payload)),0) FROM inhouse_source_records",
+        ),
+    ] {
+        let actual: u64 = db.query_row(sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(profile["counts"][count].as_u64(), Some(actual), "{count}");
+    }
+    for phase in [
+        "reader_decode_merge_deferred",
+        "reader_target_validation_and_diagnostics",
+        "runtime_database_export",
+        "provenance_source_records",
+        "terrain_runtime_cache",
+        "terrain_preserved_cache",
+    ] {
+        assert!(
+            profile["elapsed_seconds"][phase]
+                .as_f64()
+                .is_some_and(|seconds| seconds.is_finite() && seconds >= 0.0),
+            "{phase}"
+        );
+    }
     for id in [0x900, 0x902] {
         assert_eq!(
             db.query_row("SELECT model_path FROM statics WHERE id=?1", [id], |row| {
@@ -521,6 +574,7 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
 #[test]
 fn reader_identity_separates_configuration_proofs() {
     let mut config = PipelineConfig::new("Data", "output");
+    config.record_reader = RecordReader::Legacy;
     let legacy = converter::cache::configuration_hash(&config).unwrap();
     assert_eq!(config.record_reader, RecordReader::Legacy);
     let texture_settings = converter::cache::asset_configuration_hash_for_schema(
@@ -740,7 +794,18 @@ async fn inhouse_bad_overrides_preserve_prior_movement_and_authored_heights() {
         }
         fs::write(data.join(name), patch).unwrap();
     }
-    convert(&data, &output, RecordReader::Inhouse).await;
+    let report = convert(&data, &output, RecordReader::Inhouse).await;
+    assert!(!report.complete);
+    assert_eq!(report.skipped, 0);
+    for plugin in ["badnegative.esp", "badnonfinite.esp"] {
+        assert!(
+            report.warnings.iter().any(|warning| {
+                warning.contains(plugin) && warning.contains("in-house reader skipped")
+            }),
+            "{:?}",
+            report.warnings
+        );
+    }
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     let movement = db
         .query_row(
@@ -885,7 +950,9 @@ async fn metadata_reader_switch_preserves_retained_producer_identity() {
     )
     .unwrap();
     let original = temp.path().join("legacy");
-    convert(&data, &original, RecordReader::Legacy).await;
+    let report = convert(&data, &original, RecordReader::Legacy).await;
+    assert!(report.complete, "{:?}", report.warnings);
+    assert!(report.warnings.is_empty());
     let original_manifest: converter::cache::ConversionManifest =
         serde_json::from_slice(&fs::read(original.join("conversion-manifest.json")).unwrap())
             .unwrap();

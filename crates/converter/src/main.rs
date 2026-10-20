@@ -2,6 +2,7 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, bail},
 };
+use converter::archive::IngestionSync;
 use converter::config::RecordReader;
 use converter::{
     AssetPipeline, PipelineConfig, PipelineReport, ProgressEvent, ProgressStage, TextureEncoder,
@@ -32,7 +33,10 @@ struct Cli {
     report_json: Option<PathBuf>,
     cpu_jobs: Option<usize>,
     io_jobs: Option<usize>,
+    ingestion_sync: IngestionSync,
+    extract_all_archive_files: bool,
     texture_encoder: TextureEncoder,
+    lod_texture_encoder: TextureEncoder,
     record_reader: RecordReader,
     schema_addons: Vec<PathBuf>,
     texture_fallback_quality: Option<u8>,
@@ -43,6 +47,8 @@ struct Cli {
     verify_cache: bool,
     no_lod: bool,
     verbose: bool,
+    /// Overrides the default string-table language.
+    language: Option<String>,
 }
 
 impl Cli {
@@ -60,7 +66,13 @@ impl Cli {
         config.invalidate_cache = self.invalidate_cache;
         config.verify_cache = self.verify_cache;
         config.no_lod = self.no_lod;
+        config.ingestion_sync = self.ingestion_sync;
+        config.extract_all_archive_files = self.extract_all_archive_files;
         config.texture_encoder = self.texture_encoder;
+        config.lod_texture_encoder = self.lod_texture_encoder;
+        if let Some(language) = &self.language {
+            config.language = language.clone();
+        }
         if let Some(value) = self.texture_fallback_quality {
             config.texture_fallback_quality = value;
         }
@@ -223,7 +235,12 @@ async fn main() -> Result<()> {
                 report.failures.len(),
                 report.directory.display()
             );
-            if !report.failures.is_empty() {
+            if !report.record_data_complete {
+                eprintln!(
+                    "Record data remains incomplete or unverified. Run normal conversion to recheck plugin data and rebuild world metadata."
+                );
+            }
+            if !report.failures.is_empty() || !report.record_data_complete {
                 std::process::exit(1);
             }
             return Ok(());
@@ -367,6 +384,9 @@ fn print_summary(cli: &Cli, report: &PipelineReport, clock: &StageClock) {
     println!("{}", summary_headline(report));
     for notice in &report.notices {
         println!("  note: {notice}");
+    }
+    for warning in &report.selection_warnings {
+        println!("  warning: {warning}");
     }
     let (bytes, files) = artifact_size(&cli.output, &report.artifacts);
     println!(
@@ -525,6 +545,16 @@ fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
             " --texture-encoder gpu --gpu-quality {quality} --gpu-batch-mb {batch_mb}"
         ));
     }
+    if let TextureEncoder::Gpu { quality, batch_mb } = cli.lod_texture_encoder {
+        command.push_str(" --lod-encoder gpu");
+        if !matches!(cli.texture_encoder, TextureEncoder::Gpu { .. }) {
+            command.push_str(&format!(
+                " --gpu-quality {quality} --gpu-batch-mb {batch_mb}"
+            ));
+        }
+    } else {
+        command.push_str(" --lod-encoder cpu");
+    }
     for (flag, path) in [
         ("--plugins-file", &cli.plugins_file),
         ("--skyrim-ccc-file", &cli.skyrim_ccc_file),
@@ -534,14 +564,27 @@ fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
             command.push_str(&format!(" {flag} \"{}\"", path.display()));
         }
     }
+    if cli.extract_all_archive_files {
+        command.push_str(" --extract-all-archive-files");
+    }
+    match cli.ingestion_sync {
+        IngestionSync::PerFile => command.push_str(" --ingestion-sync per-file"),
+        IngestionSync::Archive => command.push_str(" --ingestion-sync archive"),
+        IngestionSync::None => command.push_str(" --ingestion-sync none"),
+    }
     if cli.no_lod {
         command.push_str(" --no-lod");
     }
-    if cli.record_reader == RecordReader::Inhouse {
-        command.push_str(" --record-reader inhouse");
-    }
+    command.push_str(match cli.record_reader {
+        RecordReader::Legacy => " --record-reader legacy",
+        RecordReader::Inhouse => " --record-reader inhouse",
+    });
     for path in &cli.schema_addons {
         command.push_str(&format!(" --schema-addon \"{}\"", path.display()));
+    }
+    // The database is rebuilt on resume; it must read the same string tables.
+    if let Some(language) = &cli.language {
+        command.push_str(&format!(" --language {language}"));
     }
     command
 }
@@ -721,12 +764,21 @@ fn parse_command(args: Vec<OsString>) -> Result<Command> {
     }
     if args.first().and_then(|argument| argument.to_str()) == Some("repair-failed") {
         let apply = args.iter().any(|argument| argument == "--apply");
+        let gpu_tuning = args
+            .iter()
+            .any(|argument| argument == "--gpu-quality" || argument == "--gpu-batch-mb");
         let cli = parse_cli(
             args.into_iter()
                 .skip(1)
                 .filter(|argument| argument != "--apply")
                 .collect(),
         )?;
+        // Repair encodes textures only; terrain LOD defaults to GPU but never runs here.
+        if gpu_tuning && !matches!(cli.texture_encoder, TextureEncoder::Gpu { .. }) {
+            bail!(
+                "repair-failed applies --gpu-quality and --gpu-batch-mb only with --texture-encoder gpu"
+            );
+        }
         if cli.resume_staging.is_some()
             || cli.plugins_file.is_some()
             || cli.skyrim_ccc_file.is_some()
@@ -782,8 +834,11 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut skyrim_ini_file = None;
     let mut cpu_jobs = None;
     let mut io_jobs = None;
+    let mut ingestion_sync = IngestionSync::Archive;
+    let mut extract_all_archive_files = false;
     let mut use_gpu = false;
-    let mut record_reader = RecordReader::Legacy;
+    let mut use_lod_gpu = true;
+    let mut record_reader = RecordReader::default();
     let mut schema_addons = Vec::new();
     let mut gpu_quality = None;
     let mut gpu_batch_mb = None;
@@ -795,6 +850,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut verify_cache = true;
     let mut no_lod = false;
     let mut verbose = false;
+    let mut language = None;
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -846,6 +902,13 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
                     _ => bail!("--texture-encoder must be cpu or gpu"),
                 };
             }
+            Some("--lod-encoder") => {
+                use_lod_gpu = match next_value(&mut args, "--lod-encoder")?.to_str() {
+                    Some("cpu") => false,
+                    Some("gpu") => true,
+                    _ => bail!("--lod-encoder must be cpu or gpu"),
+                };
+            }
             Some("--record-reader") => {
                 record_reader = match next_value(&mut args, "--record-reader")?.to_str() {
                     Some("legacy") => RecordReader::Legacy,
@@ -888,6 +951,22 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
             Some("--invalidate-cache") => invalidate_cache = true,
             Some("--no-verify-cache") => verify_cache = false,
             Some("--no-lod") => no_lod = true,
+            Some("--ingestion-sync") => {
+                ingestion_sync = match next_value(&mut args, "--ingestion-sync")?.to_str() {
+                    Some("per-file") => IngestionSync::PerFile,
+                    Some("archive") => IngestionSync::Archive,
+                    Some("none") => IngestionSync::None,
+                    _ => bail!("--ingestion-sync must be per-file, archive, or none"),
+                };
+            }
+            Some("--extract-all-archive-files") => extract_all_archive_files = true,
+            Some("--language") => {
+                let value = next_value(&mut args, "--language")?;
+                language =
+                    Some(value.into_string().map_err(|_| {
+                        color_eyre::eyre::eyre!("--language value is not valid UTF-8")
+                    })?);
+            }
             Some("--verbose") => verbose = true,
             Some("--help" | "-h") => bail!(usage()),
             Some(flag) if flag.starts_with('-') => bail!("unknown option {flag}\n{}", usage()),
@@ -896,6 +975,18 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     }
     if positional.is_empty() || positional.len() > 2 {
         bail!(usage());
+    }
+    let gpu_encoder = TextureEncoder::Gpu {
+        quality: gpu_quality.unwrap_or(converter::texture_gpu::DEFAULT_QUALITY),
+        batch_mb: gpu_batch_mb.unwrap_or(converter::texture_gpu::DEFAULT_BATCH_MB),
+    };
+    if !use_gpu && !use_lod_gpu && (gpu_quality.is_some() || gpu_batch_mb.is_some()) {
+        bail!(
+            "--gpu-quality and --gpu-batch-mb require --texture-encoder gpu or --lod-encoder gpu"
+        );
+    }
+    if ingestion_sync == IngestionSync::None && !verify_cache {
+        bail!("--ingestion-sync none requires verified cache reuse; omit --no-verify-cache");
     }
     if reuse_assets.is_some() && mo2_instance.is_some() {
         bail!(
@@ -912,14 +1003,13 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         bail!("--mo2-instance cannot be combined with --plugins-file");
     }
     let texture_encoder = if use_gpu {
-        TextureEncoder::Gpu {
-            quality: gpu_quality.unwrap_or(converter::texture_gpu::DEFAULT_QUALITY),
-            batch_mb: gpu_batch_mb.unwrap_or(converter::texture_gpu::DEFAULT_BATCH_MB),
-        }
+        gpu_encoder
     } else {
-        if gpu_quality.is_some() || gpu_batch_mb.is_some() {
-            bail!("--gpu-quality and --gpu-batch-mb require --texture-encoder gpu");
-        }
+        TextureEncoder::Cpu
+    };
+    let lod_texture_encoder = if use_lod_gpu {
+        gpu_encoder
+    } else {
         TextureEncoder::Cpu
     };
     let mo2 = match mo2_instance {
@@ -958,7 +1048,10 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         report_json,
         cpu_jobs,
         io_jobs,
+        ingestion_sync,
+        extract_all_archive_files,
         texture_encoder,
+        lod_texture_encoder,
         record_reader,
         schema_addons,
         texture_fallback_quality,
@@ -969,6 +1062,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         verify_cache,
         no_lod,
         verbose,
+        language,
     })
 }
 
@@ -1024,12 +1118,13 @@ fn parse_u64(value: OsString, option: &str) -> Result<u64> {
 /// The help text printed for `--help` and after a usage error.
 fn usage() -> &'static str {
     "usage: converter <Skyrim Data> [output directory] [--cpu-jobs N] [--io-jobs N] [--fail-fast]
-                 [--texture-encoder cpu|gpu] [--gpu-quality N] [--gpu-batch-mb N]
+                 [--texture-encoder cpu|gpu] [--lod-encoder cpu|gpu] [--gpu-quality N] [--gpu-batch-mb N]
                  [--texture-fallback-quality 1..255] [--texture-uastc-level 0..4]
                  [--texture-zstd-level 0..22]
                  [--invalidate-cache] [--no-verify-cache] [--resume-staging DIR]
                  [--report-json FILE] [--verbose] [--reuse-assets DIR] [--no-lod]
-                 [--record-reader legacy|inhouse]
+                 [--record-reader legacy|inhouse] [--language NAME]
+                 [--ingestion-sync per-file|archive|none] [--extract-all-archive-files]
                  [--schema-addon JSON]
                  [--mo2-instance DIR] [--mo2-profile NAME]
                  [--plugins-file FILE] [--skyrim-ccc-file FILE] [--skyrim-ini-file FILE]
@@ -1045,28 +1140,57 @@ repair-failed stages only manifest failures and missing dependencies in a repair
 It preserves the record projection and cell cache, and finalizes asset references in the staged database.
 --apply validates the pack's existing hashes, publishes validated repairs with backups,
 and updates the manifest last.
+Asset repair does not rebuild records. Unresolved record loss or missing historical
+record-completeness proof keeps the pack incomplete and makes repair exit 1 even
+when corrected assets were published. Normal conversion rechecks record data.
 Use the original conversion's reader/schema identity and encoding settings. --texture-etc1s-quality is an alias for
 --texture-fallback-quality; it does not select ETC1S encoding.
 
 Converts a Skyrim Data directory into runtime assets.
+The in-house record reader is the default; --record-reader legacy selects the hand-written reader.
+Reader recovery preserves usable neighboring records and reports bounded data-loss warnings.
+Warnings mark the report and manifest incomplete and make conversion exit 1 even when the
+usable output was published. --report-json and the launcher show these warnings; metadata
+rebuild with --reuse-assets follows the same completeness rule.
+Successful master-index and supplier-self compatibility remaps are report notices and do
+not affect completeness.
 --mo2-instance overlays enabled MO2 mods and overwrite over physical Data, using the profile's
 active plugins and loadorder.txt. --mo2-profile defaults to ModOrganizer.ini's selected_profile,
 or the first sorted profile if that selection is absent or stale.
 MO2 files are read only. Native SKSE DLLs and arbitrary mod compatibility are not supported.
 
 --plugins-file reads Windows-1252 player selection. Installed official masters and
-Skyrim.ccc Creations are always active. --skyrim-ccc-file overrides the game-folder
-CCC path. --skyrim-ini-file explicitly supplies General sTestFile settings; no
-ambient profile is read.
+readable Skyrim.ccc Creations are always active. Missing or unreadable CCC activates
+installed Fish, Survival Mode, Rare Curios, Saints and Seducers and _ResourcePack,
+in that order, with a report warning. Readable CCC, including an empty file, wins.
+--skyrim-ccc-file overrides the game-folder CCC path. --skyrim-ini-file explicitly
+supplies General sTestFile settings; no ambient profile is read. Without
+--plugins-file or MO2 selection, automatic discovery orders plugins by dependency and skips unusable
+or ambiguously named plugins with bounded notices.
+The JSON report lists every recovery exclusion in skipped_plugins and surviving filenames
+in load_order; selection_warnings contains Creation fallback warnings separately from
+failed asset conversions. Archive companions match an exact plugin stem or a following
+space, dash or underscore. The longest installed owner must survive selection; unowned
+archives are admitted outside MO2 and excluded in MO2.
 
 MO2 and --plugins-file selections cannot be combined. Automatic discovery applies
 when neither selection is supplied.
 
---schema-addon <JSON> may be repeated with --record-reader inhouse to add record types
-and explicitly extend fields. The full batch is checked before conversion starts.
+--schema-addon <JSON> may be repeated to add in-house record types and explicitly
+extend fields. The full batch is checked before conversion starts. Schema add-ons
+cannot be combined with --record-reader legacy.
+
+Archive ingestion extracts the formats used by conversion and English string banks.
+--extract-all-archive-files retains every archive entry for compatibility and comparisons.
+--ingestion-sync defaults to archive: sealed packs provide batch durability. per-file also
+flushes each unique derived payload; none skips extraction flushes for regenerable bytes
+and requires verified reuse. Runtime package publication keeps its durability contract.
 
 --no-lod skips terrain LOD compilation in conversion and metadata rebuilds. Full-detail
 terrain and ordinary assets remain available. Omit it on a later run to build LOD.
+
+--language selects the string tables that localized plugins' names are read from,
+Strings/<plugin>_<language>.STRINGS, as Skyrim's sLanguage does. Default: english.
 
 While it runs, one status line is redrawn on the terminal, four times a second at most:
 
@@ -1091,6 +1215,39 @@ conversion with --mo2-instance. It cannot resume or cooperatively cancel."
 
 #[cfg(test)]
 mod tests {
+    /// Default conversion routes use in-house and explicit legacy survives configuration and resume.
+    #[test]
+    fn cli_defaults_to_inhouse_and_preserves_explicit_legacy() {
+        let conversion = parse_cli(args(&["Data", "pack"])).unwrap();
+        assert_eq!(conversion.record_reader, RecordReader::Inhouse);
+        assert_eq!(
+            conversion.pipeline_config().record_reader,
+            RecordReader::Inhouse
+        );
+
+        let metadata = parse_cli(args(&["Data", "pack", "--reuse-assets", "source"])).unwrap();
+        assert_eq!(
+            metadata.pipeline_config().record_reader,
+            RecordReader::Inhouse
+        );
+        let Command::Repair(repair, _) =
+            parse_command(args(&["repair-failed", "Data", "pack"])).unwrap()
+        else {
+            panic!("expected repair");
+        };
+        assert_eq!(
+            repair.pipeline_config().record_reader,
+            RecordReader::Inhouse
+        );
+
+        let legacy = parse_cli(args(&["Data", "pack", "--record-reader", "legacy"])).unwrap();
+        assert_eq!(legacy.pipeline_config().record_reader, RecordReader::Legacy);
+        assert!(
+            resume_command("converter", &legacy, Path::new("staging"))
+                .contains(" --record-reader legacy")
+        );
+    }
+
     /// Repeated schema paths preserve input order through parsing and resume commands.
     #[test]
     fn schema_addon_cli_preserves_order_and_resume_flags() {
@@ -1183,7 +1340,8 @@ mod tests {
         .unwrap();
         let resume = resume_command("converter", &cli, Path::new("out.staging-1-2"));
         assert!(resume.contains("--mo2-instance"));
-        assert!(resume.ends_with("--mo2-profile \"Zed\""));
+        assert!(resume.contains("--mo2-profile \"Zed\""));
+        assert!(resume.ends_with(" --record-reader inhouse"));
         assert!(parse_cli(args(&["Data", "--mo2-profile", "Zed"])).is_err());
         assert!(
             parse_cli(args(&[
@@ -1689,7 +1847,7 @@ mod tests {
         );
     }
 
-    /// The resume command repeats the paths, quotes them, and keeps the GPU encoder flags.
+    /// The resume command quotes paths and preserves the reader and GPU encoder options.
     #[test]
     fn names_the_exact_command_that_resumes_a_kept_staging_folder() {
         let cli = Cli {
@@ -1704,7 +1862,10 @@ mod tests {
             report_json: None,
             cpu_jobs: None,
             io_jobs: None,
+            ingestion_sync: IngestionSync::PerFile,
+            extract_all_archive_files: false,
             texture_encoder: TextureEncoder::Cpu,
+            lod_texture_encoder: TextureEncoder::Cpu,
             record_reader: RecordReader::Legacy,
             schema_addons: Vec::new(),
             texture_fallback_quality: None,
@@ -1715,22 +1876,26 @@ mod tests {
             verify_cache: true,
             no_lod: false,
             verbose: false,
+            language: None,
         };
         let staging = Path::new("C:/Modding/SkyrimConverted.staging-1-2");
         assert_eq!(
             resume_command("converter.exe", &cli, staging),
-            "converter.exe \"C:/Games/Skyrim/Data\" \"C:/Modding/SkyrimConverted\" --resume-staging \"C:/Modding/SkyrimConverted.staging-1-2\""
+            "converter.exe \"C:/Games/Skyrim/Data\" \"C:/Modding/SkyrimConverted\" --resume-staging \"C:/Modding/SkyrimConverted.staging-1-2\" --lod-encoder cpu --ingestion-sync per-file --record-reader legacy"
         );
         // A renamed binary is named as it is, quoted when its name has a space.
         assert_eq!(
             resume_command("mudcrab converter", &cli, staging),
-            "\"mudcrab converter\" \"C:/Games/Skyrim/Data\" \"C:/Modding/SkyrimConverted\" --resume-staging \"C:/Modding/SkyrimConverted.staging-1-2\""
+            "\"mudcrab converter\" \"C:/Games/Skyrim/Data\" \"C:/Modding/SkyrimConverted\" --resume-staging \"C:/Modding/SkyrimConverted.staging-1-2\" --lod-encoder cpu --ingestion-sync per-file --record-reader legacy"
         );
         // The test binary itself stands in for the running converter.
         assert!(!program_name().is_empty());
         let no_lod = parse_cli(vec!["Data".into(), "--no-lod".into()]).unwrap();
         assert!(no_lod.no_lod);
-        assert!(resume_command("converter", &no_lod, staging).ends_with(" --no-lod"));
+        assert!(
+            resume_command("converter", &no_lod, staging)
+                .ends_with(" --no-lod --record-reader inhouse")
+        );
         let inhouse = parse_cli(vec![
             "Data".into(),
             "--record-reader".into(),
@@ -1750,6 +1915,10 @@ mod tests {
             .is_err()
         );
         assert!(parse_cli(vec!["Data".into(), "--record-reader".into()]).is_err());
+        let german = parse_cli(vec!["Data".into(), "--language".into(), "german".into()]).unwrap();
+        assert_eq!(german.language.as_deref(), Some("german"));
+        assert_eq!(german.pipeline_config().language, "german");
+        assert!(resume_command("converter", &german, staging).ends_with(" --language german"));
         // A GPU run resumes on the GPU.
         let gpu = Cli {
             texture_encoder: TextureEncoder::Gpu {
@@ -1758,9 +1927,52 @@ mod tests {
             },
             ..cli
         };
+        assert!(resume_command("converter.exe", &gpu, staging).ends_with(
+            " --texture-encoder gpu --gpu-quality 2 --gpu-batch-mb 256 --lod-encoder cpu --ingestion-sync per-file --record-reader legacy"
+        ));
+    }
+
+    #[test]
+    fn parses_and_preserves_ingestion_options_on_resume() {
+        let staging = Path::new("assets.staging");
+        let defaults = parse_cli(vec!["Data".into()]).unwrap();
+        assert_eq!(defaults.ingestion_sync, IngestionSync::Archive);
+        assert!(!defaults.extract_all_archive_files);
+        for (value, policy) in [
+            ("per-file", IngestionSync::PerFile),
+            ("archive", IngestionSync::Archive),
+            ("none", IngestionSync::None),
+        ] {
+            let cli = parse_cli(vec![
+                "Data".into(),
+                "--ingestion-sync".into(),
+                value.into(),
+                "--extract-all-archive-files".into(),
+            ])
+            .unwrap();
+            assert_eq!(cli.ingestion_sync, policy);
+            assert!(cli.extract_all_archive_files);
+            let command = resume_command("converter", &cli, staging);
+            assert!(command.contains(" --extract-all-archive-files"));
+            assert!(command.contains(&format!(" --ingestion-sync {value}")));
+        }
+        assert!(parse_cli(vec!["Data".into(), "--ingestion-sync".into()]).is_err());
         assert!(
-            resume_command("converter.exe", &gpu, staging)
-                .ends_with(" --texture-encoder gpu --gpu-quality 2 --gpu-batch-mb 256")
+            parse_cli(vec![
+                "Data".into(),
+                "--ingestion-sync".into(),
+                "invalid".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_cli(vec![
+                "Data".into(),
+                "--ingestion-sync".into(),
+                "none".into(),
+                "--no-verify-cache".into()
+            ])
+            .is_err()
         );
     }
 
@@ -1905,6 +2117,81 @@ mod tests {
         );
     }
 
+    /// LOD defaults to GPU independently of ordinary textures, and explicit CPU survives resume.
+    #[test]
+    fn defaults_to_gpu_lod_and_preserves_explicit_cpu_on_resume() {
+        let cli = parse_cli(vec!["Data".into()]).unwrap();
+        assert_eq!(cli.texture_encoder, TextureEncoder::Cpu);
+        assert_eq!(
+            cli.lod_texture_encoder,
+            TextureEncoder::Gpu {
+                quality: converter::texture_gpu::DEFAULT_QUALITY,
+                batch_mb: converter::texture_gpu::DEFAULT_BATCH_MB,
+            }
+        );
+        let tuned = parse_cli(
+            ["Data", "--gpu-quality", "3", "--gpu-batch-mb", "128"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(tuned.texture_encoder, TextureEncoder::Cpu);
+        assert_eq!(
+            tuned.lod_texture_encoder,
+            TextureEncoder::Gpu {
+                quality: 3,
+                batch_mb: 128
+            }
+        );
+        let cpu = parse_cli(
+            ["Data", "output", "--lod-encoder", "cpu"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(cpu.lod_texture_encoder, TextureEncoder::Cpu);
+        assert!(
+            resume_command("converter", &cpu, Path::new("staging"))
+                .ends_with(" --lod-encoder cpu --ingestion-sync archive --record-reader inhouse")
+        );
+        let resumed = parse_cli(
+            [
+                "Data",
+                "output",
+                "--resume-staging",
+                "staging",
+                "--lod-encoder",
+                "cpu",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(resumed.lod_texture_encoder, cpu.lod_texture_encoder);
+        for option in ["--gpu-quality", "--gpu-batch-mb"] {
+            assert!(
+                parse_cli(
+                    [
+                        "Data",
+                        "--texture-encoder",
+                        "cpu",
+                        "--lod-encoder",
+                        "cpu",
+                        option,
+                        "2"
+                    ]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                )
+                .is_err()
+            );
+        }
+    }
+
     /// The GPU encoder flags reach the parsed configuration.
     #[test]
     fn parses_gpu_texture_options() {
@@ -1932,13 +2219,33 @@ mod tests {
         );
         // GPU settings without the GPU encoder are a mistake, not a no-op.
         let error = parse_cli(
-            ["Data", "--gpu-quality", "3"]
+            ["Data", "--lod-encoder", "cpu", "--gpu-quality", "3"]
                 .into_iter()
                 .map(OsString::from)
                 .collect(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("--texture-encoder gpu"));
+        let lod = parse_cli(
+            ["Data", "--lod-encoder", "gpu", "--gpu-quality", "3"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(lod.texture_encoder, TextureEncoder::Cpu);
+        assert_eq!(
+            lod.lod_texture_encoder,
+            TextureEncoder::Gpu {
+                quality: 3,
+                batch_mb: 256
+            }
+        );
+        assert!(
+            resume_command("converter", &lod, Path::new("staging")).ends_with(
+                " --lod-encoder gpu --gpu-quality 3 --gpu-batch-mb 256 --ingestion-sync archive --record-reader inhouse"
+            )
+        );
     }
 
     #[test]

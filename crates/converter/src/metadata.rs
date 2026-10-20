@@ -17,8 +17,10 @@ use crate::{
     lod::albedo::terrain_diffuse_paths,
     mesh::{MeshConverter, nif_source_hash, nif_unrepaired_source_hash, prune_glb_texture_bytes},
     pipeline::{
-        archive_load_order_priority, compile_lod_chunks, discover, overlay_loose_assets,
+        archive_load_order_priority, compile_lod_chunks, conversion_is_complete, discover,
+        installed_archive_owners, non_mo2_archive_is_active, overlay_loose_assets,
         publish_new_directory, sort_archives_by_load_order, staging_path, validate_artifacts,
+        write_streaming_cost_catalog,
     },
     records::addons::RuntimeSchemas,
 };
@@ -67,6 +69,8 @@ impl AssetPipeline {
     /// Publishes only to a new, disjoint directory. The source package and its
     /// retained GLB/KTX2/Luau bytes are never modified or relabeled in place.
     /// MO2 source selection is unsupported by this package-matched Data route.
+    /// Reader data-loss warnings keep the rebuilt report and manifest incomplete;
+    /// successful compatibility notices do not affect their shared completeness rule.
     pub async fn rebuild_metadata_async(
         mut config: PipelineConfig,
         source_assets: &Path,
@@ -112,11 +116,11 @@ impl AssetPipeline {
                 .map_err(color_eyre::eyre::Error::msg)?,
         )?;
         ensure!(
-            (matches!(manifest.schema_version, 15 | 16 | 19..=24)
+            (matches!(manifest.schema_version, 15 | 16 | 19..=24 | 26)
                 || manifest.schema_version == CONVERTER_SCHEMA_VERSION)
                 && manifest.complete
                 && manifest.failures.is_empty(),
-            "metadata rebuild requires complete converter schema 15, 16, 19 through 24 or {} assets",
+            "metadata rebuild requires complete converter schema 15, 16, 19 through 24, 26 or {} assets",
             CONVERTER_SCHEMA_VERSION
         );
         ensure!(
@@ -128,7 +132,8 @@ impl AssetPipeline {
             .retained_mesh_schema_version
             .unwrap_or(manifest.schema_version);
         ensure!(
-            (matches!(mesh_schema, 15 | 16 | 19..=24) || mesh_schema == CONVERTER_SCHEMA_VERSION)
+            (matches!(mesh_schema, 15 | 16 | 19..=24 | 26)
+                || mesh_schema == CONVERTER_SCHEMA_VERSION)
                 && mesh_schema <= manifest.schema_version,
             "unsupported retained mesh cache contract"
         );
@@ -183,6 +188,15 @@ impl AssetPipeline {
                 return Err(error);
             }
         };
+        // The rebuilt manifest is final here; the catalog must describe exactly those bytes.
+        // Like the normal route, a catalog failure fails the rebuild before publication.
+        if let Err(error) = write_streaming_cost_catalog(&staging) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        report.artifacts.push(PathBuf::from(
+            shared::streaming_costs::STREAMING_COST_FILE_NAME,
+        ));
         let publication_started = Instant::now();
         if let Err(error) = publish_new_directory(&staging, &config.output_dir, &output_lock) {
             let _ = fs::remove_dir_all(&staging);
@@ -274,11 +288,24 @@ fn settings_for_source_reader(
     schemas: RuntimeSchemas,
 ) -> Result<PipelineConfig> {
     let reader: crate::config::RecordReader = serde_json::from_value(identity["mode"].clone())?;
+    // A pack's string-table language changes its database text, never its asset bytes, so a
+    // pack read in any language proves its assets; the proof is checked in that language.
+    let language = identity["language"]
+        .as_str()
+        .unwrap_or(crate::config::DEFAULT_LANGUAGE)
+        .to_owned();
     ensure!(
-        identity == &crate::esm::inhouse::reader_identity_with_schemas(reader, &schemas)
+        identity
+            == &crate::esm::inhouse::reader_identity_with_schemas_in_language(
+                reader, &schemas, &language
+            )
             || (reader == crate::config::RecordReader::Inhouse
-                && crate::cache::inhouse_adapter10_reader_identity(&schemas).as_ref()
-                    == Some(identity))
+                && [
+                    crate::cache::inhouse_adapter10_reader_identity(&schemas),
+                    crate::cache::inhouse_adapter11_reader_identity(&schemas),
+                ]
+                .iter()
+                .any(|prior| prior.as_ref() == Some(identity)))
             || (reader == crate::config::RecordReader::Legacy
                 && (identity == &serde_json::json!({"mode": "legacy"})
                     || identity
@@ -290,6 +317,7 @@ fn settings_for_source_reader(
     );
     let mut settings = config.clone();
     settings.record_reader = reader;
+    settings.language = language;
     settings.schema_addons.clear();
     settings.runtime_schemas = Some(Arc::new(schemas));
     Ok(settings)
@@ -350,7 +378,7 @@ fn matched_plugins(source: &Path, data: &Path) -> Result<(Vec<PathBuf>, Vec<Stri
             "invalid plugin name {name}"
         );
         ensure!(
-            seen.insert(crate::esm::load_order::normalize_plugin_name(&name)),
+            seen.insert(shared::plugin_selection::normalize_plugin_name(&name)),
             "duplicate plugin name {name}"
         );
         let path = data.join(&name);
@@ -389,10 +417,7 @@ async fn rebuild_into(
     let (retained, replay_verified_pruned_assets) =
         copy_verified_assets(source, staging, manifest)?;
     let provenance = MetadataProvenance {
-        record_reader: crate::esm::inhouse::reader_identity_with_schemas(
-            config.record_reader,
-            config.schemas()?.as_ref(),
-        ),
+        record_reader: crate::esm::inhouse::configured_reader_identity(config)?,
         retained_asset_record_reader: retained_reader.clone(),
         retained_asset_schema_json: retained_schemas.addon_bytes().map(<[u8]>::to_vec).collect(),
         source_converter_schema: manifest.schema_version,
@@ -409,6 +434,15 @@ async fn rebuild_into(
         replay_verified_pruned_assets,
     };
     let mut report = PipelineReport {
+        load_order: plugins
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect(),
         cache_hits: retained.len() as u64,
         pruned_texture_references: manifest
             .pruned_texture_references
@@ -430,6 +464,9 @@ async fn rebuild_into(
     )
     .await;
     let files = discover(&config.data_dir)?;
+    // Keep the checksum-matched source package's plugin order authoritative. Current installed
+    // identities prevent a surviving prefix from reactivating a more specific omitted owner.
+    let archive_owners = installed_archive_owners(&config.data_dir, &files, plugins);
     let mut archives: Vec<_> = files
         .iter()
         .filter(|path| {
@@ -441,7 +478,13 @@ async fn rebuild_into(
         .cloned()
         .collect();
     archives.retain(|archive| {
-        if archive_load_order_priority(archive, plugins).is_some() {
+        if !non_mo2_archive_is_active(archive, &archive_owners) {
+            report.lod_warnings.push(format!(
+                "LOD extraction omitted archive {}: installed owner is absent from source-package plugin order",
+                archive.display()
+            ));
+            false
+        } else if archive_load_order_priority(archive, plugins).is_some() {
             true
         } else {
             report.lod_warnings.push(format!(
@@ -475,7 +518,7 @@ async fn rebuild_into(
     .await;
     let database = staging.join("skyrim_world.db");
     if config.record_reader == crate::config::RecordReader::Inhouse {
-        let strings = crate::esm::inhouse::localized_string_paths(plugins);
+        let strings = crate::esm::inhouse::localized_string_paths(plugins, &config.language);
         for archive in &archives {
             // Strings are metadata inputs; decode only the selected plugin tables.
             if let Err(error) = ArchiveExtractor::extract_paths(archive, &vfs, &strings) {
@@ -486,26 +529,33 @@ async fn rebuild_into(
             }
         }
     }
-    let merged = EsmParser::convert_plugins_with_reader_and_schemas(
+    let conversion = EsmParser::convert_plugins_with_reader_and_schemas(
         plugins,
         &database,
         config.record_reader,
         &vfs,
+        &config.language,
         Some(config.schemas()?.as_ref()),
     )?;
+    // This fresh read owns record completeness independently of the retained assets.
+    manifest.record_data_complete = Some(conversion.warnings.is_empty());
+    report.warnings.extend(conversion.warnings);
+    report.notices.extend(conversion.notices);
+    let phases = conversion.phases;
+    let merged = conversion.records;
     validate_database(&Connection::open(&database)?)?;
     if config.record_reader == crate::config::RecordReader::Inhouse {
+        crate::esm::inhouse::write_database_profile(staging, &database, &phases)?;
         crate::esm::inhouse::write_terrain_caches(&merged, &database, staging)?;
     } else {
         write_cell_cache(&merged, &staging.join("cell_cache.rkyv"))?;
     }
-    crate::esm::inhouse::write_reader_identity_with_schemas(
-        staging,
-        config.record_reader,
-        config.schemas()?.as_ref(),
-    )?;
+    crate::esm::inhouse::write_configured_reader_identity(staging, config)?;
     report.artifacts.push(PathBuf::from("record-reader.json"));
     if config.record_reader == crate::config::RecordReader::Inhouse {
+        report
+            .artifacts
+            .push(PathBuf::from(crate::esm::inhouse::DATABASE_PROFILE_FILE));
         report
             .artifacts
             .push(PathBuf::from("inhouse-reader-diagnostics.json"));
@@ -607,6 +657,8 @@ async fn rebuild_into(
     manifest.schema_addons = config.schemas()?.identities().to_vec();
     // No archive extraction cache is copied by this route.
     manifest.archives.clear();
+    report.complete = conversion_is_complete(&report);
+    manifest.complete = report.complete;
     manifest.save(&staging.join("conversion-manifest.json"))?;
     fs::write(
         staging.join("metadata-source-conversion-manifest.json"),
@@ -621,7 +673,6 @@ async fn rebuild_into(
         PathBuf::from("metadata-rebuild.json"),
         PathBuf::from("metadata-source-conversion-manifest.json"),
     ]);
-    report.complete = true;
     progress_event(
         progress,
         ProgressStage::Publishing,
@@ -918,63 +969,142 @@ mod metadata_schema_controls {
         assert!(rx.try_recv().is_err());
     }
 
-    const ORIGINAL: &[u8] = br#"{"version":1,"name":"original_source","records":[{"signature":"ZMEX","source":"synthetic metadata fixture","fields":[{"signature":"SCAL","name":"value","kind":"u32"}]}]}"#;
-    const REQUESTED: &[u8] = br#"{"version":1,"name":"requested_output","records":[{"signature":"ZMEX","source":"synthetic metadata fixture","fields":[{"signature":"SCAL","name":"value","kind":"i32"}]}]}"#;
-
-    /// Previous adapter-10 assets retain the exact original schema and reject unproven variants.
+    /// The metadata route must ship a sidecar for its rebuilt manifest. A stale sidecar linked
+    /// from the source pack is unlinked, never written through, and the incomplete-reader note
+    /// still reaches the catalog.
     #[test]
-    fn adapter10_source_settings_require_original_saved_schema_and_identity() {
-        let original = RuntimeSchemas::from_addon_bytes(&[ORIGINAL]).unwrap();
-        let mut identity =
-            crate::esm::inhouse::reader_identity_with_schemas(RecordReader::Inhouse, &original);
-        identity["adapter_version"] = serde_json::json!(10);
-        let mut config = PipelineConfig::new("Data", "output");
-        config.record_reader = RecordReader::Inhouse;
-        config
-            .schema_addons
-            .push("missing-current-addon.json".into());
-        config.runtime_schemas = Some(Arc::new(
-            RuntimeSchemas::from_addon_bytes(&[REQUESTED]).unwrap(),
-        ));
-        let recovered = settings_for_source_reader(&config, &identity, original);
+    fn metadata_rebuild_catalog_describes_the_final_manifest_and_leaves_the_source_alone() {
+        use shared::streaming_costs::{STREAMING_COST_FILE_NAME, StreamingCostCatalog};
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let staging = temp.path().join("staging");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(source.join(STREAMING_COST_FILE_NAME), b"source catalog").unwrap();
+        fs::hard_link(
+            source.join(STREAMING_COST_FILE_NAME),
+            staging.join(STREAMING_COST_FILE_NAME),
+        )
+        .unwrap();
+        let manifest = ConversionManifest {
+            complete: false,
+            ..Default::default()
+        };
+        manifest
+            .save(&staging.join("conversion-manifest.json"))
+            .unwrap();
+        let manifest_bytes = fs::read(staging.join("conversion-manifest.json")).unwrap();
+
+        write_streaming_cost_catalog(&staging).unwrap();
+
+        let catalog = StreamingCostCatalog::load(
+            &staging.join(STREAMING_COST_FILE_NAME),
+            &hash_bytes(&manifest_bytes),
+        )
+        .unwrap();
         assert!(
-            recovered.is_ok(),
-            "adapter-10 producer identity must be retained: {recovered:?}"
+            catalog
+                .notes
+                .iter()
+                .any(|note| note.contains("manifest is incomplete")),
+            "incomplete rebuild must keep its unknown-resource note"
         );
-        let recovered = recovered.unwrap();
-        assert!(recovered.schema_addons.is_empty());
         assert_eq!(
-            recovered.schemas().unwrap().addon_bytes().next().unwrap(),
-            ORIGINAL
+            fs::read(source.join(STREAMING_COST_FILE_NAME)).unwrap(),
+            b"source catalog",
+            "the source pack's catalog must not change through a shared link"
         );
-        assert_eq!(identity["adapter_version"], 10);
-        assert_eq!(crate::esm::inhouse::ADAPTER_VERSION, 11);
         assert!(
-            settings_for_source_reader(
-                &config,
-                &identity,
-                RuntimeSchemas::from_addon_bytes(&[REQUESTED]).unwrap()
+            StreamingCostCatalog::load(
+                &source.join(STREAMING_COST_FILE_NAME),
+                &hash_bytes(&manifest_bytes),
             )
             .is_err()
         );
-        for (key, value) in [
-            ("adapter_version", serde_json::json!(8)),
-            ("schema_sha256", serde_json::json!("different-schema")),
-            ("schema_addons", serde_json::json!([])),
-            ("language", serde_json::json!("french")),
-            ("extra", serde_json::json!(true)),
-        ] {
-            let mut altered = identity.clone();
-            altered[key] = value;
+    }
+
+    const ORIGINAL: &[u8] = br#"{"version":1,"name":"original_source","records":[{"signature":"ZMEX","source":"synthetic metadata fixture","fields":[{"signature":"SCAL","name":"value","kind":"u32"}]}]}"#;
+    const REQUESTED: &[u8] = br#"{"version":1,"name":"requested_output","records":[{"signature":"ZMEX","source":"synthetic metadata fixture","fields":[{"signature":"SCAL","name":"value","kind":"i32"}]}]}"#;
+
+    /// A pack read in another language proves its assets in that language: the language
+    /// changes database text, never asset bytes.
+    #[test]
+    fn source_settings_accept_a_pack_read_in_another_language() {
+        let schemas = || RuntimeSchemas::from_addon_bytes(&[]).unwrap();
+        let identity = crate::esm::inhouse::reader_identity_with_schemas_in_language(
+            RecordReader::Inhouse,
+            &schemas(),
+            "german",
+        );
+        let mut config = PipelineConfig::new("Data", "output");
+        config.record_reader = RecordReader::Inhouse;
+        let settings = settings_for_source_reader(&config, &identity, schemas()).unwrap();
+        assert_eq!(settings.language, "german");
+        assert_eq!(
+            crate::esm::inhouse::configured_reader_identity(&settings).unwrap(),
+            identity
+        );
+        let mut altered = identity.clone();
+        altered["string_table_encoding"] = serde_json::json!("windows-1252");
+        assert!(settings_for_source_reader(&config, &altered, schemas()).is_err());
+    }
+
+    /// Known prior adapters retain the exact original schema and reject unproven variants.
+    #[test]
+    fn adapter10_source_settings_require_original_saved_schema_and_identity() {
+        for adapter in [10, 11] {
+            let original = RuntimeSchemas::from_addon_bytes(&[ORIGINAL]).unwrap();
+            let mut identity =
+                crate::esm::inhouse::reader_identity_with_schemas(RecordReader::Inhouse, &original);
+            identity["adapter_version"] = serde_json::json!(adapter);
+            let mut config = PipelineConfig::new("Data", "output");
+            config.record_reader = RecordReader::Inhouse;
+            config
+                .schema_addons
+                .push("missing-current-addon.json".into());
+            config.runtime_schemas = Some(Arc::new(
+                RuntimeSchemas::from_addon_bytes(&[REQUESTED]).unwrap(),
+            ));
+            let recovered = settings_for_source_reader(&config, &identity, original);
+            assert!(
+                recovered.is_ok(),
+                "adapter-{adapter} producer identity must be retained: {recovered:?}"
+            );
+            let recovered = recovered.unwrap();
+            assert!(recovered.schema_addons.is_empty());
+            assert_eq!(
+                recovered.schemas().unwrap().addon_bytes().next().unwrap(),
+                ORIGINAL
+            );
+            assert_eq!(identity["adapter_version"], adapter);
+            assert_eq!(crate::esm::inhouse::ADAPTER_VERSION, 12);
             assert!(
                 settings_for_source_reader(
                     &config,
-                    &altered,
-                    RuntimeSchemas::from_addon_bytes(&[ORIGINAL]).unwrap()
+                    &identity,
+                    RuntimeSchemas::from_addon_bytes(&[REQUESTED]).unwrap()
                 )
-                .is_err(),
-                "accepted altered {key}"
+                .is_err()
             );
+            for (key, value) in [
+                ("adapter_version", serde_json::json!(8)),
+                ("schema_sha256", serde_json::json!("different-schema")),
+                ("schema_addons", serde_json::json!([])),
+                ("language", serde_json::json!("french")),
+                ("extra", serde_json::json!(true)),
+            ] {
+                let mut altered = identity.clone();
+                altered[key] = value;
+                assert!(
+                    settings_for_source_reader(
+                        &config,
+                        &altered,
+                        RuntimeSchemas::from_addon_bytes(&[ORIGINAL]).unwrap()
+                    )
+                    .is_err(),
+                    "accepted altered {key}"
+                );
+            }
         }
     }
 

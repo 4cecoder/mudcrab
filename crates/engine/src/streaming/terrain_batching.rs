@@ -1687,6 +1687,65 @@ mod tests {
     }
 
     #[test]
+    fn stationary_batch_retirement_reselects_held_quadrants_without_a_camera_move() {
+        let mut app = selection_app();
+        let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        // A coarser unbatched neighbour lives in the same quadrant as the Tier4 sources.
+        let held = app
+            .world_mut()
+            .spawn((
+                TerrainCoverage {
+                    grid: IVec2::ZERO,
+                    quadrant: 0,
+                    tier: Some(LodTier::Tier8),
+                },
+                TerrainSurfaceReady,
+                Visibility::Hidden,
+            ))
+            .id();
+        ready_source(&mut app, &fixture);
+        queue_source(&mut app, &fixture);
+        app.update();
+        acknowledge_uploads(&app, fixture.root);
+        app.update();
+        assert!(
+            app.world()
+                .get::<LodTerrainBatches>(fixture.root)
+                .unwrap()
+                .source_children
+                .is_none(),
+            "the initial sources were replaced by the batch"
+        );
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(held).unwrap(),
+            Visibility::Hidden
+        );
+        let revision = app.world().resource::<LodStreaming>().visibility_revision;
+
+        // Retiring the batch chunk without a camera move must reselect the held quadrant
+        // from its own remaining tiers instead of waiting for the next crossing.
+        app.world_mut().entity_mut(fixture.root).despawn();
+        app.update();
+        assert_eq!(
+            app.world().resource::<LodStreaming>().visibility_revision,
+            revision + 1,
+            "a batch retirement refreshes the selection without a camera move"
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(held).unwrap(),
+            Visibility::Inherited,
+            "the held Tier8 becomes the quadrant's selection once the batch's Tier4 is gone"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .visible_lod_terrain_patches,
+            1
+        );
+    }
+
+    #[test]
     fn transfer_tracking_expires_with_missing_events_and_without_a_camera() {
         let mut app = selection_app();
         app.update();
@@ -2391,5 +2450,71 @@ mod tests {
                 .is_some()
         );
         assert_eq!(app.world().resource::<StreamingCommitBudget>().commits, 1);
+    }
+
+    #[test]
+    fn request_controls_keep_original_lod_sources_without_generated_batches() {
+        use super::super::{LodChunkRoot, batch_ready_lod_chunks};
+        use crate::streaming::StreamingCommitBudget;
+        use shared::lod::{ChunkAnchor, ChunkKey, LodOrigin};
+        let mut app = test_app();
+        app.insert_resource(EngineConfig {
+            prioritize_streaming: true,
+            max_commit_micros_per_frame: 1_000_000,
+            ..default()
+        })
+        .init_resource::<StreamingCommitBudget>()
+        .init_resource::<LodStreaming>()
+        .init_resource::<ProfilingState>();
+        let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        app.world_mut().entity_mut(fixture.root).insert((
+            LodChunkRoot {
+                key: ChunkKey::new(1, LodTier::Tier4, ChunkAnchor::new(0, 0)),
+                generation: 1,
+                origin: LodOrigin::new(0, 0),
+                retry_count: 0,
+            },
+            PendingLodTerrainBatching {
+                source: fixture.source.clone(),
+                patches: fixture.patches.clone(),
+            },
+            Visibility::Inherited,
+        ));
+        for &(patch, coverage) in &fixture.patches {
+            app.world_mut()
+                .entity_mut(patch)
+                .insert((coverage, TerrainSurfaceReady));
+        }
+        {
+            let mut budget = app.world_mut().resource_mut::<StreamingCommitBudget>();
+            budget.remaining = 1;
+            budget.frame_started = std::time::Instant::now();
+        }
+        app.world_mut()
+            .run_system_once(batch_ready_lod_chunks)
+            .unwrap();
+        assert!(
+            app.world().get::<LodTerrainBatches>(fixture.root).is_none(),
+            "request-controlled runs must not activate generated batches"
+        );
+        assert!(
+            !app.world()
+                .entity(fixture.root)
+                .contains::<PendingLodTerrainBatching>(),
+            "the pending conversion is dropped rather than retried under controls"
+        );
+        assert!(
+            fixture
+                .primitives
+                .iter()
+                .all(|&entity| app.world().get_entity(entity).is_ok()),
+            "original LOD source hierarchy stays alive under request controls"
+        );
+        assert_eq!(app.world().resource::<StreamingCommitBudget>().commits, 0);
+        assert!(
+            app.world()
+                .resource::<LodStreaming>()
+                .terrain_batch_controls_warned
+        );
     }
 }

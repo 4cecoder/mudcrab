@@ -379,6 +379,8 @@ pub struct SettleCounts {
     pub quiet_frames: u32,
     pub pending_lod_queries: usize,
     pub pending_lod_chunks: usize,
+    /// Failed LOD queries and chunks since this shot started settling (the run's counters are
+    /// cumulative; see [`Failures`]).
     pub failed_lod_work: u64,
     pub outstanding_terrain_uploads: usize,
     pub pending_batch_cpu: usize,
@@ -396,6 +398,7 @@ pub struct Failures {
     pub failed_cells: u64,
     pub asset_load_failures: u64,
     pub validation_failures: u64,
+    pub failed_lod_work: u64,
 }
 
 impl Failures {
@@ -410,6 +413,9 @@ impl Failures {
                 .saturating_add(streaming.water_validation_failures)
                 .saturating_add(streaming.transform_bounds_validation_failures)
                 .saturating_add(renderer.renderer_validation_failures),
+            failed_lod_work: streaming
+                .failed_lod_queries
+                .saturating_add(streaming.failed_lod_chunks),
         }
     }
 }
@@ -443,9 +449,7 @@ impl SettleCounts {
             quiet_frames,
             pending_lod_queries: streaming.pending_lod_queries,
             pending_lod_chunks: streaming.pending_lod_chunks,
-            failed_lod_work: streaming
-                .failed_lod_queries
-                .saturating_add(streaming.failed_lod_chunks),
+            failed_lod_work: now.failed_lod_work.saturating_sub(baseline.failed_lod_work),
             ..default()
         }
     }
@@ -867,9 +871,6 @@ fn run_shots(
             );
             counts.pending_lod_queries = streaming.pending_lod_queries;
             counts.pending_lod_chunks = streaming.pending_lod_chunks;
-            counts.failed_lod_work = streaming
-                .failed_lod_queries
-                .saturating_add(streaming.failed_lod_chunks);
             counts.outstanding_terrain_uploads = uploads.outstanding();
             counts.pending_batch_cpu = profiler
                 .gauge("lod/pending_terrain_batch_chunks")
@@ -966,7 +967,7 @@ fn request_capture(commands: &mut Commands, run: &mut ShotsRun, request_frame: u
         run.advance();
         return;
     }
-    let ticket = crate::capture_frame::CaptureTicket::default();
+    let ticket = crate::capture_frame::CaptureTicket::new(run.failure_baseline);
     let observed = ticket.clone();
     let position = shot.position;
     let rotation = shot_camera_rotation(shot.yaw, shot.pitch).to_array();
@@ -1691,6 +1692,8 @@ mod tests {
             terrain_validation_failures: 1,
             water_validation_failures: 1,
             transform_bounds_validation_failures: 1,
+            failed_lod_queries: 2,
+            failed_lod_chunks: 3,
             ..StreamingMetrics::default()
         };
         let renderer = RendererMetrics {
@@ -1708,6 +1711,7 @@ mod tests {
             failed_cells: 1,
             asset_load_failures: 2,
             validation_failures: 5,
+            failed_lod_work: 5,
             renderer_ready: true,
             quiet_frames: 7,
             ..default()
@@ -1723,9 +1727,10 @@ mod tests {
             (
                 quiet.failed_cells,
                 quiet.asset_load_failures,
-                quiet.validation_failures
+                quiet.validation_failures,
+                quiet.failed_lod_work
             ),
-            (0, 0, 0)
+            (0, 0, 0, 0)
         );
         let idle = StreamingMetrics {
             failed_cells: metrics.failed_cells,
@@ -1734,6 +1739,8 @@ mod tests {
             terrain_validation_failures: metrics.terrain_validation_failures,
             water_validation_failures: metrics.water_validation_failures,
             transform_bounds_validation_failures: metrics.transform_bounds_validation_failures,
+            failed_lod_queries: metrics.failed_lod_queries,
+            failed_lod_chunks: metrics.failed_lod_chunks,
             ..StreamingMetrics::default()
         };
         let mut idle_counts = SettleCounts::read(&idle, &renderer, baseline, true, 0);
@@ -1742,11 +1749,40 @@ mod tests {
         assert!(idle_counts.is_quiet());
         let later = StreamingMetrics {
             failed_cells: metrics.failed_cells + 1,
+            failed_lod_chunks: metrics.failed_lod_chunks + 1,
             ..idle
         };
         let fresh = SettleCounts::read(&later, &renderer, baseline, true, 0);
-        assert_eq!(fresh.failed_cells, 1);
+        assert_eq!((fresh.failed_cells, fresh.failed_lod_work), (1, 1));
         assert!(!fresh.is_quiet());
+    }
+
+    /// The baseline frozen into a capture request is the one its receipt is judged against, so
+    /// the settled frame's own check sees the same failures as the settle rule did.
+    #[test]
+    fn a_capture_request_freezes_the_shot_failure_baseline() {
+        let output = tempfile::tempdir().unwrap();
+        let mut run = ShotsRun::new(reference_file(), output.path().into(), 60);
+        run.failure_baseline = Failures {
+            failed_cells: 1,
+            asset_load_failures: 2,
+            validation_failures: 3,
+            failed_lod_work: 4,
+        };
+        let mut world = bevy::ecs::world::World::new();
+        {
+            let mut commands = world.commands();
+            request_capture(&mut commands, &mut run, 7);
+        }
+        world.flush();
+        let mut query = world.query::<&crate::capture_frame::CaptureTicket>();
+        let ticket = query
+            .single(&world)
+            .expect("the request spawned its ticket");
+        assert_eq!(ticket.baseline(), run.failure_baseline);
+        assert!(ticket.receipt().is_none(), "nothing has been captured yet");
+        assert_eq!(run.phase, Phase::Capture);
+        assert!(!output.path().join("tower-east-0.png").exists());
     }
 
     #[test]

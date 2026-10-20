@@ -1,5 +1,6 @@
 use crate::{
     config::{EngineConfig, MAX_IO_THREADS},
+    console::{ConsolePlugin, console_closed},
     metrics::AcceptanceMetricsPlugin,
     physics::{MovementTuning, PhysicsFixturePlugin, WorldPlayerPlugin},
     profiling::{ProfilingPlugin, ProfilingState},
@@ -31,6 +32,7 @@ use bevy::{
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     light::{CascadeShadowConfig, CascadeShadowConfigBuilder, DirectionalLightShadowMap},
     log::{Level, LogPlugin},
+    math::DVec3,
     prelude::*,
     render::diagnostic::RenderDiagnosticsPlugin,
     render::occlusion_culling::OcclusionCulling,
@@ -94,6 +96,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         None
     };
+    if reads_asset_tree {
+        crate::streaming::requests::validate_pack_identity(&config).wrap_err_with(|| {
+            format!(
+                "cannot read the converted pack manifest under {}",
+                config.assets_dir.display()
+            )
+        })?;
+    }
     let runtime_data = if config.streaming_fixture {
         let database_path = config.assets_dir.join("skyrim_world.db");
         Some((
@@ -127,8 +137,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         && !config.streaming_fixture)
         .then(|| MovementTuning::from_world_database(&config.assets_dir.join("skyrim_world.db")))
         .transpose()?;
-    let benchmark_active =
-        config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some();
+    let benchmark_active = config.benchmark_frames.is_some()
+        || config.benchmark_duration_secs.is_some()
+        || config.streaming_benchmark_route_speed.is_some();
     configure_benchmark_priority(benchmark_active)?;
     let window = (!config.headless || shots_active || config.hidden_window).then(|| Window {
         title: config.window_title(),
@@ -145,7 +156,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         } else {
             WindowPosition::Automatic
         },
-        present_mode: if benchmark_active {
+        present_mode: if benchmark_active && !config.benchmark_vsync {
             PresentMode::AutoNoVsync
         } else {
             PresentMode::AutoVsync
@@ -206,13 +217,24 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
             crate::mesh_residency_audit::MeshResidencyAuditPlugin,
             SkyPlugin,
+            ConsolePlugin,
             crate::nif_material::NifMaterialPlugin,
+            crate::emittance::EmittancePlugin,
         ))
         // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
         // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
         .add_plugins(crate::lights::LightsPlugin)
-        .add_systems(Update, (fly_camera, capture_acceptance_screenshot))
         .add_systems(PostUpdate, keep_windows_hidden);
+    add_camera_and_capture_systems(&mut app);
+    if app
+        .world()
+        .resource::<EngineConfig>()
+        .streaming_benchmark_route_speed
+        .is_some()
+    {
+        app.init_resource::<StreamingBenchmarkRoute>()
+            .add_systems(PreUpdate, drive_streaming_benchmark_route);
+    }
     if let Some((database, catalog, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
             .insert_resource(catalog)
@@ -221,7 +243,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .add_plugins(StreamingPlugin);
         app.add_systems(Startup, setup_world);
         if interactive_world_physics {
-            app.add_plugins(WorldPlayerPlugin);
+            app.add_plugins((WorldPlayerPlugin, crate::door_crossing::DoorCrossingPlugin));
+            // `coc`/`coe` move the player, so they come with it, as `tcl` does: a run without a
+            // player (a benchmark, `--shots`, headless) lists neither in Help.
+            crate::cell_commands::register_cell_commands(&mut app);
         }
         if app.world().resource::<EngineConfig>().streaming_fixture {
             app.init_resource::<StreamingFixtureState>()
@@ -347,10 +372,10 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         return Ok(None);
     };
     color_eyre::eyre::ensure!(
-        config.shots.is_none() || config.matched_route.is_none(),
-        "--shots and --matched-route cannot be combined: pass only one of them"
+        !(config.shots.is_some() && config.matched_route.is_some()),
+        "--shots and --matched-route cannot be used together; choose one camera driver"
     );
-    let option = if config.matched_route.is_some() {
+    let mode = if config.matched_route.is_some() {
         "--matched-route"
     } else {
         "--shots"
@@ -368,12 +393,12 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         || config.physics_fixture;
     color_eyre::eyre::ensure!(
         !other_mode,
-        "{option} renders the converted world on its own: it cannot be combined with a benchmark, \
+        "{mode} renders the converted world on its own: it cannot be combined with a benchmark, \
          an acceptance screenshot, --auto-fly-speed or a fixture"
     );
     if config.headless {
         // The logger is not installed yet, so a `warn!` here would never be seen.
-        eprintln!("warning: {option} photographs the window, so --headless is ignored");
+        eprintln!("warning: {mode} photographs the window, so --headless is ignored");
     }
     let (file, checkpoints) = if config.matched_route.is_some() {
         let (file, checkpoints) = crate::matched_route::MatchedRoute::load(&path)?.expand()?;
@@ -547,10 +572,13 @@ impl StreamingFixtureDirectory {
     fn populate(&self, worldspace_id: u32, start_grid: (i32, i32)) -> Result<()> {
         let database_path = self.path.join("skyrim_world.db");
         let connection = Connection::open(&database_path)?;
+        connection.execute("CREATE TABLE schema_info(version INTEGER NOT NULL)", [])?;
+        connection.execute(
+            "INSERT INTO schema_info VALUES(?1)",
+            [shared::WORLD_DATABASE_SCHEMA_VERSION],
+        )?;
         connection.execute_batch(
-            r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
-            INSERT INTO schema_info VALUES(7);
-            CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
+            r#"CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
             CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,editor_id TEXT,parent_world INTEGER,flags INTEGER,lod_origin_x INTEGER,lod_origin_y INTEGER);
             CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
             CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
@@ -627,8 +655,8 @@ struct StreamingFixtureState {
 /// way a door crossing will load one; the camera then carries on over exteriors far outside the
 /// unload radius and comes back. The contract is that the interior never exists twice and its
 /// references match its root. Today it also stays loaded throughout (an interior has no grid
-/// square, so [`cell_within_unload_radius`](crate::streaming) keeps it, and no runtime path unloads
-/// one); that is current behaviour, not part of the contract.
+/// square, so [`cell_within_unload_radius`](crate::streaming) keeps it, and only a space switch
+/// unloads one); that is current behaviour, not part of the contract.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 struct InteriorCrossing {
     requested_frame: Option<u32>,
@@ -749,12 +777,14 @@ fn cross_streaming_fixture_interior(
         if state.frames < STREAMING_FIXTURE_INTERIOR_FRAME {
             return;
         }
-        streaming.request_cell(
+        if !streaming.request_cell(
             &database,
             CellKey::Interior(STREAMING_FIXTURE_INTERIOR_CELL_ID),
             &mut metrics,
             &mut profiler,
-        );
+        ) {
+            return;
+        }
         state.interior.requested_frame = Some(state.frames);
         state.interior_center = center;
         profiler.event("streaming-fixture", "interior_requested", None);
@@ -1971,7 +2001,9 @@ fn sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig {
 /// walk-around view from behind and above it. [`sun_shadow_cascades`] measures its range from the
 /// camera, so the offsets live here rather than in two places.
 fn camera_offset(config: &EngineConfig) -> Vec3 {
-    if config.acceptance_screenshot.is_some() {
+    if config.streaming_benchmark_route_speed.is_some() {
+        Vec3::new(0.0, 6000.0, 0.0)
+    } else if config.acceptance_screenshot.is_some() {
         config
             .screenshot_camera_offset
             .map(Vec3::from)
@@ -2000,6 +2032,9 @@ fn setup_world(
     let camera_transform = if config.interactive_world_physics() {
         Transform::from_translation(camera_position)
             .looking_at(camera_position + Vec3::NEG_Z, Vec3::Y)
+    } else if config.streaming_benchmark_route_speed.is_some() {
+        Transform::from_translation(camera_position)
+            .looking_at(target + Vec3::new(0.0, 0.0, -8000.0), Vec3::Y)
     } else {
         Transform::from_translation(camera_position).looking_at(target, Vec3::Y)
     };
@@ -2061,35 +2096,260 @@ fn initial_camera_ground_height(
     database_path: &std::path::Path,
     cache: &CellCache,
 ) -> Result<f32> {
+    Ok(cell_centre_ground_height(
+        config.worldspace_id,
+        config.start_grid,
+        database_path,
+        cache,
+    )?
+    .unwrap_or(0.0))
+}
+
+/// The terrain height at the middle of one exterior cell, or `None` when the cell has no terrain
+/// (or the cache has no height there).
+fn cell_centre_ground_height(
+    worldspace_id: u32,
+    grid: (i32, i32),
+    database_path: &std::path::Path,
+    cache: &CellCache,
+) -> Result<Option<f32>> {
     let connection = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .wrap_err_with(|| format!("failed to open {}", database_path.display()))?;
     let cell_id = connection
         .query_row(
             crate::world::database::EXTERIOR_CELL_ID_SQL,
-            params![
-                config.worldspace_id,
-                config.start_grid.0,
-                config.start_grid.1
-            ],
+            params![worldspace_id, grid.0, grid.1],
             |row| row.get::<_, u32>(0),
         )
         .optional()?;
-    let Some(terrain) = cell_id.and_then(|cell_id| cache.terrain(cell_id)) else {
-        return Ok(0.0);
-    };
-    let width = usize::from(terrain.width);
-    let height = usize::from(terrain.height);
-    let center = (height / 2)
-        .checked_mul(width)
-        .and_then(|row| row.checked_add(width / 2));
-    Ok(center
-        .and_then(|index| terrain.heights.get(index))
-        .copied()
-        .unwrap_or(0.0))
+    Ok(cell_id.and_then(|cell_id| cache.centre_height(cell_id)))
+}
+
+/// Where `--benchmark-jump` puts the camera: the middle of exterior cell `grid`, at that cell's
+/// ground height plus the same height offset `setup_world` gives the start position, in the
+/// coordinates of the current render `origin`.
+pub(crate) fn benchmark_jump_position(
+    config: &EngineConfig,
+    cache: &CellCache,
+    origin: IVec2,
+    grid: (i32, i32),
+) -> Vec3 {
+    let database_path = config.assets_dir.join("skyrim_world.db");
+    let ground_height =
+        match cell_centre_ground_height(config.worldspace_id, grid, &database_path, cache) {
+            Ok(Some(height)) => height,
+            // A jump target with no terrain is legitimate (a cell past the map edge the run may
+            // still want to view), but a silent 0 puts the camera at the wrong height, so say so.
+            Ok(None) => {
+                warn!(
+                    grid_x = grid.0,
+                    grid_y = grid.1,
+                    "benchmark jump: no terrain at the target cell, using ground height 0"
+                );
+                0.0
+            }
+            Err(error) => {
+                warn!(%error, "benchmark jump: ground height unavailable, using 0");
+                0.0
+            }
+        };
+    jump_camera_position(grid, origin, ground_height + camera_offset(config).y)
+}
+
+/// The middle of grid square `grid` at height `y`, in the render space around `origin`: +x is east,
+/// +grid_y runs towards -z.
+fn jump_camera_position(grid: (i32, i32), origin: IVec2, y: f32) -> Vec3 {
+    Vec3::new(
+        ((grid.0 - origin.x) as f32 + 0.5) * crate::world::components::CELL_SIZE,
+        y,
+        -((grid.1 - origin.y) as f32 + 0.5) * crate::world::components::CELL_SIZE,
+    )
 }
 
 const CELL_SIZE_HALF: f32 = crate::world::components::CELL_SIZE * 0.5;
 const AUTO_FLIGHT_HALF_SPAN: f32 = crate::world::components::CELL_SIZE * 4.0;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StreamingBenchmarkPhase {
+    #[default]
+    Waiting,
+    Moving,
+    Tail,
+    Finished,
+}
+
+/// An opt-in real-clock camera workload. CPU settlement plus a fixed quiet
+/// interval does not certify GPU preparation or collision safety.
+#[derive(Resource, Debug, Default)]
+pub(crate) struct StreamingBenchmarkRoute {
+    pub phase: StreamingBenchmarkPhase,
+    pub cpu_settled_real_seconds: Option<f64>,
+    pub movement_started_real_seconds: Option<f64>,
+    pub movement_finished_real_seconds: Option<f64>,
+    pub tail_finished_real_seconds: Option<f64>,
+    pub latest_real_seconds: f64,
+    pub route_distance_units: f64,
+    pub start_world_position: Option<[f64; 3]>,
+}
+
+impl StreamingBenchmarkRoute {
+    fn advance(&mut self, now: f64, cpu_ready: bool, config: &EngineConfig) {
+        self.latest_real_seconds = now;
+        let speed = config.streaming_benchmark_route_speed.unwrap_or(0.0);
+        if self.phase == StreamingBenchmarkPhase::Waiting {
+            if !cpu_ready {
+                self.cpu_settled_real_seconds = None;
+                return;
+            }
+            let settled = *self.cpu_settled_real_seconds.get_or_insert(now);
+            if now - settled + f64::EPSILON < config.streaming_benchmark_settle_secs {
+                return;
+            }
+            self.movement_started_real_seconds = Some(now);
+            self.phase = if speed == 0.0 {
+                self.movement_finished_real_seconds = Some(now);
+                StreamingBenchmarkPhase::Tail
+            } else {
+                StreamingBenchmarkPhase::Moving
+            };
+        }
+        let Some(started) = self.movement_started_real_seconds else {
+            return;
+        };
+        let moving_seconds = if speed == 0.0 {
+            0.0
+        } else {
+            (now - started).clamp(0.0, config.streaming_benchmark_route_secs)
+        };
+        self.route_distance_units = speed * moving_seconds;
+        if self.phase == StreamingBenchmarkPhase::Moving
+            && now - started >= config.streaming_benchmark_route_secs
+        {
+            self.movement_finished_real_seconds =
+                Some(started + config.streaming_benchmark_route_secs);
+            self.phase = StreamingBenchmarkPhase::Tail;
+        }
+        if self.phase == StreamingBenchmarkPhase::Tail
+            && let Some(finished) = self.movement_finished_real_seconds
+            && now - finished >= config.streaming_benchmark_tail_secs
+        {
+            self.tail_finished_real_seconds = Some(finished + config.streaming_benchmark_tail_secs);
+            self.phase = StreamingBenchmarkPhase::Finished;
+        }
+    }
+
+    fn local_position(&self, origin: IVec2) -> Option<Vec3> {
+        let mut position = DVec3::from_array(self.start_world_position?);
+        position.z -= self.route_distance_units;
+        position.x -= f64::from(origin.x) * f64::from(crate::world::components::CELL_SIZE);
+        position.z += f64::from(origin.y) * f64::from(crate::world::components::CELL_SIZE);
+        Some(position.as_vec3())
+    }
+}
+
+fn streaming_benchmark_cpu_ready(
+    config: &EngineConfig,
+    metrics: &StreamingMetrics,
+    admission: &crate::streaming::admission::SceneAdmission,
+    renderer: &RendererMetrics,
+    raw_responses: usize,
+    deferred_responses: usize,
+) -> bool {
+    let expected_cells =
+        ((i64::from(config.stream_radius) * 2 + 1).max(0) as usize).saturating_pow(2);
+    metrics.resident_cells == expected_cells
+        && metrics.loading_cells == 0
+        && metrics.active_requests == 0
+        && metrics.requests_submitted == metrics.responses_received
+        && metrics.retiring_cells == 0
+        && metrics.pending_asset_instances == 0
+        && metrics.pending_surface_instances == 0
+        && metrics.arming_queue_depth == 0
+        && metrics.pending_lod_queries == 0
+        && metrics.pending_lod_chunks == 0
+        && admission.active_jobs() == 0
+        && admission.queued_jobs() == 0
+        && raw_responses == 0
+        && deferred_responses == 0
+        && config
+            .streaming_benchmark_expected_models
+            .is_none_or(|expected| metrics.assets_ready == expected)
+        && config
+            .streaming_benchmark_expected_lod_chunks
+            .is_none_or(|expected| metrics.resident_lod_chunks == expected)
+        && config
+            .streaming_benchmark_expected_terrain
+            .is_none_or(|expected| metrics.terrain_patches_validated == expected)
+        && config
+            .streaming_benchmark_expected_water
+            .is_none_or(|expected| metrics.water_surfaces_validated == expected)
+        && metrics.failed_cells == 0
+        && metrics.asset_load_failures == 0
+        && metrics.material_validation_failures == 0
+        && metrics.terrain_validation_failures == 0
+        && metrics.water_validation_failures == 0
+        && metrics.transform_bounds_validation_failures == 0
+        && metrics.diagnostic_fallbacks == 0
+        && metrics.streaming_invariant_failures == 0
+        && metrics.failed_lod_queries == 0
+        && metrics.unrecovered_lod_queries == 0
+        && metrics.failed_lod_chunks == 0
+        && metrics.unrecovered_lod_chunks == 0
+        && renderer.renderer_validation_failures == 0
+        && renderer.final_path_active()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_streaming_benchmark_route(
+    time: Res<Time<Real>>,
+    config: Res<EngineConfig>,
+    origin: Res<RenderOrigin>,
+    metrics: Res<StreamingMetrics>,
+    admission: Res<crate::streaming::admission::SceneAdmission>,
+    renderer: Res<RendererMetrics>,
+    database: Res<WorldDatabase>,
+    runtime: Option<Res<crate::streaming::runtime::StreamingRuntime>>,
+    mut route: ResMut<StreamingBenchmarkRoute>,
+    mut camera: Query<&mut Transform, With<StreamingCamera>>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let Ok(mut transform) = camera.single_mut() else {
+        return;
+    };
+    route.start_world_position.get_or_insert([
+        f64::from(transform.translation.x)
+            + f64::from(origin.0.x) * f64::from(crate::world::components::CELL_SIZE),
+        f64::from(transform.translation.y),
+        f64::from(transform.translation.z)
+            - f64::from(origin.0.y) * f64::from(crate::world::components::CELL_SIZE),
+    ]);
+    let ready = streaming_benchmark_cpu_ready(
+        &config,
+        &metrics,
+        &admission,
+        &renderer,
+        database.pending_cell_responses(),
+        runtime
+            .as_ref()
+            .map_or(0, |runtime| runtime.deferred_responses.len()),
+    );
+    let before = route.phase;
+    route.advance(time.elapsed_secs_f64(), ready, &config);
+    if let Some(position) = route.local_position(origin.0) {
+        transform.translation = position;
+    }
+    if route.phase != before {
+        let stage = match route.phase {
+            StreamingBenchmarkPhase::Waiting => "route_waiting",
+            StreamingBenchmarkPhase::Moving => "route_moving",
+            StreamingBenchmarkPhase::Tail => "route_tail",
+            StreamingBenchmarkPhase::Finished => "route_finished",
+        };
+        info!(phase = ?route.phase, distance = route.route_distance_units, "streaming benchmark route phase");
+        profiler.event("streaming-benchmark-route", stage, None);
+    }
+}
 
 #[derive(Default)]
 struct AutoFlightState {
@@ -2119,6 +2379,22 @@ fn bounded_auto_flight_direction(
     state.axis * state.sign
 }
 
+/// The two `Update` systems every run gets, both gated on the console being closed. The console
+/// owns the keyboard while it is open and on the frame it closes, so the free camera must not fly
+/// on those keys and the acceptance screenshot must not enqueue a capture of the open overlay into
+/// the PNG the acceptance check reads. Both frames are rejected by the predicate, and
+/// `refresh_console_ui` hides the overlay on the closing frame, before the capture resumes on the
+/// next update.
+fn add_camera_and_capture_systems(app: &mut App) {
+    app.add_systems(
+        Update,
+        (
+            fly_camera.run_if(console_closed),
+            capture_acceptance_screenshot.run_if(console_closed),
+        ),
+    );
+}
+
 fn fly_camera(
     time: Res<Time>,
     config: Res<EngineConfig>,
@@ -2132,6 +2408,7 @@ fn fly_camera(
     if config.physics_fixture
         || config.interactive_world_physics()
         || config.shots.is_some()
+        || config.streaming_benchmark_route_speed.is_some()
         || config.matched_route.is_some()
     {
         return;
@@ -2181,27 +2458,37 @@ fn fly_camera(
     profiler.record_elapsed("world/fly_camera", started);
 }
 
+/// Frames the capture system waits past the benchmark warmup before it takes the screenshot.
+const SCREENSHOT_SETTLE_FRAMES: u32 = 10;
+
+/// Real time the capture system gives the renderer to warm up (shader compilation and first use of
+/// the final path) before it takes the screenshot.
+///
+/// Real time, not `Time`: the console pauses virtual time while it is open, and the wait is for the
+/// GPU, which is not paused with it.
+const SCREENSHOT_GPU_WARMUP: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[allow(clippy::too_many_arguments)]
 fn capture_acceptance_screenshot(
     mut commands: Commands,
     config: Res<EngineConfig>,
     mut state: Local<ScreenshotCaptureState>,
+    real_time: Res<Time<Real>>,
     streaming: Option<Res<StreamingMetrics>>,
     world_database: Option<Res<WorldDatabase>>,
     renderer: Res<RendererMetrics>,
-    windows: Query<(), With<Window>>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
 ) {
     let Some(path) = &config.acceptance_screenshot else {
         return;
     };
     state.frames = state.frames.saturating_add(1);
-    let gpu_warmed_up = state
-        .started
-        .get_or_insert_with(std::time::Instant::now)
-        .elapsed()
-        >= std::time::Duration::from_secs(2);
+    let settled_frames = config
+        .benchmark_warmup_frames
+        .saturating_add(SCREENSHOT_SETTLE_FRAMES);
     if state.captured
-        || state.frames < config.benchmark_warmup_frames.saturating_add(10)
-        || !gpu_warmed_up
+        || state.frames < settled_frames
+        || real_time.elapsed() < SCREENSHOT_GPU_WARMUP
         || windows.is_empty()
     {
         return;
@@ -2257,14 +2544,210 @@ fn screenshot_assets_ready(
 struct ScreenshotCaptureState {
     frames: u32,
     captured: bool,
-    started: Option<std::time::Instant>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::console::ConsoleState;
     use bevy::asset::{AssetApp, AssetPlugin};
+    use bevy::input::ButtonState;
+    use bevy::input::keyboard::{Key, KeyboardInput};
+    use bevy::time::TimeUpdateStrategy;
+    use bevy::window::{PrimaryWindow, Window};
     use bevy::world_serialization::WorldSerializationPlugin;
+    use std::time::Duration;
+
+    #[test]
+    fn benchmark_route_requires_an_uninterrupted_cpu_settled_interval() {
+        let config = EngineConfig {
+            streaming_benchmark_route_speed: Some(370.0),
+            ..default()
+        };
+        let mut route = StreamingBenchmarkRoute::default();
+        route.advance(1.0, false, &config);
+        route.advance(2.0, true, &config);
+        route.advance(6.0, true, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Waiting);
+        assert_eq!(route.cpu_settled_real_seconds, Some(2.0));
+        route.advance(6.5, false, &config);
+        assert_eq!(route.cpu_settled_real_seconds, None);
+        route.advance(8.0, true, &config);
+        route.advance(13.0, true, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Moving);
+        assert_eq!(route.cpu_settled_real_seconds, Some(8.0));
+        assert_eq!(route.movement_started_real_seconds, Some(13.0));
+        // New streaming demand during the route must not restart the wait.
+        route.advance(14.0, false, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Moving);
+        assert_eq!(route.route_distance_units, 370.0);
+    }
+
+    #[test]
+    fn benchmark_route_uses_absolute_real_time_across_large_deltas_and_rebases() {
+        let config = EngineConfig {
+            streaming_benchmark_route_speed: Some(3000.0),
+            streaming_benchmark_settle_secs: 0.0,
+            ..default()
+        };
+        let mut route = StreamingBenchmarkRoute {
+            start_world_position: Some([22_528.0, 5976.0, 47_104.0]),
+            ..default()
+        };
+        route.advance(10.0, true, &config);
+        let mut partitioned = StreamingBenchmarkRoute {
+            start_world_position: route.start_world_position,
+            ..default()
+        };
+        partitioned.advance(10.0, true, &config);
+        for now in [10.1, 10.4, 10.7, 11.0] {
+            partitioned.advance(now, false, &config);
+        }
+        // A one-second real interval is not reduced to virtual time's 250 ms cap.
+        route.advance(11.0, false, &config);
+        assert_eq!(route.route_distance_units, 3000.0);
+        assert_eq!(route.route_distance_units, partitioned.route_distance_units);
+        let before = route.local_position(IVec2::new(5, -12)).unwrap();
+        let after = route.local_position(IVec2::new(5, -11)).unwrap();
+        assert_eq!(before.x, after.x);
+        assert_eq!(before.y, after.y);
+        assert_eq!(after.z - before.z, crate::world::components::CELL_SIZE);
+        let stable = |position: Vec3, origin: IVec2| {
+            f64::from(position.z)
+                - f64::from(origin.y) * f64::from(crate::world::components::CELL_SIZE)
+        };
+        assert_eq!(
+            stable(before, IVec2::new(5, -12)),
+            stable(after, IVec2::new(5, -11))
+        );
+        // A long stalled frame clamps at the planned endpoint and crosses both
+        // phase boundaries without extending the route or the tail.
+        route.advance(1000.0, false, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Finished);
+        assert_eq!(route.route_distance_units, 135_000.0);
+        assert_eq!(route.movement_finished_real_seconds, Some(55.0));
+        assert_eq!(route.tail_finished_real_seconds, Some(65.0));
+    }
+
+    #[test]
+    fn stationary_benchmark_route_enters_tail_without_movement() {
+        let config = EngineConfig {
+            streaming_benchmark_route_speed: Some(0.0),
+            streaming_benchmark_settle_secs: 0.0,
+            streaming_benchmark_tail_secs: 3.0,
+            ..default()
+        };
+        let mut route = StreamingBenchmarkRoute::default();
+        route.advance(4.0, true, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Tail);
+        assert_eq!(route.movement_started_real_seconds, Some(4.0));
+        assert_eq!(route.movement_finished_real_seconds, Some(4.0));
+        assert_eq!(route.route_distance_units, 0.0);
+        route.advance(6.0, false, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Tail);
+        route.advance(7.0, false, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Finished);
+        assert_eq!(route.tail_finished_real_seconds, Some(7.0));
+        assert_eq!(route.route_distance_units, 0.0);
+    }
+
+    #[test]
+    fn benchmark_cpu_gate_checks_expected_counts_and_pending_database_payloads() {
+        let config = EngineConfig {
+            streaming_benchmark_expected_models: Some(7),
+            streaming_benchmark_expected_lod_chunks: Some(3),
+            streaming_benchmark_expected_terrain: Some(4),
+            streaming_benchmark_expected_water: Some(1),
+            ..default()
+        };
+        let metrics = StreamingMetrics {
+            resident_cells: 25,
+            requests_submitted: 25,
+            responses_received: 25,
+            assets_ready: 7,
+            resident_lod_chunks: 3,
+            terrain_patches_validated: 4,
+            water_surfaces_validated: 1,
+            ..default()
+        };
+        let admission = crate::streaming::admission::SceneAdmission::default();
+        let renderer = RendererMetrics {
+            gpu_preprocessing_active: true,
+            gpu_culling_active: true,
+            indirect_drawing_active: true,
+            occlusion_culling_views: 1,
+            hzb_views: 1,
+            indirect_phase_buffers: 1,
+            indirect_batch_sets: 1,
+            proof_frames: 1,
+            ..default()
+        };
+        let ready = |metrics: &StreamingMetrics, raw, deferred| {
+            streaming_benchmark_cpu_ready(&config, metrics, &admission, &renderer, raw, deferred)
+        };
+        assert!(ready(&metrics, 0, 0));
+        assert!(!ready(&metrics, 1, 0));
+        assert!(!ready(&metrics, 0, 1));
+        assert!(!ready(
+            &StreamingMetrics {
+                assets_ready: 6,
+                ..metrics.clone()
+            },
+            0,
+            0
+        ));
+        assert!(!ready(
+            &StreamingMetrics {
+                pending_lod_queries: 1,
+                ..metrics.clone()
+            },
+            0,
+            0
+        ));
+        assert!(!ready(
+            &StreamingMetrics {
+                pending_surface_instances: 1,
+                ..metrics.clone()
+            },
+            0,
+            0
+        ));
+        assert!(!ready(
+            &StreamingMetrics {
+                asset_load_failures: 1,
+                ..metrics
+            },
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    fn automated_camera_conflicts_name_the_selected_drivers() {
+        let mut both = EngineConfig {
+            shots: Some("shots.json".into()),
+            matched_route: Some("route.json".into()),
+            ..default()
+        };
+        let Err(error) = prepare_shots(&mut both) else {
+            panic!("drivers must conflict");
+        };
+        let message = error.to_string();
+        assert!(message.contains("--shots"));
+        assert!(message.contains("--matched-route"));
+
+        let mut route_benchmark = EngineConfig {
+            matched_route: Some("route.json".into()),
+            benchmark_frames: Some(60),
+            ..default()
+        };
+        let Err(error) = prepare_shots(&mut route_benchmark) else {
+            panic!("benchmark must conflict with route");
+        };
+        let message = error.to_string();
+        assert!(message.contains("--matched-route"));
+        assert!(message.contains("benchmark"));
+    }
 
     /// A capture window remains hidden if an update system tries to show it.
     #[test]
@@ -2288,6 +2771,29 @@ mod tests {
         app.world_mut().get_mut::<Window>(entity).unwrap().visible = true;
         app.update();
         assert!(app.world().get::<Window>(entity).unwrap().visible);
+    }
+
+    /// The origin cell's centre is (2048, y, -2048), the start position's convention, and +grid_y
+    /// runs towards -z, so the sign and the half-cell offset are pinned per axis.
+    #[test]
+    fn jump_position_is_the_target_cells_centre_around_the_origin() {
+        for (grid, origin, expected) in [
+            ((0, 0), IVec2::ZERO, Vec3::new(2048.0, 9.0, -2048.0)),
+            ((1, 0), IVec2::ZERO, Vec3::new(6144.0, 9.0, -2048.0)),
+            ((0, 1), IVec2::ZERO, Vec3::new(2048.0, 9.0, -6144.0)),
+            ((-1, -1), IVec2::ZERO, Vec3::new(-2048.0, 9.0, 2048.0)),
+            (
+                (4, -21),
+                IVec2::new(4, -12),
+                Vec3::new(2048.0, 9.0, 34816.0),
+            ),
+        ] {
+            assert_eq!(
+                jump_camera_position(grid, origin, 9.0),
+                expected,
+                "grid {grid:?} origin {origin:?}"
+            );
+        }
     }
 
     #[test]
@@ -2944,6 +3450,187 @@ mod tests {
         failed_lod.unrecovered_lod_chunks = 0;
         failed_lod.unrecovered_lod_queries = 1;
         assert!(!screenshot_assets_ready(&failed_lod, true, &config));
+    }
+
+    /// Frames `capture_acceptance_screenshot` needs before the screenshot: the run's warmup plus
+    /// its own settle frames.
+    fn capture_warmup_frames() -> u32 {
+        EngineConfig::default()
+            .benchmark_warmup_frames
+            .saturating_add(SCREENSHOT_SETTLE_FRAMES)
+    }
+
+    /// The real-time step that lets the frame gate open while the time gate stays shut: after
+    /// `capture_warmup_frames` updates the warmup frames have passed and `SCREENSHOT_GPU_WARMUP`
+    /// has not, so a capture that shows up later cannot be the frame gate's doing.
+    fn capture_step_below_the_time_warmup() -> Duration {
+        let step = SCREENSHOT_GPU_WARMUP / (capture_warmup_frames() + 1);
+        assert!(step * capture_warmup_frames() < SCREENSHOT_GPU_WARMUP);
+        step
+    }
+
+    /// The real capture system on the `Update` schedule every run gets, with everything else it
+    /// reads otherwise ready: a primary window, a renderer on its final path, no pending or failed
+    /// asset work, and the console plugin for its real input and close transition. Real time is
+    /// stepped by `step` per update rather than slept through.
+    fn acceptance_capture_app(directory: &Path, step: Duration) -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::input::InputPlugin, ConsolePlugin))
+            .insert_resource(EngineConfig {
+                acceptance_screenshot: Some(directory.join("acceptance.png")),
+                ..default()
+            })
+            // Settled: nothing pending, nothing failed, a resident cell for the world case.
+            .insert_resource(StreamingMetrics {
+                resident_cells: 1,
+                ..default()
+            })
+            // Every final-path flag, so `final_path_active` holds without a GPU.
+            .insert_resource(RendererMetrics {
+                gpu_preprocessing_active: true,
+                gpu_culling_active: true,
+                indirect_drawing_active: true,
+                occlusion_culling_views: 1,
+                hzb_views: 1,
+                indirect_phase_buffers: 1,
+                indirect_batch_sets: 1,
+                proof_frames: 1,
+                ..default()
+            })
+            .insert_resource(ProfilingState::default())
+            .insert_resource(TimeUpdateStrategy::ManualDuration(step));
+        add_camera_and_capture_systems(&mut app);
+        app.world_mut().spawn((Window::default(), PrimaryWindow));
+        app
+    }
+
+    /// One update of `step` of real time, the way a test moves the clock `Time<Real>` reads.
+    fn step_capture(app: &mut App, step: Duration) {
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(step));
+        app.update();
+    }
+
+    /// A backquote press or release through the same message path the window sends, one update.
+    fn send_backquote(app: &mut App, state: ButtonState, step: Duration) {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::Backquote,
+            logical_key: Key::Character("`".into()),
+            state,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        step_capture(app, step);
+    }
+
+    /// The `Screenshot` entities the capture system has queued for the renderer.
+    fn queued_screenshots(app: &mut App) -> usize {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<(), With<Screenshot>>();
+        query.iter(world).count()
+    }
+
+    fn console_state(app: &App) -> &ConsoleState {
+        app.world().resource::<ConsoleState>()
+    }
+
+    /// The capture is queued once when the console is closed throughout, and not again after.
+    #[test]
+    fn acceptance_capture_is_queued_once_with_the_console_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let step = capture_step_below_the_time_warmup();
+        let mut app = acceptance_capture_app(directory.path(), step);
+
+        // The frame gate opens here and the time gate does not: the capture is held back still.
+        for _ in 0..capture_warmup_frames() {
+            step_capture(&mut app, step);
+        }
+        assert_eq!(
+            queued_screenshots(&mut app),
+            0,
+            "the real-time warmup still holds the capture back"
+        );
+
+        step_capture(&mut app, SCREENSHOT_GPU_WARMUP);
+        assert_eq!(
+            queued_screenshots(&mut app),
+            1,
+            "a warm renderer with a closed console queues one capture"
+        );
+
+        for _ in 0..3 {
+            step_capture(&mut app, SCREENSHOT_GPU_WARMUP);
+        }
+        assert_eq!(
+            queued_screenshots(&mut app),
+            1,
+            "later updates do not queue a second capture"
+        );
+        // The PNG is written by the render world's observer, which needs a GPU: this test pins the
+        // queue decision the schedule makes, not the write.
+        assert!(!directory.path().join("acceptance.png").exists());
+    }
+
+    /// The console's real close transition: no capture while it is open or on the closing frame,
+    /// exactly one on the next update, and no duplicates after that.
+    #[test]
+    fn acceptance_capture_waits_for_the_console_to_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let step = capture_step_below_the_time_warmup();
+        let mut app = acceptance_capture_app(directory.path(), step);
+
+        // Both other gates open before the console is: from here every frame the capture is held
+        // back on has the warmup frames and the warmup time behind it.
+        for _ in 0..capture_warmup_frames() {
+            step_capture(&mut app, step);
+        }
+        assert_eq!(queued_screenshots(&mut app), 0);
+
+        // Open the console the way the game does: a backquote through Bevy's input.
+        send_backquote(&mut app, ButtonState::Pressed, SCREENSHOT_GPU_WARMUP);
+        assert!(console_state(&app).open);
+        send_backquote(&mut app, ButtonState::Released, SCREENSHOT_GPU_WARMUP);
+
+        // Real time runs well past the warmup while the console is open, so the capture is held
+        // back by the gate and not by the renderer still warming up.
+        for _ in 0..3 {
+            step_capture(&mut app, SCREENSHOT_GPU_WARMUP);
+        }
+        assert_eq!(
+            queued_screenshots(&mut app),
+            0,
+            "no capture is queued while the console is open"
+        );
+
+        // Close it: the frame the close lands on still carries `closing`, and is rejected too.
+        send_backquote(&mut app, ButtonState::Pressed, SCREENSHOT_GPU_WARMUP);
+        let state = console_state(&app);
+        assert!(
+            !state.open && state.closing,
+            "the close lands on the closing frame"
+        );
+        assert_eq!(
+            queued_screenshots(&mut app),
+            0,
+            "the closing frame is not a closed console"
+        );
+
+        // The next update clears `closing` in `PreUpdate`, and the capture resumes.
+        send_backquote(&mut app, ButtonState::Released, SCREENSHOT_GPU_WARMUP);
+        assert_eq!(
+            queued_screenshots(&mut app),
+            1,
+            "the update after the closing frame queues exactly one capture"
+        );
+
+        for _ in 0..3 {
+            step_capture(&mut app, SCREENSHOT_GPU_WARMUP);
+        }
+        assert_eq!(
+            queued_screenshots(&mut app),
+            1,
+            "later updates do not queue a second capture"
+        );
     }
     /// The sun's shadows reach the grid the streamer draws, whichever way the camera faces, and the
     /// shader's view of them is usable: far bounds that increase (the shader takes the first bound a
@@ -3725,5 +4412,46 @@ mod tests {
     fn terrain_water_fixture_layers_are_sampled_with_a_repeating_sampler() {
         let expected = bevy::image::ImageSampler::Descriptor(terrain_layer_sampler());
         assert_eq!(terrain_fixture_image([82, 116, 58, 255]).sampler, expected);
+    }
+    #[test]
+    fn fly_camera_stands_still_while_the_console_is_open() {
+        use crate::console::ConsoleState;
+        use bevy::time::TimeUpdateStrategy;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ProfilingState>()
+            .insert_resource(EngineConfig {
+                headless: true,
+                ..default()
+            })
+            .insert_resource(ConsoleState {
+                open: true,
+                ..default()
+            })
+            .insert_resource(TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_millis(100),
+            ))
+            .add_systems(Update, fly_camera.run_if(console_closed));
+        let camera = app
+            .world_mut()
+            .spawn((StreamingCamera, Transform::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Space);
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().get::<Transform>(camera).unwrap().translation,
+            Vec3::ZERO
+        );
+        app.world_mut().resource_mut::<ConsoleState>().open = false;
+        for _ in 0..3 {
+            app.update();
+        }
+        assert!(app.world().get::<Transform>(camera).unwrap().translation.y > 0.0);
     }
 }

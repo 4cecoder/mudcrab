@@ -1373,6 +1373,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn land_winner_priority_ties_preserve_unrelated_cells_and_raw_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cell_cache.rkyv");
+        let mut heightmap = 1.0f32.to_le_bytes().to_vec();
+        heightmap.extend(vec![0; 33 * 33 + 3]);
+        let mut a = record(1, b"LAND", None, &[(b"VHGT", heightmap)]);
+        a.cell_form_id = Some(100);
+        let mut b = a.clone();
+        b.form_id = 2;
+        b.subrecords[0].1[..4].copy_from_slice(&2.0f32.to_le_bytes());
+        let mut unrelated = a.clone();
+        unrelated.form_id = 3;
+        unrelated.cell_form_id = Some(200);
+        unrelated.subrecords[0].1[..4].copy_from_slice(&9.0f32.to_le_bytes());
+        let mut proof = None;
+        for reverse in [false, true] {
+            for _ in 0..8 {
+                let mut inputs = vec![a.clone(), b.clone(), unrelated.clone()];
+                if reverse {
+                    inputs.reverse();
+                }
+                let records = inputs.into_iter().map(|r| (r.form_id, r)).collect();
+                assert_eq!(write_cell_cache(&records, &path).unwrap(), 2);
+                let bytes = std::fs::read(&path).unwrap();
+                if let Some(expected) = &proof {
+                    assert_eq!(&bytes, expected);
+                } else {
+                    proof = Some(bytes);
+                }
+                let mmap = validate_cell_cache(&path).unwrap();
+                let cache = rkyv::access::<shared::ArchivedCellCache, Error>(&mmap).unwrap();
+                assert_eq!(f32::from(cache.cells[0].heights[0]), 16.0);
+                assert_eq!(f32::from(cache.cells[1].heights[0]), 72.0);
+                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                super::super::exporter::create_tables(&conn).unwrap();
+                super::super::exporter::export_to_db(&conn, &records).unwrap();
+                for (cell, expected) in [(100, 16.0), (200, 72.0)] {
+                    let bytes: Vec<u8> = conn
+                        .query_row(
+                            "SELECT heightmap FROM land WHERE cell_id=?1",
+                            [cell],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(decode_vhgt(&bytes)[0], expected);
+                }
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM records WHERE record_type='LAND'",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    3
+                );
+            }
+        }
+    }
+
     fn record(
         form_id: u32,
         record_type: &[u8; 4],

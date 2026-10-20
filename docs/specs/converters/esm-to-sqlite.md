@@ -2,16 +2,17 @@
 
 This document details the technical specification for parsing Skyrim Master (`.esm`) and Plugin (`.esp` / `.esl`) binary databases into an indexed **libSQL database (`skyrim_world.db`)** (Turso's open-source SQLite fork) paired with a **zero-copy `rkyv` hot storage cache**.
 
-An optional `--record-reader inhouse` frontend uses MudCrab's authored record
-schema and generic Rust decoder. `legacy` remains the default. The in-house
-decoder owns typed-field validation and FormID resolution through the existing
+The default in-house frontend uses MudCrab's authored record schema and generic
+Rust decoder. `--record-reader legacy` selects the hand-written reader, and
+`--record-reader inhouse` selects the default explicitly. The in-house decoder
+owns typed-field validation and FormID resolution through the existing
 load-order mapping. Its canonical decoded fields drive the existing SQLite and
 rkyv projections, retaining the existing rkyv `records.data` encoding. The original
 decompressed payload is separately preserved in the auxiliary
 `inhouse_source_records` table; its embedded FormIDs remain file-relative. Unknown types are
 opaque source records, not a claim of typed schema coverage. See
 [the pipeline specification](pipeline.md) for producer identity, diagnostics and
-English localized-name resolution.
+localized-name resolution in the selected `--language`.
 
 In-house output also retains localized occurrence IDs and lookup status in
 `inhouse_localized_fields`, winning LAND physical order in

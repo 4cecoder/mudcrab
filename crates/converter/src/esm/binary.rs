@@ -194,19 +194,17 @@ impl ParseWarnings {
         }
     }
 
-    fn summary(&self, source: &str) -> Option<String> {
-        self.first.as_ref().map(|first| {
-            format!(
-                "{source}: skipped {} malformed record/frame occurrence(s); first: {first}; complete neighboring records retained",
-                self.count
-            )
-        })
-    }
-
-    fn report(&self, source: &str) {
-        if let Some(summary) = self.summary(source) {
-            eprintln!("warning: {summary}");
-        }
+    /// Print and collect the same bounded summary for terminal and report consumers.
+    fn report(&self, source: &str) -> Vec<String> {
+        let Some(first) = &self.first else {
+            return Vec::new();
+        };
+        let summary = format!(
+            "warning: {source}: skipped {} malformed record/frame occurrence(s); first: {first}; complete neighboring records retained",
+            self.count
+        );
+        eprintln!("{summary}");
+        vec![summary]
     }
 }
 
@@ -226,7 +224,7 @@ pub fn parse_group(
         records,
         &mut warnings,
     );
-    warnings.report("plugin record stream");
+    let _ = warnings.report("plugin record stream");
     Ok(())
 }
 
@@ -367,25 +365,21 @@ fn decode_record_subrecords_inner(
     extract_subrecords(&decoded)
 }
 
+/// Parse usable records once, retaining the existing terminal skip summaries.
 pub fn parse_plugin_file(path: &Path) -> Result<Vec<RawRecord>> {
-    let (records, warning) = parse_plugin_file_with_warning(path)?;
-    if let Some(warning) = warning {
-        eprintln!("warning: {warning}");
-    }
-    Ok(records)
+    parse_plugin_file_with_warnings(path).map(|(records, _)| records)
 }
 
-/// Parse a plugin and return, instead of printing, the summary of skipped malformed records and
-/// frames. Callers that publish a conversion report must count it: the records it describes are
-/// missing from the result even though parsing succeeded.
-pub(crate) fn parse_plugin_file_with_warning(
+/// Return the same per-plugin skip line printed while retaining usable neighboring records.
+pub(crate) fn parse_plugin_file_with_warnings(
     path: &Path,
-) -> Result<(Vec<RawRecord>, Option<String>)> {
+) -> Result<(Vec<RawRecord>, Vec<String>)> {
     parse_plugin_file_inner(path)
         .wrap_err_with(|| format!("failed to parse plugin {}", path.display()))
 }
 
-fn parse_plugin_file_inner(path: &Path) -> Result<(Vec<RawRecord>, Option<String>)> {
+/// Keep header checks and local recovery unchanged while returning their bounded summary.
+fn parse_plugin_file_inner(path: &Path) -> Result<(Vec<RawRecord>, Vec<String>)> {
     let reader = EsmReader::open(path)?;
     let data = reader.as_slice();
 
@@ -422,9 +416,9 @@ fn parse_plugin_file_inner(path: &Path) -> Result<(Vec<RawRecord>, Option<String
         &mut records,
         &mut warnings,
     );
-    let warning = warnings.summary(&path.file_name().unwrap_or_default().to_string_lossy());
+    let summaries = warnings.report(&path.file_name().unwrap_or_default().to_string_lossy());
 
-    Ok((records, warning))
+    Ok((records, summaries))
 }
 
 /// Parses REFR payload for Position and Base Form ID pointers
@@ -746,25 +740,6 @@ mod tests {
                 "{message}"
             );
         }
-    }
-
-    #[test]
-    fn skipped_plugin_frames_are_returned_for_the_conversion_report() {
-        let directory = tempfile::tempdir().unwrap();
-        let header = [b"TES4".as_slice(), &[0; 20]].concat();
-        let path = directory.path().join("clean.esp");
-        std::fs::write(&path, &header).unwrap();
-        assert_eq!(parse_plugin_file_with_warning(&path).unwrap().1, None);
-
-        let path = directory.path().join("torn.esp");
-        std::fs::write(&path, [header.as_slice(), &[0; 7]].concat()).unwrap();
-        let (records, warning) = parse_plugin_file_with_warning(&path).unwrap();
-        assert!(records.is_empty());
-        let warning = warning.expect("a torn frame must be reported");
-        assert!(
-            warning.starts_with("torn.esp: skipped 1 ") && warning.contains("trailing 7 bytes"),
-            "{warning}"
-        );
     }
 
     #[test]

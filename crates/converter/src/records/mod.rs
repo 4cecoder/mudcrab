@@ -300,6 +300,38 @@ pub struct PluginDiagnostics {
 }
 
 impl PluginDiagnostics {
+    /// Build bounded data-loss warnings for terminal output and conversion reports.
+    pub(crate) fn warning_summary_lines(&self, plugin: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(example) = ["record", "field", "link", "unexpected"]
+            .iter()
+            .find_map(|category| self.first_by_category.get(*category))
+        {
+            lines.push(format!(
+                "warning: {plugin}: in-house reader skipped {} records, {} fields, {} unexpected subrecords; cleared {} invalid links (first: {example})",
+                self.skipped_records,
+                self.skipped_fields,
+                self.unexpected_subrecords,
+                self.invalid_links
+            ));
+        }
+        lines
+    }
+
+    /// Successful supplier-self remaps are advisory, even when another issue loses data.
+    pub(crate) fn notice_summary_lines(&self, plugin: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.compatibility_headers != 0
+            && let Some(example) = self.first_by_category.get("compatibility")
+        {
+            lines.push(format!(
+                "notice: {plugin}: used supplier-self runtime compatibility for {} headers (original owners unresolved; first: {example})",
+                self.compatibility_headers
+            ));
+        }
+        lines
+    }
+
     /// Journal every observation while retaining the least source example per category.
     pub(crate) fn note(&mut self, category: &str, example: impl FnOnce() -> String) {
         match category {
@@ -677,17 +709,26 @@ fn read_plugins_with_prepared(
                 return;
             }
             let source_id = record.source_form_id;
-            if let Some(previous) = seen.insert(record.form_id, source_id) {
+            // Zero-header GMST occurrences share no native identity. Only a known
+            // EditorID supplies a duplicate key; an unknown name cannot claim zero.
+            let duplicate_key = if record.record_type == *b"GMST" && record.form_id == 0 {
+                (candidate_id != 0).then_some(candidate_id)
+            } else {
+                Some(record.form_id)
+            };
+            if let Some(seen_id) = duplicate_key
+                && let Some(&previous) = seen.get(&seen_id)
+            {
                 if let Some(entry) = history.borrow_mut().last_mut() {
                     entry.reason = Some(format!(
                         "duplicate/colliding record {:08X}: source {previous:08X}, {source_id:08X}",
-                        record.form_id
+                        seen_id
                     ));
                 }
                 diagnostics.note("record", || {
                     format!(
                         "duplicate/colliding record {:08X}: source {previous:08X}, {source_id:08X}",
-                        record.form_id
+                        seen_id
                     )
                 });
                 return;
@@ -706,13 +747,14 @@ fn read_plugins_with_prepared(
                     let known = gmst_ids.get(&editor_id).copied();
                     let canonical = known.unwrap_or(record.form_id);
                     if canonical == 0
-                        || gmst_aliases
-                            .get(&record.form_id)
-                            .is_some_and(|&previous| known != Some(previous))
-                        || result
-                            .records
-                            .get(&record.form_id)
-                            .is_some_and(|previous| previous.record_type != *b"GMST")
+                        || record.form_id != 0
+                            && (gmst_aliases
+                                .get(&record.form_id)
+                                .is_some_and(|&previous| known != Some(previous))
+                                || result
+                                    .records
+                                    .get(&record.form_id)
+                                    .is_some_and(|previous| previous.record_type != *b"GMST"))
                     {
                         if let Some(entry) = history.borrow_mut().last_mut() {
                             entry.reason =
@@ -723,7 +765,10 @@ fn read_plugins_with_prepared(
                         });
                         return;
                     }
-                    gmst_aliases.insert(record.form_id, canonical);
+                    // Null native words cannot identify later header-only tombstones.
+                    if record.form_id != 0 {
+                        gmst_aliases.insert(record.form_id, canonical);
+                    }
                     gmst_ids.insert(editor_id, canonical);
                     record.form_id = canonical;
                 } else if record.flags & 0x20 != 0 {
@@ -757,6 +802,10 @@ fn read_plugins_with_prepared(
                     format!("record {:08X} collides with GMST identity", record.form_id)
                 });
                 return;
+            }
+            // Rejected identities cannot claim a later usable candidate's duplicate key.
+            if let Some(seen_id) = duplicate_key {
+                seen.insert(seen_id, source_id);
             }
             let source = RecordSource {
                 plugin_index: index as u32,
@@ -824,25 +873,12 @@ fn read_plugins_with_prepared(
     decoder::validate_targets_with_prepared(&mut result, schema, prepared, order);
     targets_stage.finish(result.records.len());
     for (name, diagnostics) in &result.diagnostics {
-        if let Some(example) = ["record", "field", "link", "unexpected"]
-            .iter()
-            .find_map(|category| diagnostics.first_by_category.get(*category))
+        for line in diagnostics
+            .warning_summary_lines(name)
+            .into_iter()
+            .chain(diagnostics.notice_summary_lines(name))
         {
-            eprintln!(
-                "warning: {name}: in-house reader skipped {} records, {} fields, {} unexpected subrecords; cleared {} invalid links (first: {example})",
-                diagnostics.skipped_records,
-                diagnostics.skipped_fields,
-                diagnostics.unexpected_subrecords,
-                diagnostics.invalid_links
-            );
-        }
-        if diagnostics.compatibility_headers != 0
-            && let Some(example) = diagnostics.first_by_category.get("compatibility")
-        {
-            eprintln!(
-                "warning: {name}: used supplier-self runtime compatibility for {} headers (original owners unresolved; first: {example})",
-                diagnostics.compatibility_headers
-            );
+            eprintln!("{line}");
         }
     }
     Ok(result)

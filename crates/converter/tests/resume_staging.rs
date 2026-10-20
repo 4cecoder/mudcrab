@@ -6,6 +6,8 @@
 //! it. Reuse is then observable as the marker surviving the run; reconversion
 //! replaces it with the bytes a fresh run produces.
 
+mod common;
+
 use converter::{
     AssetPipeline, PipelineConfig, PipelineReport,
     cache::{
@@ -42,7 +44,7 @@ impl Fixture {
         let staging = output.with_extension(format!("staging-{}-1", std::process::id()));
         fs::create_dir_all(data.join("scripts")).unwrap();
         fs::create_dir_all(&staging).unwrap();
-        let config = PipelineConfig::new(&data, &output);
+        let config = common::cpu_lod_config(&data, &output);
         Self {
             _temp: temp,
             data,
@@ -208,6 +210,7 @@ async fn reconverts_a_staged_output_written_under_a_different_configuration() {
 #[tokio::test]
 async fn reconverts_a_staged_output_with_matching_legacy_full_configuration() {
     let mut fixture = Fixture::new();
+    fixture.config.record_reader = converter::config::RecordReader::Legacy;
     fixture.config.no_lod = true;
     fixture.write_source("One");
     fixture.stage_marker();
@@ -324,7 +327,7 @@ async fn changed_malformed_nif_does_not_publish_the_previous_staged_glb() {
     let staged_glb = staging.join("meshes/one.glb");
     converter::mesh::MeshConverter::convert_nif_to_glb(&source, &staged_glb).unwrap();
     let output_bytes = fs::read(&staged_glb).unwrap();
-    let config = PipelineConfig::new(&data, &output);
+    let config = common::cpu_lod_config(&data, &output);
     let mut journal = StagingJournal::open(&staging).unwrap();
     journal
         .record(
@@ -369,7 +372,7 @@ async fn fails_even_without_fail_fast_when_invalid_staged_output_cannot_be_remov
     fs::create_dir_all(data.join("meshes")).unwrap();
     fs::create_dir_all(staging.join("meshes/one.glb")).unwrap();
     fs::write(data.join("meshes/one.nif"), b"malformed NIF bytes").unwrap();
-    let mut config = PipelineConfig::new(&data, &output);
+    let mut config = common::cpu_lod_config(&data, &output);
     config.resume_staging = Some(staging);
     config.fail_fast = false;
 

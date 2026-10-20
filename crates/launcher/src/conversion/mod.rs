@@ -755,6 +755,10 @@ pub(crate) mod tests {
         assert_eq!(config.data_dir, data);
         assert_eq!(config.output_dir, output);
         assert_eq!(
+            config.record_reader,
+            converter::config::RecordReader::Inhouse
+        );
+        assert_eq!(
             app.world().resource::<ConversionStatus>().overall_percent(),
             0.0,
             "a run that has not reported anything shows an empty bar"
@@ -840,6 +844,7 @@ pub(crate) mod tests {
             cache_hits: 3,
             skipped: 0,
             warnings: Vec::new(),
+            notices: Vec::new(),
             lod_chunks: 1693,
             lod_warnings: (0..12).map(|i| format!("Skipped world {i}")).collect(),
             artifacts: 15,

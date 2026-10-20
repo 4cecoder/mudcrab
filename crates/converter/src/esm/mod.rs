@@ -1,5 +1,5 @@
 use crate::esm::{
-    binary::parse_plugin_file_with_warning,
+    binary::parse_plugin_file_with_warnings,
     exporter::{create_tables, validate_inhouse_record},
     records::RawRecord,
 };
@@ -15,6 +15,8 @@ use std::{
 };
 pub mod binary;
 pub mod cell_cache;
+pub mod doors;
+pub mod emittance;
 pub mod exporter;
 pub mod extractors;
 pub mod inhouse;
@@ -25,14 +27,29 @@ pub mod lodsettings;
 pub mod mmap_reader;
 pub mod plugins_txt;
 pub mod records;
+pub mod rooms;
 pub mod types;
 pub use plugins_txt::{
     OFFICIAL_MASTERS, read_plugins_txt, read_plugins_txt_with_options, read_skyrim_ccc,
 };
 #[cfg(test)]
+mod emittance_parity_tests;
+#[cfg(test)]
 mod plugin_table_tests;
+#[cfg(test)]
+mod report_warnings_official_tests;
 
 pub struct EsmParser;
+
+/// Winning records with bounded recovery warnings and harmless compatibility notices.
+#[derive(Debug)]
+pub(crate) struct RecordConversion {
+    pub(crate) records: HashMap<u32, RawRecord>,
+    pub(crate) warnings: Vec<String>,
+    pub(crate) notices: Vec<String>,
+    /// In-house stage seconds for the database profile; legacy exports record none.
+    pub(crate) phases: std::collections::BTreeMap<String, f64>,
+}
 
 /// Populate the common plugin metadata contract without allocating each complete input.
 fn insert_plugins(conn: &Connection, plugin_paths: &[PathBuf]) -> Result<()> {
@@ -86,63 +103,54 @@ impl EsmParser {
             db_path,
             reader,
             strings_root,
+            crate::config::DEFAULT_LANGUAGE,
             None,
         )
+        .map(|conversion| conversion.records)
     }
 
-    /// Use a prevalidated, immutable schema batch throughout publication.
+    /// Publish with one immutable schema batch and retain summaries for the pipeline report.
+    /// Localized names come from `strings_root`'s tables in `language`.
     pub(crate) fn convert_plugins_with_reader_and_schemas(
         plugin_paths: &[PathBuf],
         db_path: &Path,
         reader: crate::config::RecordReader,
         strings_root: &Path,
+        language: &str,
         schemas: Option<&crate::records::addons::RuntimeSchemas>,
-    ) -> Result<HashMap<u32, RawRecord>> {
+    ) -> Result<RecordConversion> {
         Self::convert_plugins_with_reader_and_schemas_with_string_sources(
             plugin_paths,
             db_path,
             reader,
-            inhouse::StringSources::PluginLooseFirst(strings_root),
+            inhouse::StringSources {
+                roots: inhouse::StringRoots::PluginLooseFirst(strings_root),
+                language,
+            },
             schemas,
-            &mut Vec::new(),
         )
     }
 
-    /// Select authoritative loose string inputs independently of the plugin's physical parent.
+    /// Select loose string inputs independently of the physical parent and collect reader summaries.
     pub(crate) fn convert_plugins_with_reader_and_schemas_with_string_sources(
         plugin_paths: &[PathBuf],
         db_path: &Path,
         reader: crate::config::RecordReader,
         string_sources: inhouse::StringSources<'_>,
         schemas: Option<&crate::records::addons::RuntimeSchemas>,
-        parse_warnings: &mut Vec<String>,
-    ) -> Result<HashMap<u32, RawRecord>> {
+    ) -> Result<RecordConversion> {
         match reader {
-            crate::config::RecordReader::Legacy => Self::convert_plugins_with_records_and_warnings(
-                plugin_paths,
-                db_path,
-                parse_warnings,
-            ),
-            crate::config::RecordReader::Inhouse => match string_sources {
-                inhouse::StringSources::PluginLooseFirst(strings_root) => {
-                    if let Some(schemas) = schemas {
-                        inhouse::convert_plugins_with_schemas(
-                            plugin_paths,
-                            db_path,
-                            strings_root,
-                            schemas,
-                        )
-                    } else {
-                        inhouse::convert_plugins(plugin_paths, db_path, strings_root)
-                    }
-                }
-                source => inhouse::convert_plugins_with_string_sources(
+            crate::config::RecordReader::Legacy => {
+                Self::convert_plugins_with_records_report(plugin_paths, db_path)
+            }
+            crate::config::RecordReader::Inhouse => {
+                inhouse::convert_plugins_with_string_sources_report(
                     plugin_paths,
                     db_path,
-                    source,
+                    string_sources,
                     schemas,
-                ),
-            },
+                )
+            }
         }
     }
     /// Parses .esm files and exports world data to skyrim_world.db
@@ -156,20 +164,20 @@ impl EsmParser {
         plugin_paths: &[PathBuf],
         db_path: &Path,
     ) -> Result<HashMap<u32, RawRecord>> {
-        Self::convert_plugins_with_records_and_warnings(plugin_paths, db_path, &mut Vec::new())
+        Self::convert_plugins_with_records_report(plugin_paths, db_path)
+            .map(|conversion| conversion.records)
     }
 
-    /// As `convert_plugins_with_records`, also returning skipped-record parse warnings.
-    fn convert_plugins_with_records_and_warnings(
+    /// Export legacy records with each printed recovery warning and compatibility notice once.
+    pub(crate) fn convert_plugins_with_records_report(
         plugin_paths: &[PathBuf],
         db_path: &Path,
-        parse_warnings: &mut Vec<String>,
-    ) -> Result<HashMap<u32, RawRecord>> {
+    ) -> Result<RecordConversion> {
         let order = load_order::LoadOrder::read(plugin_paths)?;
-        let master = Self::merge_plugins_with_load_order(plugin_paths, &order, parse_warnings)?;
+        let master = Self::merge_plugins_with_load_order(plugin_paths, &order)?;
         let conn = Connection::open(db_path)?;
         create_tables(&conn)?;
-        exporter::export_plugins_to_db(&conn, &master, &order, plugin_paths)?;
+        exporter::export_plugins_to_db(&conn, &master.records, &order, plugin_paths)?;
 
         Ok(master)
     }
@@ -177,18 +185,17 @@ impl EsmParser {
     /// Merge plugin records with validated slots and EditorID-based game settings.
     pub fn merge_plugins(plugin_paths: &[PathBuf]) -> Result<HashMap<u32, RawRecord>> {
         let order = load_order::LoadOrder::read(plugin_paths)?;
-        Self::merge_plugins_with_load_order(plugin_paths, &order, &mut Vec::new())
+        Self::merge_plugins_with_load_order(plugin_paths, &order)
+            .map(|conversion| conversion.records)
     }
 
-    /// Use one load-order mapping for both merging and ownership export.
-    /// Malformed records and frames skipped while parsing are printed and appended to
-    /// `parse_warnings`, so a caller can mark its conversion incomplete.
+    /// Use one load-order mapping for merge/export and retain all printed reader summaries.
     fn merge_plugins_with_load_order(
         plugin_paths: &[PathBuf],
         order: &load_order::LoadOrder,
-        parse_warnings: &mut Vec<String>,
-    ) -> Result<HashMap<u32, RawRecord>> {
+    ) -> Result<RecordConversion> {
         let mut merged = HashMap::new();
+        let mut summaries = Vec::new();
         // Unlike ordinary forms, game settings override by EditorID. Retain
         // the first definition's key/owner while taking the last setting value.
         // Keep keys through deletions so a later restoration has the same ID.
@@ -199,11 +206,8 @@ impl EsmParser {
             // Final ID -> (source ID, whether its master index was out of range). Two different
             // source IDs that resolve to one final ID would silently replace each other.
             let mut sources: HashMap<u32, (u32, bool)> = HashMap::new();
-            let (records, parse_warning) = parse_plugin_file_with_warning(path)?;
-            if let Some(warning) = parse_warning {
-                eprintln!("warning: {warning}");
-                parse_warnings.push(warning);
-            }
+            let (records, parser_summaries) = parse_plugin_file_with_warnings(path)?;
+            summaries.extend(parser_summaries);
             for mut record in records {
                 record.load_order = priority as u32;
                 let source_id = record.form_id;
@@ -292,8 +296,14 @@ impl EsmParser {
                 }
             }
         }
-        warnings.report();
-        Ok(merged)
+        let (remap_warnings, notices) = warnings.report();
+        summaries.extend(remap_warnings);
+        Ok(RecordConversion {
+            records: merged,
+            warnings: summaries,
+            notices,
+            phases: std::collections::BTreeMap::new(),
+        })
     }
 }
 
@@ -306,8 +316,9 @@ type OutOfRangeCounts = BTreeMap<String, (u64, u32, [u8; 4])>;
 struct RemapWarnings {
     /// Light-plugin local IDs wider than 12 bits, keyed by owning plugin.
     truncations: RefCell<BTreeMap<String, (u64, u32)>>,
-    /// IDs whose master index lies past the plugin's master list, keyed by the plugin that
-    /// contains them; the example keeps its record type.
+    /// IDs beyond the master list observed on the permissive supplier-self path.
+    /// Keyed by the containing plugin, retaining the first record kind.
+    /// Any separate truncation or candidate rejection remains a recovery warning.
     out_of_range: RefCell<OutOfRangeCounts>,
     /// Invalid optional links, counted per containing plugin with the first diagnostic.
     skipped_optional: RefCell<BTreeMap<String, (u64, String)>>,
@@ -323,7 +334,7 @@ impl RemapWarnings {
         entry.0 += 1;
     }
 
-    /// Accumulate one ID that names a master the plugin does not have.
+    /// Accumulate one permissive supplier-self remap without changing recovery diagnostics.
     fn out_of_range(&self, plugin: &str, form_id: u32, record_type: [u8; 4]) {
         let mut counts = self.out_of_range.borrow_mut();
         let entry = counts
@@ -354,29 +365,40 @@ impl RemapWarnings {
         entry.0 += 1;
     }
 
-    /// Emit one deterministic summary per affected plugin after a successful merge.
-    fn report(&self) {
+    /// Print diagnostics in kind/plugin order and return warnings separately from notices.
+    fn report(&self) -> (Vec<String>, Vec<String>) {
+        let mut warning_lines = Vec::new();
+        let mut notice_lines = Vec::new();
         for (owner, (count, example)) in self.truncations.borrow().iter() {
-            eprintln!(
+            let summary = format!(
                 "warning: {owner}: {count} light-plugin ID occurrences exceeded 12 bits and were truncated (first: {example:08X}); compact the plugin's FormIDs before ESL-flagging it"
             );
+            eprintln!("{summary}");
+            warning_lines.push(summary);
         }
         for (plugin, (count, example, record_type)) in self.out_of_range.borrow().iter() {
-            eprintln!(
-                "warning: {plugin}: {count} FormID occurrences name a master index past the plugin's master list and were treated as the plugin's own (first: {example:08X} in {})",
+            let summary = format!(
+                "notice: {plugin}: {count} FormID occurrences name a master index past the plugin's master list and were treated as the plugin's own (first: {example:08X} in {})",
                 String::from_utf8_lossy(record_type)
             );
+            eprintln!("{summary}");
+            notice_lines.push(summary);
         }
         for (plugin, (count, example)) in self.skipped_optional.borrow().iter() {
-            eprintln!(
+            let summary = format!(
                 "warning: {plugin}: skipped {count} invalid optional FormID links (cleared or removed; first: {example})"
             );
+            eprintln!("{summary}");
+            warning_lines.push(summary);
         }
         for (plugin, (count, example)) in self.skipped_records.borrow().iter() {
-            eprintln!(
+            let summary = format!(
                 "warning: {plugin}: skipped {count} unusable record candidate(s); first: {example}; earlier complete candidates and neighboring records retained"
             );
+            eprintln!("{summary}");
+            warning_lines.push(summary);
         }
+        (warning_lines, notice_lines)
     }
 }
 
@@ -457,8 +479,11 @@ fn is_required_form_id_subrecord(record_type: &[u8; 4], tag: &[u8]) -> bool {
 enum FormIdLayout {
     /// A fixed-size structure: each accepted byte length with its FormID offsets.
     Fixed(&'static [(usize, &'static [usize])]),
-    /// A packed array of `stride`-byte entries, each starting with a FormID.
-    Array { stride: usize },
+    /// A packed array of `stride`-byte entries, with a FormID at each of `form_ids` in every entry.
+    Array {
+        stride: usize,
+        form_ids: &'static [usize],
+    },
 }
 
 /// Field layouts per xEdit's TES5 definitions
@@ -511,7 +536,10 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         // Each activate parent is a separate subrecord: reference plus f32 delay.
         b"XAPR" if placed => Fixed(&[(8, &[0])]),
         // Location reference types.
-        b"XLRT" if placed => Array { stride: 4 },
+        b"XLRT" if placed => Array {
+            stride: 4,
+            form_ids: &[0],
+        },
         // A rider's horse.
         b"XHOR" if record_type == b"ACHR" => Fixed(SINGLE),
         // Lighting template, on cells and on worldspaces.
@@ -519,8 +547,28 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         // Image space, music, acoustic space, and the region a cell takes its sky and weather
         // from (`XCCM` names a REGN, not a climate).
         b"XCIM" | b"XCMO" | b"XCAS" | b"XCCM" if record_type == b"CELL" => Fixed(SINGLE),
+        // Room marker references (REFR only; `LNAM` and `INAM` mean other things on other
+        // record types): the rooms a portal joins, links between rooms, and a room's own
+        // lighting template and image space. `XPOD` is an array of (origin, destination)
+        // FormID pairs (xEdit 4.1.5f defs: `wbArray(XPOD, 'Portal Data', wbStruct('References',
+        // [wbFormIDCk('Origin'), wbFormIDCk('Destination')]))`), so every u32 is a FormID.
+        // The official masters only ever store one pair (8 bytes). Like every `Array`, a
+        // length that is not a multiple of the stride is dropped and reported.
+        b"XPOD" if record_type == b"REFR" => Array {
+            stride: 4,
+            form_ids: &[0],
+        },
+        b"XLRM" | b"LNAM" | b"INAM" if record_type == b"REFR" => Fixed(SINGLE),
         // Regions.
-        b"XCLR" if record_type == b"CELL" => Array { stride: 4 },
+        b"XCLR" if record_type == b"CELL" => Array {
+            stride: 4,
+            form_ids: &[0],
+        },
+        // A region's weathers: the weather, its chance, then an optional global.
+        b"RDWT" if record_type == b"REGN" => Array {
+            stride: 12,
+            form_ids: &[0, 8],
+        },
         _ => return None,
     })
 }
@@ -561,9 +609,9 @@ fn remap_record_form_ids(
             warnings.out_of_range(plugin_name, form_id, record_type);
         }
         let owner = if local_index < masters.len() {
-            load_order::normalize_plugin_name(&masters[local_index])
+            shared::plugin_selection::normalize_plugin_name(&masters[local_index])
         } else {
-            load_order::normalize_plugin_name(plugin_name)
+            shared::plugin_selection::normalize_plugin_name(plugin_name)
         };
         if let Some(index) = light_indices.get(&owner) {
             if form_id & 0x00ff_ffff > 0xfff {
@@ -642,6 +690,12 @@ fn remap_record_form_ids(
                 .wrap_err("VMAD references")?;
             continue;
         }
+        // Legacy faction remapping recognizes only the exact eight-byte layout.
+        // Preserve other widths without guessing offsets, as required by main;
+        // the independent in-house decoder rejects malformed canonical fields.
+        if record_type == *b"NPC_" && tag.as_slice() == b"SNAM" && data.len() != 8 {
+            continue;
+        }
         if let Some(layout) = form_id_layout(&record.record_type, tag) {
             // Broken optional links, including wrong lengths, must not block unrelated
             // content. Drop a malformed subrecord: its FormID offsets cannot be trusted.
@@ -660,9 +714,12 @@ fn remap_record_form_ids(
                             data.len()
                         )
                     }),
-                FormIdLayout::Array { stride } => {
+                FormIdLayout::Array { stride, form_ids } => {
                     if data.len().is_multiple_of(stride) {
-                        Ok((0..data.len()).step_by(stride).collect())
+                        Ok((0..data.len())
+                            .step_by(stride)
+                            .flat_map(|entry| form_ids.iter().map(move |offset| entry + offset))
+                            .collect())
                     } else {
                         Err(format!(
                             "{name} length {} is not a multiple of {stride}",
@@ -849,6 +906,53 @@ mod tests {
             assert!(warnings.out_of_range.borrow().is_empty());
             assert!(warnings.truncations.borrow().is_empty());
         }
+    }
+
+    /// Each `RDWT` entry names a weather and, optionally, a global; its chance is not a FormID.
+    #[test]
+    fn remaps_region_weathers_and_their_globals() {
+        let indices = HashMap::from([("base.esm".into(), 0), ("patch.esp".into(), 2)]);
+        let entry = |weather: u32, chance: u32, global: u32| {
+            [
+                weather.to_le_bytes(),
+                chance.to_le_bytes(),
+                global.to_le_bytes(),
+            ]
+            .concat()
+        };
+        let mut record = RawRecord {
+            form_id: 0x0100_0800,
+            record_type: *b"REGN",
+            flags: 0,
+            subrecords: vec![(
+                b"RDWT".to_vec(),
+                [
+                    entry(0x0000_0901, 60, 0),
+                    entry(0x0100_0902, 40, 0x0100_0903),
+                ]
+                .concat(),
+            )],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 0,
+        };
+        remap_record_form_ids(
+            &mut record,
+            "patch.esp",
+            &["base.esm".into()],
+            &indices,
+            &HashMap::new(),
+            &RemapWarnings::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.subrecords[0].1,
+            [
+                entry(0x0000_0901, 60, 0),
+                entry(0x0200_0902, 40, 0x0200_0903)
+            ]
+            .concat()
+        );
     }
 
     #[test]

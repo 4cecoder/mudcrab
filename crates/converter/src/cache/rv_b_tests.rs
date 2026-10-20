@@ -18,7 +18,8 @@ fn producer_24_mesh_compatibility_does_not_follow_a_future_producer() {
 /// Every asset kind ignores the full reader identity while metadata retains it.
 #[test]
 fn asset_settings_are_independent_of_reader_metadata() {
-    let legacy = PipelineConfig::new("synthetic-data", "synthetic-output");
+    let mut legacy = PipelineConfig::new("synthetic-data", "synthetic-output");
+    legacy.record_reader = RecordReader::Legacy;
     let mut inhouse = legacy.clone();
     inhouse.record_reader = RecordReader::Inhouse;
     assert_ne!(
@@ -48,7 +49,8 @@ fn mo2_profile_and_reader_bind_metadata_without_changing_asset_settings() {
         "[General]\ngameName=Skyrim Special Edition\n",
     )
     .unwrap();
-    let original = PipelineConfig::new(&data, root.path().join("output"));
+    let mut original = PipelineConfig::new(&data, root.path().join("output"));
+    original.record_reader = RecordReader::Legacy;
     let mut mo2_config = original.clone();
     mo2_config.mo2 = Some(mo2::Selection {
         instance_path: instance,
@@ -73,8 +75,9 @@ fn mo2_profile_and_reader_bind_metadata_without_changing_asset_settings() {
 /// New legacy projections have distinct metadata proof without changing asset settings.
 #[test]
 fn legacy_projection_identity_separates_current_and_historical_full_hashes() {
-    let legacy = PipelineConfig::new("synthetic-data", "synthetic-output");
-    let historical = configuration_hash_for_schema(&legacy, 26).unwrap();
+    let mut legacy = PipelineConfig::new("synthetic-data", "synthetic-output");
+    legacy.record_reader = RecordReader::Legacy;
+    let historical = configuration_hash_for_schema(&legacy, CONVERTER_SCHEMA_VERSION).unwrap();
     let identity = crate::esm::inhouse::reader_identity(RecordReader::Legacy);
     assert_eq!(
         identity,
@@ -91,7 +94,7 @@ fn legacy_projection_identity_separates_current_and_historical_full_hashes() {
     );
     assert_eq!(
         configuration_hash(&legacy).unwrap(),
-        "4482b6966e40954faa2655b13e909ba75a107d58ebbf6478b977dcf45c92b912"
+        "ea9304455759dbc325ff58bd124686bf534d09925923914beea84ea66205c7da"
     );
     assert_eq!(
         configuration_hash_for_schema(&legacy, 15).unwrap(),
@@ -102,7 +105,12 @@ fn legacy_projection_identity_separates_current_and_historical_full_hashes() {
         serde_json::json!(crate::esm::inhouse::LEGACY_PROJECTION_VERSION + 1);
     assert_ne!(
         configuration_hash(&legacy).unwrap(),
-        configuration_hash_with_identity(&legacy, 26, Some(&changed_identity)).unwrap()
+        configuration_hash_with_identity(
+            &legacy,
+            CONVERTER_SCHEMA_VERSION,
+            Some(&changed_identity)
+        )
+        .unwrap()
     );
     for kind in ["nif", "dds", "pex"] {
         let mut inhouse = legacy.clone();
@@ -117,15 +125,16 @@ fn legacy_projection_identity_separates_current_and_historical_full_hashes() {
 /// A recorded projection contract must match its own full settings proof.
 #[test]
 fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
-    let config = PipelineConfig::new("synthetic-data", "synthetic-output");
+    let mut config = PipelineConfig::new("synthetic-data", "synthetic-output");
+    config.record_reader = RecordReader::Legacy;
     let old_identity = serde_json::json!({"mode": "legacy"});
     let current_identity = crate::esm::inhouse::reader_identity(RecordReader::Legacy);
     let v1_identity = serde_json::json!({"mode": "legacy", "projection_version": 1});
     let v2_identity = serde_json::json!({"mode": "legacy", "projection_version": 2});
-    let historical = configuration_hash_for_schema(&config, 26).unwrap();
+    let historical = configuration_hash_for_schema(&config, CONVERTER_SCHEMA_VERSION).unwrap();
     let current = configuration_hash(&config).unwrap();
-    let v1 = legacy_projection_v1_configuration_hash(&config, 26).unwrap();
-    let v2 = legacy_projection_v2_configuration_hash(&config, 26).unwrap();
+    let v1 = legacy_projection_v1_configuration_hash(&config, CONVERTER_SCHEMA_VERSION).unwrap();
+    let v2 = legacy_projection_v2_configuration_hash(&config, CONVERTER_SCHEMA_VERSION).unwrap();
     let contracts = [
         (&old_identity, historical.as_str()),
         (&v1_identity, v1.as_str()),
@@ -134,21 +143,38 @@ fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
     ];
     for (identity, matching) in contracts {
         assert!(
-            retained_configuration_matches_for_reader(&config, 26, matching, identity).unwrap()
+            retained_configuration_matches_for_reader(
+                &config,
+                CONVERTER_SCHEMA_VERSION,
+                matching,
+                identity
+            )
+            .unwrap()
         );
         for (other_identity, other_hash) in contracts {
             if identity != other_identity {
                 assert_ne!(matching, other_hash);
                 assert!(
-                    !retained_configuration_matches_for_reader(&config, 26, other_hash, identity)
-                        .unwrap()
+                    !retained_configuration_matches_for_reader(
+                        &config,
+                        CONVERTER_SCHEMA_VERSION,
+                        other_hash,
+                        identity
+                    )
+                    .unwrap()
                 );
             }
         }
         let mut changed = config.clone();
         changed.script_abi_version += 1;
         assert!(
-            !retained_configuration_matches_for_reader(&changed, 26, matching, identity).unwrap()
+            !retained_configuration_matches_for_reader(
+                &changed,
+                CONVERTER_SCHEMA_VERSION,
+                matching,
+                identity
+            )
+            .unwrap()
         );
     }
     assert!(

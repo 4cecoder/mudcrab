@@ -1,8 +1,6 @@
 //! Native construction of converted NIF materials using Bevy's glTF extension hooks.
-use crate::nif_depth::{
-    DECAL, DEPTH_TEST, DEPTH_WRITE, DYNAMIC_DECAL, NifDepthMaterial, NifDepthMaterialSource,
-    NifDepthState, depth_material,
-};
+use crate::nif_depth::{NifDepthMaterial, NifDepthMaterialSource, NifDepthState, depth_material};
+use ::gltf::material::AlphaMode as GltfAlphaMode;
 use bevy::{
     asset::LoadContext,
     gltf::{
@@ -22,7 +20,8 @@ impl Plugin for NifMaterialPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MaterialPlugin::<NifDepthMaterial>::default())
             .register_type::<NifSourceMaterial>()
-            .register_type::<NifDepthMaterialSource>();
+            .register_type::<NifDepthMaterialSource>()
+            .register_type::<ExternalEmittance>();
         app.world_mut()
             .resource_mut::<GltfExtensionHandlers>()
             .0
@@ -42,7 +41,28 @@ struct NativeMaterialHandler {
 /// Keep its strong handle in the scene so scene-only loads remain fully loaded.
 #[derive(Component, Clone, Reflect)]
 #[reflect(Component)]
-struct NifSourceMaterial(Handle<StandardMaterial>);
+pub(crate) struct NifSourceMaterial(pub Handle<StandardMaterial>);
+
+/// `SLSF1_External_Emittance` (`vendor/project-wormhole-nif/src/nif_flags.rs`, bit 29).
+const SLSF1_EXTERNAL_EMITTANCE: u64 = 1 << 29;
+
+/// Marks a primitive whose NIF shader takes its emission colour from outside the model: from the
+/// placing reference's `XEMI` light or region (`crate::emittance`). Reflected so the marker is
+/// cloned with the scene into every world instance.
+#[derive(Component, Clone, Copy, Default, Reflect)]
+#[reflect(Component, Default)]
+pub struct ExternalEmittance;
+
+/// Whether the converter published `SLSF1_External_Emittance` in the material's
+/// `extras.openSkyrim.shaderFlags1`.
+fn has_external_emittance(material: &gltf::Material<'_>) -> bool {
+    material
+        .extras()
+        .as_ref()
+        .and_then(|extras| serde_json::from_str::<serde_json::Value>(extras.get()).ok())
+        .and_then(|extras| extras["openSkyrim"]["shaderFlags1"].as_u64())
+        .is_some_and(|flags| flags & SLSF1_EXTERNAL_EMITTANCE != 0)
+}
 
 fn native_tag(material: &gltf::Material<'_>, name: &str, value: &str) -> bool {
     material
@@ -72,14 +92,15 @@ fn native_uv_transform(material: &gltf::Material<'_>) -> Option<bevy::math::Affi
 }
 
 fn needs_native_material(material: &gltf::Material<'_>) -> bool {
+    let alpha_mode = match material.alpha_mode() {
+        GltfAlphaMode::Opaque => AlphaMode::Opaque,
+        GltfAlphaMode::Mask => AlphaMode::Mask(material.alpha_cutoff().unwrap_or(0.5)),
+        GltfAlphaMode::Blend => AlphaMode::Blend,
+    };
     has_normal_alpha_mask(material)
         || native_tag(material, "normalConvention", "directx")
         || native_uv_transform(material).is_some()
-        || native_depth_flags(material).is_some_and(|(flags_1, flags_2)| {
-            flags_1 & (DECAL | DYNAMIC_DECAL) != 0
-                || flags_1 & DEPTH_TEST == 0
-                || flags_2 & DEPTH_WRITE == 0
-        })
+        || native_depth_state(material, alpha_mode).is_some()
 }
 
 fn native_depth_flags(material: &gltf::Material<'_>) -> Option<(u32, u32)> {
@@ -167,6 +188,9 @@ impl GltfExtensionHandler for NativeMaterialHandler {
         entity: &mut EntityWorldMut,
         label: &str,
     ) {
+        if has_external_emittance(material) {
+            entity.insert(ExternalEmittance);
+        }
         if needs_native_material(material) {
             let source = entity
                 .get::<MeshMaterial3d<StandardMaterial>>()
@@ -196,6 +220,65 @@ impl GltfExtensionHandler for NativeMaterialHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nif_depth::{CAST_SHADOWS, DECAL, DEPTH_TEST, DEPTH_WRITE, DYNAMIC_DECAL};
+
+    #[test]
+    fn native_depth_reads_authored_shadow_flag_for_decals_and_depth_overrides() {
+        for flags in [
+            0,
+            DEPTH_TEST,
+            DEPTH_TEST | DECAL,
+            DEPTH_TEST | DYNAMIC_DECAL,
+        ] {
+            for casts in [false, true] {
+                let document = gltf::Gltf::from_slice(
+                    &serde_json::to_vec(&serde_json::json!({
+                        "asset":{"version":"2.0"},"materials":[{
+                            "extras":{"openSkyrim":{
+                                "shaderFlags1":flags | if casts { CAST_SHADOWS } else { 0 },
+                                "shaderFlags2":0
+                            }}
+                        }]
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let source = document.materials().next().unwrap();
+                let state = native_depth_state(&source, AlphaMode::Opaque).unwrap();
+                assert_eq!(state.cast_shadows, casts);
+                assert_eq!(state.excludes_shadow(), !casts);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_blend_without_depth_write_keeps_loaded_material() {
+        for decal in [0, DECAL, DYNAMIC_DECAL] {
+            let document = gltf::Gltf::from_slice(
+                &serde_json::to_vec(&serde_json::json!({
+                    "asset":{"version":"2.0"},"materials":[{
+                        "alphaMode":"BLEND",
+                        "extras":{"openSkyrim":{
+                            "shaderFlags1":DEPTH_TEST | decal,"shaderFlags2":0
+                        }}
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let source = document.materials().next().unwrap();
+            let loaded = StandardMaterial {
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            };
+            assert_eq!(needs_native_material(&source), decal != 0);
+            assert_eq!(native_material(&source, &loaded).is_some(), decal != 0);
+            assert_eq!(
+                native_depth_state(&source, loaded.alpha_mode).is_some(),
+                decal != 0
+            );
+        }
+    }
 
     #[test]
     fn native_depth_requires_both_valid_flags_and_keeps_generic_gltf_unchanged() {
@@ -343,6 +426,56 @@ mod tests {
         let (retained, rendered) = query.single(&cloned.world).unwrap();
         assert_eq!(retained.0, source);
         assert_eq!(rendered.0, native);
+    }
+
+    /// The flags are those of `architecture\farmhouse\inn01.nif`: its window, then its walls.
+    #[test]
+    fn external_emittance_needs_bit_29_of_shader_flags_1() {
+        for (extras, expected) in [
+            (
+                serde_json::json!({"openSkyrim": {"shaderFlags1": 0xA240_0301u32}}),
+                true,
+            ),
+            (
+                serde_json::json!({"openSkyrim": {"shaderFlags1": 0x8240_0301u32}}),
+                false,
+            ),
+            (
+                serde_json::json!({"openSkyrim": {"shaderFlags2": 0x2000_0000u32}}),
+                false,
+            ),
+            (serde_json::json!({}), false),
+        ] {
+            let document = gltf::Gltf::from_slice(
+                serde_json::to_string(&serde_json::json!({
+                    "asset": {"version": "2.0"}, "materials": [{"extras": extras}]
+                }))
+                .unwrap()
+                .as_bytes(),
+            )
+            .unwrap();
+            let material = document.materials().next().unwrap();
+            assert_eq!(has_external_emittance(&material), expected, "{extras}");
+        }
+    }
+
+    #[test]
+    fn scene_cloning_retains_the_external_emittance_marker() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_resource::<GltfExtensionHandlers>()
+            .init_asset::<StandardMaterial>()
+            .add_plugins(NifMaterialPlugin);
+        let mut world = World::new();
+        world.spawn(ExternalEmittance);
+        let mut cloned = WorldAsset::new(world)
+            .clone_with(
+                app.world()
+                    .resource::<bevy::ecs::reflect::AppTypeRegistry>(),
+            )
+            .unwrap();
+        let mut query = cloned.world.query::<&ExternalEmittance>();
+        assert!(query.single(&cloned.world).is_ok());
     }
 
     #[test]
