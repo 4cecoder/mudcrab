@@ -47,7 +47,9 @@ prevention does not establish that a run had no clock or suspend gap; retain and
 disclose any difference before treating a timing as experienced wall time.
 
 `audit_lod_pack.py` checks every chunk's payload hash, cell membership, geometry,
-spatial rows and embedded three-mip sRGB UASTC atlas. It compares cold/warm
+spatial rows and embedded three-mip raw (unsupercompressed) sRGB UASTC atlas. The
+geometry digest covers every declared non-atlas BIN byte and the scene graph, with
+downstream offsets normalized, so an atlas-only change does not alter it. It compares cold/warm
 outputs exactly or compares geometry and coverage across an encoder change.
 It supplements the converter's ordinary `check --full`. `--allow-unproven` is
 only for an intentional fallback run; healthy GPU runs require full reusable

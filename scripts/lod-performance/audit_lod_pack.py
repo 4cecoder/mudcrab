@@ -107,7 +107,7 @@ def ktx_contract(data):
     require(vk == 0 and typesize == 1, "atlas must use a DFD-described byte format")
     require(0 < width <= 1024 and height == width and depth <= 1 and layers <= 1 and faces == 1, "invalid atlas dimensions")
     require(levels == 3, "terrain atlas must preserve exactly three mips")
-    require(compression in (0, 2), "unexpected atlas supercompression")
+    require(compression == 0, "terrain atlas must not use supercompression")
     require(dfd_len >= 28 and dfd_off + dfd_len <= len(data), "invalid DFD range")
     require(data[dfd_off + 12] == 166, "atlas DFD must identify UASTC")
     require(data[dfd_off + 14] == 2, "atlas DFD must identify sRGB")
@@ -118,9 +118,55 @@ def ktx_contract(data):
         expected = ((max(width >> mip, 1) + 3) // 4) ** 2 * 16
         require(offset >= 80 + levels * 24 and offset + length <= len(data), "invalid mip range")
         require(expanded == expected, "invalid expanded UASTC block length")
-        require(compression != 0 or length == expected, "invalid raw UASTC block length")
+        require(length == expected, "invalid raw UASTC block length")
         payloads.append({"mip": mip, "offset": offset, "bytes": length, "expanded_bytes": expanded})
     return {"width": width, "height": height, "levels": levels, "faces": faces, "layers": layers, "depth": depth, "srgb": True, "uastc": True, "supercompression": compression, "mips": payloads}
+
+
+def geometry_digest(doc, binary, image_view_id):
+    """Hash the scene and every declared non-atlas BIN byte, ignoring the atlas.
+
+    The embedded atlas is removed from the buffer and downstream bufferView offsets
+    move back by its length, so an atlas-only size change with the same geometry
+    keeps the digest. Views must not overlap each other or the atlas, and bytes
+    outside every view (alignment padding) must be zero. GLB padding after the
+    declared buffer length is not geometry and is ignored.
+    """
+    declared = doc["buffers"][0]["byteLength"]
+    views = doc["bufferViews"]
+    image = views[image_view_id]
+    image_start = image.get("byteOffset", 0)
+    shift = image["byteLength"]
+    image_end = image_start + shift
+    require(image_end <= declared, "embedded atlas escapes the declared BIN")
+    spans = []
+    for index, view in enumerate(views):
+        if index == image_view_id:
+            continue
+        start = view.get("byteOffset", 0)
+        end = start + view["byteLength"]
+        require(end <= declared, "bufferView escapes the declared BIN")
+        require(end <= image_start or start >= image_end, "bufferView overlaps the embedded atlas")
+        spans.append((start, end, index))
+    spans.sort()
+    for (_, previous_end, _), (start, _, _) in zip(spans, spans[1:]):
+        require(start >= previous_end, "overlapping bufferViews are not supported by the geometry audit")
+    cursor = 0
+    for start, end in sorted([(image_start, image_end), *[(start, end) for start, end, _ in spans]]):
+        require(not any(binary[cursor:start]), "nonzero undeclared BIN bytes")
+        cursor = end
+    require(not any(binary[cursor:declared]), "nonzero undeclared BIN bytes")
+    canonical = json.loads(json.dumps(doc))
+    canonical["buffers"][0]["byteLength"] = declared - shift
+    for index, view in enumerate(canonical["bufferViews"]):
+        if index == image_view_id:
+            view["byteOffset"] = image_start
+            view["byteLength"] = 0
+            continue
+        offset = view.get("byteOffset", 0)
+        view["byteOffset"] = offset - shift if offset >= image_end else offset
+    payload = b"".join(binary[start:end] for start, end, _ in spans)
+    return sha(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode() + payload)
 
 
 def audit_chunk(root, row, cells, proof):
@@ -178,11 +224,7 @@ def audit_chunk(root, row, cells, proof):
         require(group["name"] == "terrain" and len(group["children"]) == 4, "missing terrain quadrants")
         require([nodes[n]["name"] for n in group["children"]] == ["terrain_quadrant_sw", "terrain_quadrant_se", "terrain_quadrant_nw", "terrain_quadrant_ne"], "quadrant identity/order differs")
     require(len(actual_cells) == len(expected_cells) and set(actual_cells) == set(expected_cells), "GLB source cells differ from indexed coverage")
-    # Hash geometry and scene metadata independently of codec/container differences.
-    geometry_doc = json.loads(json.dumps(doc))
-    geometry_doc["buffers"][0]["byteLength"] = image_start
-    geometry_doc["bufferViews"][image_view_id]["byteLength"] = 0
-    geometry = sha(json.dumps(geometry_doc, sort_keys=True, separators=(",", ":")).encode() + binary[:image_start])
+    geometry = geometry_digest(doc, binary, image_view_id)
     return rel, {"content_hash": digest, "bytes": len(data), "geometry_hash": geometry, "atlas_hash": sha(atlas_bytes), "atlas_contract": atlas, "key": [world, tier, ax, ay], "source_cells": [list(xy) for xy in sorted(expected_cells)], "bounds": [xmin, ymin, zmin, xmax, ymax, zmax], "input_proof": proof.get(rel)}
 
 

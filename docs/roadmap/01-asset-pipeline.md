@@ -46,7 +46,9 @@ Use `--invalidate-cache` to force fresh archive extraction and asset conversion.
 ### 1.1 BSA / BA2 Archive Extractor
 
 - Extracted virtual filesystem (`vfs`) using async decompression threads.
-- Preserves directory layout (`meshes/`, `textures/`, `scripts/`, `sound/`).
+- Preserves directory layout for the entries it extracts.
+- The default converter selection (`ArchiveSelection::ConverterInputs`) extracts only converter inputs: `dds`, `nif`, `pex`, `lod`, `strings`, `ilstrings` and `dlstrings`. Other archive entries, including `sound/`, are skipped and do not appear in the VFS or the archive inventory.
+- `ArchiveSelection::All` extracts every entry and is the full-VFS mode.
 
 ### 1.2 Relational World & Spatial Database Transpiler (`ESM_TO_SQLITE`)
 
