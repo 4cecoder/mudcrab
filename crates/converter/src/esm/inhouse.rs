@@ -22,6 +22,7 @@ use std::{
     fs,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 /// Decoder/adapter behavior version for output changes outside the authored schema.
@@ -31,9 +32,27 @@ pub const ADAPTER_VERSION: u32 = 12;
 /// This identity does not change the independent converted-asset producer/settings proofs.
 pub const LEGACY_PROJECTION_VERSION: u32 = 3;
 
+/// Where localized plugins' string tables are found, and in which language.
+#[derive(Clone, Copy)]
+pub(crate) struct StringSources<'a> {
+    pub(crate) roots: StringRoots<'a>,
+    /// As Skyrim's `sLanguage`: the tables are `Strings/<plugin>_<language>.<bank>`.
+    pub(crate) language: &'a str,
+}
+
+impl<'a> StringSources<'a> {
+    /// Tables in Skyrim's default language, for exports without a configuration.
+    pub(crate) fn default_language(roots: StringRoots<'a>) -> Self {
+        Self {
+            roots,
+            language: crate::config::DEFAULT_LANGUAGE,
+        }
+    }
+}
+
 /// Explicit loose-text precedence while keeping original plugin paths and provenance.
 #[derive(Clone, Copy)]
-pub(crate) enum StringSources<'a> {
+pub(crate) enum StringRoots<'a> {
     /// Ordinary Data inputs search each plugin's loose directory before the archive VFS.
     PluginLooseFirst(&'a Path),
     /// MO2 inputs read only the effective loose winner, then the effective archive VFS.
@@ -43,7 +62,7 @@ pub(crate) enum StringSources<'a> {
     },
 }
 
-impl<'a> StringSources<'a> {
+impl<'a> StringRoots<'a> {
     /// Archive extraction already resolves load-order precedence in this directory.
     fn archive_root(self) -> &'a Path {
         match self {
@@ -90,20 +109,78 @@ const DEFERRED_RUNTIME_TABLES: &[&str] = &[
     "emittance",
 ];
 
+/// Diagnostic timings do not participate in producer identity or asset reuse.
+pub(crate) const DATABASE_PROFILE_FILE: &str = "inhouse-database-profile.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DatabaseProfile {
+    schema_version: u32,
+    reader: String,
+    counts: BTreeMap<String, u64>,
+    elapsed_seconds: BTreeMap<String, f64>,
+}
+
+impl DatabaseProfile {
+    fn new() -> Self {
+        Self {
+            schema_version: 1,
+            reader: "inhouse".to_owned(),
+            counts: BTreeMap::new(),
+            elapsed_seconds: BTreeMap::new(),
+        }
+    }
+
+    fn elapsed(&mut self, phase: &str, started: Instant) {
+        self.elapsed_seconds
+            .insert(phase.to_owned(), started.elapsed().as_secs_f64());
+    }
+
+    fn write(&self, output: &Path) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(self)?;
+        let path = output.join(DATABASE_PROFILE_FILE);
+        // Resumed staging can share files with the previous pack through hard links.
+        if path.is_file() {
+            fs::remove_file(&path)?;
+        }
+        fs::write(path, bytes)?;
+        Ok(())
+    }
+}
+
 /// Identity binds decoder behavior and schema bytes so stale output cannot prove reuse.
+/// Localized names are read in Skyrim's default language.
 pub fn reader_identity(reader: RecordReader) -> serde_json::Value {
+    reader_identity_in_language(reader, crate::config::DEFAULT_LANGUAGE)
+}
+
+/// As [`reader_identity`], for names read from `language`'s string tables. English tables are
+/// Windows-1252 like plugin text, so an English identity is the one English-only adapters
+/// stamped; another language's tables are UTF-8 ([`decode_table_text`]), which its identity
+/// records. The legacy reader does not read string tables, so its identity has no language.
+pub fn reader_identity_in_language(reader: RecordReader, language: &str) -> serde_json::Value {
     match reader {
         RecordReader::Legacy => serde_json::json!({
             "mode": "legacy", "projection_version": LEGACY_PROJECTION_VERSION,
         }),
-        RecordReader::Inhouse => serde_json::json!({
-            "mode": "inhouse", "adapter_version": ADAPTER_VERSION,
-            "schema_sha256": crate::cache::hash_bytes(records::SCHEMA_BYTES),
-            "diagnostics_version": records::diagnostics::SCHEMA_VERSION,
-            "language": "english",
-            "text_encoding": "windows-1252", "vmad_text_encoding": "utf-8",
-        }),
+        RecordReader::Inhouse => {
+            let mut identity = serde_json::json!({
+                "mode": "inhouse", "adapter_version": ADAPTER_VERSION,
+                "schema_sha256": crate::cache::hash_bytes(records::SCHEMA_BYTES),
+                "diagnostics_version": records::diagnostics::SCHEMA_VERSION,
+                "language": language,
+                "text_encoding": "windows-1252", "vmad_text_encoding": "utf-8",
+            });
+            if !is_english(language) {
+                identity["string_table_encoding"] = serde_json::json!("utf-8-or-windows-1252");
+            }
+            identity
+        }
     }
+}
+
+/// Skyrim's English string tables, the language its own `sLanguage` defaults to.
+pub(crate) fn is_english(language: &str) -> bool {
+    language.eq_ignore_ascii_case(crate::config::DEFAULT_LANGUAGE)
 }
 
 /// Bind the ordered add-on bytes to metadata without changing asset settings proofs.
@@ -111,7 +188,28 @@ pub fn reader_identity_with_schemas(
     reader: RecordReader,
     schemas: &records::addons::RuntimeSchemas,
 ) -> serde_json::Value {
-    let mut identity = reader_identity(reader);
+    reader_identity_with_schemas_in_language(reader, schemas, crate::config::DEFAULT_LANGUAGE)
+}
+
+/// The identity a configuration's database is produced with: its reader, schema add-ons and
+/// string-table language.
+pub(crate) fn configured_reader_identity(
+    config: &crate::config::PipelineConfig,
+) -> Result<serde_json::Value> {
+    Ok(reader_identity_with_schemas_in_language(
+        config.record_reader,
+        config.schemas()?.as_ref(),
+        &config.language,
+    ))
+}
+
+/// As [`reader_identity_with_schemas`], for names read from `language`'s string tables.
+pub fn reader_identity_with_schemas_in_language(
+    reader: RecordReader,
+    schemas: &records::addons::RuntimeSchemas,
+    language: &str,
+) -> serde_json::Value {
+    let mut identity = reader_identity_in_language(reader, language);
     if reader == RecordReader::Inhouse && !schemas.identities().is_empty() {
         identity["schema_sha256"] = serde_json::json!(schemas.schema_sha256());
         identity["schema_addons"] = serde_json::json!(schemas.identities());
@@ -193,7 +291,7 @@ pub fn export_record_bundle_typed_with_options(
     let database_path = database_root.join("skyrim_world.db");
     let strings_root = output.join(".strings-input");
     fs::create_dir(&strings_root)?;
-    let paths = localized_string_paths(&plugins);
+    let paths = localized_string_paths(&plugins, crate::config::DEFAULT_LANGUAGE);
     let mut archives = fs::read_dir(data)?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
@@ -205,7 +303,7 @@ pub fn export_record_bundle_typed_with_options(
         .filter(|path| crate::pipeline::archive_load_order_priority(path, &plugins).is_some())
         .collect::<Vec<_>>();
     crate::pipeline::sort_archives_by_load_order(&mut archives, &plugins);
-    let strings_stage = records::profile::ProfileStage::start("english_archive_inputs");
+    let strings_stage = records::profile::ProfileStage::start("localized_archive_inputs");
     for archive in archives {
         if let Err(error) =
             crate::archive::ArchiveExtractor::extract_paths(&archive, &strings_root, &paths)
@@ -351,36 +449,39 @@ mod inhouse_determinism_tests;
 pub(crate) fn write_reader_identity(staging: &Path, reader: RecordReader) -> Result<()> {
     let schemas = records::addons::RuntimeSchemas::from_addon_bytes(&[])
         .map_err(color_eyre::eyre::Error::msg)?;
-    write_reader_identity_with_schemas(staging, reader, &schemas)
+    write_reader_identity_value(staging, &reader_identity_with_schemas(reader, &schemas))
 }
 
-/// Publish the same immutable schema provenance used by the decoder and history.
-pub(crate) fn write_reader_identity_with_schemas(
+/// Publish the same immutable schema provenance and string-table language used by the decoder
+/// and history.
+pub(crate) fn write_configured_reader_identity(
     staging: &Path,
-    reader: RecordReader,
-    schemas: &records::addons::RuntimeSchemas,
+    config: &crate::config::PipelineConfig,
 ) -> Result<()> {
+    write_reader_identity_value(staging, &configured_reader_identity(config)?)
+}
+
+/// Replace `record-reader.json` with `identity`.
+fn write_reader_identity_value(staging: &Path, identity: &serde_json::Value) -> Result<()> {
     let path = staging.join("record-reader.json");
     if path.is_file() {
         fs::remove_file(&path)?;
     }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(&reader_identity_with_schemas(reader, schemas))?,
-    )?;
+    fs::write(path, serde_json::to_vec_pretty(identity)?)?;
     Ok(())
 }
 
-/// English localized-name tables needed by the selected plugins.
-pub(crate) fn localized_string_paths(plugins: &[PathBuf]) -> BTreeSet<PathBuf> {
+/// The localized-name tables in `language` needed by the selected plugins.
+pub(crate) fn localized_string_paths(plugins: &[PathBuf], language: &str) -> BTreeSet<PathBuf> {
     plugins
         .iter()
         .filter_map(|path| path.file_stem())
         .flat_map(|stem| {
             ["strings", "dlstrings", "ilstrings"].map(|bank| {
                 PathBuf::from(format!(
-                    "strings/{}_english.{bank}",
-                    super::load_order::normalize_plugin_name(&stem.to_string_lossy())
+                    "strings/{}_{}.{bank}",
+                    super::load_order::normalize_plugin_name(&stem.to_string_lossy()),
+                    super::load_order::normalize_plugin_name(language)
                 ))
             })
         })
@@ -517,27 +618,75 @@ pub(crate) fn terrain_runtime_layers(
     Ok(output)
 }
 
+/// Write the counters the database itself proves and the reader's phase timings. Terrain writers
+/// then merge their own timings into the same file, so restores keep one producer profile.
+pub(crate) fn write_database_profile(
+    output: &Path,
+    db_path: &Path,
+    phases: &BTreeMap<String, f64>,
+) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    let count = |sql: &str| -> Result<u64> { Ok(conn.query_row(sql, [], |row| row.get(0))?) };
+    let mut profile = DatabaseProfile::new();
+    profile.counts.insert(
+        "decoded_winners".into(),
+        count("SELECT count(*) FROM inhouse_source_records")?,
+    );
+    profile.counts.insert(
+        "runtime_winners".into(),
+        count("SELECT count(*) FROM records")?,
+    );
+    profile.counts.insert(
+        "localized_fields".into(),
+        count("SELECT count(*) FROM inhouse_localized_fields")?,
+    );
+    profile.counts.insert(
+        "source_payload_bytes".into(),
+        count("SELECT coalesce(sum(length(payload)),0) FROM inhouse_source_records")?,
+    );
+    profile.elapsed_seconds = phases.clone();
+    profile.write(output)
+}
+
 /// Share source-order and layer preservation across conversion, diagnostics and metadata rebuild.
 pub(crate) fn write_terrain_caches(
     records: &HashMap<u32, RawRecord>,
     db_path: &Path,
     output: &Path,
 ) -> Result<usize> {
+    let started = Instant::now();
+    let profile_path = output.join(DATABASE_PROFILE_FILE);
+    let mut profile = if profile_path.is_file() {
+        serde_json::from_slice::<DatabaseProfile>(&fs::read(profile_path)?)?
+    } else {
+        DatabaseProfile::new()
+    };
+    let auxiliary_started = Instant::now();
     let offsets = terrain_source_offsets(db_path)?;
     let preserved = terrain_preserved_layers(db_path)?;
     let runtime = terrain_runtime_layers(db_path, &preserved)?;
+    profile.elapsed("terrain_auxiliary_reads", auxiliary_started);
+    let runtime_started = Instant::now();
     let count = crate::esm::cell_cache::write_cell_cache_with_preserved_layers(
         records,
         &offsets,
         &runtime,
         &output.join("cell_cache.rkyv"),
     )?;
+    profile.elapsed("terrain_runtime_cache", runtime_started);
+    let preserved_started = Instant::now();
     crate::esm::cell_cache::write_preserved_cell_cache_with_source_layers(
         records,
         &offsets,
         &preserved,
         &output.join("cell_cache_preserved.rkyv"),
     )?;
+    profile.elapsed("terrain_preserved_cache", preserved_started);
+    profile
+        .counts
+        .insert("terrain_cells".to_owned(), count as u64);
+    profile.elapsed("total_terrain_caches", started);
+    profile.write(output)?;
     Ok(count)
 }
 
@@ -622,7 +771,7 @@ fn convert_plugins_with_dump_impl(
     convert_plugins_with_text_sources_impl(
         plugin_paths,
         db_path,
-        StringSources::PluginLooseFirst(strings_root),
+        StringSources::default_language(StringRoots::PluginLooseFirst(strings_root)),
         dump,
         mode,
         schemas,
@@ -673,6 +822,8 @@ fn convert_plugins_with_text_sources_report_impl(
             &builtin
         }
     };
+    let total_started = Instant::now();
+    let mut phases = BTreeMap::<String, f64>::new();
     let order_stage = records::profile::ProfileStage::start("read_load_order");
     let order = LoadOrder::read(plugin_paths)?;
     order_stage.finish(plugin_paths.len());
@@ -741,6 +892,10 @@ fn convert_plugins_with_text_sources_report_impl(
     // Winner validation and the observer have finished; physical history and
     // winning source payloads stay alive for the established provenance SQL pass.
     release_reader_metadata(&mut decoded);
+    phases.insert(
+        "reader_decode_merge_deferred".into(),
+        total_started.elapsed().as_secs_f64(),
+    );
     let mut localized_fields = Vec::new();
     let mut unresolved_fields = HashMap::new();
     let mut typed_output = dump
@@ -912,6 +1067,7 @@ fn convert_plugins_with_text_sources_report_impl(
         .map(|record| (record.form_id, record.source_record_offset))
         .collect::<HashMap<_, _>>();
     setup_stage.finish(plugin_paths.len());
+    let runtime_started = Instant::now();
     let runtime_stage = records::profile::ProfileStage::start(if mode == RecordBundleMode::Full {
         "runtime_database_export"
     } else {
@@ -930,6 +1086,10 @@ fn convert_plugins_with_text_sources_report_impl(
         export_inhouse_record_archive_to_db(&conn, &master, &order, plugin_paths)?;
     }
     runtime_stage.finish(master.len());
+    phases.insert(
+        "runtime_database_export".into(),
+        runtime_started.elapsed().as_secs_f64(),
+    );
     drop(unresolved_fields);
     // Canonical SQL retains every opaque occurrence; caches see only runtime fields.
     for (id, omitted) in &opaque_fields {
@@ -982,7 +1142,12 @@ fn convert_plugins_with_text_sources_report_impl(
         .execute(params![id, offset])?;
     }
     let source_count = decoded.records.len();
+    let source_records_started = Instant::now();
     write_source_records(&tx, &mut decoded.records)?;
+    phases.insert(
+        "provenance_source_records".into(),
+        source_records_started.elapsed().as_secs_f64(),
+    );
     records::history::write_tables_with_schemas(
         &tx,
         &decoded.history,
@@ -1012,6 +1177,7 @@ fn convert_plugins_with_text_sources_report_impl(
     )?;
     tx.commit()?;
     provenance_stage.finish(source_count);
+    let diagnostics_started = Instant::now();
     if let Some(staging) = db_path.parent() {
         let path = staging.join("inhouse-reader-diagnostics.json");
         if path.is_file() {
@@ -1038,7 +1204,13 @@ fn convert_plugins_with_text_sources_report_impl(
     drop(decoded);
     release_stage.finish(master.len());
     report_warnings.extend(warnings.report());
+    phases.insert(
+        "reader_target_validation_and_diagnostics".into(),
+        diagnostics_started.elapsed().as_secs_f64(),
+    );
+    phases.insert("total_reader".into(), total_started.elapsed().as_secs_f64());
     Ok(RecordConversion {
+        phases,
         records: master,
         warnings: report_warnings,
         notices: report_notices,
@@ -1065,7 +1237,7 @@ fn validate_candidate(
         record,
         prepared,
         plugin_paths,
-        StringSources::PluginLooseFirst(strings_root),
+        StringSources::default_language(StringRoots::PluginLooseFirst(strings_root)),
         tables,
     )
 }
@@ -1335,62 +1507,122 @@ fn runtime_string(text: &str) -> Vec<u8> {
     bytes
 }
 
-/// Resolve the authoritative loose bank before the effective archive VFS.
-/// A broken winning loose source remains unresolved instead of falling back to losing text.
+/// The localized bank one reader uses for a plugin: the loose winner first, then the archive VFS.
+/// The database cache identity calls the same resolver, so both cannot choose different banks.
+#[derive(Debug)]
+pub(crate) struct LocalizedBank {
+    pub(crate) origin: &'static str,
+    pub(crate) path: PathBuf,
+}
+
+/// Resolve the authoritative bank for one plugin. A broken winning loose source remains
+/// unresolved instead of falling back to losing text; ambiguous names fail closed.
+pub(crate) fn resolve_localized_bank(
+    string_sources: StringSources<'_>,
+    plugin: &Path,
+    bank: &str,
+) -> Result<Option<LocalizedBank>> {
+    let file_name = format!(
+        "{}_{}.{bank}",
+        plugin.file_stem().unwrap_or_default().to_string_lossy(),
+        string_sources.language
+    );
+    match string_sources.roots {
+        StringRoots::PluginLooseFirst(_) => {
+            if let Some(folder) =
+                unique_child(plugin.parent().unwrap_or(Path::new(".")), "strings")?
+                && let Some(path) = unique_child(&folder, &file_name)?
+            {
+                return Ok(Some(LocalizedBank {
+                    origin: "loose",
+                    path,
+                }));
+            }
+        }
+        StringRoots::EffectiveData { loose_files, .. } => {
+            // MO2 indexes direct Strings banks with the same plugin-derived Unicode key.
+            // A single key retains layer precedence; scanning equivalent keys could select a loser.
+            let key = super::load_order::normalize_plugin_name(&format!("strings/{file_name}"));
+            if let Some(path) = loose_files.get(&key) {
+                return Ok(Some(LocalizedBank {
+                    origin: "loose",
+                    path: path.clone(),
+                }));
+            }
+        }
+    }
+    if let Some(folder) = unique_child(string_sources.roots.archive_root(), "strings")?
+        && let Some(path) = unique_child(&folder, &file_name)?
+    {
+        return Ok(Some(LocalizedBank {
+            origin: "archive",
+            path,
+        }));
+    }
+    Ok(None)
+}
+
+/// Read the resolved bank, or an empty table when no bank exists for this plugin.
 fn read_plugin_strings(
     plugin: &Path,
     string_sources: StringSources<'_>,
     bank: &str,
 ) -> Result<HashMap<u32, String>> {
-    let file_name = format!(
-        "{}_english.{bank}",
-        plugin.file_stem().unwrap_or_default().to_string_lossy()
-    );
-    match string_sources {
-        StringSources::PluginLooseFirst(_) => {
-            if let Some(folder) =
-                child_case_insensitive(plugin.parent().unwrap_or(Path::new(".")), "strings")
-                && let Some(path) = child_case_insensitive(&folder, &file_name)
-            {
-                return parse_text_table(&fs::read(path)?, bank != "strings");
-            }
-        }
-        StringSources::EffectiveData { loose_files, .. } => {
-            // MO2 indexes direct Strings banks with the same plugin-derived Unicode key.
-            // A single key retains layer precedence; scanning equivalent keys could select a loser.
-            let key = super::load_order::normalize_plugin_name(&format!("strings/{file_name}"));
-            if let Some(path) = loose_files.get(&key) {
-                return parse_text_table(&fs::read(path)?, bank != "strings");
-            }
-        }
+    match resolve_localized_bank(string_sources, plugin, bank)? {
+        Some(source) => parse_text_table(
+            &fs::read(source.path)?,
+            bank != "strings",
+            string_sources.language,
+        ),
+        None => Ok(HashMap::new()),
     }
-    if let Some(folder) = child_case_insensitive(string_sources.archive_root(), "strings")
-        && let Some(path) = child_case_insensitive(&folder, &file_name)
-    {
-        return parse_text_table(&fs::read(path)?, bank != "strings");
-    }
-    Ok(HashMap::new())
 }
 
 /// Resolve a single path component on both case-sensitive and Windows filesystems.
-fn child_case_insensitive(parent: &Path, name: &str) -> Option<PathBuf> {
+/// An exact child wins; otherwise one case-insensitive Unicode match is required.
+fn unique_child(parent: &Path, name: &str) -> Result<Option<PathBuf>> {
     let direct = parent.join(name);
     if direct.exists() {
-        return Some(direct);
+        return Ok(Some(direct));
     }
-    fs::read_dir(parent)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .find(|entry| {
-            super::load_order::normalize_plugin_name(&entry.file_name().to_string_lossy())
-                == super::load_order::normalize_plugin_name(name)
-        })
-        .map(|entry| entry.path())
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let wanted = super::load_order::normalize_plugin_name(name);
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if super::load_order::normalize_plugin_name(&entry.file_name().to_string_lossy()) == wanted
+        {
+            matches.push(entry.path());
+        }
+    }
+    color_eyre::eyre::ensure!(matches.len() <= 1, "ambiguous localized string path {name}");
+    Ok(matches.pop())
+}
+
+/// English string tables are Windows-1252, like plugin text, even where the bytes also form
+/// valid UTF-8. Skyrim SE's tables in other languages are UTF-8 (Cyrillic, Polish); a string in
+/// them that is not valid UTF-8 is read as Windows-1252.
+fn decode_table_text(bytes: &[u8], language: &str) -> String {
+    if is_english(language) {
+        return records::decode_text(bytes);
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => records::decode_text(bytes),
+    }
 }
 
 /// Read STRINGS offsets within their declared data region; one bad entry is skipped.
 /// DLSTRINGS/ILSTRINGS directory offsets point to a checked length prefix followed by text.
-fn parse_text_table(bytes: &[u8], length_prefixed: bool) -> Result<HashMap<u32, String>> {
+fn parse_text_table(
+    bytes: &[u8],
+    length_prefixed: bool,
+    language: &str,
+) -> Result<HashMap<u32, String>> {
     let word = |offset: usize| {
         bytes
             .get(offset..offset + 4)
@@ -1425,7 +1657,7 @@ fn parse_text_table(bytes: &[u8], length_prefixed: bool) -> Result<HashMap<u32, 
         if let Some(tail) = tail
             && let Some(end) = tail.iter().position(|byte| *byte == 0)
         {
-            strings.insert(id, records::decode_text(&tail[..end]));
+            strings.insert(id, decode_table_text(&tail[..end], language));
         }
     }
     Ok(strings)
@@ -1460,12 +1692,12 @@ mod tests {
         table.extend(u32::MAX.to_le_bytes());
         table.extend(4u32.to_le_bytes());
         table.extend(b"yes\0");
-        let decoded = parse_text_table(&table, true).unwrap();
+        let decoded = parse_text_table(&table, true, crate::config::DEFAULT_LANGUAGE).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[&42], "yes");
         assert!(!decoded.contains_key(&41));
         table[4..8].copy_from_slice(&13u32.to_le_bytes());
-        assert!(parse_text_table(&table, true).is_err());
+        assert!(parse_text_table(&table, true, crate::config::DEFAULT_LANGUAGE).is_err());
     }
 }
 

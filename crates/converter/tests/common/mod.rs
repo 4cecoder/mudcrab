@@ -1,8 +1,24 @@
 //! Assertions shared by synthetic publication fixtures with reader recovery warnings.
 use converter::PipelineReport;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+/// Keep deterministic pipeline fixtures independent of GPU availability.
+// Each test crate uses only some of these helpers.
+#[allow(dead_code)]
+pub fn cpu_lod_config(
+    data_dir: impl Into<PathBuf>,
+    output_dir: impl Into<PathBuf>,
+) -> converter::PipelineConfig {
+    let mut config = converter::PipelineConfig::new(data_dir, output_dir);
+    config.lod_texture_encoder = converter::TextureEncoder::Cpu;
+    config
+}
 
 /// Reader recovery publishes usable assets without certifying complete record data.
+#[allow(dead_code)]
 pub fn assert_reader_warning_publication(report: &PipelineReport, output: &Path) {
     assert!(
         !report.complete,
