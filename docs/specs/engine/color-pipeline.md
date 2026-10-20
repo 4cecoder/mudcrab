@@ -145,7 +145,7 @@ Community Shaders, revision `4d6ac751a05f2e0a10f8add4cc1ba5a0b80ea9e5`,
   effect shader, and goes through the usual fog and output transform.
 
 Colour spaces: the game looks up the stored grey level, so the shader re-encodes the
-sRGB-decoded source sample. Bevy loads a texture no standard glTF slot names through an sRGB
+sRGB-decoded source sample. Bevy loads a texture with no standard glTF slot names through an sRGB
 view, so the palette colour is decoded once on sampling; spawn validation requires that view. The
 base colour scale is recovered from the published emission (`emissive / base colour`, see the
 emission publication above); a black base colour publishes none and falls back to 1.
@@ -176,9 +176,9 @@ nonstandard blend factors and every animation controller.
 synthetic effect contracts → glTF/KTX2 → production palette material → GPU swatches beside unlit
 references computed on the CPU (bilinear filtering of the decoded 4×4 palette), with a depth
 prepass as the engine's cameras have. Nine cases: mid grey, HDR scale with the row from base red
-only, clamped corner, colour and alpha blended, alpha only, two depth-tested decals drawn through
-the depth wrapper (colour and alpha; an alpha-tested palette alpha that must discard), and two
-alpha-tested cases over an unlit plane: opaque source alpha with transparent palette alpha (must
+only, clamped corner, colour and alpha blended, alpha only, a depth-tested decal drawn
+through the depth wrapper, and three alpha-tested cases over an unlit plane: a decal through the
+wrapper whose palette alpha must discard, opaque source alpha with transparent palette alpha (must
 leave the plane visible, not a prepass hole) and the reverse. A second glTF names a palette file that does not exist; its
 palette material's recursive load must fail rather than finish. The palette view must be
 `Rgba8UnormSrgb`; tolerance 2/255; references must be visible. `--standard-material` draws the

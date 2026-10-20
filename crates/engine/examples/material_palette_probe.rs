@@ -157,9 +157,10 @@ const CASES: [Case; 9] = [
     },
 ];
 
-/// Unlit plane behind the masked rows (the last two), so a fragment a pass wrongly keeps or
-/// discards shows.
+/// Unlit plane behind the masked rows, so a fragment a pass wrongly keeps or discards shows.
 const BACKGROUND: [u8; 3] = [140, 26, 26];
+/// The masked cases are the last rows of [`CASES`]; the background spans exactly these.
+const MASKED_ROWS: usize = 3;
 
 fn srgb_decode(byte: u8) -> f32 {
     Color::srgb_u8(byte, 0, 0).to_linear().red
@@ -383,6 +384,12 @@ fn fixtures(output: &std::path::Path) -> PathBuf {
 }
 
 fn main() {
+    let (unmasked, masked) = CASES.split_at(CASES.len() - MASKED_ROWS);
+    assert!(
+        unmasked.iter().all(|case| case.mode != Mode::Mask)
+            && masked.iter().all(|case| case.mode == Mode::Mask),
+        "the background covers only the last {MASKED_ROWS} cases, which must be the masked ones"
+    );
     let mut output = PathBuf::from("material-palette-probe");
     let mut interior = false;
     let mut standard = false;
@@ -563,11 +570,12 @@ fn render_and_capture(
             ..default()
         });
         commands.spawn((
-            Mesh3d(meshes.add(Rectangle::new(8.0, 2.0))),
+            Mesh3d(meshes.add(Rectangle::new(8.0, MASKED_ROWS as f32))),
             MeshMaterial3d(background),
             Transform::from_xyz(
                 0.0,
-                (CASES.len() as f32 - 1.0) * 0.5 - (CASES.len() as f32 - 1.5),
+                (CASES.len() as f32 - 1.0) * 0.5
+                    - (CASES.len() as f32 - (MASKED_ROWS as f32 + 1.0) * 0.5),
                 -1.0,
             ),
         ));
