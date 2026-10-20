@@ -352,8 +352,10 @@ fn validate_bundle(directory: &Path, identity: &Identity) -> Result<()> {
     validate_cell_cache(&directory.join("cell_cache.rkyv"))?;
     let reader: serde_json::Value =
         serde_json::from_slice(&fs::read(directory.join("record-reader.json"))?)?;
+    // The stamp carries the selected language, so it is checked against that language.
+    let language = identity.inputs["language"].as_str().unwrap_or_default();
     ensure!(
-        reader == inhouse::reader_identity(identity.reader),
+        reader == inhouse::reader_identity_in_language(identity.reader, language),
         "reader stamp mismatch"
     );
     Ok(())
