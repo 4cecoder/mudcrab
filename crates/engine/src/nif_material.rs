@@ -462,7 +462,9 @@ mod tests {
     #[test]
     fn scene_cloning_retains_the_external_emittance_marker() {
         let mut app = App::new();
-        app.init_resource::<GltfExtensionHandlers>()
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_resource::<GltfExtensionHandlers>()
+            .init_asset::<StandardMaterial>()
             .add_plugins(NifMaterialPlugin);
         let mut world = World::new();
         world.spawn(ExternalEmittance);
