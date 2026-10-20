@@ -364,11 +364,13 @@ impl ProfilingState {
                 commit: config.profile_commit.clone(),
                 dirty_worktree: config.profile_dirty_worktree,
                 hardware_label: config.profile_hardware.clone(),
-                build_profile: if cfg!(debug_assertions) {
-                    "debug"
-                } else {
-                    "release"
-                },
+                build_profile: option_env!("MUDCRAB_BUILD_PROFILE").unwrap_or(
+                    if cfg!(debug_assertions) {
+                        "debug"
+                    } else {
+                        "release"
+                    },
+                ),
                 resolution: self
                     .window
                     .as_ref()

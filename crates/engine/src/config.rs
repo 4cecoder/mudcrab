@@ -112,6 +112,17 @@ pub struct EngineConfig {
     pub benchmark_frames: Option<u32>,
     pub benchmark_duration_secs: Option<f64>,
     pub benchmark_warmup_frames: u32,
+    /// Keep the interactive app's presentation mode for an opt-in benchmark.
+    pub benchmark_vsync: bool,
+    /// Dedicated post-settlement camera route; Some(0) measures its stationary tail.
+    pub streaming_benchmark_route_speed: Option<f64>,
+    pub streaming_benchmark_route_secs: f64,
+    pub streaming_benchmark_tail_secs: f64,
+    pub streaming_benchmark_settle_secs: f64,
+    pub streaming_benchmark_expected_models: Option<u64>,
+    pub streaming_benchmark_expected_lod_chunks: Option<usize>,
+    pub streaming_benchmark_expected_terrain: Option<u64>,
+    pub streaming_benchmark_expected_water: Option<u64>,
     /// `--benchmark-jump <grid-x>,<grid-y>`: once the world around the camera is first fully
     /// loaded, move the camera to the centre of that cell of the same worldspace and measure how
     /// long the world takes to become fully loaded again (`time_to_world_ready_after_jump_ms`).
@@ -204,6 +215,15 @@ impl Default for EngineConfig {
             benchmark_frames: None,
             benchmark_duration_secs: None,
             benchmark_warmup_frames: 60,
+            benchmark_vsync: false,
+            streaming_benchmark_route_speed: None,
+            streaming_benchmark_route_secs: 45.0,
+            streaming_benchmark_tail_secs: 10.0,
+            streaming_benchmark_settle_secs: 5.0,
+            streaming_benchmark_expected_models: None,
+            streaming_benchmark_expected_lod_chunks: None,
+            streaming_benchmark_expected_terrain: None,
+            streaming_benchmark_expected_water: None,
             benchmark_jump: None,
             benchmark_output: PathBuf::from("benchmark-report.json"),
             benchmark_frame_times: None,
@@ -283,8 +303,17 @@ Streaming:
 Benchmark and profiling:
   --benchmark-only                      run the synthetic benchmark; opens no world database
   --benchmark-frames <count>            stop after this many measured frames
-  --benchmark-duration <seconds>        stop after this many measured seconds
+  --benchmark-duration <seconds>        stop after this many measured seconds (a route run: real seconds since start)
   --benchmark-warmup-frames <count>     frames discarded before measuring (default: 60)
+  --benchmark-vsync                     use the interactive app's vsync during benchmarks
+  --streaming-benchmark-route-speed <units/s>  start a real-time route after CPU settlement; 0 is stationary
+  --streaming-benchmark-route-secs <seconds>   moving route duration (default: 45)
+  --streaming-benchmark-tail-secs <seconds>    stationary tail duration (default: 10)
+  --streaming-benchmark-settle-secs <seconds>  continuous CPU-settled wait before starting (default: 5)
+  --streaming-benchmark-expected-models <count>       optional initial validated model count
+  --streaming-benchmark-expected-lod-chunks <count>   optional initial resident LOD chunk count
+  --streaming-benchmark-expected-terrain <count>      optional initial validated terrain patch count
+  --streaming-benchmark-expected-water <count>        optional initial validated water surface count
   --benchmark-jump <x,y>                after the world first loads, jump to this grid cell and time the reload
   --benchmark-output <file>             benchmark report path (default: benchmark-report.json)
   --benchmark-frame-times [<file>]      write every measured frame time to this CSV file
@@ -504,6 +533,7 @@ impl EngineConfig {
             && self.shots.is_none()
             && self.matched_route.is_none()
             && self.auto_fly_speed <= 0.0
+            && self.streaming_benchmark_route_speed.is_none()
             && !self.material_fixture
             && !self.terrain_water_fixture
             && !self.transform_bounds_fixture
@@ -520,7 +550,9 @@ impl EngineConfig {
     /// The same test the report uses to decide whether to write itself (`metrics::collect_and_finish`),
     /// so anything that only makes sense for a benchmark can key off it.
     pub fn is_benchmark_run(&self) -> bool {
-        self.benchmark_frames.is_some() || self.benchmark_duration_secs.is_some()
+        self.benchmark_frames.is_some()
+            || self.benchmark_duration_secs.is_some()
+            || self.streaming_benchmark_route_speed.is_some()
     }
 
     /// Whether the pacing instrumentation should run at all. It is measurement only, and only a
@@ -760,6 +792,67 @@ impl EngineConfig {
                     config.benchmark_warmup_frames =
                         take_value("--benchmark-warmup-frames", "a frame count", args.next())?;
                 }
+                "--benchmark-vsync" => config.benchmark_vsync = true,
+                "--streaming-benchmark-route-speed" => {
+                    config.streaming_benchmark_route_speed = Some(take_number(
+                        "--streaming-benchmark-route-speed",
+                        "a finite speed in units per second, 0 or more",
+                        Bound::NonNegative,
+                        args.next(),
+                    )?);
+                }
+                "--streaming-benchmark-route-secs" => {
+                    config.streaming_benchmark_route_secs = take_number(
+                        "--streaming-benchmark-route-secs",
+                        "a positive finite number of seconds",
+                        Bound::Positive,
+                        args.next(),
+                    )?;
+                }
+                "--streaming-benchmark-tail-secs" => {
+                    config.streaming_benchmark_tail_secs = take_number(
+                        "--streaming-benchmark-tail-secs",
+                        "a finite number of seconds, 0 or more",
+                        Bound::NonNegative,
+                        args.next(),
+                    )?;
+                }
+                "--streaming-benchmark-settle-secs" => {
+                    config.streaming_benchmark_settle_secs = take_number(
+                        "--streaming-benchmark-settle-secs",
+                        "a finite number of seconds, 0 or more",
+                        Bound::NonNegative,
+                        args.next(),
+                    )?;
+                }
+                "--streaming-benchmark-expected-models" => {
+                    config.streaming_benchmark_expected_models = Some(take_value(
+                        "--streaming-benchmark-expected-models",
+                        "a model count",
+                        args.next(),
+                    )?);
+                }
+                "--streaming-benchmark-expected-lod-chunks" => {
+                    config.streaming_benchmark_expected_lod_chunks = Some(take_value(
+                        "--streaming-benchmark-expected-lod-chunks",
+                        "a LOD chunk count",
+                        args.next(),
+                    )?);
+                }
+                "--streaming-benchmark-expected-terrain" => {
+                    config.streaming_benchmark_expected_terrain = Some(take_value(
+                        "--streaming-benchmark-expected-terrain",
+                        "a terrain patch count",
+                        args.next(),
+                    )?);
+                }
+                "--streaming-benchmark-expected-water" => {
+                    config.streaming_benchmark_expected_water = Some(take_value(
+                        "--streaming-benchmark-expected-water",
+                        "a water surface count",
+                        args.next(),
+                    )?);
+                }
                 // Unlike its neighbours, a bad jump only warns: the jump is an add-on to a
                 // benchmark run, which still measures and writes its report without it.
                 "--benchmark-jump" => match args.next_if(|value| !value.starts_with("--")) {
@@ -911,6 +1004,47 @@ impl EngineConfig {
                 unknown => return Err(ConfigError::unrecognized(unknown)),
             }
         }
+        if config.streaming_benchmark_route_speed.is_some()
+            && (config.benchmark_only
+                || config.acceptance_screenshot.is_some()
+                || config.shots.is_some()
+                || config.matched_route.is_some()
+                || config.auto_fly_speed > 0.0
+                || config.material_fixture
+                || config.terrain_water_fixture
+                || config.transform_bounds_fixture
+                || config.renderer_fixture
+                || config.streaming_fixture
+                || config.physics_fixture)
+        {
+            return Err(ConfigError::invalid_value(
+                "--streaming-benchmark-route-speed",
+                config
+                    .streaming_benchmark_route_speed
+                    .map(|speed| speed.to_string()),
+                "a world camera route without screenshots, shots, synthetic mode or fixtures",
+            ));
+        }
+        // A route waits for CPU settlement with no other bound, so it needs the real-time deadline.
+        if config.streaming_benchmark_route_speed.is_some()
+            && config.benchmark_duration_secs.is_none()
+        {
+            return Err(ConfigError::MissingRequirement {
+                option: "--streaming-benchmark-route-speed",
+                requires: "--benchmark-duration",
+            });
+        }
+        if let Some(speed) = config.streaming_benchmark_route_speed
+            && (!(speed * config.streaming_benchmark_route_secs).is_finite()
+                || !(config.streaming_benchmark_route_secs + config.streaming_benchmark_tail_secs)
+                    .is_finite())
+        {
+            return Err(ConfigError::invalid_value(
+                "--streaming-benchmark-route-secs",
+                Some(config.streaming_benchmark_route_secs.to_string()),
+                "a duration whose route distance and total duration remain finite",
+            ));
+        }
         // The inventory is written into the profile bundle; without one it would do nothing.
         if config.profile_gpu_inventory && config.profile_output_dir.is_none() {
             return Err(ConfigError::MissingRequirement {
@@ -957,6 +1091,8 @@ impl EngineConfig {
             Some("--streaming-fixture moves the camera every frame")
         } else if self.shots.is_some() {
             Some("--shots sets the camera pose for each shot")
+        } else if self.streaming_benchmark_route_speed.is_some() {
+            Some("--streaming-benchmark-route-speed owns the camera")
         } else if self.matched_route.is_some() {
             Some("--matched-route sets the camera pose for each route step")
         } else {
@@ -1254,6 +1390,16 @@ mod tests {
         "--timeout", // repeat-terrain-startup.py
         "--launch-prefix", // repeat-terrain-startup.py
         "--commit", // repeat-terrain-startup.py
+        "--costs",  // compare-streaming-modes.py
+        "--thermal-probe", // compare-streaming-modes.py
+        "--ablation-repeats", // compare-streaming-modes.py
+        "--resume", // compare-streaming-modes.py
+        "--seed",   // streaming comparison scripts
+        "--smoke",  // compare-streaming-modes.py
+        "--experiment", // analyze-streaming-comparison.py
+        "--output-dir", // analyze-streaming-comparison.py
+        "--bootstrap-samples", // analyze-streaming-comparison.py
+        "--comparison", // analyze-streaming-comparison.py
     ];
 
     fn run_config(arguments: &[&str]) -> EngineConfig {
@@ -1354,6 +1500,123 @@ mod tests {
         assert_eq!(config.max_scene_loads, 0);
         assert_eq!(config.max_model_spawns_per_frame, 32);
         assert_eq!(config.max_upload_bytes_per_frame(), Some(16 * 1024 * 1024));
+    }
+
+    #[test]
+    fn dedicated_streaming_benchmark_route_is_opt_in_and_accepts_stationary_speed() {
+        let defaults = run_config(&[]);
+        assert!(!defaults.benchmark_vsync);
+        assert!(defaults.streaming_benchmark_route_speed.is_none());
+        assert_eq!(defaults.streaming_benchmark_settle_secs, 5.0);
+        let config = run_config(&[
+            "--streaming-benchmark-route-speed",
+            "0",
+            "--streaming-benchmark-route-secs",
+            "45",
+            "--streaming-benchmark-tail-secs",
+            "10",
+            "--streaming-benchmark-settle-secs",
+            "5",
+            "--streaming-benchmark-expected-models",
+            "2029",
+            "--streaming-benchmark-expected-lod-chunks",
+            "176",
+            "--streaming-benchmark-expected-terrain",
+            "100",
+            "--streaming-benchmark-expected-water",
+            "25",
+            "--benchmark-vsync",
+            "--benchmark-duration",
+            "210",
+        ]);
+        assert_eq!(config.streaming_benchmark_route_speed, Some(0.0));
+        assert_eq!(config.streaming_benchmark_route_secs, 45.0);
+        assert_eq!(config.streaming_benchmark_tail_secs, 10.0);
+        assert_eq!(config.streaming_benchmark_expected_models, Some(2029));
+        assert_eq!(config.streaming_benchmark_expected_lod_chunks, Some(176));
+        assert_eq!(config.streaming_benchmark_expected_terrain, Some(100));
+        assert_eq!(config.streaming_benchmark_expected_water, Some(25));
+        assert!(config.benchmark_vsync);
+        assert!(!config.interactive_world_physics());
+        assert!(!config.streaming_controls_enabled());
+    }
+
+    #[test]
+    fn benchmark_route_requires_a_real_time_deadline() {
+        let error = parse_error(&["--streaming-benchmark-route-speed", "370"]);
+        assert!(matches!(
+            error,
+            ConfigError::MissingRequirement {
+                option: "--streaming-benchmark-route-speed",
+                requires: "--benchmark-duration",
+            }
+        ));
+        let config = run_config(&[
+            "--streaming-benchmark-route-speed",
+            "370",
+            "--benchmark-duration",
+            "210",
+        ]);
+        assert_eq!(config.benchmark_duration_secs, Some(210.0));
+    }
+
+    #[test]
+    fn benchmark_route_rejects_invalid_numbers_and_anchored_camera_modes() {
+        for option in [
+            "--streaming-benchmark-route-speed",
+            "--streaming-benchmark-tail-secs",
+            "--streaming-benchmark-settle-secs",
+        ] {
+            for value in ["-1", "NaN", "inf"] {
+                assert!(matches!(
+                    parse_error(&[option, value]),
+                    ConfigError::InvalidValue { .. }
+                ));
+            }
+        }
+        for value in ["0", "-1", "NaN", "inf"] {
+            assert!(matches!(
+                parse_error(&["--streaming-benchmark-route-secs", value]),
+                ConfigError::InvalidValue { .. }
+            ));
+        }
+        for args in [
+            vec![
+                "--streaming-benchmark-route-speed",
+                "370",
+                "--acceptance-screenshot",
+                "out.png",
+            ],
+            vec![
+                "--streaming-benchmark-route-speed",
+                "370",
+                "--shots",
+                "poses.json",
+            ],
+            vec![
+                "--streaming-benchmark-route-speed",
+                "370",
+                "--benchmark-only",
+            ],
+            vec![
+                "--streaming-benchmark-route-speed",
+                "370",
+                "--physics-fixture",
+            ],
+            vec![
+                "--streaming-benchmark-route-speed",
+                "1e308",
+                "--streaming-benchmark-route-secs",
+                "1e308",
+            ],
+        ] {
+            let mut args = args;
+            args.extend(["--benchmark-duration", "60"]);
+            assert!(matches!(
+                parse_error(&args),
+                ConfigError::InvalidValue { .. }
+            ));
+        }
     }
 
     #[test]

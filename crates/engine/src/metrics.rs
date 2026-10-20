@@ -6,7 +6,10 @@ use crate::{
     render_timing::{PipelineActivity, RenderTimingPlugin, RenderTimings},
     streaming::{ActiveSpace, RenderOrigin, StreamingMetrics},
     streaming_gpu_metrics::StreamingGpuMetricsBridge,
-    streaming_trace::{BenchmarkWindow, CameraMotion, CameraObservation, StreamingFrameSample},
+    streaming_trace::{
+        BenchmarkWindow, CameraMotion, CameraObservation, StreamingBenchmarkRouteSnapshot,
+        StreamingFrameSample,
+    },
     world::components::{CELL_SIZE, StreamingCamera},
 };
 use bevy::{
@@ -89,6 +92,46 @@ fn benchmark_window(config: &EngineConfig, samples: &BenchmarkSamples) -> Benchm
     }
 }
 
+fn route_snapshot(
+    route: &crate::app::StreamingBenchmarkRoute,
+    elapsed_ms: f64,
+) -> StreamingBenchmarkRouteSnapshot {
+    use crate::app::StreamingBenchmarkPhase;
+    let offset_ms = elapsed_ms - route.latest_real_seconds * 1000.0;
+    let timestamp = |seconds: f64| offset_ms + seconds * 1000.0;
+    StreamingBenchmarkRouteSnapshot {
+        phase: match route.phase {
+            StreamingBenchmarkPhase::Waiting => "waiting",
+            StreamingBenchmarkPhase::Moving => "moving",
+            StreamingBenchmarkPhase::Tail => "tail",
+            StreamingBenchmarkPhase::Finished => "finished",
+        },
+        elapsed_ms,
+        real_elapsed_ms: route.latest_real_seconds * 1000.0,
+        cpu_settled_elapsed_ms: route.cpu_settled_real_seconds.map(timestamp),
+        movement_started_elapsed_ms: route.movement_started_real_seconds.map(timestamp),
+        movement_finished_elapsed_ms: route.movement_finished_real_seconds.map(timestamp),
+        tail_finished_elapsed_ms: route.tail_finished_real_seconds.map(timestamp),
+        route_distance_units: route.route_distance_units,
+    }
+}
+
+fn route_window(route: &crate::app::StreamingBenchmarkRoute) -> BenchmarkWindow {
+    use crate::app::StreamingBenchmarkPhase;
+    match route.phase {
+        StreamingBenchmarkPhase::Waiting => BenchmarkWindow::Warmup,
+        StreamingBenchmarkPhase::Moving => BenchmarkWindow::Measured,
+        StreamingBenchmarkPhase::Tail
+            if route.movement_started_real_seconds == route.movement_finished_real_seconds =>
+        {
+            BenchmarkWindow::Measured
+        }
+        StreamingBenchmarkPhase::Tail | StreamingBenchmarkPhase::Finished => {
+            BenchmarkWindow::Settlement
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PreviousCamera {
     entity: Entity,
@@ -164,6 +207,7 @@ fn sample_streaming_trace(
     mut pending_ids: Local<Vec<bevy::asset::AssetId<WorldAsset>>>,
     mut profiler: ResMut<ProfilingState>,
     runtime: Option<Res<crate::streaming::runtime::StreamingRuntime>>,
+    route: Option<Res<crate::app::StreamingBenchmarkRoute>>,
 ) {
     // Trace v1 has no interior identity. Do not label interior coordinates as exterior world
     // positions or compare motion across the transition; resume observations after leaving.
@@ -185,7 +229,12 @@ fn sample_streaming_trace(
         main_frame: profiler.main_frame(),
         elapsed_ms: profiler.elapsed_ms(),
         delta_ms: profiler.trace_delta_ms,
-        benchmark_window: benchmark_window(&config, &samples),
+        benchmark_window: route
+            .as_deref()
+            .map_or_else(|| benchmark_window(&config, &samples), route_window),
+        streaming_benchmark_route: route
+            .as_deref()
+            .map(|route| route_snapshot(route, profiler.elapsed_ms())),
         camera,
         streaming: streaming.as_deref().map(Into::into),
         scene_admission: (config.prioritize_streaming || config.max_scene_loads != 0)
@@ -243,6 +292,10 @@ struct BenchmarkReport {
     scenario: String,
     frames: usize,
     warmup_frames: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    streaming_benchmark_route: Option<StreamingBenchmarkRouteSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    measurement_scope: Option<&'static str>,
     synthetic_instances: usize,
     elapsed_seconds: f64,
     average_fps: f64,
@@ -298,6 +351,7 @@ struct Thresholds {
 #[allow(clippy::too_many_arguments)]
 fn collect_and_finish(
     time: Res<Time>,
+    real_time: Res<Time<Real>>,
     config: Res<EngineConfig>,
     diagnostics: Res<DiagnosticsStore>,
     system: Option<Res<SystemInfo>>,
@@ -309,6 +363,7 @@ fn collect_and_finish(
     mut samples: ResMut<BenchmarkSamples>,
     mut profiler: ResMut<ProfilingState>,
     mut exit: MessageWriter<AppExit>,
+    route: Option<Res<crate::app::StreamingBenchmarkRoute>>,
 ) {
     if samples.finished || !config.is_benchmark_run() {
         return;
@@ -320,9 +375,20 @@ fn collect_and_finish(
             &SystemInformationDiagnosticsPlugin::PROCESS_MEM_USAGE,
         );
         profiler.sample_frame(&diagnostics, process_memory);
-        if samples.frames_seen > config.benchmark_warmup_frames {
+        let measuring = route.as_deref().map_or(
+            samples.frames_seen > config.benchmark_warmup_frames,
+            |route| route_window(route) == BenchmarkWindow::Measured,
+        );
+        if route.is_some() && !measuring {
+            render_timings.set_recording(false);
+        }
+        if measuring {
             render_timings.set_recording(true);
-            let milliseconds = time.delta_secs_f64() * 1000.0;
+            let milliseconds = if route.is_some() {
+                real_time.delta_secs_f64() * 1000.0
+            } else {
+                time.delta_secs_f64() * 1000.0
+            };
             if milliseconds.is_finite() && milliseconds > 0.0 {
                 samples.frame_ms.push(milliseconds);
                 samples.measured_seconds += milliseconds / 1000.0;
@@ -343,7 +409,18 @@ fn collect_and_finish(
         let duration_reached = config
             .benchmark_duration_secs
             .is_some_and(|limit| samples.frame_ms.iter().sum::<f64>() / 1000.0 >= limit);
-        if !frame_limit_reached && !duration_reached {
+        // A route is bounded by real elapsed time from engine start, so a route that never settles
+        // (or stops advancing) still reaches the bundle and report before the runner's own timeout.
+        let route_deadline_reached = config
+            .benchmark_duration_secs
+            .is_some_and(|limit| real_time.elapsed_secs_f64() >= limit);
+        let complete = route
+            .as_ref()
+            .map_or(frame_limit_reached || duration_reached, |route| {
+                route.phase == crate::app::StreamingBenchmarkPhase::Finished
+                    || route_deadline_reached
+            });
+        if !complete {
             return;
         }
         samples.measurement_complete = true;
@@ -423,7 +500,10 @@ fn collect_and_finish(
         && commit_budget_respected
         && streaming_lifecycle_validated
         && renderer_path_active
-        && screenshot_captured;
+        && screenshot_captured
+        && route
+            .as_ref()
+            .is_none_or(|route| route.phase == crate::app::StreamingBenchmarkPhase::Finished);
     let system_snapshot = system.map(|value| SystemSnapshot {
         os: value.os.clone(),
         kernel: value.kernel.clone(),
@@ -457,6 +537,16 @@ fn collect_and_finish(
         },
         frames: ordered.len(),
         warmup_frames: config.benchmark_warmup_frames,
+        streaming_benchmark_route: route
+            .as_deref()
+            .map(|route| route_snapshot(route, profiler.elapsed_ms())),
+        measurement_scope: route.as_ref().map(|_| {
+            if config.streaming_benchmark_route_speed == Some(0.0) {
+                "stationary_tail"
+            } else {
+                "route_motion"
+            }
+        }),
         synthetic_instances: if config.benchmark_only {
             config.synthetic_instances
         } else {
@@ -720,6 +810,106 @@ mod tests {
         })));
         assert!(!installed(Some(EngineConfig::default())));
         assert!(!installed(None), "no config means no measured run");
+    }
+
+    #[test]
+    fn route_report_clock_keeps_uncapped_real_frame_intervals() {
+        use crate::{app::StreamingBenchmarkPhase, profiling::ProfilingPlugin};
+        use bevy::time::TimeUpdateStrategy;
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(EngineConfig {
+                streaming_benchmark_route_speed: Some(370.0),
+                ..default()
+            })
+            .insert_resource(crate::app::StreamingBenchmarkRoute {
+                phase: StreamingBenchmarkPhase::Moving,
+                movement_started_real_seconds: Some(0.0),
+                ..default()
+            })
+            .insert_resource(TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_millis(600),
+            ))
+            .init_resource::<DiagnosticsStore>()
+            .init_resource::<RendererMetrics>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<Image>>()
+            .add_plugins((AcceptanceMetricsPlugin, ProfilingPlugin));
+        app.update();
+        app.update();
+        let samples = app.world().resource::<BenchmarkSamples>();
+        assert_eq!(samples.frame_ms, vec![600.0]);
+        assert_eq!(samples.measured_seconds, 0.6);
+        assert!(app.world().resource::<Time>().delta_secs_f64() < 0.6);
+    }
+
+    /// A route whose CPU never settles still finalises at its real-time deadline: the profile
+    /// bundle and the report are written, and acceptance fails because the route did not finish.
+    #[test]
+    fn unsettled_route_writes_bundle_and_fails_at_its_real_time_deadline() {
+        use crate::{app::StreamingBenchmarkRoute, profiling::ProfilingPlugin};
+        use bevy::time::TimeUpdateStrategy;
+
+        let directory = tempfile::tempdir().unwrap();
+        let report_path = directory.path().join("report.json");
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(EngineConfig {
+                streaming_benchmark_route_speed: Some(370.0),
+                benchmark_duration_secs: Some(1.0),
+                benchmark_output: report_path.clone(),
+                profile_output_dir: Some(directory.path().join("profile")),
+                ..default()
+            })
+            .insert_resource(StreamingBenchmarkRoute::default())
+            .insert_resource(TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_millis(600),
+            ))
+            .init_resource::<DiagnosticsStore>()
+            .init_resource::<RendererMetrics>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<Image>>()
+            .add_plugins((AcceptanceMetricsPlugin, ProfilingPlugin));
+        // The deadline is 1 s of real time, so the second 600 ms update reaches it.
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(
+            directory.path().join("profile/metadata.json").is_file(),
+            "the profile bundle must be written at the deadline"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report_path).expect("report written")).unwrap();
+        assert_eq!(
+            report["passed"], false,
+            "an unfinished route cannot pass acceptance"
+        );
+        assert_eq!(report["streaming_benchmark_route"]["phase"], "waiting");
+        assert!(app.world().resource::<BenchmarkSamples>().finished);
+    }
+
+    #[test]
+    fn route_windows_exclude_wait_and_moving_tail_but_measure_stationary_tail() {
+        use crate::app::{StreamingBenchmarkPhase, StreamingBenchmarkRoute};
+
+        let mut route = StreamingBenchmarkRoute::default();
+        assert_eq!(route_window(&route), BenchmarkWindow::Warmup);
+        route.phase = StreamingBenchmarkPhase::Moving;
+        route.movement_started_real_seconds = Some(5.0);
+        assert_eq!(route_window(&route), BenchmarkWindow::Measured);
+        route.phase = StreamingBenchmarkPhase::Tail;
+        route.movement_finished_real_seconds = Some(50.0);
+        assert_eq!(route_window(&route), BenchmarkWindow::Settlement);
+        route.movement_finished_real_seconds = Some(5.0);
+        assert_eq!(route_window(&route), BenchmarkWindow::Measured);
+        route.phase = StreamingBenchmarkPhase::Finished;
+        assert_eq!(route_window(&route), BenchmarkWindow::Settlement);
+        route.latest_real_seconds = 8.0;
+        route.cpu_settled_real_seconds = Some(2.0);
+        let snapshot = route_snapshot(&route, 10_000.0);
+        assert_eq!(snapshot.cpu_settled_elapsed_ms, Some(4000.0));
+        assert_eq!(snapshot.movement_started_elapsed_ms, Some(7000.0));
     }
 
     /// Verify trace frame ordering across all benchmark windows with GPU inventory on and off.
