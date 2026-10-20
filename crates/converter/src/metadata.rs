@@ -126,7 +126,7 @@ impl AssetPipeline {
         );
         ensure!(
             manifest.complete && manifest.failures.is_empty(),
-            "metadata rebuild requires a complete, failure-free converter schema {CONVERTER_SCHEMA_VERSION} source"
+            "metadata rebuild requires complete converter schema {CONVERTER_SCHEMA_VERSION} assets with no failures"
         );
         ensure!(
             manifest.retained_mesh_schema_version.is_some()
