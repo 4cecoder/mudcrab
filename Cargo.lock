@@ -2839,6 +2839,7 @@ dependencies = [
  "crossbeam-channel",
  "ddsfile",
  "dummy-content",
+ "gltf",
  "ktx2",
  "memmap2",
  "mlua",
