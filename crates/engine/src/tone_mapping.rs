@@ -567,9 +567,18 @@ mod tests {
             SceneVisualPreset::CoolGray,
             overrides,
         );
-        assert_eq!(evidence["loaded_record"]["hdr"]["white"], 1.05);
-        assert_eq!(evidence["tone_mapping"]["loaded_white"], 1.05);
-        assert_eq!(evidence["grade_overrides"]["brightness"], 1.8);
+        assert_eq!(
+            evidence["loaded_record"]["hdr"]["white"],
+            serde_json::json!(1.05_f32)
+        );
+        assert_eq!(
+            evidence["tone_mapping"]["loaded_white"],
+            serde_json::json!(1.05_f32)
+        );
+        assert_eq!(
+            evidence["grade_overrides"]["brightness"],
+            serde_json::json!(1.8_f32)
+        );
         assert_eq!(evidence["effective_stages"]["tone_operator"], 2);
     }
 

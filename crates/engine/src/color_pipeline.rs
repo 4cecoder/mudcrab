@@ -1056,9 +1056,18 @@ mod tests {
             SceneVisualPreset::CoolGray,
             overrides,
         );
-        assert_eq!(evidence["base_grade"]["brightness"], 1.37);
-        assert_eq!(evidence["grade_overrides"]["saturation"], 1.8);
-        assert_eq!(evidence["effective_grade"]["saturation"], 1.8);
+        assert_eq!(
+            evidence["base_grade"]["brightness"],
+            serde_json::json!(1.37_f32)
+        );
+        assert_eq!(
+            evidence["grade_overrides"]["saturation"],
+            serde_json::json!(1.8_f32)
+        );
+        assert_eq!(
+            evidence["effective_grade"]["saturation"],
+            serde_json::json!(1.8_f32)
+        );
     }
 
     #[test]
@@ -1259,12 +1268,18 @@ mod tests {
             SceneVisualPreset::CoolGray,
             overrides,
         );
-        assert_eq!(tuned_evidence["grade_overrides"]["brightness"], 1.62);
+        assert_eq!(
+            tuned_evidence["grade_overrides"]["brightness"],
+            serde_json::json!(1.62_f32)
+        );
         assert_eq!(
             tuned_evidence["loaded_record"]["cinematic"]["brightness"],
-            1.29
+            serde_json::json!(1.29_f32)
         );
-        assert_eq!(tuned_evidence["effective_grade"]["brightness"], 1.62);
+        assert_eq!(
+            tuned_evidence["effective_grade"]["brightness"],
+            serde_json::json!(1.62_f32)
+        );
         let mut app = App::new();
         app.insert_resource(changed)
             .insert_resource(SceneGradeMode::SnapshotSrgb)

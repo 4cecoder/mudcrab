@@ -421,12 +421,27 @@ mod tests {
             overrides,
         )
         .expect("the same resolved grade labels the camera frame");
-        assert_eq!(capture.resolved_grade["brightness"], 1.74);
-        assert_eq!(capture.resolved_grade["tint_rgb"][1], 0.67);
-        assert_eq!(capture.resolved_grade["pivot"], 0.29);
-        assert_eq!(capture.source["grade_overrides"]["brightness"], 1.74);
-        assert_eq!(capture.source["effective_grade"]["brightness"], 1.74);
-        assert_eq!(capture.source["effective_stages"]["pivot"], 0.29);
+        assert_eq!(
+            capture.resolved_grade["brightness"],
+            serde_json::json!(1.74_f32)
+        );
+        assert_eq!(
+            capture.resolved_grade["tint_rgb"][1],
+            serde_json::json!(0.67_f32)
+        );
+        assert_eq!(capture.resolved_grade["pivot"], serde_json::json!(0.29_f32));
+        assert_eq!(
+            capture.source["grade_overrides"]["brightness"],
+            serde_json::json!(1.74_f32)
+        );
+        assert_eq!(
+            capture.source["effective_grade"]["brightness"],
+            serde_json::json!(1.74_f32)
+        );
+        assert_eq!(
+            capture.source["effective_stages"]["pivot"],
+            serde_json::json!(0.29_f32)
+        );
     }
 
     #[test]
