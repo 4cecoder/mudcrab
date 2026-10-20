@@ -142,6 +142,44 @@ function Get-WindowArguments([string]$Name, [hashtable]$Parameters) {
     return $arguments + @("--frame-budget-ms", "$FrameBudgetMs")
 }
 
+# The windows a scenario is measured in: a route scenario only its moving window, a flying scenario
+# a standing-still window and a streaming window, everything else one standing-still window.
+function Get-WindowKinds([string]$Name, $WindowCounts) {
+    if ($routeScenarios.ContainsKey($Name)) { return @("streaming") }
+    if ($WindowCounts[$Name] -eq 2) { return @("standing_still", "streaming") }
+    return @("standing_still")
+}
+
+# The parameters of one window's engine arguments. `$Run` adds the per-run fields (run directory,
+# label, identity) that the planner does not need and the window loop does.
+function Get-WindowInvocationParameters([string]$Name, [string]$Kind, [hashtable]$Run) {
+    $parameters = @{
+        StandingStill = ($Kind -eq "standing_still")
+        DurationSeconds = (Get-WindowDuration $Name); StabilitySeconds = $StabilitySeconds
+        ResolvedAssets = $resolvedAssets; Worldspace = $Worldspace
+        RuralGridX = $RuralGridX; RuralGridY = $RuralGridY; DenseGridX = $DenseGridX; DenseGridY = $DenseGridY
+        DenseLegacyGridX = $DenseLegacyGridX; DenseLegacyGridY = $DenseLegacyGridY
+        WaterGridX = $WaterGridX; WaterGridY = $WaterGridY
+    }
+    foreach ($key in $Run.Keys) { $parameters[$key] = $Run[$key] }
+    return $parameters
+}
+
+# The workload each window of the campaign will be started with, known before any engine runs, keyed
+# `scenario/kind`. The planner builds the same engine arguments the window loop does.
+function Get-PlannedWorkloads($Names, $WindowCounts) {
+    $planned = [ordered]@{}
+    foreach ($name in $Names) {
+        foreach ($kind in (Get-WindowKinds $name $WindowCounts)) {
+            $arguments = Get-WindowArguments $name (Get-WindowInvocationParameters $name $kind @{
+                RunDirectory = "."; Commit = "plan"; Hardware = "plan"; RunId = "plan"; DirtyWorktree = $false
+            })
+            $planned["$name/$kind"] = Get-KnownScenarioInputs $arguments (Get-WindowDuration $name)
+        }
+    }
+    return $planned
+}
+
 function Get-WindowDuration([string]$Name) {
     if ($Name -eq "stability") { return $StabilitySeconds }
     if ($routeScenarios.ContainsKey($Name)) {
@@ -366,7 +404,7 @@ function Get-AssetsIdentity([string]$ResolvedAssets) {
 # The asset set is recorded as its full path, so the same set named by a different relative path is
 # the same identity and a different set is a difference — and by its own manifest identity, because
 # that path can hold a re-converted or modded set without changing.
-function Get-ScenarioInputs($Arguments, $Report, [int]$DurationSeconds) {
+function Get-KnownScenarioInputs($Arguments, [int]$DurationSeconds) {
     $worldspace = Get-ArgumentValue $Arguments "--worldspace"
     $gridX = Get-ArgumentValue $Arguments "--grid-x"
     $gridY = Get-ArgumentValue $Arguments "--grid-y"
@@ -398,8 +436,30 @@ function Get-ScenarioInputs($Arguments, $Report, [int]$DurationSeconds) {
             schema_version = $assetsIdentity.schema_version
         }
         assets_identity_unavailable = $assetsIdentity.unavailable
-        stream_radius = $Report.fingerprint.graphics.stream_radius
         duration_seconds = $DurationSeconds
+    }
+}
+
+# The keys of `Get-KnownScenarioInputs`: everything about a window's workload that is fixed before its
+# engine starts. The stream radius and the warm-up come from the report and are checked after a run.
+$script:knownInputKeys = @(
+    "worldspace", "grid", "fly_speed", "synthetic_instances", "route", "assets", "assets_identity",
+    "assets_identity_unavailable", "duration_seconds"
+)
+
+function Get-ScenarioInputs($Arguments, $Report, [int]$DurationSeconds) {
+    $known = Get-KnownScenarioInputs $Arguments $DurationSeconds
+    return [ordered]@{
+        worldspace = $known.worldspace
+        grid = $known.grid
+        fly_speed = $known.fly_speed
+        synthetic_instances = $known.synthetic_instances
+        route = $known.route
+        assets = $known.assets
+        assets_identity = $known.assets_identity
+        assets_identity_unavailable = $known.assets_identity_unavailable
+        stream_radius = $Report.fingerprint.graphics.stream_radius
+        duration_seconds = $known.duration_seconds
         warmup_frames = $Report.warmup_frames
     }
 }
@@ -847,6 +907,34 @@ function Assert-AssetIdentityKnown($Inputs, [string]$Path, [string]$Scope) {
     }
 }
 
+# The planned workload of every window of the campaign, compared with the baseline window of the same
+# name and kind before the first engine starts. Only what is known before the run is compared: the
+# stream radius and warm-up are report fields and are checked against the report after its window.
+# A route window's identity is its file's hash, so an edited route, its coordinates, speed or
+# worldspace, is a different workload. The frame budget is part of the workload too.
+function Assert-ComparisonWorkloads($Old, $Planned, [double]$FrameBudgetMs, [string]$Path) {
+    foreach ($key in @($Planned.Keys)) {
+        $parts = $key -split "/"
+        $name = $parts[0]; $kind = $parts[1]
+        if (-not $Old.scenarios.ContainsKey($name)) { continue }
+        $oldWindow = $Old.scenarios[$name].windows[$kind]
+        if ($null -eq $oldWindow) { continue }
+        $planWindow = $Planned[$key]
+        Assert-AssetIdentityKnown $planWindow $Path "baseline $key"
+        $oldInputs = [ordered]@{}
+        foreach ($field in $script:knownInputKeys) { $oldInputs[$field] = $oldWindow.scenario_inputs[$field] }
+        $newInputs = [ordered]@{}
+        foreach ($field in $script:knownInputKeys) { $newInputs[$field] = $planWindow[$field] }
+        $differences = @(Get-FieldDifferences $oldInputs $newInputs)
+        if ($null -ne $oldWindow.frame_budget -and [double]$oldWindow.frame_budget.budget_ms -ne $FrameBudgetMs) {
+            $differences += "frame_budget_ms : $(Format-FieldValue $oldWindow.frame_budget.budget_ms) -> $(Format-FieldValue $FrameBudgetMs)"
+        }
+        if ($differences.Count -gt 0) {
+            throw "Cannot compare baseline $key with ${Path}: the window would not be the same workload ($($differences -join '; ')). The check runs before the campaign's first timed window, so nothing was measured; rerun without -CompareTo, or with a baseline measured on this workload"
+        }
+    }
+}
+
 # Asset identity needs no engine report, so refuse unusable comparisons before timed windows.
 function Assert-ComparisonAssetIdentities($Old, [string]$ResolvedAssets, $Requested, $WindowCounts, [string]$Path) {
     foreach ($name in $Requested) {
@@ -1039,6 +1127,14 @@ if ($previous) {
         $previous = $null
     }
 }
+if ($previous) {
+    $planned = Get-PlannedWorkloads $requested $windowsPerScenario
+    $refusal = Get-ComparisonRefusal { Assert-ComparisonWorkloads $previous $planned $FrameBudgetMs $comparePath }
+    if ($refusal) {
+        Write-Warning "$refusal The campaign continues without a comparison"
+        $previous = $null
+    }
+}
 
 # Named `$scenarioReports`, not `$scenarios`: PowerShell variable names are case-insensitive, so a
 # local `$scenarios` would be this script's own `-Scenarios` parameter, validation and all.
@@ -1050,7 +1146,7 @@ $campaignFingerprintLabel = $null
 foreach ($name in $requested) {
     $isRoute = $routeScenarios.ContainsKey($name)
     $moves = $isRoute -or $windowsPerScenario[$name] -eq 2
-    $kinds = if ($isRoute) { @("streaming") } elseif ($moves) { @("standing_still", "streaming") } else { @("standing_still") }
+    $kinds = Get-WindowKinds $name $windowsPerScenario
     $reports = @{}
     foreach ($kind in $kinds) {
         $windowReports = @()
@@ -1061,16 +1157,10 @@ foreach ($name in $requested) {
             $label = if ($kind -eq "streaming") { "baseline $name streaming $run/$Repeats" } else { "baseline $name $run/$Repeats" }
             $reportLabel = "baseline $name/$kind/run-$run"
             $runDirectory = Join-Path $campaignRoot "$name\$($kind -replace '_', '-')\run-$run"
-            $arguments = Get-WindowArguments $name @{
+            $arguments = Get-WindowArguments $name (Get-WindowInvocationParameters $name $kind @{
                 RunDirectory = $runDirectory; Commit = $identity.commit
                 Hardware = $hardware; RunId = "run-$run"; RunLabel = $label; DirtyWorktree = [bool]$identity.dirty
-                StandingStill = ($kind -eq "standing_still")
-                DurationSeconds = (Get-WindowDuration $name); StabilitySeconds = $StabilitySeconds
-                ResolvedAssets = $resolvedAssets; Worldspace = $Worldspace
-                RuralGridX = $RuralGridX; RuralGridY = $RuralGridY; DenseGridX = $DenseGridX; DenseGridY = $DenseGridY
-                DenseLegacyGridX = $DenseLegacyGridX; DenseLegacyGridY = $DenseLegacyGridY
-                WaterGridX = $WaterGridX; WaterGridY = $WaterGridY
-            }
+            })
             if ($null -eq $windowArguments) { $windowArguments = $arguments }
             # A baseline measures a window; it is not the acceptance campaign, so a window the engine
             # ended on a failed gate is kept with its gate recorded (`acceptance`, below) rather than

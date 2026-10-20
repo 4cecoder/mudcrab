@@ -26,14 +26,16 @@ function Import-ScriptFunctions([string]$Path, [string[]]$Names) {
 
 $baselineScript = Join-Path $repository "scripts/phase2-baseline.ps1"
 $profileScript = Join-Path $repository "scripts/phase2-profile.ps1"
-foreach ($text in @(Import-ScriptFunctions $profileScript @("Get-Median", "Get-RegressionComparison"))) {
+foreach ($text in @(Import-ScriptFunctions $profileScript @("Get-Median", "Get-RegressionComparison", "Get-ScenarioArguments", "Get-ArgumentValue"))) {
     . ([scriptblock]::Create($text))
 }
 $baselineFunctions = @(
     "Get-Values", "Get-Spread", "Get-SummaryMap", "Get-CountMap", "Get-SummaryLine", "Format-Spread", "Get-FieldDifferences", "Format-FieldValue",
     "Get-LaggingPasses", "Assert-AssetIdentityKnown", "Assert-ComparisonAssetIdentities",
     "Assert-WindowComparable", "Get-ComparisonRefusal", "Get-Comparison",
-    "Get-RouteShortfall", "Get-BaselineProblem", "Get-RouteTravelSeconds", "Get-WindowDuration", "Get-WindowReport"
+    "Get-RouteShortfall", "Get-BaselineProblem", "Get-RouteTravelSeconds", "Get-WindowDuration", "Get-WindowReport",
+    "Get-WindowArguments", "Get-WindowInvocationParameters", "Get-WindowKinds", "Get-KnownScenarioInputs",
+    "Get-PlannedWorkloads", "Assert-ComparisonWorkloads"
 )
 # The constants the imported functions read, taken from the script's own assignments so a changed
 # value cannot leave the fixtures testing a different workload.
@@ -53,6 +55,14 @@ $fixtureDirectory = Join-Path ([IO.Path]::GetTempPath()) "phase2-route-fixtures-
 New-Item -ItemType Directory -Path $fixtureDirectory -Force | Out-Null
 Set-Content -LiteralPath (Join-Path $fixtureDirectory "long.json") -Value '{"speed": 100, "loop": false, "waypoints": [[0, 0], [10000, 0]]}'
 Set-Content -LiteralPath (Join-Path $fixtureDirectory "loop.json") -Value '{"speed": 100, "loop": true, "waypoints": [[0, 0], [10000, 0], [0, 0]]}'
+# The campaign's workload variables, as the script sets them, for the planner fixtures.
+$resolvedAssets = "D:\Mudcrab\Converted"
+$Worldspace = "0x3c"
+$RuralGridX = 0; $RuralGridY = 0; $DenseGridX = 3; $DenseGridY = -12
+$DenseLegacyGridX = 18; $DenseLegacyGridY = -5; $WaterGridX = 0; $WaterGridY = 0
+$StabilitySeconds = 1800
+$FrameBudgetMs = 6.25
+$script:knownInputKeys = Invoke-Expression ([regex]::Match($baselineText, '(?s)\$script:knownInputKeys = (@\(.*?\))').Groups[1].Value)
 function Get-RouteFilePath([string]$Name) {
     if ($Name -in @("long", "loop")) { return Join-Path $fixtureDirectory $routeScenarios[$Name] }
     return Join-Path $repository "scripts/routes/$($routeScenarios[$Name])"
@@ -280,6 +290,69 @@ $tokens = $null; $errors = $null
 $windowReportAst = [System.Management.Automation.Language.Parser]::ParseFile($baselineScript, [ref]$tokens, [ref]$errors).FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Get-WindowReport" }, $true)[0]
 $shortfallCalls = @($windowReportAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "Get-RouteShortfall" }, $true))
 Assert-True ($shortfallCalls.Count -eq 1) "Get-WindowReport refuses a partial route before it builds the window's numbers"
+
+Remove-Item -LiteralPath $fixtureDirectory -Recurse -Force
+
+# --- Planned workloads: refused before the first window, whichever input changed --------------------
+
+$script:preflightIdentity = @{ unavailable = $null; configuration_hash = "h1"; schema_version = 1 }
+$planCounts = @{ rural = 1; dense = 1; long = 1; synthetic = 1 }
+$requestedPlan = @("rural", "dense", "long")
+# A baseline shaped as the campaign writes one: each window's scenario inputs are the planned ones.
+function New-PlannedBaseline($Planned, [double]$BudgetMs = 6.25) {
+    $windows = @{}
+    foreach ($key in @($Planned.Keys)) {
+        $parts = $key -split "/"
+        if (-not $windows.ContainsKey($parts[0])) { $windows[$parts[0]] = @{ windows = @{} } }
+        $windows[$parts[0]].windows[$parts[1]] = @{ scenario_inputs = $Planned[$key]; frame_budget = @{ budget_ms = $BudgetMs } }
+    }
+    return @{ scenarios = $windows }
+}
+
+New-Item -ItemType Directory -Path $fixtureDirectory -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $fixtureDirectory "long.json") -Value '{"speed": 100, "loop": false, "waypoints": [[0, 0], [10000, 0]]}'
+$planned = Get-PlannedWorkloads $requestedPlan $planCounts
+Assert-True ($planned.Keys -contains "long/streaming" -and -not ($planned.Keys -contains "long/standing_still")) "a route scenario plans its streaming window only" ($planned.Keys -join ",")
+Assert-True ($planned["dense/standing_still"].grid.x -eq 3 -and $planned["dense/standing_still"].duration_seconds -eq 120) "the planner takes the dense grid and the window duration from the campaign's arguments"
+Assert-True ($planned["long/streaming"].route.sha256.Length -gt 0) "a planned route window carries its file's hash"
+Assert-True (-not $planned["rural/standing_still"].Contains("stream_radius")) "the planner keeps report-only fields out of the pre-run check"
+
+$unchangedBaseline = New-PlannedBaseline $planned
+Assert-Passes { Assert-ComparisonWorkloads $unchangedBaseline $planned $FrameBudgetMs "baseline.json" } "an identical plan passes before the first window"
+
+# A changed route file is a different workload, whatever the other windows say.
+Set-Content -LiteralPath (Join-Path $fixtureDirectory "long.json") -Value '{"speed": 100, "loop": false, "waypoints": [[0, 0], [9000, 0]]}'
+$editedRoute = Get-PlannedWorkloads $requestedPlan $planCounts
+Assert-Throws { Assert-ComparisonWorkloads $unchangedBaseline $editedRoute $FrameBudgetMs "baseline.json" } "route" "a changed route file's coordinates are refused before any window"
+Set-Content -LiteralPath (Join-Path $fixtureDirectory "long.json") -Value '{"speed": 100, "loop": false, "waypoints": [[0, 0], [10000, 0]]}'
+
+# A later scenario's changed grid is refused even though the first scenario still matches.
+$DenseGridX = 4
+$movedDense = Get-PlannedWorkloads $requestedPlan $planCounts
+$DenseGridX = 3
+Assert-Throws { Assert-ComparisonWorkloads $unchangedBaseline $movedDense $FrameBudgetMs "baseline.json" } "grid" "a later scenario whose grid moved is refused before the first window"
+Assert-True ($movedDense["rural/standing_still"].grid.x -eq $planned["rural/standing_still"].grid.x) "the earlier scenario's plan is unchanged by a later scenario's grid"
+
+# A changed time limit or frame budget is a different workload too.
+$DurationSeconds = 200
+$longerPlan = Get-PlannedWorkloads $requestedPlan $planCounts
+$DurationSeconds = 120
+Assert-Throws { Assert-ComparisonWorkloads $unchangedBaseline $longerPlan $FrameBudgetMs "baseline.json" } "duration_seconds" "a changed time limit is refused before the first window"
+Assert-Throws { Assert-ComparisonWorkloads $unchangedBaseline $planned 8.33 "baseline.json" } "frame_budget_ms" "a changed frame budget is refused before the first window"
+
+# Explicit comparisons throw; an implicit one (a baseline from -Out) returns the reason to warn about.
+$explicitCompare = $true
+Assert-Throws { Get-ComparisonRefusal { Assert-ComparisonWorkloads $unchangedBaseline $movedDense $FrameBudgetMs "baseline.json" } } "grid" "an explicit planned-workload mismatch throws"
+$explicitCompare = $false
+$refusal = Get-ComparisonRefusal { Assert-ComparisonWorkloads $unchangedBaseline $movedDense $FrameBudgetMs "baseline.json" }
+Assert-True ($refusal -match "grid") "an implicit planned-workload mismatch returns the reason for a warning" $refusal
+
+# The route kind is streaming, and the check runs before the first engine window in the script.
+$scriptAst = [System.Management.Automation.Language.Parser]::ParseFile($baselineScript, [ref]$null, [ref]$null)
+$checkCalls = @($scriptAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "Assert-ComparisonWorkloads" }, $true))
+$windowCalls = @($scriptAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "Invoke-EngineWindow" }, $true))
+Assert-True ($checkCalls.Count -eq 1 -and $windowCalls.Count -ge 1 -and $checkCalls[0].Extent.StartOffset -lt $windowCalls[0].Extent.StartOffset) "the planned-workload check precedes the first Invoke-EngineWindow" "check=$($checkCalls.Count) windows=$($windowCalls.Count)"
+Assert-True ((Get-WindowKinds "long" $planCounts) -join "," -eq "streaming") "a route scenario's window kind is streaming"
 
 Remove-Item -LiteralPath $fixtureDirectory -Recurse -Force
 
