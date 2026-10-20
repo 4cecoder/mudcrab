@@ -144,7 +144,7 @@ fn prepare_scene_shot(
         world.get_resource::<StreamingMetrics>(),
         world.get_resource::<crate::render::RendererMetrics>(),
     ) {
-        (Some(streaming), Some(renderer)) => crate::shots::Failures::read(&streaming, &renderer),
+        (Some(streaming), Some(renderer)) => crate::shots::Failures::read(streaming, renderer),
         _ => crate::shots::Failures::default(),
     };
     let state = scene_state(world, baseline);
