@@ -1,7 +1,7 @@
 use crate::{
     archive::{
         ArchiveExtractor, ExtractOptions, ExtractionProgress, ExtractionTimings,
-        RawIngestionSession,
+        RawIngestionSession, prune_stale_reader_packs,
     },
     asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
     cache::{
@@ -4230,8 +4230,12 @@ fn prune_stale_ingestion_blobs(cache_root: &Path, manifest: &ConversionManifest)
     }
     let mut live = BTreeSet::new();
     let mut live_sources = BTreeSet::new();
+    let mut live_reader_sources = BTreeMap::new();
     for entry in manifest.archives.values() {
         live_sources.insert(entry.source_hash.clone());
+        if entry.reader_version > 0 {
+            live_reader_sources.insert(entry.source_hash.clone(), entry.reader_version);
+        }
         for file in &entry.files {
             live.insert(file.hash.clone());
         }
@@ -4268,6 +4272,7 @@ fn prune_stale_ingestion_blobs(cache_root: &Path, manifest: &ConversionManifest)
             }
         }
     }
+    prune_stale_reader_packs(cache_root, &live_reader_sources)?;
     Ok(())
 }
 
@@ -9024,6 +9029,7 @@ mod tests {
                     size: 4,
                     hash: live.clone(),
                 }],
+                reader_version: 0,
             },
         );
         prune_stale_ingestion_blobs(
