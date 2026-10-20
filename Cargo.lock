@@ -2844,6 +2844,7 @@ dependencies = [
  "ktx2",
  "memmap2",
  "mlua",
+ "naga_oil",
  "rkyv",
  "rusqlite",
  "serde",
