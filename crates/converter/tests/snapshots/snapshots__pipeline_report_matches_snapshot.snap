@@ -191,5 +191,8 @@ expression: report
     "runtime_pack_preparation": "[elapsed_ms]"
   },
   "skipped": 0,
+  "terrain": null,
+  "terrain_elapsed_ms": 0,
+  "terrain_warnings": [],
   "warnings": []
 }

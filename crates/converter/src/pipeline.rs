@@ -36,7 +36,7 @@ use crate::{
 };
 use color_eyre::{
     Result,
-    eyre::{WrapErr, bail, ensure},
+    eyre::{WrapErr, bail, ensure, eyre},
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -121,6 +121,18 @@ pub struct PipelineReport {
     pub database_runtime_records_built: u64,
     #[serde(default)]
     pub lod_warnings: Vec<String>,
+    /// The merged terrain (#215) this run built, when `merged_terrain` is on: the land texture
+    /// arrays, one merged mesh per exterior cell, the chunk files, and every cell or texture
+    /// left out with its reason. `None` when the option is off or no world database was built.
+    #[serde(default)]
+    pub terrain: Option<crate::terrain_pipeline::TerrainReport>,
+    /// Wall time spent building merged terrain, excluding other conversion stages.
+    #[serde(default)]
+    pub terrain_elapsed_ms: u128,
+    /// Merged-terrain omissions. Like `lod_warnings`, these do not make the run incomplete: a
+    /// skipped land texture or cell falls back at runtime, and the full list is in `terrain`.
+    #[serde(default)]
+    pub terrain_warnings: Vec<String>,
     pub warnings: Vec<String>,
     /// Advisory messages, including successful reader compatibility remaps,
     /// that do not affect completeness.
@@ -901,6 +913,8 @@ impl AssetPipeline {
         );
         interrupt(cancellation)?;
 
+        let mut merged_terrain_records = None;
+        let mut merged_terrain_offsets = std::collections::HashMap::new();
         if !plugins.is_empty() {
             send(
                 progress_tx,
@@ -936,7 +950,8 @@ impl AssetPipeline {
             );
             let database_cache_root = config.ingestion_cache_dir().join(".database-cache");
             let lookup_started = Instant::now();
-            let mut restored = if !config.invalidate_cache {
+            // Merged terrain reads the records of a fresh conversion, so it never restores a database.
+            let mut restored = if !config.invalidate_cache && !config.merged_terrain {
                 match &cache_identity {
                     Some(identity) => database_cache::restore(
                         &database_cache_root,
@@ -1065,7 +1080,19 @@ impl AssetPipeline {
                 );
                 let database_artifacts_started = Instant::now();
                 crate::esm::inhouse::write_configured_reader_identity(staging, config)?;
-                drop(merged);
+                // Merged terrain (#215) keeps only the records its stage reads, and the LAND each
+                // cell keeps is checked before the texture, mesh and LOD stages run, so a bad load
+                // order fails in minutes. The positions are the ones the cell cache was ordered by.
+                if config.merged_terrain {
+                    merged_terrain_offsets = crate::terrain_pipeline::cell_cache_source_offsets(
+                        config.record_reader,
+                        &db_path,
+                    )?;
+                    crate::esm::cell_cache::merged_terrain_lands(&merged, &merged_terrain_offsets)?;
+                    merged_terrain_records = Some(crate::terrain_pipeline::terrain_records(merged));
+                } else {
+                    drop(merged);
+                }
                 report.phase_elapsed_ms.insert(
                     "database_artifacts_and_release".into(),
                     database_artifacts_started.elapsed().as_millis(),
@@ -1439,6 +1466,23 @@ impl AssetPipeline {
         .await?;
         report.lod_elapsed_ms = lod_started.elapsed().as_millis();
         interrupt(cancellation)?;
+        let terrain_started = Instant::now();
+        // Merged terrain (#215): the arrays, one mesh per exterior cell and the chunk files,
+        // once the world database and every converted texture are in staging. Off by default
+        // until the engine half that reads these outputs lands.
+        if config.merged_terrain {
+            crate::terrain_pipeline::run_merged_terrain_stage(
+                staging,
+                merged_terrain_records.take(),
+                std::mem::take(&mut merged_terrain_offsets),
+                &plugins,
+                &crate::terrain_pipeline::TerrainOptions::from_config(config),
+                progress_tx,
+                &mut report,
+            )
+            .await?;
+        }
+        report.terrain_elapsed_ms = terrain_started.elapsed().as_millis();
         let integration_started = Instant::now();
         let integration_sources = source_paths
             .iter()
@@ -2685,6 +2729,38 @@ pub(crate) fn validate_artifact(
 ) -> Result<()> {
     let path = staging.join(relative);
     match path.extension().and_then(|extension| extension.to_str()) {
+        // Land texture arrays (#215) are not converted source textures: they are KTX2 texture
+        // arrays whose class (usage, block format, size) the land texture table records, and
+        // their transfer function (sRGB diffuse, linear normal) is a property of that class, not
+        // of any source texture semantics. The stage that built them checked every layer and
+        // level against the class; here the file's own shape is checked.
+        Some("ktx2") if relative.starts_with("terrain") => {
+            // A class can be many gigabytes and validation runs on every CPU job at once, so only
+            // the header and the first level's index entry are read, never the pixel data.
+            let mut file = fs::File::open(&path)?;
+            let file_len = file.metadata()?.len();
+            let mut prefix = [0u8; 104];
+            std::io::Read::read_exact(&mut file, &mut prefix)
+                .map_err(|error| eyre!("invalid KTX2 array {}: {error}", path.display()))?;
+            let header_bytes: [u8; ktx2::Header::LENGTH] = prefix[..ktx2::Header::LENGTH]
+                .try_into()
+                .expect("the prefix is longer than the header");
+            let header = ktx2::Header::from_bytes(&header_bytes)
+                .map_err(|error| eyre!("invalid KTX2 array {}: {error:?}", path.display()))?;
+            let level_offset = u64::from_le_bytes(prefix[80..88].try_into().expect("eight bytes"));
+            let level_length = u64::from_le_bytes(prefix[88..96].try_into().expect("eight bytes"));
+            ensure!(
+                header.layer_count >= 2
+                    && header.level_count > 0
+                    && header.format.is_some()
+                    && level_length > 0
+                    && level_offset
+                        .checked_add(level_length)
+                        .is_some_and(|end| end <= file_len),
+                "invalid KTX2 array {}",
+                path.display()
+            );
+        }
         Some("ktx2") => {
             let bytes = fs::read(&path)?;
             let key = source_texture_key(&canonical_asset_path(
@@ -3130,6 +3206,13 @@ fn invalidate_staged_generated_outputs(staging: &Path) -> Result<()> {
     let lod_dir = staging.join("lod");
     if lod_dir.exists() {
         fs::remove_dir_all(&lod_dir)?;
+    }
+    // The merged terrain (#215) lives entirely under `terrain`: the arrays, the table and the
+    // chunk files. It is rebuilt from the current records, so a resume with the option off
+    // publishes an output without it rather than carrying a stale one.
+    let terrain_dir = staging.join("terrain");
+    if terrain_dir.exists() {
+        fs::remove_dir_all(&terrain_dir)?;
     }
     Ok(())
 }
@@ -4934,6 +5017,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::esm::cell_cache::write_cell_cache;
 
     fn cpu_lod_config(data: impl Into<PathBuf>, output: impl Into<PathBuf>) -> PipelineConfig {
         let mut config = PipelineConfig::new(data, output);
