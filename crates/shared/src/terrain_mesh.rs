@@ -257,6 +257,44 @@ pub struct LandTextureEntry {
     pub normal: Option<ArrayLayer>,
 }
 
+/// The default texture a conversion was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandTextureRequest {
+    White,
+    SkyrimIni,
+}
+
+/// What entry 0 of a table holds once the arrays are built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandTextureDefault {
+    /// The generated 4 x 4 white diffuse: requested, or the only option.
+    GeneratedWhite,
+    /// The `[Landscape]` default diffuse (and normal, when one was named and converted).
+    SkyrimIni,
+    /// `skyrim-ini` was requested, but its diffuse could not be converted: entry 0 is white.
+    SkyrimIniFallbackWhite,
+}
+
+/// The settings a table was built from, as the converter's terrain stage resolved them. Entry 0's
+/// source, the downscale allowance and the Skyrim.ini bytes it was read from change the arrays
+/// and entries, so a stored table records them. `terrain_ini_sha256` is the SHA-256 of the
+/// configured ini file (`None` for the built-in Dirt02 paths and for `white`). The DDS paths are
+/// the ones resolved, not the machine's file locations.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct LandTextureSettings {
+    pub request: LandTextureRequest,
+    pub default: LandTextureDefault,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_diffuse: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_normal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terrain_ini_sha256: Option<String>,
+    pub allow_downscale: bool,
+}
+
 /// `terrain/land-textures.json`: the land-texture arrays and the lookup table.
 /// `entries` is indexed by id (`entries[i].id == i`, dense from 0); entry 0 is the default
 /// texture.
@@ -268,6 +306,11 @@ pub struct LandTextureTable {
     pub max_layers_per_array: u32,
     pub arrays: Vec<LandTextureArray>,
     pub entries: Vec<LandTextureEntry>,
+    /// The settings the converter built this table from. Absent in tables written before the
+    /// field existed, and then the table does not say which default texture it holds: it must not
+    /// be taken as proof of any particular setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<LandTextureSettings>,
 }
 
 /// Why a cell mesh or texture table is refused. The engine falls back to the runtime build
@@ -554,6 +597,7 @@ mod tests {
         LandTextureTable {
             format_version: TERRAIN_MESH_FORMAT_VERSION,
             max_layers_per_array: 2048,
+            settings: None,
             arrays: vec![LandTextureArray {
                 path: "terrain/land-diffuse-bc1-1024.ktx2".into(),
                 usage: LandTextureUsage::DiffuseSrgb,
@@ -708,6 +752,38 @@ mod tests {
             mesh.validate(&ids),
             Err(TerrainMeshError::SlotStride { found: 12 })
         );
+    }
+
+    /// A table with no `settings` key is the pre-field format: it parses with `settings` absent,
+    /// and a table without settings serializes to exactly that key-free form, so readers that
+    /// predate the field see no change.
+    #[test]
+    fn the_settings_field_is_additive_in_both_directions() {
+        let without = serde_json::to_string(&table(2)).unwrap();
+        assert!(!without.contains("settings"), "{without}");
+        let parsed: LandTextureTable = serde_json::from_str(&without).unwrap();
+        assert_eq!(parsed.settings, None);
+        assert_eq!(parsed, table(2));
+
+        let mut with = table(2);
+        with.settings = Some(LandTextureSettings {
+            request: LandTextureRequest::SkyrimIni,
+            default: LandTextureDefault::SkyrimIniFallbackWhite,
+            default_diffuse: Some("textures/landscape/Dirt02.dds".into()),
+            default_normal: None,
+            terrain_ini_sha256: Some("ab".repeat(32)),
+            allow_downscale: true,
+        });
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains("\"skyrim_ini_fallback_white\""), "{json}");
+        assert!(
+            !json.contains("default_normal"),
+            "an absent normal is omitted: {json}"
+        );
+        let back: LandTextureTable = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with);
+        // The same arrays and entries under different settings are different tables.
+        assert_ne!(back.settings, table(2).settings);
     }
 
     #[test]
