@@ -117,8 +117,12 @@ pub(crate) struct StreamingRuntime {
     next_resource: u64,
     frame: u64,
     previous_camera: Option<(DVec3, DVec3, u32)>,
+    /// Commit window from `collect_cells` through `finish_streaming_commit_budget`. It already
+    /// contains the readiness scan, so it must not be added to `previous_validation_ms`.
     pub previous_commit_ms: f64,
+    /// Scene spawn batch, measured outside the commit window.
     pub previous_spawn_ms: f64,
+    /// Readiness scan diagnostic, a subset of `previous_commit_ms`. Not an additive input.
     pub previous_validation_ms: f64,
     pressure_blocked: bool,
     previous_denied_total: u64,
@@ -829,9 +833,9 @@ pub(super) fn update_streaming_control(world: &mut World) {
             delta_seconds: time,
             frame_ms: (time > 0.0).then_some(time * 1000.0),
             gpu_frame_ms: None,
-            streaming_work_ms: runtime.previous_commit_ms
-                + runtime.previous_spawn_ms
-                + runtime.previous_validation_ms,
+            // Validation is already inside the commit window; adding it again would make a
+            // healthy readiness scan look like a streaming spike.
+            streaming_work_ms: runtime.previous_commit_ms + runtime.previous_spawn_ms,
             camera_moving: moving,
             camera_turning: turning,
             camera_discontinuity: discontinuity,

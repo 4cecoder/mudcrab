@@ -1,6 +1,8 @@
 use super::*;
 use crate::{
-    streaming::{RenderOrigin, StaticCollisionCache, admission::SceneDemand},
+    streaming::{
+        RenderOrigin, StaticCollisionCache, admission::SceneDemand, control::ControllerReasons,
+    },
     streaming_preparation::StreamingPreparationPlugin,
     world::{
         components::{StreamingCamera, TerrainPatch},
@@ -180,6 +182,49 @@ fn returned_cell(generation: u64, key: CellKey) -> DatabaseResponse {
         total_request_micros: 0,
         row_count: 0,
     }
+}
+
+/// Runs one control tick over a healthy 12 ms frame whose commit window already contains an
+/// 8 ms readiness scan, and returns the controller's reasons.
+fn control_after_window(commit_ms: f64, validation_ms: f64) -> ControllerReasons {
+    let (mut app, _directory) = fixture(true);
+    {
+        let mut runtime = app.world_mut().resource_mut::<StreamingRuntime>();
+        // The runtime copied its controller settings at construction, before this test runs.
+        runtime.settings.adaptive = true;
+        runtime.previous_commit_ms = commit_ms;
+        runtime.previous_validation_ms = validation_ms;
+        runtime.previous_spawn_ms = 0.0;
+    }
+    app.world_mut()
+        .resource_mut::<Time<Real>>()
+        .advance_by(std::time::Duration::from_millis(12));
+    update_streaming_control(app.world_mut());
+    app.world()
+        .resource::<StreamingRuntime>()
+        .snapshot
+        .as_ref()
+        .unwrap()
+        .control
+        .reasons
+}
+
+#[test]
+fn readiness_scan_inside_the_commit_window_is_not_counted_twice() {
+    // The commit window (9 ms) already contains the 8 ms readiness scan. Adding the scan again
+    // would report 17 ms of streaming work against a 16.67 ms startup pressure threshold.
+    let reasons = control_after_window(9.0, 8.0);
+    assert!(
+        !reasons.frame_pressure,
+        "validation alone must not pause intake"
+    );
+    assert!(!reasons.frame_spike);
+    // The same controller still reacts to genuine commit work that exceeds the threshold.
+    let reasons = control_after_window(20.0, 8.0);
+    assert!(
+        reasons.frame_pressure,
+        "real commit-window work must still pressure intake"
+    );
 }
 
 #[test]
