@@ -688,9 +688,9 @@ pub(crate) fn ktx2_metadata_end(header: &ktx2::Header) -> u64 {
 /// previous level, in file order, ends rounded up to it, and the first
 /// starts at the end of `output` rounded up the same way, with no slack
 /// beyond that. What lies at that end is the caller's business: the
-/// combiners truncate a template at its first-data offset, already at the
-/// alignment, and `write_native_ktx2` hands over the metadata, whose end
-/// the rounding lifts to the alignment. That is the layout section 3.9.7
+/// combiners truncate a template at its first-data offset, and
+/// `write_native_ktx2` hands over the metadata. The rounding aligns either
+/// starting point. That is the layout section 3.9.7
 /// and the KTX-Software validator expect.
 fn append_ktx2_levels_spec_order(
     output: &mut Vec<u8>,

@@ -320,7 +320,8 @@ pub struct ConversionManifest {
 /// Script ABI/settings, source and output proofs still have to match. Archive
 /// extraction uses its own source/blob integrity proof, independent of this gate.
 /// Schema 25 is excluded: two unmerged candidates both used it for different contracts.
-/// Producer 27 changed only texture container bytes (producer 28), so its scripts remain valid.
+/// The producer-27 to producer-28 transition changes only texture container bytes,
+/// so producer-27 scripts remain valid.
 pub(crate) fn can_reuse_scripts_and_archives(schema: u32) -> bool {
     matches!(schema, 12..=24 | 26 | 27)
 }
