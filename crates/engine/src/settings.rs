@@ -831,9 +831,9 @@ fn save_settings(path: &Path, settings: &RenderingSettings) -> Result<(), String
 }
 
 /// Targets affected by interactive renderer preferences, grouped under Bevy's system parameter limit.
-#[derive(SystemParam)]
+#[derive(bevy::ecs::system::SystemParam)]
 #[allow(clippy::type_complexity)]
-struct RenderSettingsTargets<'w, 's> {
+pub(crate) struct RenderSettingsTargets<'w, 's> {
     cameras: Query<
         'w,
         's,
