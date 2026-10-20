@@ -808,6 +808,12 @@ fn parse_command(args: Vec<OsString>) -> Result<Command> {
                 "repair-failed applies --gpu-quality and --gpu-batch-mb only with --texture-encoder gpu"
             );
         }
+        // Repair skips the merged-terrain stage, so accepting the option would publish without it.
+        if cli.merged_terrain {
+            bail!(
+                "repair-failed does not build merged terrain; drop --merged-terrain and its options"
+            );
+        }
         if cli.resume_staging.is_some()
             || cli.plugins_file.is_some()
             || cli.skyrim_ccc_file.is_some()
@@ -882,6 +888,8 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut terrain_default_texture = TerrainDefaultTexture::default();
     let mut terrain_ini = None;
     let mut terrain_allow_downscale = false;
+    // The first merged-terrain option named, which needs --merged-terrain to mean anything.
+    let mut terrain_option: Option<&'static str> = None;
     let mut verbose = false;
     let mut language = None;
     let mut args = args.into_iter();
@@ -986,6 +994,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
             Some("--no-lod") => no_lod = true,
             Some("--merged-terrain") => merged_terrain = true,
             Some("--terrain-default-texture") => {
+                terrain_option.get_or_insert("--terrain-default-texture");
                 let value = next_value(&mut args, "--terrain-default-texture")?;
                 terrain_default_texture = match value.to_str() {
                     Some("white") => TerrainDefaultTexture::White,
@@ -994,9 +1003,13 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
                 };
             }
             Some("--terrain-ini") => {
-                terrain_ini = Some(PathBuf::from(next_value(&mut args, "--terrain-ini")?))
+                terrain_option.get_or_insert("--terrain-ini");
+                terrain_ini = Some(next_path_value(&mut args, "--terrain-ini")?)
             }
-            Some("--terrain-allow-downscale") => terrain_allow_downscale = true,
+            Some("--terrain-allow-downscale") => {
+                terrain_option.get_or_insert("--terrain-allow-downscale");
+                terrain_allow_downscale = true
+            }
             Some("--ingestion-sync") => {
                 ingestion_sync = match next_value(&mut args, "--ingestion-sync")?.to_str() {
                     Some("per-file") => IngestionSync::PerFile,
@@ -1021,6 +1034,14 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     }
     if positional.is_empty() || positional.len() > 2 {
         bail!(usage());
+    }
+    if let Some(option) = terrain_option
+        && !merged_terrain
+    {
+        bail!("{option} requires --merged-terrain");
+    }
+    if terrain_ini.is_some() && terrain_default_texture != TerrainDefaultTexture::SkyrimIni {
+        bail!("--terrain-ini requires --terrain-default-texture skyrim-ini");
     }
     let gpu_encoder = TextureEncoder::Gpu {
         quality: gpu_quality.unwrap_or(converter::texture_gpu::DEFAULT_QUALITY),
@@ -2058,6 +2079,90 @@ mod tests {
         assert!(resume_command("converter.exe", &gpu, staging).ends_with(
             " --texture-encoder gpu --gpu-quality 2 --gpu-batch-mb 256 --lod-encoder cpu --ingestion-sync per-file --record-reader legacy"
         ));
+    }
+
+    /// Merged-terrain options mean nothing without --merged-terrain, an ini needs the skyrim-ini
+    /// default, --terrain-ini takes a path and never another option, and repair refuses the option.
+    #[test]
+    fn merged_terrain_options_need_the_option_and_their_own_values() {
+        for dependent in [
+            vec!["--terrain-default-texture", "skyrim-ini"],
+            vec!["--terrain-default-texture", "white"],
+            vec!["--terrain-allow-downscale"],
+            vec!["--terrain-ini", "Skyrim.ini"],
+        ] {
+            let mut values = vec!["Data"];
+            values.extend(dependent.iter().copied());
+            let error = parse_cli(args(&values)).unwrap_err().to_string();
+            assert!(
+                error.contains("requires --merged-terrain"),
+                "{values:?}: {error}"
+            );
+        }
+        // Explicit white with an ini is refused: the ini is only read by skyrim-ini.
+        let error = parse_cli(args(&[
+            "Data",
+            "--merged-terrain",
+            "--terrain-default-texture",
+            "white",
+            "--terrain-ini",
+            "Skyrim.ini",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("requires --terrain-default-texture skyrim-ini"),
+            "{error}"
+        );
+        let ini_without_default = parse_cli(args(&[
+            "Data",
+            "--merged-terrain",
+            "--terrain-ini",
+            "S.ini",
+        ]));
+        assert!(ini_without_default.is_err(), "the default is white");
+
+        // The ini value is a path: the next option is not taken as one.
+        let error = parse_cli(args(&[
+            "Data",
+            "--merged-terrain",
+            "--terrain-default-texture",
+            "skyrim-ini",
+            "--terrain-ini",
+            "--merged-terrain",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("requires a path value"), "{error}");
+
+        let ok = parse_cli(args(&[
+            "Data",
+            "--merged-terrain",
+            "--terrain-default-texture",
+            "skyrim-ini",
+            "--terrain-ini",
+            "C:/Games/Skyrim.ini",
+        ]))
+        .unwrap();
+        assert_eq!(ok.terrain_ini, Some(PathBuf::from("C:/Games/Skyrim.ini")));
+
+        // Repair applies no merged terrain, so it refuses the option with its settings.
+        let error = parse_command(args(&["repair-failed", "Data", "out", "--merged-terrain"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("repair-failed does not build merged terrain"),
+            "{error}"
+        );
+        assert!(
+            parse_command(args(&[
+                "repair-failed",
+                "Data",
+                "out",
+                "--terrain-allow-downscale"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
