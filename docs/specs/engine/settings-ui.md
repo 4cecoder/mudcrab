@@ -94,12 +94,13 @@ Startup precedence is field-specific. Valid INI values and explicit CLI options
 overlay saved preferences for their corresponding fields. `--color-grade`
 owns the active mode and clears saved numeric overrides for that launch, so the
 selected source supplies canonical values. `--visual-preset` owns only the
-preset and keeps saved mode and tuning. Explicit `--grade-preset`, image-space,
-`--tone-map` and `--tone-map-params` sources protect the active mode and numeric
-overrides from stale saved values. An image-space selector supplies source data;
-it does not select Record sRGB by itself. Saved Record sRGB without an explicit
-image-space selection reports unavailability and uses the approved default.
-The grade source and tuning resolve before the first visible camera frame.
+preset and keeps saved mode and tuning. Explicit `--grade-preset`, `--tone-map`
+and `--tone-map-params` sources protect the active mode and numeric overrides
+from stale saved values. An image-space selector pins authored source data but
+does not select Record sRGB by itself. A previously saved Record sRGB mode uses
+that source only when selection is explicit; without a selection it reports
+unavailability and uses the approved default. The grade source and tuning
+resolve before the first visible camera frame.
 
 Save preserves the stored grade mode and override values for fields owned by
 launch sources, while saving unrelated menu changes. It does not write the

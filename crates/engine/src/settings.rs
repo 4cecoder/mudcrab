@@ -665,9 +665,6 @@ fn grade_source_is_launch_owned(overrides: &[String]) -> bool {
     [
         "--color-grade",
         "--grade-preset",
-        "--image-space",
-        "--image-space-weather",
-        "--image-space-slot",
         "--tone-map",
         "--tone-map-params",
     ]
@@ -1388,7 +1385,6 @@ mod tests {
         save_settings(&path, &saved).unwrap();
 
         for args in [
-            vec!["--image-space".into(), "0x12F88".into()],
             vec!["--grade-preset".into(), "custom.json".into()],
             vec!["--tone-map".into(), "retail-curve".into()],
             vec!["--tone-map-params".into(), "curve.json".into()],
@@ -1412,6 +1408,24 @@ mod tests {
             assert_eq!(persisted.hud, active.hud);
             save_settings(&path, &saved).unwrap();
         }
+
+        let mut selected_record = launch(&["--image-space".into(), "0x12F88".into()]);
+        let (active, _) = prepare_settings_at(&mut selected_record, Some(path));
+        assert_eq!(
+            selected_record.color_grade,
+            crate::color_pipeline::SceneGradeMode::RecordSrgb,
+            "an explicit record source enables an already-persisted record mode"
+        );
+        assert_eq!(active.color_grade, saved.color_grade);
+        assert_eq!(active.grade_overrides().brightness, Some(2.2));
+
+        let mut selection_only = launch(&["--image-space".into(), "0x12F88".into()]);
+        let (active, _) = prepare_settings_at(&mut selection_only, None);
+        assert_eq!(
+            selection_only.color_grade,
+            crate::color_pipeline::SceneGradeMode::SnapshotSrgb
+        );
+        assert_eq!(active.color_grade, selection_only.color_grade.index());
     }
 
     #[test]
