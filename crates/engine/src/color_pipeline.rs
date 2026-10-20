@@ -523,7 +523,7 @@ fn scene_preset_command() -> ConsoleCommand {
     }
 }
 
-fn scene_grade_command() -> ConsoleCommand {
+pub(crate) fn scene_grade_command() -> ConsoleCommand {
     ConsoleCommand {
         name: "SceneGrade",
         short: None,
@@ -550,6 +550,11 @@ fn scene_grade_command() -> ConsoleCommand {
                         *world.resource::<SceneVisualPreset>(),
                         overrides,
                     )?;
+                    if let Some(mut file) =
+                        world.get_resource_mut::<crate::settings::SettingsFile>()
+                    {
+                        file.note_grade_mode_selection();
+                    }
                     *world.resource_mut::<SceneGradeMode>() = mode;
                     sync_settings_from_console(world);
                 }

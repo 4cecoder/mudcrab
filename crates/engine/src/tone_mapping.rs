@@ -538,7 +538,7 @@ mod tests {
         let overrides = SceneGradeOverrides {
             brightness: Some(1.8),
             pivot: Some(0.29),
-            ..default()
+            ..Default::default()
         };
         let resolved = tone
             .resolve_with_overrides(
@@ -709,7 +709,7 @@ mod tests {
         let source = SceneGradeSource::default();
         let tone = SceneToneMapSource {
             bevy_tonemapping: Tonemapping::AgX,
-            ..default()
+            ..Default::default()
         };
         let resolved = tone
             .resolve(

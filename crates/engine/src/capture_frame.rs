@@ -218,9 +218,9 @@ struct ExtractedCaptures {
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn extract_capture_frames(
     mut extracted: ResMut<ExtractedCaptures>,
-    frame: Extract<Res<FrameCount>>,
-    origin: Extract<Res<RenderOrigin>>,
-    camera: Extract<
+    frame_inputs: Extract<(
+        Res<FrameCount>,
+        Res<RenderOrigin>,
         Query<
             (
                 &Transform,
@@ -233,21 +233,34 @@ fn extract_capture_frames(
             ),
             With<StreamingCamera>,
         >,
-    >,
-    tickets: Extract<Query<&CaptureTicket, With<Screenshot>>>,
-    streaming: Extract<Res<crate::streaming::StreamingMetrics>>,
-    renderer: Extract<Res<crate::render::RendererMetrics>>,
-    profiler: Extract<Res<crate::profiling::ProfilingState>>,
-    uploads: Extract<Res<crate::terrain_upload::TerrainMeshUploadReadiness>>,
-    windows: Extract<Query<Entity, With<bevy::window::PrimaryWindow>>>,
-    surfaces: Extract<Query<(&crate::streaming::TerrainCoverage, &InheritedVisibility)>>,
-    batches: Extract<Query<&crate::streaming::lod::terrain_batching::LodTerrainBatches>>,
-    grade_source: Extract<Option<Res<SceneGradeSource>>>,
-    grade_mode: Extract<Option<Res<SceneGradeMode>>>,
-    visual_preset: Extract<Option<Res<SceneVisualPreset>>>,
-    tone_source: Extract<Option<Res<SceneToneMapSource>>>,
-    grade_overrides: Extract<Option<Res<SceneGradeOverrides>>>,
+        Query<&CaptureTicket, With<Screenshot>>,
+        Res<crate::streaming::StreamingMetrics>,
+        Res<crate::render::RendererMetrics>,
+        Res<crate::profiling::ProfilingState>,
+        Res<crate::terrain_upload::TerrainMeshUploadReadiness>,
+    )>,
+    scene_inputs: Extract<(
+        Query<Entity, With<bevy::window::PrimaryWindow>>,
+        Query<(&crate::streaming::TerrainCoverage, &InheritedVisibility)>,
+        Query<&crate::streaming::lod::terrain_batching::LodTerrainBatches>,
+        Option<Res<SceneGradeSource>>,
+        Option<Res<SceneGradeMode>>,
+        Option<Res<SceneVisualPreset>>,
+        Option<Res<SceneToneMapSource>>,
+        Option<Res<SceneGradeOverrides>>,
+    )>,
 ) {
+    let (frame, origin, camera, tickets, streaming, renderer, profiler, uploads) = &*frame_inputs;
+    let (
+        windows,
+        surfaces,
+        batches,
+        grade_source,
+        grade_mode,
+        visual_preset,
+        tone_source,
+        grade_overrides,
+    ) = &*scene_inputs;
     extracted.render_frame += 1;
     extracted.captures.clear();
     if windows.single().is_err() || tickets.iter().all(|ticket| ticket.receipt().is_some()) {

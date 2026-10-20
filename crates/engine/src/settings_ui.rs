@@ -361,9 +361,7 @@ fn menu_actions(
             }
             MenuAction::Save => file.save(&settings),
             MenuAction::Defaults => {
-                *settings = RenderingSettings::default();
-                file.status =
-                    "Defaults restored for this session. Choose Save to keep them.".into();
+                file.restore_defaults(&mut settings);
             }
             MenuAction::Resume => {
                 menu.close(&mut capture, &mut time);
