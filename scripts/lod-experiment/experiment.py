@@ -694,18 +694,21 @@ def run_experiment(input_path, output_path, builder_path, asset_root=None, max_t
                                         "vertex_count": len(primitive["positions"]), "triangle_count": len(primitive["indices"]) // 3},
                                 settings_sha256=settings_hash, simplification_input_sha256=digest(request))
                             name = f"{checksum[:16]}-{digest(relative.encode())[:12]}-m{mesh_index}-p{primitive_index}.json"
-                            model_candidates[(mesh_index, primitive_index)] = candidate
                             candidate_data = canonical(candidate)
-                            (stage / "candidates" / name).write_bytes(candidate_data)
-                            row.update(status="candidate", candidate="candidates/" + name, sha256=digest(candidate_data),
-                                       source_triangles=len(primitive["indices"]) // 3,
-                                       conventional_triangles=[len(level["indices"]) // 3 for level in candidate["conventional"]],
-                                       cluster_cut_triangles=[cut["triangle_count"] for cut in candidate["uniform_cuts"]])
+                            # Validate the builder's timing before any candidate is registered or written.
                             timing = strict_json(result.stderr)
+                            if not isinstance(timing, dict):
+                                raise ValueError("builder timing must be a JSON object")
                             timing.update(path=relative, mesh=mesh_index, primitive=primitive_index,
                                           process_seconds=process_seconds, candidate_json_bytes=len(candidate_data),
                                           conventional_index_u32_bytes=sum(len(level["indices"]) * 4 for level in candidate["conventional"]),
                                           cluster_index_u32_bytes=sum(len(cluster["indices"]) * 4 for cluster in candidate["clusters"]))
+                            (stage / "candidates" / name).write_bytes(candidate_data)
+                            model_candidates[(mesh_index, primitive_index)] = candidate
+                            row.update(status="candidate", candidate="candidates/" + name, sha256=digest(candidate_data),
+                                       source_triangles=len(primitive["indices"]) // 3,
+                                       conventional_triangles=[len(level["indices"]) // 3 for level in candidate["conventional"]],
+                                       cluster_cut_triangles=[cut["triangle_count"] for cut in candidate["uniform_cuts"]])
                             measurements.append(timing)
                         except Omission as error:
                             row.update(status="omitted", reason=str(error))
