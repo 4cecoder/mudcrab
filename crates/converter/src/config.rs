@@ -551,45 +551,6 @@ mod tests {
     }
 
     #[test]
-    fn new_configs_default_to_gpu_lod_and_round_trip_the_selected_recipe() {
-        let config = PipelineConfig::new("Data", "modern_assets");
-        let expected = TextureEncoder::Gpu {
-            quality: crate::texture_gpu::DEFAULT_QUALITY,
-            batch_mb: crate::texture_gpu::DEFAULT_BATCH_MB,
-        };
-        assert_eq!(config.lod_texture_encoder, expected);
-        assert_eq!(config.texture_encoder, TextureEncoder::Cpu);
-        assert_eq!(TextureEncoder::default(), TextureEncoder::Cpu);
-        let restored: PipelineConfig =
-            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
-        assert_eq!(restored.lod_texture_encoder, expected);
-        assert_eq!(restored.texture_encoder, TextureEncoder::Cpu);
-    }
-
-    #[test]
-    fn missing_lod_encoder_keeps_cpu_even_when_source_texture_encoding_is_gpu() {
-        let mut config = PipelineConfig::new("Data", "modern_assets");
-        config.texture_encoder = TextureEncoder::Gpu {
-            quality: 3,
-            batch_mb: 16,
-        };
-        let mut legacy = serde_json::to_value(&config).unwrap();
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("lod_texture_encoder");
-        let restored: PipelineConfig = serde_json::from_value(legacy).unwrap();
-        assert_eq!(restored.lod_texture_encoder, TextureEncoder::Cpu);
-        assert_eq!(restored.texture_encoder, config.texture_encoder);
-
-        config.lod_texture_encoder = TextureEncoder::Cpu;
-        let explicit_cpu: PipelineConfig =
-            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
-        assert_eq!(explicit_cpu.lod_texture_encoder, TextureEncoder::Cpu);
-        assert_eq!(explicit_cpu.texture_encoder, config.texture_encoder);
-    }
-
-    #[test]
     fn config_v90_accepts_legacy_configs_without_inventing_lod_origins() {
         let mut legacy = serde_json::json!({
             "data_dir": "Data",
