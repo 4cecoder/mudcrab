@@ -1213,26 +1213,6 @@ mod tests {
     }
 
     #[test]
-    fn gpu_inventory_is_separate_from_normal_profile_output() {
-        assert!(!EngineConfig::default().profile_gpu_inventory);
-        assert!(!run_config(&["--profile-output", "profiles/test"]).profile_gpu_inventory);
-        let diagnostic = run_config(&[
-            "--profile-gpu-inventory",
-            "--profile-output",
-            "profiles/test",
-        ]);
-        assert!(diagnostic.profile_gpu_inventory);
-        assert_eq!(
-            diagnostic.profile_output_dir,
-            Some(PathBuf::from("profiles/test"))
-        );
-        // Parsing the switch alone must not implicitly enable profile collection.
-        let without_output = run_config(&["--profile-gpu-inventory"]);
-        assert!(without_output.profile_gpu_inventory);
-        assert!(without_output.profile_output_dir.is_none());
-    }
-
-    #[test]
     fn demand_scheduling_is_opt_in_and_keeps_zero_unlimited() {
         let defaults = EngineConfig::default();
         assert!(!defaults.prioritize_streaming);

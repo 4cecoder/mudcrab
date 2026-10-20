@@ -43,7 +43,7 @@ use std::time::Instant;
 pub(crate) mod admission;
 pub(crate) mod lod;
 mod priority;
-mod requests;
+pub(crate) mod requests;
 
 // Wall-clock spans can include a short OS scheduler preemption. Keep the raw maximum in metrics,
 // but require a material overrun before classifying the frame as a commit-budget violation.

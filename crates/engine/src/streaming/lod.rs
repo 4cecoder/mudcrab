@@ -72,6 +72,7 @@ pub(super) struct LodStreaming {
     terrain_batch_fallback_chunks: u64,
     terrain_batch_pending_cpu_chunks: usize,
     terrain_batch_completion_report: Option<(u64, u64, u64)>,
+    terrain_batch_controls_warned: bool,
 }
 
 impl LodStreaming {
@@ -806,6 +807,24 @@ pub(super) fn batch_ready_lod_chunks(
     streaming.terrain_batch_commit_used = false;
     let pending_cpu = pending.iter().len();
     let pending_gpu = activation.pending_count();
+    // Derived batches retain source scene assets and allocate additional meshes outside the
+    // scene-admission ledger. While request controls are enabled, the original hierarchy stays
+    // active and no batch is activated; default-mode batching is unchanged.
+    if requests::enabled(&config) {
+        if pending_cpu != 0 && !streaming.terrain_batch_controls_warned {
+            warn!(
+                "terrain LOD batching disabled with streaming admission/control limits; original meshes remain active until generated retained-byte reservations are supported"
+            );
+            streaming.terrain_batch_controls_warned = true;
+        }
+        for (entity, _, _) in &pending {
+            commands
+                .entity(entity)
+                .remove::<terrain_batching::PendingLodTerrainBatching>();
+        }
+        record_terrain_batch_progress(&mut streaming, &mut profiler, 0, pending_gpu);
+        return;
+    }
     record_terrain_batch_progress(&mut streaming, &mut profiler, pending_cpu, pending_gpu);
     if !preparation.has_render_backend() {
         for (entity, _, _) in &pending {

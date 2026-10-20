@@ -49,7 +49,7 @@ LOD keeps its existing build/content validation, hash verification, bounded retr
 
 ## Trace fields
 
-The existing [streaming trace](streaming-trace.md) receives an additive `scene_admission` object when either new switch enables admission; the default fixed path records `null`. The trace retains `format_version: 1`, benchmark format 7 and the existing measured-frame CSV layout.
+The existing [streaming trace](streaming-trace.md) receives an additive `scene_admission` object when either new switch enables admission; the default fixed path records `null`. The trace retains `format_version: 1`, benchmark format 8 and the existing measured-frame CSV layout.
 
 | Field | Meaning |
 | --- | --- |
