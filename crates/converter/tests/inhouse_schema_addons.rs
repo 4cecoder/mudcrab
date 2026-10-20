@@ -1439,7 +1439,7 @@ async fn database_cache_keys_and_restores_by_schema_addon_bytes() {
     );
     let base_stamp = stamp(&output);
     assert!(base_stamp.get("schema_addons").is_none());
-    assert!(history_record(&output, 0x0300_1820).supported == false);
+    assert!(!history_record(&output, 0x0300_1820).supported);
 
     let typed = run_config(mod_config(&data, &output, &[&addon]))
         .await
