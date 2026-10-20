@@ -49,18 +49,18 @@ expression: report
       "checkpoint_sync_calls": 1,
       "checkpoint_sync_worker_seconds": "[seconds]",
       "extraction_seconds": "[seconds]",
-      "payload_bytes_written": 21316,
+      "payload_bytes_written": 24208,
       "payload_reuses": 0,
-      "payload_writes": 5,
+      "payload_writes": 6,
       "physical_copy_bytes_written": 0,
       "physical_copy_writes": 0,
-      "selected_bytes": 21316,
-      "selected_files": 5,
+      "selected_bytes": 24208,
+      "selected_files": 6,
       "source_hash_seconds": "[seconds]",
       "sync_calls": 0,
       "sync_seconds": "[seconds]",
       "sync_worker_seconds": "[seconds]",
-      "unique_payloads": 5
+      "unique_payloads": 6
     }
   },
   "artifacts": [

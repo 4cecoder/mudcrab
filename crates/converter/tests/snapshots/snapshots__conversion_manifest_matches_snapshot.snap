@@ -131,7 +131,7 @@ expression: manifest
     "textures/landscape/dirt02.dds": {
       "output": "textures/landscape/dirt02.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 3169,
+      "output_size": 3099,
       "source_hash": "[source_hash]"
     }
   },

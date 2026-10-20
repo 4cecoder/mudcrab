@@ -169,10 +169,10 @@ impl TerrainTextures {
                     .map(|source| (layer.texture_form_id, source))
             })
             .collect();
-        if any_uses_default(cells.iter().copied()) {
-            if let Some(source) = self.sources.get(&DEFAULT_TEXTURE_KEY) {
-                sources.insert(DEFAULT_TEXTURE_KEY, source);
-            }
+        if any_uses_default(cells.iter().copied())
+            && let Some(source) = self.sources.get(&DEFAULT_TEXTURE_KEY)
+        {
+            sources.insert(DEFAULT_TEXTURE_KEY, source);
         }
         sources
     }
@@ -1578,10 +1578,21 @@ mod tests {
         let path = directory.path().join("textures/shared.dds");
         std::fs::write(&path, test_dds()).unwrap();
         let mut cache = TerrainTextureCache::default();
+        let fully_painted = |id| {
+            cell(
+                (0..4)
+                    .map(|quadrant| {
+                        let mut base = layer(id, true, 0.0);
+                        base.quadrant = quadrant;
+                        base
+                    })
+                    .collect(),
+            )
+        };
         let first = TerrainTextures::load_with_cache(
             &connection,
             directory.path(),
-            &[cell(vec![layer(1, true, 0.0)])],
+            &[fully_painted(1)],
             &mut cache,
         )
         .unwrap();
@@ -1589,7 +1600,7 @@ mod tests {
         let second = TerrainTextures::load_with_cache(
             &connection,
             directory.path(),
-            &[cell(vec![layer(2, true, 0.0)])],
+            &[fully_painted(2)],
             &mut cache,
         )
         .unwrap();
@@ -1703,21 +1714,24 @@ mod tests {
             )
             .unwrap();
             std::fs::write(&default_file, bytes).unwrap();
-            let defaulted = cell(Vec::new());
-            let grass = cell(vec![layer(2, true, 0.0)]);
-            let textures = TerrainTextures::load(
-                &connection,
-                vfs.path(),
-                &[cell(Vec::new()), cell(vec![layer(2, true, 0.0)])],
-            )
-            .unwrap();
+            let grass = cell(
+                (0..4)
+                    .map(|quadrant| {
+                        let mut base = layer(2, true, 0.0);
+                        base.quadrant = quadrant;
+                        base
+                    })
+                    .collect(),
+            );
+            let cells = [cell(Vec::new()), grass];
+            let textures = TerrainTextures::load(&connection, vfs.path(), &cells).unwrap();
             let defaulted_sources: BTreeMap<u32, (String, String)> = textures
-                .sources_for(&[&defaulted])
+                .sources_for(&[&cells[0]])
                 .into_iter()
                 .map(|(id, source)| (id, source.clone()))
                 .collect();
             let grass_sources: BTreeMap<u32, (String, String)> = textures
-                .sources_for(&[&grass])
+                .sources_for(&[&cells[1]])
                 .into_iter()
                 .map(|(id, source)| (id, source.clone()))
                 .collect();

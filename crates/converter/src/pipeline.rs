@@ -5372,6 +5372,174 @@ mod tests {
     }
 
     #[test]
+    fn changed_default_bytes_change_persisted_lod_identity_and_only_defaulted_chunks() {
+        use crate::lod::{
+            albedo::TerrainTextures,
+            terrain::{TerrainCellInput, terrain_jobs},
+        };
+        use std::collections::HashMap;
+
+        struct Proof {
+            identity: String,
+            asset_identity: String,
+            manifest: crate::lod::reuse::LodManifest,
+            default_inputs: BTreeMap<String, String>,
+            grass_inputs: BTreeMap<String, String>,
+            default_outputs: BTreeMap<String, String>,
+            grass_outputs: BTreeMap<String, String>,
+            grass_source: String,
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let vfs = directory.path();
+        let default_path = vfs.join("textures/landscape/Dirt02.dds");
+        let grass_path = vfs.join("textures/landscape/grass.dds");
+        fs::create_dir_all(default_path.parent().unwrap()).unwrap();
+        let grass_bytes = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 16, 16),
+            &mut dummy_content::rng::Rng::new(19),
+        )
+        .unwrap();
+        fs::write(&grass_path, grass_bytes).unwrap();
+
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets (id INTEGER PRIMARY KEY, diffuse_path TEXT);
+                 CREATE TABLE landscape_textures (id INTEGER PRIMARY KEY, texture_set_id INTEGER);
+                 INSERT INTO texture_sets VALUES (1, 'textures/landscape/grass.dds');
+                 INSERT INTO landscape_textures VALUES (2, 1);",
+            )
+            .unwrap();
+        let defaulted = TerrainCellInput {
+            cell_id: 1,
+            grid_x: 0,
+            grid_y: 0,
+            heights: vec![0.0; 33 * 33],
+            vertex_colors: vec![255; 33 * 33 * 3],
+            layers: Vec::new(),
+        };
+        let grass = TerrainCellInput {
+            cell_id: 2,
+            grid_x: 64,
+            grid_y: 0,
+            heights: vec![0.0; 33 * 33],
+            vertex_colors: vec![255; 33 * 33 * 3],
+            layers: (0..4)
+                .map(|quadrant| shared::TerrainLayer {
+                    texture_form_id: 2,
+                    quadrant,
+                    layer: 0,
+                    is_base: true,
+                    weights: Vec::new(),
+                })
+                .collect(),
+        };
+        let cells = [defaulted, grass];
+        let cell_hashes: HashMap<_, _> = cells
+            .iter()
+            .map(|cell| (cell.cell_id, cell.fingerprint()))
+            .collect();
+        let origin = shared::lod::LodOrigin::new(0, 0);
+        let asset_identity = configuration_hash(&cpu_lod_config("/data", "/output")).unwrap();
+
+        // Exercise production chunk fingerprints and build identity with synthetic cells. The
+        // persistence assertions use the same DB row and manifest field as compilation, without
+        // running archive ingestion or the full AssetPipeline.
+        let build = |seed| {
+            let default_bytes = dummy_content::dds::generate(
+                &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 16, 16),
+                &mut dummy_content::rng::Rng::new(seed),
+            )
+            .unwrap();
+            fs::write(&default_path, default_bytes).unwrap();
+            let textures = TerrainTextures::load(&connection, vfs, &cells).unwrap();
+            let mut chunk_inputs = BTreeMap::new();
+            let mut chunk_hashes = Vec::new();
+            let mut default_inputs = BTreeMap::new();
+            let mut grass_inputs = BTreeMap::new();
+            let mut default_outputs = BTreeMap::new();
+            let mut grass_outputs = BTreeMap::new();
+
+            for job in terrain_jobs(0x3c, origin, &cells) {
+                let path = shared::lod::chunk_payload_path(job.key);
+                let input_hash = job.fingerprint(origin, &cell_hashes, &textures).unwrap();
+                let output_hash =
+                    crate::cache::hash_bytes(&job.compile(origin, &textures).unwrap().glb);
+                chunk_inputs.insert(path.clone(), input_hash.clone());
+                chunk_hashes.push(format!("{path}:{output_hash}"));
+                if job.members.iter().any(|cell| cell.cell_id == 1) {
+                    default_inputs.insert(path.clone(), input_hash);
+                    default_outputs.insert(path, output_hash);
+                } else {
+                    grass_inputs.insert(path.clone(), input_hash);
+                    grass_outputs.insert(path, output_hash);
+                }
+            }
+            chunk_hashes.sort();
+            let terrain_sources = textures.source_hashes.clone();
+            let identity =
+                build_identity(&[], &chunk_hashes, &asset_identity, &[], &terrain_sources).unwrap();
+            let manifest = crate::lod::reuse::LodManifest {
+                build_identity: identity.clone(),
+                converter_schema: CONVERTER_SCHEMA_VERSION,
+                world_database_schema: shared::WORLD_DATABASE_SCHEMA_VERSION,
+                chunks: chunk_hashes.len() as u64,
+                land_texture_repeats_per_cell: shared::LAND_TEXTURE_REPEATS_PER_CELL,
+                terrain_sources,
+                compiler_version: crate::lod::TERRAIN_COMPILER_VERSION,
+                chunk_inputs,
+            };
+            Proof {
+                identity,
+                asset_identity: asset_identity.clone(),
+                manifest,
+                default_inputs,
+                grass_inputs,
+                default_outputs,
+                grass_outputs,
+                grass_source: textures.source_hashes["textures/landscape/grass.dds"].clone(),
+            }
+        };
+
+        let first = build(7);
+        let second = build(8);
+        assert_ne!(first.identity, second.identity);
+        assert_ne!(first.default_inputs, second.default_inputs);
+        assert_eq!(first.grass_inputs, second.grass_inputs);
+        assert_ne!(first.default_outputs, second.default_outputs);
+        assert_eq!(first.grass_outputs, second.grass_outputs);
+        assert_eq!(first.grass_source, second.grass_source);
+        assert_eq!(first.asset_identity, second.asset_identity);
+
+        let database = Connection::open_in_memory().unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE lod_build (id INTEGER PRIMARY KEY, build_identity TEXT NOT NULL);",
+            )
+            .unwrap();
+        for proof in [&first, &second] {
+            database
+                .execute(
+                    "INSERT OR REPLACE INTO lod_build(id, build_identity) VALUES (1, ?1)",
+                    [&proof.identity],
+                )
+                .unwrap();
+            let stored: String = database
+                .query_row(
+                    "SELECT build_identity FROM lod_build WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&serde_json::to_vec(&proof.manifest).unwrap()).unwrap();
+            assert_eq!(stored, proof.identity);
+            assert_eq!(manifest["build_identity"], stored);
+        }
+    }
+
+    #[test]
     fn explicit_lod_origin_precedes_invalid_staged_sidecar() {
         let directory = tempfile::tempdir().unwrap();
         let vfs = directory.path().join("vfs");
