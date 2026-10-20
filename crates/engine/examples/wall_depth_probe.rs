@@ -367,6 +367,7 @@ fn capture(
                         depth_write: true,
                         decal: false,
                         alpha_mask: false,
+                        cast_shadows: true,
                     },
                     false,
                 )

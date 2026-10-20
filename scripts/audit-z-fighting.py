@@ -7,6 +7,7 @@ or invalid input. Reports always distinguish inventory from geometry coverage.
 Only Python's standard library is needed. All input files are read-only.
 """
 
+from contextlib import closing
 import argparse
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -96,23 +97,23 @@ def skyrim_tag(material):
     return tag if isinstance(tag, dict) else {}
 
 
-def material_risks(material):
-    """Return authored depth requirements not implemented by the native hook."""
+def material_requirements(material):
+    """Inventory authored depth settings handled by the native material path."""
     tag = skyrim_tag(material)
     first, second = tag.get("shaderFlags1"), tag.get("shaderFlags2")
     if any(type(value) is not int or not 0 <= value <= 0xffffffff
            for value in (first, second)):
         return None
-    risks = []
+    requirements = []
     if first & DECAL:
-        risks.append("authored_decal")
+        requirements.append("authored_decal")
     if first & DYNAMIC_DECAL:
-        risks.append("authored_dynamic_decal")
+        requirements.append("authored_dynamic_decal")
     if not first & DEPTH_TEST:
-        risks.append("depth_test_disabled")
+        requirements.append("depth_test_disabled")
     if not second & DEPTH_WRITE and material.get("alphaMode", "OPAQUE") != "BLEND":
-        risks.append("opaque_or_mask_depth_write_disabled")
-    return risks
+        requirements.append("opaque_or_mask_depth_write_disabled")
+    return requirements
 
 
 def accessor(document, binary, index, kind):
@@ -309,6 +310,12 @@ def overlap_area(a, b, normal):
             if new >= 0:
                 polygon.append(current)
             previous, old = current, new
+    if len(polygon) < 3:
+        return 0.
+    # The area is translation invariant. Subtract a nearby origin so absolute
+    # scene coordinates do not overflow or cancel the shoelace products.
+    origin = polygon[0]
+    polygon = [(p[0]-origin[0], p[1]-origin[1]) for p in polygon]
     projected = abs(sum(polygon[i][0]*polygon[(i+1) % len(polygon)][1]
                         - polygon[i][1]*polygon[(i+1) % len(polygon)][0] for i in range(len(polygon))))/2
     return projected / abs(normal[axis])
@@ -375,6 +382,8 @@ def find_overlaps(items, tolerance, minimum_area, max_comparisons, max_examples)
             if separation > tolerance:
                 continue
             area = overlap_area(old.points, current.points, old.normal)
+            if not math.isfinite(area):
+                raise AuditError("nonfinite triangle overlap area")
             if area <= minimum_area:
                 continue
             pairs += 1
@@ -386,7 +395,7 @@ def find_overlaps(items, tolerance, minimum_area, max_comparisons, max_examples)
 
 def duplicate_placements(database, max_examples):
     """Find exact same-model placements; conditional references remain unknown."""
-    with sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True) as connection:
+    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)) as connection, connection:
         rows = connection.execute('''SELECT f.id, f.cell_id, f.worldspace_id, f.is_exterior,
             f.pos_x, f.pos_y, f.pos_z, f.rot_x, f.rot_y, f.rot_z, f.scale,
             f.header_flags, f.enable_parent_id, s.model_path
@@ -430,7 +439,7 @@ def audit_file(task):
     errors = []
     included = False
     relative = path.relative_to(mesh_root).as_posix()
-    entry = {"path": relative, "material_risks": []}
+    entry = {"path": relative, "material_risks": [], "material_requirements": []}
     if path.is_symlink() or not path.resolve().is_relative_to(mesh_root.resolve()):
         errors.append({"path": relative, "error": "symlink or escaped mesh path"})
         return counts, materials, None, errors
@@ -439,22 +448,22 @@ def audit_file(task):
         counts["files_read"] += 1
         for index, material in enumerate(document.get("materials", [])):
             materials["total"] += 1
-            risks = material_risks(material)
-            if risks is None:
+            requirements = material_requirements(material)
+            if requirements is None:
                 materials["unannotated"] += 1
                 continue
             materials["annotated"] += 1
             first = material["extras"]["openSkyrim"]["shaderFlags1"]
             second = material["extras"]["openSkyrim"]["shaderFlags2"]
             materials["depth_write_disabled_all_alpha_modes"] += not second & DEPTH_WRITE
-            if risks:
-                materials["risk_materials"] += 1
-                materials.update(risks)
+            materials["native_handled_materials"] += bool(requirements)
+            materials.update(requirements)
+            if requirements:
                 tag = material["extras"]["openSkyrim"]
-                entry["material_risks"].append({"material": index, "name": material.get("name"),
+                entry["material_requirements"].append({"material": index, "name": material.get("name"),
                     "shape_block": tag.get("shapeBlock"), "shader_block": tag.get("shaderBlock"),
                     "shader_flags_1": first, "shader_flags_2": second,
-                    "alpha_mode": material.get("alphaMode", "OPAQUE"), "requirements": risks})
+                    "alpha_mode": material.get("alphaMode", "OPAQUE"), "requirements": requirements})
         if not args.materials_only:
             try:
                 geometry, degenerates = triangles(document, binary, args.max_triangles)
@@ -472,7 +481,7 @@ def audit_file(task):
                 if isinstance(error, BudgetError):
                     entry["geometry"].update(error.partial)
                     counts["overlapping_triangle_pairs"] += error.partial["pairs"]
-        if entry["material_risks"] or entry.get("geometry", {}).get("pairs") or entry.get("geometry", {}).get("complete") is False:
+        if entry["material_requirements"] or entry.get("geometry", {}).get("pairs") or entry.get("geometry", {}).get("complete") is False:
             entry["sha256"] = hash_file(path)
             included = True
     except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError, struct.error) as error:
@@ -537,7 +546,7 @@ def audit(args):
             gaps.append("placement audit failed")
     else:
         gaps.append("placement audit not requested")
-    risks_found = bool(materials["risk_materials"] or counts["overlapping_triangle_pairs"]
+    risks_found = bool(counts["overlapping_triangle_pairs"]
                        or (placement and placement["duplicate_groups"]))
     return {"format": FORMAT, "elapsed_seconds": round(time.monotonic()-started, 3),
             "scope": {"assets": str(args.assets.resolve()), "include": args.include,

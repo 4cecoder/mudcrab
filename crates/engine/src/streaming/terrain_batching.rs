@@ -1687,6 +1687,65 @@ mod tests {
     }
 
     #[test]
+    fn stationary_batch_retirement_reselects_held_quadrants_without_a_camera_move() {
+        let mut app = selection_app();
+        let fixture = fixture(&mut app, &[IVec2::ZERO], LodTier::Tier4);
+        // A coarser unbatched neighbour lives in the same quadrant as the Tier4 sources.
+        let held = app
+            .world_mut()
+            .spawn((
+                TerrainCoverage {
+                    grid: IVec2::ZERO,
+                    quadrant: 0,
+                    tier: Some(LodTier::Tier8),
+                },
+                TerrainSurfaceReady,
+                Visibility::Hidden,
+            ))
+            .id();
+        ready_source(&mut app, &fixture);
+        queue_source(&mut app, &fixture);
+        app.update();
+        acknowledge_uploads(&app, fixture.root);
+        app.update();
+        assert!(
+            app.world()
+                .get::<LodTerrainBatches>(fixture.root)
+                .unwrap()
+                .source_children
+                .is_none(),
+            "the initial sources were replaced by the batch"
+        );
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(held).unwrap(),
+            Visibility::Hidden
+        );
+        let revision = app.world().resource::<LodStreaming>().visibility_revision;
+
+        // Retiring the batch chunk without a camera move must reselect the held quadrant
+        // from its own remaining tiers instead of waiting for the next crossing.
+        app.world_mut().entity_mut(fixture.root).despawn();
+        app.update();
+        assert_eq!(
+            app.world().resource::<LodStreaming>().visibility_revision,
+            revision + 1,
+            "a batch retirement refreshes the selection without a camera move"
+        );
+        assert_eq!(
+            *app.world().get::<Visibility>(held).unwrap(),
+            Visibility::Inherited,
+            "the held Tier8 becomes the quadrant's selection once the batch's Tier4 is gone"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .visible_lod_terrain_patches,
+            1
+        );
+    }
+
+    #[test]
     fn transfer_tracking_expires_with_missing_events_and_without_a_camera() {
         let mut app = selection_app();
         app.update();

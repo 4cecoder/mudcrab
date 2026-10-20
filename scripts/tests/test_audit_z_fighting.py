@@ -1,8 +1,11 @@
 """Synthetic regressions for the static depth-risk audit; no retail assets."""
 
+from contextlib import closing
 import importlib.util
 import json
+import math
 from pathlib import Path
+import re
 import sqlite3
 import struct
 import subprocess
@@ -45,7 +48,7 @@ def write_glb(path, document, binary):
 
 
 def create_database(path):
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.executescript('''CREATE TABLE "references" (id INTEGER, cell_id INTEGER,
             worldspace_id INTEGER, is_exterior INTEGER, pos_x REAL, pos_y REAL, pos_z REAL,
             rot_x REAL, rot_y REAL, rot_z REAL, scale REAL, header_flags INTEGER,
@@ -71,6 +74,15 @@ class OverlapTests(unittest.TestCase):
         self.assertEqual(result["pairs"], 1)
         self.assertAlmostEqual(result["examples"][0]["overlap_area"], .5)
         self.assertEqual(result["examples"][0]["a"]["shape_block"], 9)
+
+    def test_overlap_area_remains_finite_after_a_large_translation(self):
+        offset = 1e160
+        width = 8 * math.ulp(offset)
+        points = [(offset, offset, 0), (offset + width, offset, 0),
+                  (offset, offset + width, 0)]
+        area = AUDIT.overlap_area(points, points, (0, 0, 1))
+        self.assertTrue(math.isfinite(area))
+        self.assertAlmostEqual(area / (width * width / 2), 1.)
 
     def test_partial_overlap_with_different_triangulation(self):
         result = self.scan([(0,0,0), (2,0,0), (0,2,0), (1,0,0), (3,0,0), (1,2,0)])
@@ -134,11 +146,104 @@ class OverlapTests(unittest.TestCase):
 
 
 class InputTests(unittest.TestCase):
+    def test_depth_masks_match_rust_material_path(self):
+        source = (Path(__file__).resolve().parents[2] /
+                  "crates/engine/src/nif_depth.rs").read_text()
+        for name in ("DECAL", "DYNAMIC_DECAL", "DEPTH_TEST", "DEPTH_WRITE"):
+            with self.subTest(mask=name):
+                declaration = re.search(
+                    rf"pub const {name}: u32 = (0x[0-9a-fA-F_]+|[0-9_]+)"
+                    r"(?:\s*<<\s*([0-9_]+))?;", source)
+                self.assertIsNotNone(declaration, f"unrecognized Rust mask: {name}")
+                value, shift = declaration.groups()
+                rust_mask = int(value.replace("_", ""), 0) << int(shift or "0")
+                self.assertEqual(getattr(AUDIT, name), rust_mask)
+
+    def test_literal_depth_flags_report_authored_requirements(self):
+        self.assertEqual(AUDIT.material_requirements(material(0x84000000, 0)),
+                         ["authored_decal", "opaque_or_mask_depth_write_disabled"])
+        self.assertEqual(AUDIT.material_requirements(material(0x88000000, 0, alphaMode="MASK")),
+                         ["authored_dynamic_decal", "opaque_or_mask_depth_write_disabled"])
+        self.assertEqual(AUDIT.material_requirements(material(0x80000000, 1)), [])
+
+    def test_cli_translated_duplicate_triangles_remain_overlap_risks(self):
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "meshes").mkdir()
+                document, binary = fixture([(0,0,0), (1,0,0), (0,1,0)] * 2,
+                    nodes=[{"mesh": 0, "translation": [1e8, 1e8, 0]}])
+                write_glb(root / "meshes/test.glb", document, binary)
+                create_database(root / "skyrim_world.db")
+                report = root / "report.json"
+                process = subprocess.run([sys.executable, str(SPEC.origin), str(root),
+                    "--jobs", str(jobs), "--out", str(report)], capture_output=True, text=True)
+                self.assertEqual(process.returncode, 1, process.stderr)
+                result = json.loads(report.read_text())
+                self.assertEqual(result["coverage"]["overlapping_triangle_pairs"], 1)
+                self.assertAlmostEqual(result["files"][0]["geometry"]["examples"][0]["overlap_area"], .5)
+                self.assertFalse(result["static_scope_passed"])
+                self.assertEqual(result["coverage_gaps"], [])
+
+    def test_nonfinite_overlap_area_produces_an_incomplete_report(self):
+        for area in (float("nan"), float("inf")):
+            with self.subTest(area=area), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "meshes").mkdir()
+                document, binary = fixture([(0,0,0), (1,0,0), (0,1,0)] * 2)
+                write_glb(root / "meshes/test.glb", document, binary)
+                create_database(root / "skyrim_world.db")
+                report = root / "report.json"
+                with mock.patch.object(AUDIT, "overlap_area", return_value=area):
+                    self.assertEqual(AUDIT.main([str(root), "--out", str(report)]), 2)
+                result = json.loads(report.read_text())
+                self.assertFalse(result["static_scope_passed"])
+                self.assertFalse(result["risks_found"])
+                self.assertTrue(result["coverage_gaps"])
+                self.assertFalse(result["files"][0]["geometry"]["complete"])
+                self.assertEqual(result["files"][0]["geometry"]["reason"],
+                                 "nonfinite triangle overlap area")
+
+    def test_cli_handled_depth_flags_are_inventory_not_risks(self):
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                meshes = root / "meshes"
+                meshes.mkdir()
+                create_database(root / "skyrim_world.db")
+                authored = [
+                    material(AUDIT.DEPTH_TEST | AUDIT.DECAL, 0),
+                    material(AUDIT.DEPTH_TEST | AUDIT.DYNAMIC_DECAL, 0, alphaMode="MASK"),
+                    material(first=0),
+                    material(second=0, alphaMode="MASK"),
+                    material(second=0, alphaMode="BLEND"),
+                ]
+                for index, source in enumerate(authored):
+                    document, binary = fixture([(0,0,0), (1,0,0), (0,1,0)], materials=[source])
+                    write_glb(meshes / f"handled-{index}.glb", document, binary)
+                report = root / "report.json"
+                process = subprocess.run([sys.executable, str(SPEC.origin), str(root),
+                    "--jobs", str(jobs), "--out", str(report)], capture_output=True, text=True)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                result = json.loads(report.read_text())
+                self.assertFalse(result["risks_found"])
+                self.assertTrue(result["static_scope_passed"])
+                self.assertEqual(result["coverage_gaps"], [])
+                inventory = result["material_requirements"]
+                self.assertEqual(inventory["native_handled_materials"], 4)
+                self.assertEqual(inventory["authored_decal"], 1)
+                self.assertEqual(inventory["authored_dynamic_decal"], 1)
+                self.assertEqual(inventory["depth_test_disabled"], 1)
+                self.assertEqual(inventory["opaque_or_mask_depth_write_disabled"], 3)
+                self.assertEqual(len(result["files"]), 4)
+                self.assertTrue(all(not entry["material_risks"] for entry in result["files"]))
+                self.assertTrue(all(entry["material_requirements"] for entry in result["files"]))
+
     def test_optional_metadata_accepts_non_object_json(self):
         for value in (None, [], "x", 7, 1.5, True):
             for metadata in ({"extras": value}, {"extras": {"openSkyrim": value}}):
                 with self.subTest(metadata=metadata):
-                    self.assertIsNone(AUDIT.material_risks(metadata))
+                    self.assertIsNone(AUDIT.material_requirements(metadata))
                     document, binary = fixture([(0,0,0), (1,0,0), (0,1,0)], materials=[metadata])
                     geometry, _ = AUDIT.triangles(document, binary, 100)
                     self.assertEqual(len(geometry), 1)
@@ -178,7 +283,7 @@ class InputTests(unittest.TestCase):
                                            ("e-tag", {"extras": {"openSkyrim": "x"}})):
                         document, binary = fixture(points, materials=[metadata])
                         write_glb(meshes / (name + ".glb"), document, binary)
-                    document, binary = fixture(points, materials=[material(
+                    document, binary = fixture(points * (2 if risk else 1), materials=[material(
                         first=AUDIT.DEPTH_TEST | (AUDIT.DECAL if risk else 0))])
                     write_glb(meshes / "z-valid.glb", document, binary)
                     report = root / "report.json"
@@ -199,12 +304,12 @@ class InputTests(unittest.TestCase):
                         self.assertIn("z-valid.glb", [entry["path"] for entry in result["files"]])
 
     def test_depth_requirements_and_blend_exception(self):
-        self.assertEqual(AUDIT.material_risks(material()), [])
-        self.assertEqual(AUDIT.material_risks(material(AUDIT.DEPTH_TEST | AUDIT.DECAL | AUDIT.DYNAMIC_DECAL, 0)),
+        self.assertEqual(AUDIT.material_requirements(material()), [])
+        self.assertEqual(AUDIT.material_requirements(material(AUDIT.DEPTH_TEST | AUDIT.DECAL | AUDIT.DYNAMIC_DECAL, 0)),
             ["authored_decal", "authored_dynamic_decal", "opaque_or_mask_depth_write_disabled"])
-        self.assertEqual(AUDIT.material_risks(material(second=0, alphaMode="BLEND")), [])
-        self.assertEqual(AUDIT.material_risks(material(first=0)), ["depth_test_disabled"])
-        self.assertIsNone(AUDIT.material_risks({}))
+        self.assertEqual(AUDIT.material_requirements(material(second=0, alphaMode="BLEND")), [])
+        self.assertEqual(AUDIT.material_requirements(material(first=0)), ["depth_test_disabled"])
+        self.assertIsNone(AUDIT.material_requirements({}))
 
     def test_strided_positions_and_uint16_indices(self):
         binary = b"".join(struct.pack("<4f", *p, 99) for p in [(0,0,0), (1,0,0), (0,1,0)]) + struct.pack("<3H", 2,1,0)
@@ -262,7 +367,7 @@ class InputTests(unittest.TestCase):
             self.assertTrue(json.loads(report.read_text())["static_scope_passed"])
             self.assertEqual(AUDIT.main([str(root), "--materials-only", "--out", str(report)]), 2)
             self.assertFalse(json.loads(report.read_text())["static_scope_passed"])
-            document["materials"][0] = material(first=AUDIT.DEPTH_TEST | AUDIT.DECAL)
+            document, binary = fixture([(0,0,0), (1,0,0), (0,1,0)] * 2)
             write_glb(root / "meshes/test.glb", document, binary)
             self.assertEqual(AUDIT.main([str(root), "--out", str(report)]), 1)
             document["nodes"][0]["skin"] = 0
@@ -282,7 +387,7 @@ class InputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "world.db"
             create_database(path)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 for ident, cell, exterior, flags, parent in [(1,10,1,0,None), (2,11,1,0,None),
                         (3,12,1,0x800,None), (4,12,1,0,1), (5,10,0,0,None), (6,11,0,0,None)]:
                     db.execute('INSERT INTO "references" VALUES (?,?,60,?,0,0,0,0,0,0,1,?,?,1)',
@@ -318,7 +423,7 @@ class PlacementTests(unittest.TestCase):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "world.db"
                 create_database(path)
-                with sqlite3.connect(path) as db:
+                with closing(sqlite3.connect(path)) as db, db:
                     for ident in (1, 2, 3, 4):
                         insert_reference(db, ident)
                     db.execute(f'UPDATE "references" SET {field}=NULL WHERE id IN (3,4)')
@@ -333,7 +438,7 @@ class PlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "world.db"
             create_database(path)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 insert_reference(db, 1, transform=(None,) * 7)
                 insert_reference(db, 2, flags=None, transform=(None,) * 7)
             result = AUDIT.duplicate_placements(path, 10)
@@ -344,7 +449,7 @@ class PlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "world.db"
             create_database(path)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 for ident, flags, parent in ((1, 0x20, None), (2, 0x800, None),
                         (3, 0x20, 42), (4, 0x800, 42), (5, 0, 42), (6, None, 42)):
                     insert_reference(db, ident, flags, parent, (None,) * 7)
@@ -363,7 +468,7 @@ class PlacementTests(unittest.TestCase):
                 root = Path(tmp)
                 self.prepare_assets(root)
                 database = root / "skyrim_world.db"
-                with sqlite3.connect(database) as db:
+                with closing(sqlite3.connect(database)) as db, db:
                     for ident in (1, 2, 3):
                         insert_reference(db, ident)
                     db.execute(f'UPDATE "references" SET {field}=NULL WHERE id=3')
@@ -383,7 +488,7 @@ class PlacementTests(unittest.TestCase):
             with self.subTest(conditional=conditional), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 self.prepare_assets(root)
-                with sqlite3.connect(root / "skyrim_world.db") as db:
+                with closing(sqlite3.connect(root / "skyrim_world.db")) as db, db:
                     insert_reference(db, 1, 0x20, transform=(None,) * 7)
                     insert_reference(db, 2, 0x800, transform=(None,) * 7)
                     if conditional:
@@ -400,7 +505,7 @@ class PlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.prepare_assets(root)
-            with sqlite3.connect(root / "skyrim_world.db") as db:
+            with closing(sqlite3.connect(root / "skyrim_world.db")) as db, db:
                 insert_reference(db, 1, transform=("invalid", 0, 0, 0, 0, 0, 1))
             status, result = self.run_cli(root)
             self.assertEqual(status, 2)
@@ -414,7 +519,7 @@ class PlacementTests(unittest.TestCase):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "world.db"
                 create_database(path)
-                with sqlite3.connect(path) as db:
+                with closing(sqlite3.connect(path)) as db, db:
                     for ident in (1, 2, 3, 4):
                         insert_reference(db, ident)
                     db.execute(f'UPDATE "references" SET {mutation} WHERE id IN (3,4)')
@@ -429,7 +534,7 @@ class PlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "world.db"
             create_database(path)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 for ident in (1, 2, 3, 4):
                     insert_reference(db, ident)
                 db.execute('UPDATE "references" SET is_exterior=NULL,cell_id=NULL,worldspace_id=NULL,pos_x=NULL')
@@ -444,7 +549,7 @@ class PlacementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "world.db"
             create_database(path)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 for ident in (1, 2, 3, 4):
                     insert_reference(db, ident)
                 db.execute('UPDATE "references" SET cell_id=NULL WHERE id IN (1,2)')
@@ -462,7 +567,7 @@ class PlacementTests(unittest.TestCase):
                 root = Path(tmp)
                 self.prepare_assets(root)
                 database = root / "skyrim_world.db"
-                with sqlite3.connect(database) as db:
+                with closing(sqlite3.connect(database)) as db, db:
                     insert_reference(db, 1)
                     db.execute(f'UPDATE "references" SET {mutation}')
                 original_database = database.read_bytes()
@@ -482,7 +587,7 @@ class PlacementTests(unittest.TestCase):
                 root = Path(tmp)
                 self.prepare_assets(root)
                 database = root / "skyrim_world.db"
-                with sqlite3.connect(database) as db:
+                with closing(sqlite3.connect(database)) as db, db:
                     insert_reference(db, 1)
                     db.execute(f'UPDATE "references" SET {mutation}')
                 original_database = database.read_bytes()
@@ -499,7 +604,7 @@ class PlacementTests(unittest.TestCase):
                 root = Path(tmp)
                 self.prepare_assets(root)
                 database = root / "skyrim_world.db"
-                with sqlite3.connect(database) as db:
+                with closing(sqlite3.connect(database)) as db, db:
                     insert_reference(db, 1, 0x20)
                     insert_reference(db, 2, 0x800)
                     if conditional:
