@@ -1195,7 +1195,7 @@ mod tests {
         // The world is ready on the first frame, which stands still; the window closes at once.
         let mut partial = route_at(waypoints);
         partial.step(1.0, true, 0.0);
-        let mut app = acceptance_report_app(directory.path(), None, Duration::ZERO);
+        let mut app = acceptance_report_app(directory.path(), None, std::time::Duration::ZERO);
         app.insert_resource(partial).update();
         let report = written_report(directory.path());
         assert_eq!(report["route"]["completed"], false);
@@ -1205,7 +1205,7 @@ mod tests {
         let mut finished = route_at(waypoints);
         finished.step(0.0, true, 0.0);
         finished.step(2.0, true, 2000.0);
-        let mut app = acceptance_report_app(directory.path(), None, Duration::ZERO);
+        let mut app = acceptance_report_app(directory.path(), None, std::time::Duration::ZERO);
         app.insert_resource(finished).update();
         let report = written_report(directory.path());
         assert_eq!(report["route"]["completed"], true);
