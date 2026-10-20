@@ -105,16 +105,24 @@ pub const LIGHT_FLAG_NEGATIVE: u32 = 0x0000_0004;
 /// The ambient brightness the engine applies in its world path, in Bevy's ambient units: the
 /// `brightness` the world startup of `crate::app` inserts beside its `GlobalAmbientLight` colour.
 ///
-/// This is the illuminance a converted light is stated against, so the ratio
-/// [`LIGHT_EXPOSURE`] names is the ratio a rendered surface really sees. A run that lights the
-/// world differently - the fixture paths of `crate::app` each insert their own ambient - is not the
-/// world this scale is written for, and the value has to be re-derived if per-space ambient lands.
+/// This is the illuminance converted lights are stated against, so [`LIGHT_EXPOSURE`] is a ratio
+/// of configured inputs in this scale. It is not a measured or rendered ratio: Bevy's PBR ambient
+/// path applies an environment-BRDF approximation and specular terms, so a surface's rendered
+/// ambient is not `albedo * brightness`, and no native capture has matched this scale to Skyrim.
+/// A run that lights the world differently - the fixture paths of `crate::app` each insert their
+/// own ambient - is not the world this scale is written for, and the value has to be re-derived
+/// if per-space ambient lands.
 ///
-/// It is derived, not chosen: Skyrim lights a surface with `albedo * (ambient + sunlight * 2.8 *
-/// NdotL)`, and Bevy's sun adds `albedo * illuminance / PI * NdotL` against an ambient of
-/// `albedo * brightness`, so matching the two ratios gives `brightness = illuminance / (PI * 2.8)`.
-/// The sun and ambient colours carry the weather's own hues (`crate::sky::WeatherLighting`), so
-/// this number sets only their relative level.
+/// Simplified heuristic: Skyrim lights a surface with `albedo * (ambient + sunlight * 2.8 *
+/// NdotL)`, and Bevy's sun adds `albedo * illuminance / PI * NdotL` against an ambient input of
+/// `brightness`. Equating the sun and ambient input ratios gives `brightness = illuminance / (PI *
+/// 2.8)`. The sun and ambient colours carry the weather's own hues (`crate::sky::WeatherLighting`),
+/// so this number sets only their relative input level.
+///
+/// Intended 219 change, uncalibrated: the world ambient brightness moves from the previous
+/// engine value of 160 to about 1364 (`1364.2`, about 8.5 times). Converted light intensities are
+/// expressed against this value, so they scale by the same factor. Both need matched native
+/// qualification before any claim about the rendered result.
 pub const AMBIENT_ILLUMINANCE: f32 = SUN_ILLUMINANCE / (core::f32::consts::PI * SUNLIGHT_SCALE);
 
 /// The sun's illuminance in the world path, in lux. With the scene's EV100 of 9.7 this puts a
@@ -136,10 +144,10 @@ pub const SUNLIGHT_SCALE: f32 = 2.8;
 /// which is what makes one number usable for a 75-unit Dwarven lamp and a 3300-unit water light
 /// alike.
 ///
-/// Ten is a round default rather than a measured one: at half its radius a light delivers ten times
-/// the ambient illuminance, an order of magnitude, so a lamp's pool reads clearly against the room.
-/// It is not fitted to any image, and tuning it is a later pass - see
-/// `docs/specs/engine/point-lights.md`.
+/// Ten is a round default rather than a measured one: at half its radius a light is configured to
+/// deliver ten times the ambient input level, an order of magnitude. That is an input-scale choice.
+/// It is not fitted to any image, no native capture has checked how a pool reads against the room,
+/// and tuning it is a later pass - see `docs/specs/engine/point-lights.md`.
 pub const LIGHT_EXPOSURE: f32 = 10.0;
 
 /// The largest reference distance [`intensity_for_radius`] sizes a light's intensity from: a light
@@ -399,11 +407,12 @@ mod tests {
             / (4.0 * core::f32::consts::PI * core::f32::consts::PI * distance * distance)
     }
 
-    /// The world's ambient is not a tuned number: Bevy's sun puts `illuminance / PI` on a surface
-    /// facing it and the ambient puts `AMBIENT_ILLUMINANCE`, and Skyrim's puts `SUNLIGHT_SCALE`
-    /// times as much sunlight as ambient, so the two ratios have to agree.
+    /// Algebra-only consistency check of the input constants: the sun's illuminance over `PI`
+    /// divided by `AMBIENT_ILLUMINANCE` equals `SUNLIGHT_SCALE`. This checks the stated input
+    /// ratio, not the rendered output. Bevy's ambient path (environment-BRDF approximation and
+    /// specular terms) is not modelled here, so this test does not validate a rendered ratio.
     #[test]
-    fn the_ambient_keeps_skyrims_sun_to_ambient_ratio() {
+    fn the_configured_sun_to_ambient_input_ratio_matches_the_sunlight_scale() {
         let bevy_ratio = SUN_ILLUMINANCE / core::f32::consts::PI / AMBIENT_ILLUMINANCE;
         assert!(
             (bevy_ratio - SUNLIGHT_SCALE).abs() < 1.0e-3,
@@ -419,12 +428,12 @@ mod tests {
         0.2126 * linear.red + 0.7152 * linear.green + 0.0722 * linear.blue
     }
 
-    /// The ambient of `crate::app` contributes `albedo * colour * brightness` to a surface; a
-    /// converted light contributes what `illuminance` computes - already the light's colour times
-    /// its intensity, since `illuminance` takes the colour out of the formula to keep the scale
-    /// colour-free. A converted light has to put [`LIGHT_EXPOSURE`] times the ambient on a surface
-    /// at half its radius, and that is the whole point of the intensity scale - so this is the test
-    /// that catches a wrong formula.
+    /// Input-level consistency check, not rendered parity. The ambient of `crate::app` is stated as
+    /// `brightness` in this scale; a converted light's `illuminance` is computed in the same units
+    /// (its colour is taken out of the formula, so the scale stays colour-free). This checks that the
+    /// configured intensity scale states [`LIGHT_EXPOSURE`] times `AMBIENT_ILLUMINANCE` at half a
+    /// light's radius, so it catches a wrong formula in the input scale. It does not validate the
+    /// rendered surface brightness, which Bevy's ambient and specular paths determine.
     ///
     /// Above [`INTENSITY_REFERENCE_RADIUS`] that stops being true on purpose: a light bigger than
     /// twice the cap is lit like the largest calibrated one, so what reaches a surface at half its

@@ -2060,8 +2060,9 @@ fn setup_world(
     commands.insert_resource(DirectionalLightShadowMap {
         size: SUN_SHADOW_MAP_SIZE,
     });
-    // The sun and ambient are the clear weather's own (`WTHR` 0x81A, day), at the relative level
-    // Skyrim's sunlight scale gives them (`crate::lights::AMBIENT_ILLUMINANCE`).
+    // The sun and ambient colours are the clear weather's own (`WTHR` 0x81A, day). Their levels are
+    // the configured input ratio in `crate::lights::AMBIENT_ILLUMINANCE` (a simplified heuristic,
+    // not a rendered-parity calibration).
     let weather_lighting = crate::sky::WeatherLighting::default();
     commands.spawn((
         DirectionalLight {
