@@ -9,8 +9,8 @@ use crate::{
     archive::ArchiveExtractor,
     asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
     cache::{
-        CONVERTER_SCHEMA_VERSION, ConversionManifest, configuration_hash, hash_bytes, hash_file,
-        retained_configuration_matches_for_reader,
+        CONVERTER_SCHEMA_VERSION, ConversionManifest, can_reuse_meshes_for_producer,
+        configuration_hash, hash_bytes, hash_file, retained_configuration_matches_for_reader,
     },
     esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database},
     integration::finalize_world_database,
@@ -115,13 +115,18 @@ impl AssetPipeline {
             RuntimeSchemas::from_addon_bytes(&retained_schema_documents)
                 .map_err(color_eyre::eyre::Error::msg)?,
         )?;
+        // Metadata rebuild copies retained KTX2 bytes verbatim and then stamps the current
+        // schema. Only current-producer textures carry the current layout, so an earlier
+        // producer's texture bytes cannot be relabeled here; they need a normal conversion.
         ensure!(
-            (matches!(manifest.schema_version, 15 | 16 | 19..=24 | 26)
-                || manifest.schema_version == CONVERTER_SCHEMA_VERSION)
-                && manifest.complete
-                && manifest.failures.is_empty(),
-            "metadata rebuild requires complete converter schema 15, 16, 19 through 24, 26 or {} assets",
-            CONVERTER_SCHEMA_VERSION
+            manifest.schema_version == CONVERTER_SCHEMA_VERSION,
+            "metadata rebuild requires converter schema {CONVERTER_SCHEMA_VERSION} textures, but this source is schema {}; \
+             its KTX2 textures predate the current texture layout. Run normal conversion to regenerate them",
+            manifest.schema_version
+        );
+        ensure!(
+            manifest.complete && manifest.failures.is_empty(),
+            "metadata rebuild requires complete converter schema {CONVERTER_SCHEMA_VERSION} assets with no failures"
         );
         ensure!(
             manifest.retained_mesh_schema_version.is_some()
@@ -131,9 +136,11 @@ impl AssetPipeline {
         let mesh_schema = manifest
             .retained_mesh_schema_version
             .unwrap_or(manifest.schema_version);
+        // Only the explicit mesh pairs in `can_reuse_meshes_for_producer` survive a
+        // producer change, so producers 24 and 26 cannot reach the current schema here.
         ensure!(
-            (matches!(mesh_schema, 15 | 16 | 19..=24 | 26)
-                || mesh_schema == CONVERTER_SCHEMA_VERSION)
+            (mesh_schema == CONVERTER_SCHEMA_VERSION
+                || can_reuse_meshes_for_producer(mesh_schema, CONVERTER_SCHEMA_VERSION))
                 && mesh_schema <= manifest.schema_version,
             "unsupported retained mesh cache contract"
         );
