@@ -226,6 +226,7 @@ fn table() -> LandTextureTable {
     LandTextureTable {
         format_version: TERRAIN_MESH_FORMAT_VERSION,
         max_layers_per_array: 2048,
+        settings: None,
         arrays: vec![
             array(
                 LandTextureUsage::DiffuseSrgb,

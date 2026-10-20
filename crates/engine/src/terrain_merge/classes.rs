@@ -282,6 +282,7 @@ pub(crate) mod tests {
         LandTextureTable {
             format_version: TERRAIN_MESH_FORMAT_VERSION,
             max_layers_per_array: 2048,
+            settings: None,
             arrays,
             entries: (0..textures)
                 .map(|id| LandTextureEntry {

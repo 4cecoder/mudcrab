@@ -591,6 +591,7 @@ pub fn build_land_texture_arrays(
         max_layers_per_array: options.max_layers_per_array,
         arrays,
         entries: table_entries,
+        settings: None,
     };
     // `validate` accepts only the production size classes, so a test class set skips it.
     if options.size_classes == LAND_TEXTURE_SIZE_CLASSES {

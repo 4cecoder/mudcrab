@@ -8,7 +8,7 @@
 //! [`crate::terrain_chunks`] groups and writes the meshes. Every winning LTEX of the merged
 //! records becomes an array source; each exterior cell with a grid square builds one mesh from
 //! the one LAND it keeps — the LAND whose version comes from the plugin latest in the load
-//! order ([`crate::esm::cell_cache::land_per_cell`], the choice the cell cache uses too) — keyed
+//! order ([`crate::esm::cell_cache::merged_terrain_lands`], the choice the cell cache uses too) — keyed
 //! by [`crate::terrain_chunks::cell_mesh_key`] over the LAND, its plugin's master list and the
 //! LTEX and TXST records the LAND names. The LANDs a cell drops are reported in
 //! [`TerrainReport::warnings`].
@@ -49,9 +49,10 @@
 
 use crate::{
     asset_path::{AssetKind, canonical_asset_path},
-    config::{PipelineConfig, TerrainDefaultTexture},
+    cache::hash_bytes,
+    config::{PipelineConfig, RecordReader, TerrainDefaultTexture},
     esm::{
-        cell_cache::{extract_texture_layers, land_per_cell},
+        cell_cache::{extract_texture_layers, merged_terrain_lands},
         extractors::{SubrecordView, extract_cell_info},
         load_order::LoadOrder,
         records::RawRecord,
@@ -71,8 +72,8 @@ use color_eyre::{
 };
 use serde::{Deserialize, Serialize};
 use shared::terrain_mesh::{
-    DEFAULT_LAND_TEXTURE_FORM_ID, LAND_TEXTURE_TABLE_PATH, TERRAIN_CHUNK_SIDE_CELLS,
-    terrain_chunk_for_cell, terrain_chunk_path,
+    DEFAULT_LAND_TEXTURE_FORM_ID, LAND_TEXTURE_TABLE_PATH, LandTextureDefault, LandTextureRequest,
+    LandTextureSettings, TERRAIN_CHUNK_SIDE_CELLS, terrain_chunk_for_cell, terrain_chunk_path,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -107,6 +108,19 @@ pub fn terrain_records(merged: HashMap<u32, RawRecord>) -> HashMap<u32, RawRecor
         .into_iter()
         .filter(|(_, record)| TERRAIN_RECORD_TYPES.contains(&&record.record_type))
         .collect()
+}
+
+/// The native record positions the cell cache orders LANDs by, for the reader a conversion used.
+/// The in-house reader writes them into the database it exports, so they are read back from it;
+/// the legacy reader has none, so every LAND is ordered by load order and FormID alone.
+pub fn cell_cache_source_offsets(
+    reader: RecordReader,
+    db_path: &Path,
+) -> Result<HashMap<u32, u64>> {
+    match reader {
+        RecordReader::Inhouse => crate::esm::inhouse::terrain_source_offsets(db_path),
+        RecordReader::Legacy => Ok(HashMap::new()),
+    }
 }
 
 /// The conversion settings a merged-terrain build reads.
@@ -271,6 +285,7 @@ pub fn build_merged_terrain(
     staging: &Path,
     merged: &HashMap<u32, RawRecord>,
     masters: &PluginMasters,
+    source_offsets: &HashMap<u32, u64>,
     options: &TerrainOptions,
 ) -> Result<TerrainReport> {
     let started = Instant::now();
@@ -299,13 +314,17 @@ pub fn build_merged_terrain(
             Some(landscape_defaults(options.terrain_ini.as_deref())?)
         }
     };
+    // Taken from the same read that parsed the defaults, before any array is built.
+    let ini_sha256 = defaults
+        .as_ref()
+        .and_then(|defaults| defaults.ini_sha256.clone());
     let (default, default_texture_source) =
         default_source(staging, merged, defaults.as_ref(), &mut pre_skipped)?;
     let array_options = ArrayOptions {
         allow_downscale: options.allow_downscale,
         ..ArrayOptions::default()
     };
-    let (table, mut array_report) =
+    let (mut table, mut array_report) =
         build_land_texture_arrays(&sources, default, staging, &array_options)
             .wrap_err("failed to build the land texture arrays")?;
     let arrays_ms = arrays_started.elapsed().as_millis();
@@ -324,12 +343,13 @@ pub fn build_merged_terrain(
     let mut placed: Vec<PlacedCellMesh> = Vec::new();
     let mut skipped_cells: Vec<SkippedCell> = Vec::new();
     let mut stats = CellStats::default();
-    // One LAND per cell, chosen by load order the way the cell cache chooses: the dropped
-    // LANDs are reported with the stage's other warnings, and two LANDs for one cell from the
-    // same load-order slot are an error. The database stage has already checked this when the
-    // option is on, so an error here is a wiring bug, not the run's first sight of one.
-    let (lands, land_warnings) = land_per_cell(merged, true)?;
-    for land in lands.values() {
+    // One LAND per cell, chosen the way the cell cache chooses (the same native positions order
+    // it): the dropped LANDs are reported with the stage's other warnings, and two LANDs for one
+    // cell from the same load-order slot without positions are an error. The conversion has
+    // already checked this before the texture and LOD stages, so an error here is a wiring bug.
+    let (lands, land_warnings) = merged_terrain_lands(merged, source_offsets)?;
+    for form_id in lands.values() {
+        let land = &merged[form_id];
         match cell_mesh(merged, masters, land, &known) {
             Ok((cell, report)) => {
                 stats.observe(&report);
@@ -359,14 +379,25 @@ pub fn build_merged_terrain(
     }
     // The source was chosen before the arrays were built; say what survived building them.
     let default_texture_source = reconcile_default_source(default_texture_source, &array_report);
+    // The arrays were built before the outcome was known, so the table is rewritten with the
+    // settings it was built from: a stored table then says which default texture it holds.
+    table.settings = Some(land_texture_settings(
+        &default_texture_source,
+        options,
+        ini_sha256,
+    ));
+    let table_file = staging.join(LAND_TEXTURE_TABLE_PATH);
+    fs::write(&table_file, serde_json::to_vec_pretty(&table)?)
+        .wrap_err_with(|| format!("failed to rewrite {}", table_file.display()))?;
     let mut warnings = land_warnings;
     warnings.extend(array_report.warnings());
+    let default_fell_back = matches!(
+        default_texture_source,
+        DefaultTextureSource::SkyrimIniFallback { .. }
+    );
     for skipped in &pre_skipped {
         if skipped.ltex_form_id == DEFAULT_LAND_TEXTURE_FORM_ID {
-            warnings.push(format!(
-                "the default land texture falls back to the generated white one: {}",
-                skipped.reason
-            ));
+            warnings.push(default_skip_warning(&skipped.reason, default_fell_back));
             continue;
         }
         warnings.push(format!(
@@ -434,6 +465,7 @@ pub fn build_merged_terrain(
 pub async fn run_merged_terrain_stage(
     staging: &Path,
     records: Option<HashMap<u32, RawRecord>>,
+    source_offsets: HashMap<u32, u64>,
     plugins: &[PathBuf],
     options: &TerrainOptions,
     progress_tx: &Sender<ProgressEvent>,
@@ -460,10 +492,11 @@ pub async fn run_merged_terrain_stage(
     let masters = load_order_masters(&order);
     let staging = staging.to_path_buf();
     let options = options.clone();
-    let terrain =
-        spawn_blocking(move || build_merged_terrain(&staging, &records, &masters, &options))
-            .await
-            .wrap_err("the merged terrain worker panicked")??;
+    let terrain = spawn_blocking(move || {
+        build_merged_terrain(&staging, &records, &masters, &source_offsets, &options)
+    })
+    .await
+    .wrap_err("the merged terrain worker panicked")??;
     // Everything the stage wrote is published by name, as the LOD stage does with its payloads.
     report
         .artifacts
@@ -804,11 +837,68 @@ fn reconcile_default_source(
     }
 }
 
+/// The settings a merged-terrain build's land texture table records: what was requested, what entry
+/// 0 holds once the arrays are built, the converted `.ktx2` textures it holds (only when they are
+/// the ini's own), the SHA-256 of the Skyrim.ini bytes the defaults were parsed from, and the
+/// downscale allowance. `ini_sha256` is the hash taken at parse time and is never re-read here.
+/// The raw DDS paths a run asked for stay in the report, not in these settings.
+pub(crate) fn land_texture_settings(
+    source: &DefaultTextureSource,
+    options: &TerrainOptions,
+    ini_sha256: Option<String>,
+) -> LandTextureSettings {
+    let request = match options.default_texture {
+        TerrainDefaultTexture::White => LandTextureRequest::White,
+        TerrainDefaultTexture::SkyrimIni => LandTextureRequest::SkyrimIni,
+    };
+    let (default, diffuse, normal) = match source {
+        DefaultTextureSource::White => (LandTextureDefault::GeneratedWhite, None, None),
+        DefaultTextureSource::SkyrimIni {
+            diffuse, normal, ..
+        } => (
+            LandTextureDefault::SkyrimIni,
+            Some(diffuse.clone()),
+            normal.clone(),
+        ),
+        DefaultTextureSource::SkyrimIniFallback { .. } => {
+            (LandTextureDefault::SkyrimIniFallbackWhite, None, None)
+        }
+    };
+    let terrain_ini_sha256 = match source {
+        DefaultTextureSource::White => None,
+        DefaultTextureSource::SkyrimIni { .. } | DefaultTextureSource::SkyrimIniFallback { .. } => {
+            ini_sha256
+        }
+    };
+    LandTextureSettings {
+        request,
+        default,
+        default_diffuse: diffuse,
+        default_normal: normal,
+        terrain_ini_sha256,
+        allow_downscale: options.allow_downscale,
+    }
+}
+
+/// The warning for an entry-0 source that could not be used. Entry 0 is the generated white texture
+/// only when the default diffuse fell back, which the default source already reports; a skipped
+/// default normal map leaves the diffuse in place, so the warning must not claim the white one.
+fn default_skip_warning(reason: &str, default_fell_back: bool) -> String {
+    if default_fell_back {
+        format!("the default land texture falls back to the generated white one: {reason}")
+    } else {
+        format!("the default land normal map is left out, the default diffuse stays: {reason}")
+    }
+}
+
 /// The `[Landscape]` defaults a `skyrim-ini` run resolved, still as Bethesda DDS paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LandscapeDefaults {
     /// The ini they were read from; `None` for the built-in Dirt02 paths.
     ini: Option<PathBuf>,
+    /// SHA-256 of the bytes the paths were parsed from, taken from that same read: the identity
+    /// the settings record, so a later change to the file cannot alter what the run recorded.
+    ini_sha256: Option<String>,
     diffuse: String,
     normal: String,
 }
@@ -820,6 +910,7 @@ fn landscape_defaults(ini_path: Option<&Path>) -> Result<LandscapeDefaults> {
     let Some(path) = ini_path else {
         return Ok(LandscapeDefaults {
             ini: None,
+            ini_sha256: None,
             diffuse: DIRT02_DIFFUSE.to_string(),
             normal: DIRT02_NORMAL.to_string(),
         });
@@ -862,6 +953,7 @@ fn landscape_defaults(ini_path: Option<&Path>) -> Result<LandscapeDefaults> {
     };
     Ok(LandscapeDefaults {
         ini: Some(path.to_path_buf()),
+        ini_sha256: Some(hash_bytes(&bytes)),
         diffuse: intact(diffuse, DIRT02_DIFFUSE),
         normal: intact(normal, DIRT02_NORMAL),
     })
@@ -1162,6 +1254,7 @@ mod tests {
                 staging.path(),
                 &records,
                 &masters,
+                &HashMap::new(),
                 &TerrainOptions::default(),
             )
             .unwrap();
@@ -1199,6 +1292,185 @@ mod tests {
         }
     }
 
+    /// The table's settings identify the default texture and every input that changes its bytes:
+    /// a different request, source, ini file contents, or downscale allowance is a different table,
+    /// and the built-in Dirt02 paths carry no ini hash.
+    #[test]
+    fn table_settings_identify_the_default_source_and_its_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini_a = dir.path().join("a.ini");
+        let ini_b = dir.path().join("b.ini");
+        fs::write(&ini_a, "[Landscape]\nsDefaultLandDiffuseTexture=a.dds\n").unwrap();
+        fs::write(&ini_b, "[Landscape]\nsDefaultLandDiffuseTexture=b.dds\n").unwrap();
+        let skyrim = |ini: Option<PathBuf>| DefaultTextureSource::SkyrimIni {
+            ini,
+            diffuse: "textures/landscape/dirt02.ktx2".into(),
+            normal: Some("textures/landscape/dirt02_n.ktx2".into()),
+        };
+        let options = |texture, downscale| TerrainOptions {
+            default_texture: texture,
+            allow_downscale: downscale,
+            ..TerrainOptions::default()
+        };
+        let skyrim_options = options(TerrainDefaultTexture::SkyrimIni, false);
+        let hash_of = |path: &Path| Some(hash_bytes(&fs::read(path).unwrap()));
+        let white = land_texture_settings(
+            &DefaultTextureSource::White,
+            &options(TerrainDefaultTexture::White, false),
+            None,
+        );
+        assert_eq!(white.request, LandTextureRequest::White);
+        assert_eq!(white.default, LandTextureDefault::GeneratedWhite);
+        assert_eq!(white.default_diffuse, None);
+        assert_eq!(white.terrain_ini_sha256, None);
+
+        let built_in = land_texture_settings(&skyrim(None), &skyrim_options, None);
+        assert_eq!(
+            built_in.terrain_ini_sha256, None,
+            "built-in paths name no ini"
+        );
+        let from_a = land_texture_settings(
+            &skyrim(Some(ini_a.clone())),
+            &skyrim_options,
+            hash_of(&ini_a),
+        );
+        let from_b = land_texture_settings(
+            &skyrim(Some(ini_b.clone())),
+            &skyrim_options,
+            hash_of(&ini_b),
+        );
+        assert_ne!(from_a.terrain_ini_sha256, from_b.terrain_ini_sha256);
+        assert_ne!(from_a, from_b, "same paths, different ini bytes");
+        assert_ne!(from_a, built_in);
+        assert_ne!(from_a, white);
+
+        // A fallen-back default persists no texture paths: entry 0 is white, and the paths it
+        // named are only in the report.
+        let fallback_source = DefaultTextureSource::SkyrimIniFallback {
+            ini: Some(ini_a.clone()),
+            diffuse: DIRT02_DIFFUSE.into(),
+            normal: None,
+            reason: "unreadable".into(),
+        };
+        let fallback = land_texture_settings(&fallback_source, &skyrim_options, hash_of(&ini_a));
+        assert_eq!(fallback.default, LandTextureDefault::SkyrimIniFallbackWhite);
+        assert_eq!(fallback.default_diffuse, None);
+        assert_eq!(fallback.default_normal, None);
+        assert_ne!(
+            fallback, from_a,
+            "a fallen-back default is not the ini texture"
+        );
+
+        let downscaled = land_texture_settings(
+            &skyrim(Some(ini_a.clone())),
+            &options(TerrainDefaultTexture::SkyrimIni, true),
+            hash_of(&ini_a),
+        );
+        assert_ne!(
+            downscaled, from_a,
+            "downscale changes the arrays, so it is identity"
+        );
+    }
+
+    /// The ini hash is the one taken from the read that parsed the defaults. Changing or deleting
+    /// the file afterwards does not change what the run records, and the default source and its
+    /// reconciliation are the real paths, not hand-built values.
+    #[test]
+    fn the_ini_hash_is_taken_at_parse_time_and_never_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        let ini = dir.path().join("Skyrim.ini");
+        let original = b"[Landscape]\nsDefaultLandDiffuseTexture=textures\\landscape\\Rock.dds\n\
+            sDefaultLandNormalTexture=textures\\landscape\\Rock_N.dds\n";
+        fs::write(&ini, original).unwrap();
+        let recorded = hash_bytes(original);
+        let defaults = landscape_defaults(Some(&ini)).unwrap();
+        assert_eq!(defaults.ini_sha256.as_deref(), Some(recorded.as_str()));
+        let options = TerrainOptions {
+            default_texture: TerrainDefaultTexture::SkyrimIni,
+            terrain_ini: Some(ini.clone()),
+            ..TerrainOptions::default()
+        };
+        let source_of = |defaults: &LandscapeDefaults| {
+            let mut skipped = Vec::new();
+            default_source(dir.path(), &HashMap::new(), Some(defaults), &mut skipped)
+                .unwrap()
+                .1
+        };
+
+        // Overwrite the file with other bytes: the recorded identity is still the parsed one.
+        fs::write(&ini, "[Landscape]\nsDefaultLandDiffuseTexture=Other.dds\n").unwrap();
+        let source = source_of(&defaults);
+        let settings = land_texture_settings(&source, &options, defaults.ini_sha256.clone());
+        assert_eq!(
+            settings.terrain_ini_sha256.as_deref(),
+            Some(recorded.as_str())
+        );
+        assert_ne!(
+            hash_bytes(&fs::read(&ini).unwrap()),
+            recorded,
+            "the file really changed"
+        );
+
+        // Delete it: the same settings still come out, with the same hash.
+        fs::remove_file(&ini).unwrap();
+        let settings = land_texture_settings(&source, &options, defaults.ini_sha256.clone());
+        assert_eq!(
+            settings.terrain_ini_sha256.as_deref(),
+            Some(recorded.as_str())
+        );
+
+        // The persisted texture is the converted .ktx2 entry 0 holds, not the DDS the ini named.
+        assert_eq!(
+            settings.default_diffuse.as_deref(),
+            Some("textures/landscape/rock.ktx2")
+        );
+        assert_eq!(
+            settings.default_normal.as_deref(),
+            Some("textures/landscape/rock_n.ktx2")
+        );
+
+        // A builder that drops the diffuse makes the outcome a fallback: reconciliation sees the
+        // arrays' own report, and the settings then persist no texture path at all.
+        let dropped = crate::terrain_arrays::ArrayReport {
+            default_texture: DefaultTexture::White,
+            arrays: Vec::new(),
+            textures: Vec::new(),
+            skipped: vec![SkippedTexture {
+                ltex_form_id: DEFAULT_LAND_TEXTURE_FORM_ID,
+                usage: shared::terrain_mesh::LandTextureUsage::DiffuseSrgb,
+                source: "textures/landscape/rock.ktx2".into(),
+                reason: "unreadable".into(),
+            }],
+        };
+        let reconciled = reconcile_default_source(source, &dropped);
+        assert!(matches!(
+            reconciled,
+            DefaultTextureSource::SkyrimIniFallback { .. }
+        ));
+        let settings = land_texture_settings(&reconciled, &options, defaults.ini_sha256.clone());
+        assert_eq!(settings.default, LandTextureDefault::SkyrimIniFallbackWhite);
+        assert_eq!(settings.default_diffuse, None);
+        assert_eq!(settings.default_normal, None);
+        assert_eq!(
+            settings.terrain_ini_sha256.as_deref(),
+            Some(recorded.as_str())
+        );
+    }
+
+    /// A skipped default normal map does not turn the default albedo into the white texture in the
+    /// warning; only a fallen-back diffuse does.
+    #[test]
+    fn a_skipped_default_normal_map_does_not_claim_the_white_albedo() {
+        let normal = default_skip_warning("the default normal texture cannot be resolved", false);
+        assert!(!normal.contains("white"), "{normal}");
+        assert!(normal.contains("the default diffuse stays"), "{normal}");
+        let diffuse = default_skip_warning("the default land texture cannot be resolved", true);
+        assert!(
+            diffuse.contains("falls back to the generated white one"),
+            "{diffuse}"
+        );
+    }
+
     /// Two distinct LANDs for one cell from the same load-order slot stop the terrain build:
     /// the game's order for that case is not established, so nothing is picked.
     #[test]
@@ -1212,6 +1484,7 @@ mod tests {
             staging.path(),
             &records,
             &masters(0, &["Skyrim.esm"]),
+            &HashMap::new(),
             &TerrainOptions::default(),
         )
         .unwrap_err()
@@ -1228,6 +1501,7 @@ mod tests {
         // Both defaults convert: the report names the converted paths entry 0 holds.
         let defaults = LandscapeDefaults {
             ini: Some(PathBuf::from("C:/Games/Skyrim/Skyrim.ini")),
+            ini_sha256: None,
             diffuse: "textures\\landscape\\Dirt02.dds".to_string(),
             normal: "textures\\landscape\\Dirt02_N.dds".to_string(),
         };
