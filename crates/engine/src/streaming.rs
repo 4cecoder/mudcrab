@@ -58,7 +58,7 @@ pub struct TerrainCollider;
 
 /// Grid cell and quadrant covered by a terrain surface at one LOD tier.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
-struct TerrainCoverage {
+pub(crate) struct TerrainCoverage {
     grid: IVec2,
     quadrant: u8,
     tier: Option<LodTier>,
@@ -97,11 +97,12 @@ impl Plugin for StreamingPlugin {
                     collect_cells,
                     lod::collect_lod_chunks,
                     arm_pending_models,
-                    finish_streaming_commit_budget,
                     track_asset_readiness,
                     track_surface_readiness,
                     lod::track_lod_readiness,
+                    lod::batch_ready_lod_chunks,
                     lod::update_terrain_lod_visibility,
+                    finish_streaming_commit_budget,
                     update_render_origin,
                     validate_streaming_lifecycle,
                 )
@@ -4054,6 +4055,16 @@ fn validate_streaming_lifecycle(
     metrics.streaming_invariant_failures = metrics.streaming_invariant_failures.max(violations);
     profiler.set_gauge("streaming/active_requests", active_requests as f64);
     profiler.set_gauge("streaming/resident_roots", root_entries.len() as f64);
+}
+
+impl TerrainCoverage {
+    pub(crate) fn receipt(&self) -> serde_json::Value {
+        serde_json::json!({
+            "cell": self.grid.to_array(),
+            "quadrant": self.quadrant,
+            "tier": format!("{:?}", self.tier)
+        })
+    }
 }
 
 #[cfg(test)]

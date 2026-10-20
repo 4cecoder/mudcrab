@@ -202,7 +202,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
         .add_plugins((
             VercidiumRendererPlugin,
+            crate::visibility_optimization::VisibilityOptimizationPlugin,
+            crate::terrain_upload::TerrainUploadPlugin,
             crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
+            crate::mesh_residency_audit::MeshResidencyAuditPlugin,
             SkyPlugin,
             ConsolePlugin,
             crate::nif_material::NifMaterialPlugin,
@@ -264,7 +267,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             output = %run.output_dir.display(),
             "rendering camera poses"
         );
-        app.add_plugins(ShotsPlugin { run });
+        app.add_plugins((
+            crate::capture_frame::CaptureFramePlugin,
+            ShotsPlugin { run },
+        ));
     }
     let exit = app.run();
     drop(app);
@@ -339,8 +345,21 @@ fn world_gltf_plugin() -> bevy::gltf::GltfPlugin {
 /// shot's worldspace and grid square are where streaming starts, so the first view does not wait
 /// for cells around a start the file never looks at.
 fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
-    let Some(path) = config.shots.clone() else {
+    let Some(path) = config
+        .shots
+        .clone()
+        .or_else(|| config.matched_route.clone())
+    else {
         return Ok(None);
+    };
+    color_eyre::eyre::ensure!(
+        !(config.shots.is_some() && config.matched_route.is_some()),
+        "--shots and --matched-route cannot be used together; choose one camera driver"
+    );
+    let mode = if config.matched_route.is_some() {
+        "--matched-route"
+    } else {
+        "--shots"
     };
     let other_mode = config.benchmark_only
         || config.benchmark_frames.is_some()
@@ -355,14 +374,19 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         || config.physics_fixture;
     color_eyre::eyre::ensure!(
         !other_mode,
-        "--shots renders the converted world on its own: it cannot be combined with a benchmark, \
+        "{mode} renders the converted world on its own: it cannot be combined with a benchmark, \
          an acceptance screenshot, --auto-fly-speed or a fixture"
     );
     if config.headless {
         // The logger is not installed yet, so a `warn!` here would never be seen.
-        eprintln!("warning: --shots photographs the window, so --headless is ignored");
+        eprintln!("warning: {mode} photographs the window, so --headless is ignored");
     }
-    let file = ShotsFile::load(&path)?;
+    let (file, checkpoints) = if config.matched_route.is_some() {
+        let (file, checkpoints) = crate::matched_route::MatchedRoute::load(&path)?.expand()?;
+        (file, Some(checkpoints))
+    } else {
+        (ShotsFile::load(&path)?, None)
+    };
     if let Some((worldspace_id, grid)) = file.start() {
         if let Some(worldspace_id) = worldspace_id {
             config.worldspace_id = worldspace_id;
@@ -373,7 +397,9 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         .shots_out
         .clone()
         .unwrap_or_else(|| default_output_dir(&path));
-    Ok(Some(ShotsRun::new(file, output_dir, config.worldspace_id)))
+    let mut run = ShotsRun::new(file, output_dir, config.worldspace_id);
+    run.route_checkpoints = checkpoints;
+    Ok(Some(run))
 }
 
 fn validate_fixture_selection(config: &EngineConfig) -> Result<()> {
@@ -489,9 +515,10 @@ fn check_existing_io_pool(requested: usize, threads: usize, existing: Option<usi
              first, or use 0 to keep the existing pool"
         );
     }
-    warn!(
-        threads,
-        existing, "the asset IO pool already exists with a different thread count; keeping it"
+    // `run` checks the pool before installing LogPlugin, so report directly to stderr.
+    eprintln!(
+        "warning: the asset IO pool already exists with {existing} threads; \
+         automatic sizing selected {threads}; keeping the existing pool"
     );
     Ok(())
 }
@@ -2166,7 +2193,11 @@ fn fly_camera(
 ) {
     // Interactive player paths own the camera; automated camera paths keep legacy controls. A
     // shots run poses the camera itself, and a key press must not move a pose.
-    if config.physics_fixture || config.interactive_world_physics() || config.shots.is_some() {
+    if config.physics_fixture
+        || config.interactive_world_physics()
+        || config.shots.is_some()
+        || config.matched_route.is_some()
+    {
         return;
     }
     let started = std::time::Instant::now();
@@ -2313,6 +2344,33 @@ mod tests {
     use bevy::window::{PrimaryWindow, Window};
     use bevy::world_serialization::WorldSerializationPlugin;
     use std::time::Duration;
+
+    #[test]
+    fn automated_camera_conflicts_name_the_selected_drivers() {
+        let mut both = EngineConfig {
+            shots: Some("shots.json".into()),
+            matched_route: Some("route.json".into()),
+            ..default()
+        };
+        let Err(error) = prepare_shots(&mut both) else {
+            panic!("drivers must conflict");
+        };
+        let message = error.to_string();
+        assert!(message.contains("--shots"));
+        assert!(message.contains("--matched-route"));
+
+        let mut route_benchmark = EngineConfig {
+            matched_route: Some("route.json".into()),
+            benchmark_frames: Some(60),
+            ..default()
+        };
+        let Err(error) = prepare_shots(&mut route_benchmark) else {
+            panic!("benchmark must conflict with route");
+        };
+        let message = error.to_string();
+        assert!(message.contains("--matched-route"));
+        assert!(message.contains("benchmark"));
+    }
 
     /// A capture window remains hidden if an update system tries to show it.
     #[test]

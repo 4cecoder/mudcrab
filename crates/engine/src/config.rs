@@ -126,6 +126,8 @@ pub struct EngineConfig {
     /// `--shots <file>`: render the camera poses in a shots file, one PNG each, and exit instead of
     /// running interactively. See [`crate::shots`].
     pub shots: Option<PathBuf>,
+    /// Exact, fixed-step profiling traversal. Mutually exclusive with other camera drivers.
+    pub matched_route: Option<PathBuf>,
     /// `--shots-out <dir>`: where the PNGs and `shots.log` go. `None` is
     /// [`crate::shots::default_output_dir`], a `<file stem>-shots/` folder beside the shots file.
     pub shots_out: Option<PathBuf>,
@@ -196,6 +198,7 @@ impl Default for EngineConfig {
             acceptance_screenshot: None,
             screenshot_camera_offset: None,
             shots: None,
+            matched_route: None,
             shots_out: None,
             diagnostic_asset_fallbacks: false,
             material_fixture: false,
@@ -257,6 +260,7 @@ Benchmark and profiling:
   --accept-max-memory-growth-gib <gib>  fail the run above this memory growth (default: 0.5)
   --acceptance-screenshot <file>        write a screenshot when the run ends
   --screenshot-camera-offset <x,y,z>    camera offset for the acceptance screenshot
+  --matched-route <file>                execute exact route steps with transition and settled checkpoints
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
   --shots-out <dir>                     where the shots' PNGs and shots.log go (default: beside the shots file)
   --profile-output <dir>                profile bundle directory (default: no bundle)
@@ -427,6 +431,7 @@ impl EngineConfig {
             && self.benchmark_duration_secs.is_none()
             && self.acceptance_screenshot.is_none()
             && self.shots.is_none()
+            && self.matched_route.is_none()
             && self.auto_fly_speed <= 0.0
             && !self.material_fixture
             && !self.terrain_water_fixture
@@ -468,6 +473,8 @@ impl EngineConfig {
             Some("benchmark")
         } else if self.streaming_fixture {
             Some("streaming fixture")
+        } else if self.matched_route.is_some() {
+            Some("matched-route")
         } else if self.shots.is_some() {
             Some("shots")
         } else {
@@ -757,6 +764,13 @@ impl EngineConfig {
                 // A path left out is an error, and must not swallow the next option: a `--shots`
                 // with no path is no mode at all, and continuing would silently launch an ordinary
                 // interactive run.
+                "--matched-route" => {
+                    config.matched_route = Some(take_value(
+                        "--matched-route",
+                        "a route fixture",
+                        args.next(),
+                    )?);
+                }
                 "--shots" => {
                     config.shots = Some(take_value("--shots", "a shots file path", args.next())?);
                 }
@@ -824,6 +838,8 @@ impl EngineConfig {
             Some("--streaming-fixture moves the camera every frame")
         } else if self.shots.is_some() {
             Some("--shots sets the camera pose for each shot")
+        } else if self.matched_route.is_some() {
+            Some("--matched-route sets the camera pose for each route step")
         } else {
             None
         };
@@ -1066,46 +1082,47 @@ mod tests {
         "--ignore-submodules",   // git diff
         "--quiet",               // git diff
         "--short",               // git rev-parse
-        "--output",              // world-inspect, repeat-terrain-startup.py
-        "--radius",              // world-inspect
-        "--library-path",        // ld-linux
-        "--meshes",              // audit-collision.py
-        "--min-x",               // audit-collision.py
-        "--max-x",               // audit-collision.py
-        "--min-y",               // audit-collision.py
-        "--max-y",               // audit-collision.py
-        "--out",                 // audit-collision.py
-        "--expect-solid",        // audit-collision.py
-        "--expect-passable",     // audit-collision.py
-        "--original",            // audit_asset_sizes.py
-        "--json",                // audit_asset_sizes.py
+        "--output", // world-inspect, profiling, startup runner, repeat-terrain-startup.py
+        "--pairs-output", // correlate_drawables.py
+        "--radius", // world-inspect
+        "--library-path", // ld-linux
+        "--meshes", // audit-collision.py
+        "--min-x",  // audit-collision.py
+        "--max-x",  // audit-collision.py
+        "--min-y",  // audit-collision.py
+        "--max-y",  // audit-collision.py
+        "--out",    // audit-collision.py
+        "--expect-solid", // audit-collision.py
+        "--expect-passable", // audit-collision.py
+        "--original", // audit_asset_sizes.py
+        "--json",   // audit_asset_sizes.py
         "--candidate-inventory", // audit-riverwood-reuse.py
         "--reference-inventory", // audit-riverwood-reuse.py
-        "--manifest",            // audit-riverwood-reuse.py
-        "--include",             // audit-z-fighting.py
-        "--materials-only",      // audit-z-fighting.py
-        "--no-placements",       // audit-z-fighting.py
-        "--plane-tolerance",     // audit-z-fighting.py
-        "--min-overlap-area",    // audit-z-fighting.py
-        "--max-triangles",       // audit-z-fighting.py
-        "--max-comparisons",     // audit-z-fighting.py
-        "--max-examples",        // audit-z-fighting.py
-        "--progress",            // audit-z-fighting.py
-        "--jobs",                // audit-z-fighting.py
-        "--locked",              // cargo run
-        "--manifest-path",       // cargo run
-        "--cpu-jobs",            // converter
-        "--io-jobs",             // converter
-        "--binary",              // git diff
-        "--porcelain",           // git status
-        "--engine",              // repeat-terrain-startup.py
-        "--repeats",             // repeat-terrain-startup.py
-        "--upload-budgets",      // repeat-terrain-startup.py
-        "--warmup",              // repeat-terrain-startup.py
-        "--duration",            // repeat-terrain-startup.py
-        "--timeout",             // repeat-terrain-startup.py
-        "--launch-prefix",       // repeat-terrain-startup.py
-        "--commit",              // repeat-terrain-startup.py
+        "--manifest", // audit-riverwood-reuse.py
+        "--include", // audit-z-fighting.py
+        "--materials-only", // audit-z-fighting.py
+        "--no-placements", // audit-z-fighting.py
+        "--plane-tolerance", // audit-z-fighting.py
+        "--min-overlap-area", // audit-z-fighting.py
+        "--max-triangles", // audit-z-fighting.py
+        "--max-comparisons", // audit-z-fighting.py
+        "--max-examples", // audit-z-fighting.py
+        "--progress", // audit-z-fighting.py
+        "--jobs",   // audit-z-fighting.py
+        "--locked", // cargo run
+        "--manifest-path", // cargo run
+        "--cpu-jobs", // converter
+        "--io-jobs", // converter
+        "--binary", // git diff
+        "--porcelain", // git status
+        "--engine", // repeat-terrain-startup.py
+        "--repeats", // repeat-terrain-startup.py
+        "--upload-budgets", // repeat-terrain-startup.py
+        "--warmup", // repeat-terrain-startup.py
+        "--duration", // repeat-terrain-startup.py
+        "--timeout", // repeat-terrain-startup.py
+        "--launch-prefix", // repeat-terrain-startup.py
+        "--commit", // repeat-terrain-startup.py
     ];
 
     fn run_config(arguments: &[&str]) -> EngineConfig {
@@ -1427,6 +1444,14 @@ mod tests {
         ]);
         assert_eq!(config.benchmark_jump, None);
         assert!(config.shots.is_some());
+        for list in [
+            ["--benchmark-jump", "3,4", "--matched-route", "route.json"],
+            ["--matched-route", "route.json", "--benchmark-jump", "3,4"],
+        ] {
+            let config = args(&list);
+            assert_eq!(config.benchmark_jump, None, "{list:?}");
+            assert_eq!(config.matched_route, Some(PathBuf::from("route.json")));
+        }
         // A synthetic benchmark loads no world, so no streaming system would issue the jump.
         let config = args(&[
             "--benchmark-only",
@@ -1555,6 +1580,18 @@ mod tests {
             "Mudcrab - shots: riverwood"
         );
         assert_eq!(args(&[]).window_title(), "Mudcrab");
+    }
+
+    #[test]
+    fn matched_route_is_a_separate_automated_camera_mode() {
+        let config = run_config(&["--matched-route", "route.json"]);
+        assert_eq!(config.matched_route, Some(PathBuf::from("route.json")));
+        assert!(!config.interactive_world_physics());
+        assert!(
+            run_config(&["--matched-route", "route.json", "--run-label", "test"])
+                .window_title()
+                .contains("matched-route")
+        );
     }
 
     /// A shots path left out does not swallow the next option, and it is an error rather than a
