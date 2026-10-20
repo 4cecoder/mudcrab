@@ -65,6 +65,7 @@ pub(crate) struct CaptureGrade {
     pub source: serde_json::Value,
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn capture_grade(
     source: Option<&SceneGradeSource>,
@@ -281,10 +282,10 @@ fn extract_capture_frames(
         }
         let work = captured_work(
             ticket,
-            &streaming,
-            &renderer,
-            &profiler,
-            &uploads,
+            streaming,
+            renderer,
+            profiler,
+            uploads,
             renderer.final_path_active(),
         );
         let record = CaptureFrame {

@@ -627,6 +627,8 @@ fn sync_settings_from_console(world: &mut World) {
     settings.show_resolved_grade(resolved.grade, resolved.post.pivot);
 }
 
+// Bevy injects these resources and the camera query independently.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_scene_grade_mode(
     mode: Res<SceneGradeMode>,
     preset: Res<SceneVisualPreset>,
@@ -1126,9 +1128,11 @@ mod tests {
 
     #[test]
     fn console_mode_and_preset_keep_explicit_tuning_and_sync_settings() {
-        let mut settings = crate::settings::RenderingSettings::default();
-        settings.grade_brightness = 1.75;
-        settings.grade_override_mask = 1 << 1;
+        let settings = crate::settings::RenderingSettings {
+            grade_brightness: 1.75,
+            grade_override_mask: 1 << 1,
+            ..default()
+        };
         let mut app = App::new();
         app.init_resource::<SceneGradeMode>()
             .insert_resource(SceneVisualPreset::CoolGray)
