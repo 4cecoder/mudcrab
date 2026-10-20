@@ -3559,10 +3559,14 @@ async fn compile_lod_chunks_with_cancel(
     let runtime = tokio::runtime::Handle::current();
     #[cfg(test)]
     let fail_gpu_init = FAIL_LOD_GPU_INIT.with(std::cell::Cell::get);
+    #[cfg(test)]
+    let wait_ready = LOD_PROGRESS_WAIT_READY.with(|ready| ready.borrow_mut().take());
     let (result, returned_report) =
         run_owned_lod_worker(cancellation.clone(), ownership, move || {
             #[cfg(test)]
             let _gpu_override = LodGpuInitOverride::new(fail_gpu_init);
+            #[cfg(test)]
+            LOD_PROGRESS_WAIT_READY.with(|ready| *ready.borrow_mut() = wait_ready);
             let result = runtime.block_on(async {
                 // Cancellation must also release a worker waiting for a full progress
                 // channel. Synchronous transactions poll the same flag between batches.
@@ -3614,6 +3618,12 @@ async fn compile_lod_chunks_inline(
         interrupt(cancellation)?;
         let message = "Terrain LOD compilation disabled by --no-lod";
         report.notices.push(message.to_owned());
+        #[cfg(test)]
+        LOD_PROGRESS_WAIT_READY.with(|ready| {
+            if let Some(ready) = ready.borrow_mut().take() {
+                let _ = ready.send(());
+            }
+        });
         let _ = progress_tx
             .send(ProgressEvent::notice(
                 ProgressStage::LodChunks,
@@ -4110,6 +4120,10 @@ async fn compile_lod_chunks_inline(
 #[cfg(test)]
 thread_local! {
     static FAIL_LOD_GPU_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Fired once compilation has passed its early cancellation check and is about to wait on
+    /// the progress channel, so a test can cancel a compile that is genuinely blocked there.
+    static LOD_PROGRESS_WAIT_READY: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn create_lod_gpu(quality: u32, batch_mb: u64) -> Result<GpuUastc> {
@@ -4994,6 +5008,8 @@ mod tests {
             no_lod: true,
             ..cpu_lod_config(temp.path(), temp.path().join("out"))
         };
+        // The receiver stays alive and undrained, so the next send can only complete by
+        // cancellation.
         let (tx, _rx) = mpsc::channel(1);
         tx.send(ProgressEvent::notice(
             ProgressStage::LodChunks,
@@ -5002,9 +5018,13 @@ mod tests {
         ))
         .await
         .unwrap();
+        let probe = tx.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let cancellation = Cancellation::new();
         let trigger = cancellation.clone();
         let task = tokio::spawn(async move {
+            // Same-thread hand-off: the current-thread runtime runs this task and the compiler here.
+            LOD_PROGRESS_WAIT_READY.with(|ready| *ready.borrow_mut() = Some(ready_tx));
             compile_lod_chunks_with_cancel(
                 &config,
                 temp.path(),
@@ -5018,11 +5038,25 @@ mod tests {
             )
             .await
         });
-        tokio::task::yield_now().await;
+        // Cancel only once compilation has passed its early check and is waiting on the full channel.
+        tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("compiler never reached the progress wait")
+            .unwrap();
+        assert!(
+            probe
+                .try_send(ProgressEvent::notice(
+                    ProgressStage::LodChunks,
+                    None,
+                    "probe"
+                ))
+                .is_err(),
+            "the progress channel must still be full while compilation waits"
+        );
         trigger.cancel();
         let error = tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await
-            .unwrap()
+            .expect("cancellation did not release the blocked progress send")
             .unwrap()
             .unwrap_err();
         assert!(error.downcast_ref::<Interrupted>().is_some());
