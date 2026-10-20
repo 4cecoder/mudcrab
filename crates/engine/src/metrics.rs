@@ -1276,7 +1276,7 @@ mod tests {
         );
         let frames = [(10.0, false), (10.0, true)]
             .into_iter()
-            .chain(std::iter::repeat((0.1, true)).take(8));
+            .chain(std::iter::repeat_n((0.1, true), 8));
         for (seconds, ready) in frames {
             app.insert_resource(FixtureWorldReady(ready))
                 .insert_resource(TimeUpdateStrategy::ManualDuration(
