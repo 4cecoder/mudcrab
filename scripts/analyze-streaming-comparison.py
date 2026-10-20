@@ -26,6 +26,8 @@ EMPTY_STREAMING = (
     "pending_lod_chunks", "arming_queue_depth", "pending_model_placements", "pending_surface_instances",
 )
 EMPTY_ADMISSION = ("active_jobs", "queued_jobs", "orphan_active_jobs")
+# Identity a run must carry consistently in the manifest and its own run.json before pairing.
+PAIR_IDENTITY_KEYS = ("run_id", "pair_id", "scenario", "mode")
 FAILURE_KEYS = (
     "failed_cells", "asset_load_failures", "material_validation_failures", "diagnostic_fallbacks",
     "terrain_validation_failures", "water_validation_failures", "transform_bounds_validation_failures",
@@ -570,9 +572,15 @@ def analyze_run(experiment, record):
         censored.append("process did not finish")
     if record.get("status") in ("pending", "running", "scheduled", "failed", "error"):
         errors.append(f"run status is {record['status']}")
-    for key in ("run_id",):
-        if run.get(key) is not None and record.get(key) != run[key]:
+    # The manifest's pairing identity must match what the engine run recorded. run.json is the
+    # launcher's own record, so a missing field there cannot be certified: it fails closed. The
+    # profile metadata only carries run_id by contract, so the other fields are compared if present.
+    for key in PAIR_IDENTITY_KEYS:
+        if run.get(key) is None:
+            errors.append(f"run provenance lacks {key}")
+        elif record.get(key) != run[key]:
             errors.append(f"run provenance mismatch: {key}")
+    for key in PAIR_IDENTITY_KEYS:
         if metadata and metadata.get(key) is not None and record.get(key) != metadata[key]:
             errors.append(f"profile provenance mismatch: {key}")
     if trace.get("format_version") != 1 or trace.get("dropped_samples") != 0:

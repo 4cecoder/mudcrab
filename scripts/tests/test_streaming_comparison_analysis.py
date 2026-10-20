@@ -193,6 +193,44 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(result["comparisons"][0]["paired_count"], 0)
         self.assertEqual(result["comparisons"][0]["excluded_pair_ids"], ["01"])
 
+    def test_wrong_pair_label_in_manifest_cannot_produce_a_paired_comparison(self):
+        self.fixture()
+        treatment, _ = self.fixture("adaptive128")
+        treatment["pair_id"] = "unrelated-repetition"
+        result = ANALYSIS.analyze_experiment(self.experiment, comparisons=[("fixed64", "adaptive128")], iterations=20)
+        comparison = result["comparisons"][0]
+        self.assertEqual(comparison["paired_count"], 0)
+        self.assertEqual(comparison["unpaired_pair_ids"], ["01", "unrelated-repetition"])
+        relabelled = next(r for r in result["runs"] if r["run_id"] == treatment["run_id"])
+        self.assertFalse(relabelled["valid"])
+        self.assertFalse(relabelled["comparison_eligible"])
+        self.assertIn("run provenance mismatch: pair_id", relabelled["errors"])
+        self.assertTrue(all(r["comparison_eligible"] for r in result["runs"] if r is not relabelled))
+
+    def test_run_json_pairing_identity_must_match_the_manifest(self):
+        for key, value in (("mode", "adaptive128"), ("scenario", "stress"), ("pair_id", "other"), ("run_id", "99-other")):
+            record, _ = self.fixture()
+            self.mutate(record, "run.json", lambda r: r.update({key: value}))
+            result = self.analyze(record)
+            self.assertFalse(result["comparison_eligible"], key)
+            self.assertIn(f"run provenance mismatch: {key}", result["errors"])
+
+    def test_missing_run_json_pairing_identity_fails_closed(self):
+        for key in ("run_id", "pair_id", "scenario", "mode"):
+            record, _ = self.fixture()
+            self.mutate(record, "run.json", lambda r: r.pop(key))
+            result = self.analyze(record)
+            self.assertFalse(result["comparison_eligible"], key)
+            self.assertIn(f"run provenance lacks {key}", result["errors"])
+
+    def test_profile_metadata_pairing_fields_are_compared_only_when_present(self):
+        record, _ = self.fixture()
+        self.assertTrue(self.analyze(record)["comparison_eligible"])
+        self.mutate(record, "profile/metadata.json", lambda m: m.update(pair_id="unrelated-repetition"))
+        result = self.analyze(record)
+        self.assertFalse(result["comparison_eligible"])
+        self.assertIn("profile provenance mismatch: pair_id", result["errors"])
+
     def test_invalid_and_unpaired_runs_are_exposed_without_erasing_completed_pairs(self):
         self.fixture(pair="good")
         self.fixture("adaptive128", pair="good")
