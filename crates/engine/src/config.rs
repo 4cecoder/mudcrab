@@ -3408,7 +3408,7 @@ mod tests {
         } else {
             script
         };
-        for flag in option_tokens(scanned) {
+        for flag in script_cli_options(scanned) {
             // This database-only tool owns --verify. Keep it scoped to the tool:
             // an engine launcher passing --verify must still fail the audit.
             let observation_option = path.file_name().is_some_and(|name| {
@@ -3498,6 +3498,20 @@ mod tests {
     fn script_scan_ignores_css_references_but_keeps_identically_named_cli_arguments() {
         let script = "color:var(--foreground); x.style.setProperty('--aspect','16/9'); args=['--foreground','--assets','pack'];";
         assert_eq!(script_cli_options(script), ["--foreground", "--assets"]);
+    }
+
+    #[test]
+    fn checked_script_audit_ignores_css_but_rejects_the_same_unknown_cli_option() {
+        let path = std::path::Path::new("capture_tonemap_tuning.py");
+        let script = "color:var(--foreground); x.style.setProperty('--aspect','16/9'); engine --headless --assets pack";
+        assert_eq!(checked_script_engine_flags(script, path), 2);
+
+        assert!(
+            std::panic::catch_unwind(|| {
+                checked_script_engine_flags("color:var(--foreground); engine --foreground", path)
+            })
+            .is_err()
+        );
     }
 
     /// The numbers a script writes after an engine option still parse. Values a
