@@ -4981,10 +4981,9 @@ mod tests {
         assert!(output.join("skyrim_world.db").is_file());
     }
 
-    /// Producer 27 changed the GLB collision data, so the producer-24/26 mesh contract
-    /// no longer grants reuse: every mesh and texture regenerates, scripts stay reused.
+    /// An unchanged conversion at the current producer reuses every mesh and its manifest entry.
     #[tokio::test]
-    async fn current24_meshes_reuse_but_changed_mesh_source_reconverts() {
+    async fn current_producer_meshes_are_reused_unchanged() {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("Data");
         let output = directory.path().join("assets");
@@ -4998,9 +4997,9 @@ mod tests {
         let mut config = cpu_lod_config(&data, &output);
         config.cpu_jobs = 2;
         run_without_progress(config.clone()).await;
-        let path = output.join("conversion-manifest.json");
-        let old: ConversionManifest = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        old.save(&path).unwrap();
+        let old: ConversionManifest =
+            serde_json::from_slice(&fs::read(output.join("conversion-manifest.json")).unwrap())
+                .unwrap();
         let meshes: BTreeMap<_, _> = old
             .entries
             .values()
@@ -5035,7 +5034,7 @@ mod tests {
                 dummy_content::layout::Formats::parse("dds,pex,nif,esm,lodsettings").unwrap(),
             )
             .unwrap();
-            let mut config = PipelineConfig::new(&data, &output);
+            let mut config = cpu_lod_config(&data, &output);
             config.cpu_jobs = 2;
             run_without_progress(config.clone()).await;
             let path = output.join("conversion-manifest.json");
