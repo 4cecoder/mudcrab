@@ -224,6 +224,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 })
                 .set(LogPlugin {
                     level: Level::INFO,
+                    custom_layer: crate::bug_report::logging::report_log_layer,
                     ..default()
                 }),
         )
@@ -245,6 +246,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             crate::mesh_residency_audit::MeshResidencyAuditPlugin,
             SkyPlugin,
             ConsolePlugin,
+            crate::bug_report::BugReportPlugin,
             crate::nif_material::NifMaterialPlugin,
             crate::emittance::EmittancePlugin,
         ))

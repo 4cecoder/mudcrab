@@ -1,4 +1,5 @@
 pub mod app;
+pub mod bug_report;
 mod capture_frame;
 pub mod cell_commands;
 pub mod color_pipeline;
