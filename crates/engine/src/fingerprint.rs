@@ -2,8 +2,9 @@
 //! compared.
 //!
 //! A report's frame times only mean something next to the machine, the renderer, the world data and
-//! the settings that produced them. [`RunFingerprint`] gathers all of that once at startup, from
-//! resources Bevy has already set up, and only for a run that records measurements
+//! the settings that produced them. [`RunFingerprint`] gathers all of that once, on the first frame
+//! after the saved settings have been applied to the window, from resources Bevy has already set up,
+//! and only for a run that records measurements
 //! ([`records_measurements`]): an ordinary play session installs nothing from this module.
 
 use crate::config::EngineConfig;
@@ -36,13 +37,19 @@ pub fn records_measurements(config: &EngineConfig) -> bool {
     config.is_benchmark_run() || config.profile_output_dir.is_some()
 }
 
-/// Reads the run's [`RunFingerprint`] once at startup. Added only when
-/// [`records_measurements`] is true.
+/// Reads the run's [`RunFingerprint`] once. Added only when [`records_measurements`] is true.
 pub struct RunFingerprintPlugin;
 
 impl Plugin for RunFingerprintPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, insert_run_fingerprint);
+        // Startup is too early: the settings menu applies saved vsync and window size on the first
+        // frame, so a Startup snapshot would describe the window before the run used it.
+        app.add_systems(
+            Update,
+            insert_run_fingerprint
+                .after(crate::settings_ui::SettingsUiSet)
+                .run_if(not(resource_exists::<RunFingerprint>)),
+        );
     }
 }
 
@@ -348,7 +355,7 @@ mod tests {
     /// The plugin reads the config the app was built with; without a renderer it still records a
     /// fingerprint, with the adapter left absent.
     #[test]
-    fn the_plugin_inserts_a_fingerprint_at_startup() {
+    fn the_plugin_inserts_a_fingerprint_on_the_first_frame() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .insert_resource(EngineConfig {

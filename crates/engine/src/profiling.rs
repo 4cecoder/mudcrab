@@ -3,18 +3,28 @@ use crate::{
     fingerprint::{RendererFingerprint, RunFingerprint},
     render::RendererMetrics,
     streaming::StreamingMetrics,
+    streaming_gpu_metrics::{StreamingGpuMetricsBridge, StreamingGpuMetricsPlugin},
+    streaming_trace::{SceneLoadStatus, StreamingTrace},
 };
 use bevy::{
+    asset::{AssetId, DependencyLoadState, LoadState, RecursiveDependencyLoadState},
     diagnostic::{Diagnostic, DiagnosticPath, DiagnosticsStore},
     prelude::*,
     render::{
+        Render, RenderApp, RenderSystems,
         diagnostic::{
             ErasedRenderAssetDiagnosticPlugin, MeshAllocatorDiagnosticPlugin,
             RenderAssetDiagnosticPlugin,
         },
         mesh::RenderMesh,
+        render_resource::WgpuFeatures,
+        renderer::{RenderAdapterInfo, RenderDevice},
         texture::GpuImage,
+        view::window::{ExtractedWindows, prepare_windows},
     },
+    time::TimeSystems,
+    window::PrimaryWindow,
+    world_serialization::WorldAsset,
 };
 use serde::Serialize;
 use std::{
@@ -30,6 +40,8 @@ use std::{
 
 const MAX_SAMPLES_PER_METRIC: usize = 200_000;
 const MAX_TIMELINE_EVENTS: usize = 100_000;
+const MAX_STREAMING_FRAMES: usize = 20_000;
+const MAX_STREAMING_SCENES: usize = 20_000;
 
 /// Why the report has no per-pass GPU times or counters: the run had no renderer, so no device
 /// measured anything. This is not the same as a device that lacks the feature, and a report must
@@ -138,9 +150,58 @@ struct RenderCursor {
 pub struct ProfilingPlugin;
 
 impl Plugin for ProfilingPlugin {
+    /// Install aggregate profiling and enable bounded frame tracing only for profile output.
     fn build(&self, app: &mut App) {
+        app.add_plugins(crate::scene_evidence::SceneEvidencePlugin);
         app.init_resource::<ProfilingState>()
-            .add_systems(Update, sample_scene_inventory);
+            .add_systems(Update, (sample_profile_metadata, sample_scene_inventory));
+        // Requested bundles also record whether each primary drawable was acquired. This keeps
+        // occluded or interrupted captures from being accepted as ordinary renderer timings.
+        let drawable_warmup = app
+            .world()
+            .get_resource::<EngineConfig>()
+            .and_then(|config| {
+                config
+                    .profile_output_dir
+                    .as_ref()
+                    .map(|_| config.benchmark_warmup_frames)
+            });
+        if let Some(warmup_frames) = drawable_warmup
+            && let Some(render_app) = app.get_sub_app_mut(RenderApp)
+        {
+            render_app
+                .insert_resource(ProfilePrimaryDrawableProof::new(warmup_frames))
+                .add_systems(
+                    Render,
+                    sample_primary_drawable
+                        .after(prepare_windows)
+                        .before(RenderSystems::Render),
+                );
+        }
+        if std::env::var("MUDCRAB_PROFILE_DRAW_COUNTS").is_ok_and(|value| value == "1") {
+            app.add_plugins(crate::indirect_metrics::IndirectDrawMetricsPlugin);
+        }
+        if app
+            .world()
+            .get_resource::<EngineConfig>()
+            .is_some_and(|config| config.profile_output_dir.is_some())
+        {
+            app.world_mut().resource_mut::<ProfilingState>().trace = Some(StreamingTrace::new(
+                MAX_STREAMING_FRAMES,
+                MAX_STREAMING_SCENES,
+            ));
+            if app.world().resource::<EngineConfig>().profile_gpu_inventory {
+                app.add_plugins(StreamingGpuMetricsPlugin);
+                app.world_mut()
+                    .resource_mut::<ProfilingState>()
+                    .trace
+                    .as_mut()
+                    .unwrap()
+                    .set_gpu_inventory_enabled(true);
+            }
+            app.add_message::<AssetEvent<WorldAsset>>()
+                .add_systems(First, begin_trace_frame.after(TimeSystems));
+        }
     }
 }
 
@@ -163,6 +224,13 @@ pub struct ProfilingState {
     /// The measured frames in which the render world's GPU-memory counters were recorded. Zero when
     /// the render world never measured them, whatever zeros the diagnostics store published.
     gpu_memory_frames: u64,
+    /// Non-finite render measurements, counted instead of sampled, per diagnostic path.
+    rejected_render_measurements: BTreeMap<String, u64>,
+    render_capabilities: Option<RenderCapabilities>,
+    window: Option<WindowMetadata>,
+    draw_submission: Option<crate::indirect_metrics::DrawSubmissionReport>,
+    draw_submission_frames: Vec<crate::indirect_metrics::DrawSubmissionFrame>,
+    dropped_draw_submission_frames: u64,
     counters: BTreeMap<String, u64>,
     gauges: BTreeMap<String, f64>,
     /// The counts [`ProfilingState::stage_scene_inventory`] took this frame, waiting for
@@ -172,9 +240,14 @@ pub struct ProfilingState {
     staged_inventory: Option<BTreeMap<String, f64>>,
     timeline: Vec<TimelineEvent>,
     memory: Vec<MemorySample>,
+    pub(crate) trace: Option<StreamingTrace>,
+    pub(crate) frame_cpu_spans_ms: BTreeMap<String, f64>,
+    pub(crate) frame_completion_latencies_ms: BTreeMap<String, f64>,
+    pub(crate) trace_delta_ms: f64,
 }
 
 impl Default for ProfilingState {
+    /// Start an empty aggregate profile with frame tracing disabled.
     fn default() -> Self {
         Self {
             started: Instant::now(),
@@ -185,16 +258,44 @@ impl Default for ProfilingState {
             memory_metrics: BTreeMap::new(),
             measured_frames: 0,
             gpu_memory_frames: 0,
+            rejected_render_measurements: BTreeMap::new(),
+            render_capabilities: None,
+            window: None,
+            draw_submission: None,
+            draw_submission_frames: Vec::new(),
+            dropped_draw_submission_frames: 0,
             counters: BTreeMap::new(),
             gauges: BTreeMap::new(),
             staged_inventory: None,
             timeline: Vec::new(),
             memory: Vec::new(),
+            trace: None,
+            frame_cpu_spans_ms: BTreeMap::new(),
+            frame_completion_latencies_ms: BTreeMap::new(),
+            trace_delta_ms: 0.0,
         }
     }
 }
 
 impl ProfilingState {
+    pub(crate) fn set_draw_submission(
+        &mut self,
+        mut report: crate::indirect_metrics::DrawSubmissionReport,
+        frames: Vec<crate::indirect_metrics::DrawSubmissionFrame>,
+    ) {
+        let remaining = crate::indirect_metrics::MAX_DRAW_FRAME_SAMPLES
+            .saturating_sub(self.draw_submission_frames.len());
+        self.dropped_draw_submission_frames = self
+            .dropped_draw_submission_frames
+            .saturating_add(frames.len().saturating_sub(remaining) as u64);
+        report.dropped_frame_samples = report
+            .dropped_frame_samples
+            .saturating_add(self.dropped_draw_submission_frames);
+        self.draw_submission = Some(report);
+        self.draw_submission_frames
+            .extend(frames.into_iter().take(remaining));
+    }
+
     pub fn record_elapsed(&mut self, name: impl Into<String>, started: Instant) {
         self.record_ms(name, started.elapsed().as_secs_f64() * 1000.0);
     }
@@ -215,13 +316,75 @@ impl ProfilingState {
         self.record_ms(name, micros as f64 / 1000.0);
     }
 
+    /// Attribute a reported asynchronous latency to its arrival frame, not as CPU work.
+    pub(crate) fn record_completed_latency_micros(&mut self, name: impl Into<String>, micros: u64) {
+        self.record_completed_latency_ms(name.into(), micros as f64 / 1000.0);
+    }
+
+    /// Record elapsed asynchronous latency in the arrival frame and the aggregate profile.
+    pub(crate) fn record_completed_latency_elapsed(
+        &mut self,
+        name: impl Into<String>,
+        started: Instant,
+    ) {
+        self.record_completed_latency_ms(name.into(), started.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    /// Accumulate completion latency separately from frame CPU spans while preserving aggregate samples.
+    fn record_completed_latency_ms(&mut self, name: String, value: f64) {
+        if self.trace.is_some() {
+            *self
+                .frame_completion_latencies_ms
+                .entry(name.clone())
+                .or_default() += value;
+        }
+        // Preserve the existing aggregate profiling contract.
+        push_bounded(self.cpu_spans_ms.entry(name).or_default(), value);
+    }
+
+    /// Record a CPU span in the bounded aggregate and, when enabled, sum it into this frame.
     pub fn record_ms(&mut self, name: impl Into<String>, value: f64) {
-        push_bounded(self.cpu_spans_ms.entry(name.into()).or_default(), value);
+        let name = name.into();
+        if self.trace.is_some() {
+            *self.frame_cpu_spans_ms.entry(name.clone()).or_default() += value;
+        }
+        push_bounded(self.cpu_spans_ms.entry(name).or_default(), value);
+    }
+
+    /// Observe an existing request without retaining its strong handle.
+    pub(crate) fn observe_scene(&mut self, id: AssetId<WorldAsset>, server: &AssetServer) {
+        if let Some(trace) = self.trace.as_mut()
+            && trace.observe_scene(id)
+        {
+            reconcile_scene(trace, server, id);
+        }
+    }
+
+    /// Return the shared main-frame index used by trace samples and timeline events.
+    pub(crate) fn main_frame(&self) -> u64 {
+        self.frame
+    }
+
+    /// Return milliseconds since this profiling session began.
+    pub(crate) fn elapsed_ms(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1000.0
     }
 
     pub fn increment(&mut self, name: impl Into<String>, amount: u64) {
         let counter = self.counters.entry(name.into()).or_default();
         *counter = counter.saturating_add(amount);
+    }
+
+    pub(crate) fn terrain_gauges(&self) -> BTreeMap<String, f64> {
+        self.gauges
+            .iter()
+            .filter(|(name, _)| name.starts_with("lod/"))
+            .map(|(name, value)| (name.clone(), *value))
+            .collect()
+    }
+
+    pub(crate) fn gauge(&self, name: &str) -> Option<f64> {
+        self.gauges.get(name).copied()
     }
 
     /// Records a gauge outright: the last value written is what the bundle carries, whatever frame
@@ -287,7 +450,9 @@ impl ProfilingState {
         measured: bool,
         gpu_memory_measured: bool,
     ) {
-        self.frame = self.frame.saturating_add(1);
+        if self.trace.is_none() {
+            self.frame = self.frame.saturating_add(1);
+        }
         // The scene inventory is staged earlier in the same frame (it runs in `Update`, this sample
         // in `Last`), so this is where its frame's measured-ness is known. The staged counts are
         // taken either way — a warm-up inventory is dropped, never left to be committed by a later
@@ -305,12 +470,16 @@ impl ProfilingState {
         for diagnostic in diagnostics.iter() {
             let path = diagnostic.path().as_str();
             if path.starts_with("render/") {
-                take_render_measurements(
-                    diagnostic,
-                    &mut self.render_metrics,
-                    &mut self.render_cursors,
-                    measured,
-                );
+                // A disabled diagnostic keeps its history but is not a measurement of this run.
+                if diagnostic.is_enabled {
+                    take_render_measurements(
+                        diagnostic,
+                        &mut self.render_metrics,
+                        &mut self.render_cursors,
+                        &mut self.rejected_render_measurements,
+                        measured,
+                    );
+                }
             }
             // The GPU-memory diagnostics do not sit under `render/`, so they are matched by their
             // own names, deliberately: the mesh allocator's counters and the live render-asset
@@ -570,6 +739,8 @@ impl ProfilingState {
         self.memory_metrics.get(path.as_str()).copied()
     }
 
+    /// Write aggregate profiling files and the optional frame trace to the configured output directory.
+    /// Return without writing when no directory is configured; propagate filesystem and JSON errors.
     pub fn write_bundle(
         &self,
         config: &EngineConfig,
@@ -604,16 +775,37 @@ impl ProfilingState {
             device.is_some_and(|value| value.timestamp_queries_supported);
         let pipeline_statistics_supported =
             device.is_some_and(|value| value.pipeline_statistics_supported);
+        let mut gpu = gpu_profile(render.clone(), self.render_capabilities.clone());
+        gpu.rejected_nonfinite_measurements = self.rejected_render_measurements.clone();
+        gpu.timestamp_queries_supported = timestamp_queries_supported;
+        gpu.pipeline_statistics_supported = pipeline_statistics_supported;
         write_json(
             &root.join("metadata.json"),
             &Metadata {
                 format_version: 2,
+                engine_version: env!("CARGO_PKG_VERSION"),
+                bevy_version: "0.19",
                 generated_unix_ms: unix_ms(),
                 scenario: config.profile_scenario.clone(),
                 run_id: config.profile_run_id.clone(),
+                commit: config.profile_commit.clone(),
+                dirty_worktree: config.profile_dirty_worktree,
                 hardware_label: config.profile_hardware.clone(),
+                build_profile: option_env!("MUDCRAB_BUILD_PROFILE").unwrap_or(
+                    if cfg!(debug_assertions) {
+                        "debug"
+                    } else {
+                        "release"
+                    },
+                ),
+                resolution: self
+                    .window
+                    .as_ref()
+                    .map(|window| window.physical_resolution),
+                window: self.window.clone(),
                 worldspace_id: config.worldspace_id,
                 start_grid: config.start_grid,
+                stream_radius: config.stream_radius,
                 synthetic_instances: config.synthetic_instances,
                 system,
                 fingerprint: fingerprint.cloned(),
@@ -628,15 +820,7 @@ impl ProfilingState {
                 gauges: self.gauges.clone(),
             },
         )?;
-        write_json(
-            &root.join("gpu-passes.json"),
-            &GpuProfile {
-                timestamp_queries_supported,
-                pipeline_statistics_supported,
-                metrics: render.clone(),
-                unavailable: unavailable_render_metrics(&render),
-            },
-        )?;
+        write_json(&root.join("gpu-passes.json"), &gpu)?;
         write_json(
             &root.join("streaming.json"),
             &StreamingProfile {
@@ -644,7 +828,19 @@ impl ProfilingState {
                 timeline: self.timeline.clone(),
             },
         )?;
+        if let Some(trace) = &self.trace {
+            write_json(&root.join("streaming-frames.json"), &trace.report())?;
+        }
         write_json(&root.join("renderer.json"), renderer)?;
+        if let Some(draw_submission) = &self.draw_submission {
+            write_json(
+                &root.join("draw-submission.json"),
+                &DrawSubmissionProfile {
+                    report: draw_submission,
+                    frames: &self.draw_submission_frames,
+                },
+            )?;
+        }
         write_json(
             &root.join("memory.json"),
             &MemoryProfile {
@@ -657,6 +853,85 @@ impl ProfilingState {
             summary_markdown(config, frame_metrics, &cpu, &render, streaming, renderer),
         )?;
         Ok(())
+    }
+}
+
+fn sample_profile_metadata(
+    mut profiler: ResMut<ProfilingState>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    device: Option<Res<RenderDevice>>,
+    adapter: Option<Res<RenderAdapterInfo>>,
+) {
+    if let Ok(window) = windows.single() {
+        profiler.window = Some(WindowMetadata {
+            physical_resolution: [window.physical_width(), window.physical_height()],
+            logical_resolution: [window.width(), window.height()],
+            scale_factor: window.scale_factor(),
+        });
+    }
+    if let Some(device) = device
+        && (device.is_changed() || profiler.render_capabilities.is_none())
+    {
+        let features = device.features();
+        profiler.render_capabilities = Some(RenderCapabilities {
+            backend: adapter
+                .as_ref()
+                .map(|adapter| format!("{:?}", adapter.backend)),
+            timestamp_queries_supported: features.contains(WgpuFeatures::TIMESTAMP_QUERY),
+            timestamp_queries_inside_passes_supported: features
+                .contains(WgpuFeatures::TIMESTAMP_QUERY_INSIDE_PASSES),
+            timestamp_queries_inside_encoders_supported: features
+                .contains(WgpuFeatures::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+            pipeline_statistics_supported: features
+                .contains(WgpuFeatures::PIPELINE_STATISTICS_QUERY),
+            multi_draw_indirect_count_supported: features
+                .contains(WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT),
+        });
+    }
+}
+
+/// Advance the trace clock, retain the real frame delta and clear frame-local span totals.
+/// Request a matching render observation when GPU inventory is enabled.
+fn begin_trace_frame(
+    time: Res<Time<Real>>,
+    bridge: Option<Res<StreamingGpuMetricsBridge>>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    profiler.frame = profiler.frame.saturating_add(1);
+    profiler.trace_delta_ms = time.delta_secs_f64() * 1000.0;
+    profiler.frame_cpu_spans_ms.clear();
+    profiler.frame_completion_latencies_ms.clear();
+    if let Some(bridge) = bridge {
+        bridge.request(profiler.frame);
+    }
+}
+
+/// Refresh an observed scene from asset-server state, marking it inactive if no state remains.
+pub(crate) fn reconcile_scene(
+    trace: &mut StreamingTrace,
+    server: &AssetServer,
+    id: AssetId<WorldAsset>,
+) {
+    if let Some(status) = scene_status(server.get_load_states(id)) {
+        trace.update_scene(id, status);
+    } else {
+        trace.remove_scene(id);
+    }
+}
+
+/// Classify scene loading, requiring recursive dependencies for CPU readiness.
+/// An absent load state remains unknown; scene or recursive dependency failures count as failed.
+fn scene_status(
+    states: Option<(LoadState, DependencyLoadState, RecursiveDependencyLoadState)>,
+) -> Option<SceneLoadStatus> {
+    match states {
+        Some((LoadState::Failed(_), _, _))
+        | Some((_, _, RecursiveDependencyLoadState::Failed(_))) => Some(SceneLoadStatus::Failed),
+        Some((LoadState::Loaded, _, RecursiveDependencyLoadState::Loaded)) => {
+            Some(SceneLoadStatus::CpuLoaded)
+        }
+        Some(_) => Some(SceneLoadStatus::Loading),
+        None => None,
     }
 }
 
@@ -675,6 +950,7 @@ fn take_render_measurements(
     diagnostic: &Diagnostic,
     metrics: &mut BTreeMap<String, Vec<f64>>,
     cursors: &mut BTreeMap<String, RenderCursor>,
+    rejected: &mut BTreeMap<String, u64>,
     keep: bool,
 ) {
     let path = diagnostic.path().as_str();
@@ -694,10 +970,15 @@ fn take_render_measurements(
             }
         }
         if keep {
-            push_bounded(
-                metrics.entry(path.to_owned()).or_default(),
-                measurement.value,
-            );
+            if measurement.value.is_finite() {
+                push_bounded(
+                    metrics.entry(path.to_owned()).or_default(),
+                    measurement.value,
+                );
+            } else {
+                let count = rejected.entry(path.to_owned()).or_default();
+                *count = count.saturating_add(1);
+            }
         }
         next = Some(match next {
             Some(next) if next.time == measurement.time => RenderCursor {
@@ -728,6 +1009,14 @@ fn sample_scene_inventory(
     mut frames: Local<u64>,
     meshes: Query<(), With<Mesh3d>>,
     terrain: Query<&ViewVisibility, With<crate::world::components::TerrainPatch>>,
+    lod_terrain_batches: Query<(), With<crate::streaming::lod::LodTerrainBatch>>,
+    structural_nodes: Query<
+        (),
+        (
+            With<crate::visibility_optimization::StructuralHierarchyNode>,
+            With<bevy::camera::visibility::NoCpuCulling>,
+        ),
+    >,
     water: Query<(), With<crate::world::components::WaterSurface>>,
     bounds: Query<(), With<crate::world::components::InstanceBounds>>,
     mesh_assets: Res<Assets<Mesh>>,
@@ -746,6 +1035,14 @@ fn sample_scene_inventory(
     counts.insert(
         "scene/terrain_patches".to_owned(),
         terrain.iter().count() as f64,
+    );
+    counts.insert(
+        "scene/lod_terrain_batches".to_owned(),
+        lod_terrain_batches.iter().count() as f64,
+    );
+    counts.insert(
+        "scene/structural_nodes_no_cpu_culling".to_owned(),
+        structural_nodes.iter().count() as f64,
     );
     counts.insert(
         "scene/visible_terrain_patches".to_owned(),
@@ -776,18 +1073,27 @@ pub struct SystemMetadata {
 
 /// The profile bundle's metadata: what this run was, and where the bundle came from.
 ///
-/// Everything the run fingerprint already records (commit, dirty state, build profile, window
-/// resolution, engine and Bevy versions, stream radius) lives in `fingerprint` alone, so the two
-/// cannot disagree.
+/// `fingerprint` is the authoritative record of the machine, build and settings. The fields that
+/// also appear in it (commit, dirty state, build profile, resolution, versions, stream radius) are
+/// still written because existing readers of `metadata.json` depend on them, and they come from
+/// the same config and build values the fingerprint is collected from.
 #[derive(Debug, Clone, Serialize)]
 struct Metadata {
     format_version: u32,
+    engine_version: &'static str,
+    bevy_version: &'static str,
     generated_unix_ms: u128,
     scenario: String,
     run_id: String,
     hardware_label: String,
+    commit: String,
+    dirty_worktree: bool,
+    build_profile: &'static str,
+    resolution: Option<[u32; 2]>,
+    window: Option<WindowMetadata>,
     worldspace_id: u32,
     start_grid: (i32, i32),
+    stream_radius: i32,
     synthetic_instances: usize,
     system: Option<SystemMetadata>,
     fingerprint: Option<RunFingerprint>,
@@ -817,6 +1123,7 @@ pub struct MetricSummary {
     pub p95: f64,
     pub p99: f64,
     pub worst: f64,
+    pub minimum: f64,
 }
 
 /// The report's per-pass GPU times: one summary per Bevy render-diagnostic path, plus what the
@@ -949,11 +1256,132 @@ struct CpuProfile {
 /// `gpu_passes` section carries, so the bundle and the report cannot disagree about the device.
 /// Which paths were *sampled* is not an answer to that question — a warm-up-only run samples none.
 #[derive(Serialize)]
+struct DrawSubmissionProfile<'a> {
+    #[serde(flatten)]
+    report: &'a crate::indirect_metrics::DrawSubmissionReport,
+    frames: &'a [crate::indirect_metrics::DrawSubmissionFrame],
+}
+
+#[derive(Serialize)]
 struct GpuProfile {
     timestamp_queries_supported: bool,
     pipeline_statistics_supported: bool,
+    query_support_observed: bool,
+    timestamp_measurements_available: bool,
+    timestamp_measurement_status: TimestampMeasurementStatus,
+    timestamp_metrics: BTreeMap<String, TimestampMeasurementStatus>,
+    rejected_nonfinite_measurements: BTreeMap<String, u64>,
+    device: Option<RenderCapabilities>,
     metrics: BTreeMap<String, MetricSummary>,
     unavailable: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WindowMetadata {
+    physical_resolution: [u32; 2],
+    logical_resolution: [f32; 2],
+    scale_factor: f32,
+}
+
+/// Features enabled on the device used for the run, independent of diagnostic values.
+#[derive(Debug, Clone, Default, Serialize)]
+struct RenderCapabilities {
+    backend: Option<String>,
+    timestamp_queries_supported: bool,
+    timestamp_queries_inside_passes_supported: bool,
+    timestamp_queries_inside_encoders_supported: bool,
+    pipeline_statistics_supported: bool,
+    multi_draw_indirect_count_supported: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TimestampMeasurementStatus {
+    NotObserved,
+    AllZero,
+    PositiveValuesObserved,
+    MixedValuesObserved,
+    InvalidNegativeValues,
+}
+
+fn timestamp_status(summary: &MetricSummary) -> TimestampMeasurementStatus {
+    if summary.count == 0 {
+        TimestampMeasurementStatus::NotObserved
+    } else if summary.minimum < 0.0 {
+        TimestampMeasurementStatus::InvalidNegativeValues
+    } else if summary.worst > 0.0 {
+        TimestampMeasurementStatus::PositiveValuesObserved
+    } else {
+        TimestampMeasurementStatus::AllZero
+    }
+}
+
+fn gpu_profile(
+    metrics: BTreeMap<String, MetricSummary>,
+    capabilities: Option<RenderCapabilities>,
+) -> GpuProfile {
+    let timestamp_metrics: BTreeMap<_, _> = metrics
+        .iter()
+        .filter(|(path, _)| path.ends_with("/elapsed_gpu"))
+        .map(|(path, summary)| (path.clone(), timestamp_status(summary)))
+        .collect();
+    let timestamp_measurements_available = timestamp_metrics
+        .values()
+        .any(|status| *status == TimestampMeasurementStatus::PositiveValuesObserved);
+    let has_negative_values = timestamp_metrics
+        .values()
+        .any(|status| *status == TimestampMeasurementStatus::InvalidNegativeValues);
+    let timestamp_measurement_status = if timestamp_metrics.is_empty()
+        || timestamp_metrics
+            .values()
+            .all(|status| *status == TimestampMeasurementStatus::NotObserved)
+    {
+        TimestampMeasurementStatus::NotObserved
+    } else if timestamp_measurements_available
+        && timestamp_metrics
+            .values()
+            .any(|status| *status != TimestampMeasurementStatus::PositiveValuesObserved)
+    {
+        TimestampMeasurementStatus::MixedValuesObserved
+    } else if has_negative_values {
+        TimestampMeasurementStatus::InvalidNegativeValues
+    } else if timestamp_measurements_available {
+        TimestampMeasurementStatus::PositiveValuesObserved
+    } else {
+        TimestampMeasurementStatus::AllZero
+    };
+    let mut unavailable = unavailable_render_metrics(&metrics);
+    if !timestamp_measurements_available {
+        unavailable.insert(
+            "elapsed_gpu".to_owned(),
+            match timestamp_measurement_status {
+                TimestampMeasurementStatus::AllZero => {
+                    "all observed GPU timestamps are zero; pass timings are unavailable"
+                }
+                TimestampMeasurementStatus::InvalidNegativeValues => {
+                    "observed GPU elapsed times contain negative values"
+                }
+                _ => "no GPU elapsed measurements were observed",
+            }
+            .to_owned(),
+        );
+    }
+    GpuProfile {
+        timestamp_queries_supported: capabilities
+            .as_ref()
+            .is_some_and(|device| device.timestamp_queries_supported),
+        pipeline_statistics_supported: capabilities
+            .as_ref()
+            .is_some_and(|device| device.pipeline_statistics_supported),
+        query_support_observed: capabilities.is_some(),
+        timestamp_measurements_available,
+        timestamp_measurement_status,
+        timestamp_metrics,
+        rejected_nonfinite_measurements: BTreeMap::new(),
+        device: capabilities,
+        metrics,
+        unavailable,
+    }
 }
 
 #[derive(Serialize)]
@@ -969,7 +1397,11 @@ struct MemoryProfile {
 }
 
 pub fn summarize(samples: &[f64]) -> MetricSummary {
-    let mut sorted = samples.to_vec();
+    let mut sorted: Vec<_> = samples
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
     sorted.sort_by(f64::total_cmp);
     let total = sorted.iter().sum::<f64>();
     MetricSummary {
@@ -980,6 +1412,7 @@ pub fn summarize(samples: &[f64]) -> MetricSummary {
         p95: percentile(&sorted, 0.95),
         p99: percentile(&sorted, 0.99),
         worst: sorted.last().copied().unwrap_or_default(),
+        minimum: sorted.first().copied().unwrap_or_default(),
     }
 }
 
@@ -1108,7 +1541,10 @@ fn summary_markdown(
     top_cpu.sort_by(|left, right| right.1.total.total_cmp(&left.1.total));
     let mut top_gpu: Vec<_> = render
         .iter()
-        .filter(|(name, _)| name.ends_with("/elapsed_gpu"))
+        .filter(|(name, summary)| {
+            name.ends_with("/elapsed_gpu")
+                && timestamp_status(summary) == TimestampMeasurementStatus::PositiveValuesObserved
+        })
         .collect();
     top_gpu.sort_by(|left, right| right.1.mean.total_cmp(&left.1.mean));
     let mut output = format!(
@@ -1148,6 +1584,9 @@ fn summary_markdown(
         ));
     }
     output.push_str("\n## Top GPU passes\n\n| Pass | Mean ms | P95 ms |\n|---|---:|---:|\n");
+    if top_gpu.is_empty() {
+        output.push_str("\nGPU pass timings are unavailable; see gpu-passes.json for device support and measurement status.\n");
+    }
     for (name, value) in top_gpu.into_iter().take(10) {
         output.push_str(&format!(
             "| {name} | {:.3} | {:.3} |\n",
@@ -1233,7 +1672,8 @@ fn push_bounded(values: &mut Vec<f64>, value: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy::diagnostic::{Diagnostic, DiagnosticMeasurement};
+    use bevy::diagnostic::{Diagnostic, DiagnosticMeasurement, DiagnosticPath};
+    use bevy::platform::time::Instant as DiagnosticInstant;
     use std::time::Duration;
 
     /// Feeds a diagnostic store with one measurement of a path, the way a diagnostic plugin's own
@@ -1630,6 +2070,199 @@ mod tests {
     }
 
     #[test]
+    fn render_measurements_are_sampled_once_per_timestamp() {
+        let path = DiagnosticPath::new("render/test/elapsed_cpu");
+        let mut diagnostics = DiagnosticsStore::default();
+        diagnostics.add(Diagnostic::new(path.clone()));
+        let started = DiagnosticInstant::now();
+        diagnostics
+            .get_mut(&path)
+            .unwrap()
+            .add_measurement(DiagnosticMeasurement {
+                time: started,
+                value: 2.0,
+            });
+        let mut profiler = ProfilingState::default();
+        profiler.sample_frame(&diagnostics, None, true, true);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        assert_eq!(profiler.render_metrics[path.as_str()], [2.0]);
+
+        // Identical values are distinct observations when their timestamps differ.
+        for offset in [1, 2] {
+            diagnostics
+                .get_mut(&path)
+                .unwrap()
+                .add_measurement(DiagnosticMeasurement {
+                    time: started + Duration::from_millis(offset),
+                    value: 2.0,
+                });
+        }
+        profiler.sample_frame(&diagnostics, None, true, true);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        assert_eq!(profiler.render_metrics[path.as_str()], [2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn sampling_collects_all_unseen_history_and_skips_disabled_diagnostics() {
+        let path = DiagnosticPath::new("render/test/elapsed_cpu");
+        let disabled_path = DiagnosticPath::new("render/disabled/elapsed_cpu");
+        let mut diagnostic = Diagnostic::new(path.clone());
+        let started = DiagnosticInstant::now();
+        for offset in [0, 1, 2] {
+            diagnostic.add_measurement(DiagnosticMeasurement {
+                time: started + Duration::from_millis(offset),
+                value: offset as f64,
+            });
+        }
+        let mut disabled = Diagnostic::new(disabled_path.clone());
+        disabled.add_measurement(DiagnosticMeasurement {
+            time: started,
+            value: 100.0,
+        });
+        disabled.is_enabled = false;
+        let mut diagnostics = DiagnosticsStore::default();
+        diagnostics.add(diagnostic);
+        diagnostics.add(disabled);
+        let mut profiler = ProfilingState::default();
+        profiler.sample_frame(&diagnostics, None, true, true);
+        assert_eq!(profiler.render_metrics[path.as_str()], [0.0, 1.0, 2.0]);
+        assert!(!profiler.render_metrics.contains_key(disabled_path.as_str()));
+    }
+
+    #[test]
+    fn all_zero_gpu_timings_are_unavailable_even_when_queries_are_supported() {
+        let gpu = gpu_profile(
+            BTreeMap::from([("render/main/elapsed_gpu".into(), summarize(&[0.0; 3]))]),
+            Some(RenderCapabilities {
+                timestamp_queries_supported: true,
+                ..Default::default()
+            }),
+        );
+        assert!(gpu.timestamp_queries_supported);
+        assert!(gpu.query_support_observed);
+        assert!(!gpu.timestamp_measurements_available);
+        assert_eq!(
+            gpu.timestamp_measurement_status,
+            TimestampMeasurementStatus::AllZero
+        );
+        assert_eq!(gpu.metrics["render/main/elapsed_gpu"].count, 3);
+        assert!(gpu.unavailable["elapsed_gpu"].contains("zero"));
+    }
+
+    #[test]
+    fn positive_gpu_diagnostics_do_not_prove_device_query_support() {
+        let gpu = gpu_profile(
+            BTreeMap::from([("render/main/elapsed_gpu".into(), summarize(&[1.0, 2.0]))]),
+            None,
+        );
+        assert!(!gpu.timestamp_queries_supported);
+        assert!(!gpu.query_support_observed);
+        assert!(gpu.timestamp_measurements_available);
+        assert_eq!(
+            gpu.timestamp_measurement_status,
+            TimestampMeasurementStatus::PositiveValuesObserved
+        );
+        assert!(!gpu.unavailable.contains_key("elapsed_gpu"));
+    }
+
+    #[test]
+    fn supported_queries_without_measurements_remain_unavailable() {
+        let gpu = gpu_profile(
+            BTreeMap::new(),
+            Some(RenderCapabilities {
+                timestamp_queries_supported: true,
+                ..Default::default()
+            }),
+        );
+        assert!(gpu.timestamp_queries_supported);
+        assert!(!gpu.timestamp_measurements_available);
+        assert_eq!(
+            gpu.timestamp_measurement_status,
+            TimestampMeasurementStatus::NotObserved
+        );
+    }
+
+    #[test]
+    fn negative_elapsed_values_are_marked_invalid() {
+        let summary = summarize(&[-1.0, 2.0, 3.0]);
+        assert_eq!(
+            timestamp_status(&summary),
+            TimestampMeasurementStatus::InvalidNegativeValues
+        );
+    }
+
+    #[test]
+    fn empty_gpu_summaries_are_unobserved_and_mixed_results_keep_invalid_status() {
+        let empty = gpu_profile(
+            BTreeMap::from([("render/empty/elapsed_gpu".into(), summarize(&[]))]),
+            None,
+        );
+        assert_eq!(
+            empty.timestamp_measurement_status,
+            TimestampMeasurementStatus::NotObserved
+        );
+        let mixed = gpu_profile(
+            BTreeMap::from([
+                ("render/valid/elapsed_gpu".into(), summarize(&[1.0])),
+                (
+                    "render/invalid/elapsed_gpu".into(),
+                    summarize(&[-1.0, 2.0, 3.0]),
+                ),
+            ]),
+            None,
+        );
+        assert!(mixed.timestamp_measurements_available);
+        assert_eq!(
+            mixed.timestamp_measurement_status,
+            TimestampMeasurementStatus::MixedValuesObserved
+        );
+        assert_eq!(
+            mixed.timestamp_metrics["render/invalid/elapsed_gpu"],
+            TimestampMeasurementStatus::InvalidNegativeValues
+        );
+    }
+
+    #[test]
+    fn nonfinite_render_measurements_are_rejected_once() {
+        let path = DiagnosticPath::new("render/test/elapsed_gpu");
+        let mut diagnostic = Diagnostic::new(path.clone());
+        diagnostic.add_measurement(DiagnosticMeasurement {
+            time: DiagnosticInstant::now(),
+            value: f64::NAN,
+        });
+        let mut diagnostics = DiagnosticsStore::default();
+        diagnostics.add(diagnostic);
+        let mut profiler = ProfilingState::default();
+        profiler.sample_frame(&diagnostics, None, true, true);
+        profiler.sample_frame(&diagnostics, None, true, true);
+        assert!(!profiler.render_metrics.contains_key(path.as_str()));
+        assert_eq!(profiler.rejected_render_measurements[path.as_str()], 1);
+        assert_eq!(summarize(&[f64::NAN, f64::INFINITY, 2.0]).count, 1);
+    }
+
+    #[test]
+    fn metadata_observes_physical_and_logical_window_dimensions() {
+        let mut app = App::new();
+        app.init_resource::<ProfilingState>()
+            .add_systems(Update, sample_profile_metadata);
+        app.world_mut().spawn((
+            Window {
+                resolution: bevy::window::WindowResolution::new(3200, 1800)
+                    .with_scale_factor_override(2.0),
+                ..Default::default()
+            },
+            PrimaryWindow,
+        ));
+        app.update();
+        let profiler = app.world().resource::<ProfilingState>();
+        let window = profiler.window.as_ref().unwrap();
+        assert_eq!(window.physical_resolution, [3200, 1800]);
+        assert_eq!(window.logical_resolution, [1600.0, 900.0]);
+        assert_eq!(window.scale_factor, 2.0);
+        assert!(profiler.render_capabilities.is_none());
+    }
+
+    #[test]
     fn summarizes_percentiles_and_worst_value() {
         let values: Vec<_> = (1..=100).map(f64::from).collect();
         let summary = summarize(&values);
@@ -1863,6 +2496,7 @@ mod tests {
         assert!((memory_slope(&samples).unwrap() - 0.1).abs() < 0.0001);
     }
 
+    /// Verify aggregate bundle files are written without a frame sidecar when tracing is disabled.
     #[test]
     fn writes_complete_profile_bundle() {
         let directory = tempfile::tempdir().unwrap();
@@ -1904,22 +2538,29 @@ mod tests {
             assert!(directory.path().join(name).is_file(), "missing {name}");
         }
         let summary = fs::read_to_string(directory.path().join("summary.md")).unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.path().join("metadata.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata["format_version"], 2);
+        assert!(metadata["resolution"].is_null());
+        assert!(summary.contains("GPU pass timings are unavailable"));
         assert!(
             summary.contains("Terrain seam points welded: 0"),
             "the summary must report the welded terrain seam points"
         );
-        let metadata: serde_json::Value =
-            serde_json::from_slice(&fs::read(directory.path().join("metadata.json")).unwrap())
-                .unwrap();
-        assert_eq!(metadata["format_version"], serde_json::json!(2));
         assert!(
             metadata["fingerprint"]["commit"].is_string(),
             "the bundle metadata must carry the run fingerprint"
         );
         assert!(
-            metadata.get("commit").is_none(),
-            "the fields the fingerprint duplicates must not be written twice"
+            metadata["commit"].is_string(),
+            "the bundle metadata keeps the commit main writes, beside the fingerprint"
         );
+        assert!(
+            metadata["build_profile"].is_string(),
+            "the bundle metadata keeps the build profile main writes, beside the fingerprint"
+        );
+        assert!(!directory.path().join("streaming-frames.json").exists());
     }
 
     /// The bundle's device capabilities are the fingerprint's, not an inference from which pass
@@ -1968,5 +2609,140 @@ mod tests {
             serde_json::json!(true),
             "the sampled paths do not answer what the device supports"
         );
+    }
+
+    /// Verify ordinary runs install neither frame tracing nor the GPU inventory bridge.
+    #[test]
+    fn normal_runs_do_not_install_trace_collection() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .add_plugins(ProfilingPlugin);
+        assert!(app.world().resource::<ProfilingState>().trace.is_none());
+        assert!(!app.world().contains_resource::<StreamingGpuMetricsBridge>());
+    }
+
+    /// Verify profile output enables frame tracing while leaving GPU inventory disabled.
+    #[test]
+    fn profile_trace_does_not_install_expensive_gpu_inventory_by_default() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            profile_output_dir: Some("unused-test-output".into()),
+            ..default()
+        })
+        .add_plugins(ProfilingPlugin);
+        assert!(app.world().resource::<ProfilingState>().trace.is_some());
+        assert!(!app.world().contains_resource::<StreamingGpuMetricsBridge>());
+    }
+
+    /// Verify recursive dependency loading and failure determine scene readiness.
+    #[test]
+    fn scene_status_requires_recursive_dependencies_and_catches_their_failures() {
+        use bevy::asset::{AssetLoadError, io::AssetReaderError};
+        use std::sync::Arc;
+        let error = Arc::new(AssetLoadError::AssetReaderError(
+            AssetReaderError::NotFound("missing-image.ktx2".into()),
+        ));
+        assert_eq!(scene_status(None), None);
+        assert_eq!(
+            scene_status(Some((
+                LoadState::Loaded,
+                DependencyLoadState::Loaded,
+                RecursiveDependencyLoadState::Loading
+            ))),
+            Some(SceneLoadStatus::Loading)
+        );
+        assert_eq!(
+            scene_status(Some((
+                LoadState::Loaded,
+                DependencyLoadState::Loaded,
+                RecursiveDependencyLoadState::Failed(error.clone())
+            ))),
+            Some(SceneLoadStatus::Failed)
+        );
+        assert_eq!(
+            scene_status(Some((
+                LoadState::Failed(error),
+                DependencyLoadState::Loaded,
+                RecursiveDependencyLoadState::Loaded
+            ))),
+            Some(SceneLoadStatus::Failed)
+        );
+        assert_eq!(
+            scene_status(Some((
+                LoadState::Loaded,
+                DependencyLoadState::Loaded,
+                RecursiveDependencyLoadState::Loaded
+            ))),
+            Some(SceneLoadStatus::CpuLoaded)
+        );
+    }
+}
+
+// Samples acquisition before presentation consumes the swapchain texture.
+#[derive(Resource)]
+struct ProfilePrimaryDrawableProof {
+    frames: u64,
+    warmup_frames: u64,
+    present_frames: u64,
+    missing_frames: u64,
+    measured_present_frames: u64,
+    measured_missing_frames: u64,
+}
+
+impl ProfilePrimaryDrawableProof {
+    fn new(warmup_frames: u32) -> Self {
+        Self {
+            frames: 0,
+            warmup_frames: u64::from(warmup_frames).saturating_add(5),
+            present_frames: 0,
+            missing_frames: 0,
+            measured_present_frames: 0,
+            measured_missing_frames: 0,
+        }
+    }
+
+    fn log(&self, final_summary: bool) {
+        info!(
+            final_summary,
+            render_frames = self.frames,
+            warmup_plus_five = self.warmup_frames,
+            present_frames = self.present_frames,
+            missing_frames = self.missing_frames,
+            measured_present_frames = self.measured_present_frames,
+            measured_missing_frames = self.measured_missing_frames,
+            "native profiling primary drawable proof"
+        );
+    }
+}
+
+impl Drop for ProfilePrimaryDrawableProof {
+    fn drop(&mut self) {
+        self.log(true);
+    }
+}
+
+fn sample_primary_drawable(
+    windows: Res<ExtractedWindows>,
+    mut proof: ResMut<ProfilePrimaryDrawableProof>,
+) {
+    let present = windows
+        .primary
+        .and_then(|primary| windows.get(&primary))
+        .is_some_and(|window| window.swap_chain_texture.is_some());
+    proof.frames = proof.frames.saturating_add(1);
+    if present {
+        proof.present_frames = proof.present_frames.saturating_add(1);
+    } else {
+        proof.missing_frames = proof.missing_frames.saturating_add(1);
+    }
+    if proof.frames > proof.warmup_frames {
+        if present {
+            proof.measured_present_frames = proof.measured_present_frames.saturating_add(1);
+        } else {
+            proof.measured_missing_frames = proof.measured_missing_frames.saturating_add(1);
+        }
+    }
+    if proof.frames.is_multiple_of(300) {
+        proof.log(false);
     }
 }

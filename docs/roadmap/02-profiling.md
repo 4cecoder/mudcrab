@@ -8,6 +8,9 @@ the user's converted, legally owned asset set.
 
 Each run writes a self-contained directory containing `metadata.json`, `frame-metrics.json`,
 `cpu-spans.json`, `gpu-passes.json`, `streaming.json`, `memory.json`, and `summary.md`.
+Profiling runs also write [`streaming-frames.json`](../research/streaming-trace.md), a bounded
+frame trace covering warmup, measurement and capture settlement. It separates synchronous CPU
+spans from reported completion latencies and keeps render observations' source-frame IDs.
 
 - CPU spans cover camera/world work, streaming planning, database queue/query/total latency, cell
   commit and spawn, terrain mesh generation, asset readiness, origin rebasing, and water systems.
@@ -403,7 +406,8 @@ cannot drift apart).
   counts, `measured_frames`, and the per-pass pipeline-statistics counters) with
   `scene.unavailable`, and `cpu` (per schedule and per span) with `cpu.unavailable`. Every
   map takes the union of its keys across the repeats and each entry keeps `samples`, the number of
-  repeats that measured it, so a pass or span only one repeat recorded is still visible. A window a
+  repeats that measured it, and `runs`, the expected repeat count. A pass or span only one repeat
+  recorded is still visible with its partial coverage. A window a
   scenario does not have is `null` with the reason in the scenario's `streaming_unavailable`.
   Nothing is zero-filled here either: a counter the report left `null` stays `null`. When the engine
   ends a repeat on a failed acceptance gate the window records `acceptance`: `runs_failed_gates` (the
@@ -413,7 +417,8 @@ cannot drift apart).
   measurement, and only a report that cannot be shown to be this repeat's (missing, stale, malformed,
   zero frames, another run's) throws.
 - **`baseline.md`.** One short table per scenario window, whose "median (min-max over N runs)"
-  cells are exactly what `baseline.json` holds; a short memory table (CPU asset bytes in MiB, the
+  cells are exactly what `baseline.json` holds, with `samples/runs` beside each measured value,
+  including GPU passes and the lagging-pass list; a short memory table (CPU asset bytes in MiB, the
   GPU counters as counts with their unit); the slowest GPU passes and CPU spans; and every
   counter a window could not measure with the reason the report gave for it. When GPU pass times
   are missing the row prints the GPU reason, not the CPU-schedule one. The measured frame counts
@@ -438,6 +443,10 @@ cannot drift apart).
   inputs (flight speed, synthetic instance count and the data set included). The data set is checked
   twice: as the resolved `assets` path, and as its own identity (`assets_identity`, above), so a
   re-conversion or an added mod at the same path is refused rather than scored as the same workload.
+  An asset-backed window with `assets_identity_unavailable` on either side is also refused,
+  even when both paths and unavailable reasons match. This check runs before timed windows:
+  explicit `-CompareTo` throws, while an implicit baseline is dropped with a warning. Synthetic
+  windows without assets need no data-set identity.
   The identity is a file identity, not a content hash: copying the same data set to another folder
   keeps the sizes but changes the last-write time, so the copy is refused too, which is the safe
   direction; rerun the baseline there to compare. A `baseline.json` written before its windows
@@ -447,6 +456,12 @@ cannot drift apart).
   it was measured from is the point of the command. `-Out` defaults to `target/phase2-baseline`, so
   a rerun compares with the previous baseline by default; each window's report bundle stays under
   `-Out/runs/`, and `baseline.json`'s `run_directory` says which campaign's bundles belong to it.
+  A metric is regression-scored only when both sides measured it in every repeat (`samples`
+  equals that campaign's `repeats`), including complete one-repeat campaigns. Partial medians
+  remain visible under the additive `comparison.unscored` map and as `n/a` comparison rows with
+  coverage and a reason; they produce no regression verdict. A metric no repeat measured stays
+  omitted, without a fabricated zero. Existing `comparison.metrics` keys remain unchanged;
+  `comparison.unscored` groups bare metric names by scenario/window.
 - **CI.** Nothing here runs in CI: the `performance` job is converter-side and has no GPU, and only
   the manual self-hosted runner can run even the synthetic scene. A baseline is a local,
   same-machine measurement.
@@ -558,6 +573,10 @@ start with frame P95/P99 and inspect the top CPU spans, GPU passes and streaming
 same run. A missing GPU counter means unsupported instrumentation, not a zero value. Real-asset and
 target-hardware sign-off remains an execution result, not something the repository can pre-certify.
 
+For native function names, library/driver stacks and thread waits, see the
+[native profiling guide](../contributing/native-profiling.md). It covers Samply, Firefox Profiler,
+Metal HUD captures and the limits of CPU/GPU timing interpretation.
+
 ## Load speed defaults: models per frame and IO threads
 
 Once a converted model has loaded, the engine hands it to Bevy's scene spawner, at most
@@ -585,3 +604,8 @@ load request to the model appearing falls from 692-704 ms at 4 a frame to 168 ms
 worst frame (20.5 -> 22.2 ms), p95 (10.2 -> 10.8 ms) and peak memory (1.51 GiB both) barely move.
 More IO threads did not load faster (the ranges overlap) and lengthened the worst loading frame, so
 the automatic size stays; the load was waiting on the arming limit, not on IO.
+
+The [archived 2026-10-08 Metal investigation](../research/metal-performance-fixes-20261008.md)
+records a separate batching candidate, not a speedup established by this diagnostics change.
+See [measurement validity](../research/profiling-measurement-validity-20261008.md) for observed
+resolution, diagnostic timestamps and optional completed-frame draw counts.
