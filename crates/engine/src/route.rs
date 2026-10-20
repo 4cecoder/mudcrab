@@ -66,11 +66,12 @@ const GROUND_PROBE_SPACING: f32 = 256.0;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteStart {
-    /// On the frame after the world is first ready; the camera waits at the first waypoint until
-    /// then. Without a measuring run (no pacing readiness to wait for) the route starts at once.
+    /// On the frame the world is first ready; the camera waits at the first waypoint until then,
+    /// and stands there on that frame too, walking from the next one. Without a measuring run (no
+    /// pacing readiness to wait for) the route starts at once.
     #[default]
     WorldReady,
-    /// On the first frame.
+    /// On the first frame, which stands still too; the walk begins on the next one.
     Immediately,
 }
 
@@ -451,14 +452,16 @@ impl RouteRunner {
 
     /// One frame. `delta_secs` is the real time since the previous frame, `ready` whether the route
     /// may start (the world is ready, or the route does not wait), and `now_ms` the real time since
-    /// the app started. Before the start the camera waits at the first waypoint; from the start on
-    /// the route advances by `speed * delta_secs` whatever the world is doing.
+    /// the app started. Before the start the camera waits at the first waypoint. The start frame
+    /// stands there too: its delta is the wait itself, which the route does not walk. From the next
+    /// frame on the route advances by `speed * delta_secs` whatever the world is doing.
     pub fn step(&mut self, delta_secs: f32, ready: bool, now_ms: f64) -> RouteFrame {
-        if !self.started && ready {
+        let starting = !self.started && ready;
+        if starting {
             self.started = true;
             self.started_at_ms = Some(now_ms);
         }
-        let moving = self.started && !self.finished;
+        let moving = self.started && !self.finished && !starting;
         if moving {
             self.distance += f64::from(self.plan.speed) * f64::from(delta_secs.max(0.0));
         }
@@ -863,22 +866,22 @@ mod tests {
         assert_eq!(waiting.eye_height, Some(220.0));
         assert!(!runner.report().started);
         assert!(!runner.scoring());
-        // Ready: the start frame already moves.
+        // Ready: the start frame stands at the first waypoint, whatever its delta was.
         let first = runner.step(0.5, true, 1234.0);
-        assert_eq!(
-            first.position,
-            Vec2::new(200.0, 0.0),
-            "400 units/s for half a second"
-        );
+        assert_eq!(first.position, Vec2::ZERO);
         let report = runner.report();
         assert!(report.started);
         assert_eq!(report.started_at_run_ms, Some(1234.0));
-        assert_eq!(report.frames_on_route, 1);
+        assert_eq!(report.frames_on_route, 0);
+        // The next frame walks its own interval: 400 units/s for half a second.
+        let second = runner.step(0.5, true, 1300.0);
+        assert_eq!(second.position, Vec2::new(200.0, 0.0));
+        assert_eq!(runner.report().frames_on_route, 1);
         assert!(
             !runner.scoring(),
-            "the start frame's own interval was the wait"
+            "the first walking frame is not scored yet"
         );
-        runner.step(0.5, true, 1300.0);
+        runner.step(0.5, true, 1350.0);
         assert!(runner.scoring());
         // Readiness is read only at the start: a world that stops being ready does not stop it.
         let later = runner.step(0.5, false, 1400.0);
@@ -887,11 +890,37 @@ mod tests {
     }
 
     #[test]
-    fn a_ready_route_moves_on_its_first_frame() {
+    fn a_ready_route_starts_still_and_walks_from_its_next_frame() {
         let ground = RouteGround::from_cells([((0, 0), flat(0.0))]);
         let mut runner = runner(GOOD, ground);
-        let frame = runner.step(0.25, true, 0.0);
+        let start = runner.step(0.25, true, 0.0);
+        assert_eq!(start.position, Vec2::ZERO);
+        let frame = runner.step(0.25, true, 250.0);
         assert_eq!(frame.position, Vec2::new(100.0, 0.0));
+    }
+
+    /// The start frame carries the whole readiness wait as its delta. A short route must not run
+    /// through its length in that one frame, nor finish on it.
+    #[test]
+    fn a_long_readiness_wait_does_not_walk_a_short_route_on_its_start_frame() {
+        const SHORT: &str = r#"{
+            "name": "short",
+            "worldspace": "0x3c",
+            "speed": 400,
+            "waypoints": [[0, 0], [100, 0]]
+        }"#;
+        let ground = RouteGround::from_cells([((0, 0), flat(0.0))]);
+        let mut runner = runner(SHORT, ground);
+        let start = runner.step(10.0, true, 10_000.0);
+        assert_eq!(start.position, Vec2::ZERO);
+        assert!(!runner.finished());
+        assert_eq!(runner.report().started_at_run_ms, Some(10_000.0));
+        let walking = runner.step(0.1, true, 10_100.0);
+        assert_eq!(walking.position, Vec2::new(40.0, 0.0));
+        assert!(!runner.finished());
+        let arrived = runner.step(0.25, true, 10_350.0);
+        assert_eq!(arrived.position, Vec2::new(100.0, 0.0));
+        assert!(runner.finished());
     }
 
     #[test]

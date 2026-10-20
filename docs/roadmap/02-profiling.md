@@ -354,7 +354,9 @@ windows and the expected duration before starting, and reuses `phase2-profile.ps
 definitions and engine invocation (that file is dot-sourced with `-AsLibrary`, so the two commands
 cannot drift apart).
 
-- **Windows.** The route scenarios `travel` and `check` get one window, the moving one. Every
+- **Windows.** The route scenarios `travel` and `check` get one window, the moving one, which runs
+  for the longer of `-DurationSeconds` and the route's travel time plus a 60 s allowance for the
+  world to load before the route starts (the route cannot begin before that). Every
   other scenario gets a standing-still window. A scenario that moves — `stress` and
   `stability`, which fly the camera — gets a second, streaming window: the same scene once with the
   camera left in place and once as the scenario defines it. That is how steady frames and streaming
@@ -487,8 +489,9 @@ frame with no terrain under the camera keeps the previous height and is counted 
 `route.route_frames_without_ground`. (It is the height field the terrain mesh is built from, and
 not a physics ray: a benchmark run builds no terrain colliders, and adding them would change what is
 measured.) The route starts when the world is first ready, so the walk is not the cold load of the
-start cell (`"start": "immediately"` skips the wait); from then on the runner never waits for
-loading, never slows down and hides nothing. The route ends the benchmark window when its last
+start cell (`"start": "immediately"` skips the wait). The start frame stands at the first waypoint,
+so the time spent loading moves nothing; the walk begins on the next frame. From then on the runner
+never waits for loading, never slows down and hides nothing. The route ends the benchmark window when its last
 waypoint is reached, so the report covers the route, and the distance travelled follows the real
 clock, so a hitch costs the camera its distance. Frame times are scored from the first full frame on the
 route (the benchmark's warm-up frames are not trimmed on top of that). The engine knows no route: the files are data, and `-Scenarios travel` or `check` only names a
