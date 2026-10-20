@@ -126,6 +126,8 @@ pub struct EngineConfig {
     /// `--shots <file>`: render the camera poses in a shots file, one PNG each, and exit instead of
     /// running interactively. See [`crate::shots`].
     pub shots: Option<PathBuf>,
+    /// Exact, fixed-step profiling traversal. Mutually exclusive with other camera drivers.
+    pub matched_route: Option<PathBuf>,
     /// `--shots-out <dir>`: where the PNGs and `shots.log` go. `None` is
     /// [`crate::shots::default_output_dir`], a `<file stem>-shots/` folder beside the shots file.
     pub shots_out: Option<PathBuf>,
@@ -196,6 +198,7 @@ impl Default for EngineConfig {
             acceptance_screenshot: None,
             screenshot_camera_offset: None,
             shots: None,
+            matched_route: None,
             shots_out: None,
             diagnostic_asset_fallbacks: false,
             material_fixture: false,
@@ -257,6 +260,7 @@ Benchmark and profiling:
   --accept-max-memory-growth-gib <gib>  fail the run above this memory growth (default: 0.5)
   --acceptance-screenshot <file>        write a screenshot when the run ends
   --screenshot-camera-offset <x,y,z>    camera offset for the acceptance screenshot
+  --matched-route <file>                execute exact route steps with transition and settled checkpoints
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
   --shots-out <dir>                     where the shots' PNGs and shots.log go (default: beside the shots file)
   --profile-output <dir>                profile bundle directory (default: no bundle)
@@ -427,6 +431,7 @@ impl EngineConfig {
             && self.benchmark_duration_secs.is_none()
             && self.acceptance_screenshot.is_none()
             && self.shots.is_none()
+            && self.matched_route.is_none()
             && self.auto_fly_speed <= 0.0
             && !self.material_fixture
             && !self.terrain_water_fixture
@@ -468,6 +473,8 @@ impl EngineConfig {
             Some("benchmark")
         } else if self.streaming_fixture {
             Some("streaming fixture")
+        } else if self.matched_route.is_some() {
+            Some("matched-route")
         } else if self.shots.is_some() {
             Some("shots")
         } else {
@@ -757,6 +764,13 @@ impl EngineConfig {
                 // A path left out is an error, and must not swallow the next option: a `--shots`
                 // with no path is no mode at all, and continuing would silently launch an ordinary
                 // interactive run.
+                "--matched-route" => {
+                    config.matched_route = Some(take_value(
+                        "--matched-route",
+                        "a route fixture",
+                        args.next(),
+                    )?);
+                }
                 "--shots" => {
                     config.shots = Some(take_value("--shots", "a shots file path", args.next())?);
                 }
@@ -824,6 +838,8 @@ impl EngineConfig {
             Some("--streaming-fixture moves the camera every frame")
         } else if self.shots.is_some() {
             Some("--shots sets the camera pose for each shot")
+        } else if self.matched_route.is_some() {
+            Some("--matched-route sets the camera pose for each route step")
         } else {
             None
         };
@@ -1066,36 +1082,47 @@ mod tests {
         "--ignore-submodules",   // git diff
         "--quiet",               // git diff
         "--short",               // git rev-parse
-        "--output",              // world-inspect, repeat-terrain-startup.py
-        "--radius",              // world-inspect
-        "--library-path",        // ld-linux
-        "--meshes",              // audit-collision.py
-        "--min-x",               // audit-collision.py
-        "--max-x",               // audit-collision.py
-        "--min-y",               // audit-collision.py
-        "--max-y",               // audit-collision.py
-        "--out",                 // audit-collision.py
-        "--expect-solid",        // audit-collision.py
-        "--expect-passable",     // audit-collision.py
-        "--original",            // audit_asset_sizes.py
-        "--json",                // audit_asset_sizes.py
+        "--output", // world-inspect, profiling, startup runner, repeat-terrain-startup.py
+        "--pairs-output", // correlate_drawables.py
+        "--radius", // world-inspect
+        "--library-path", // ld-linux
+        "--meshes", // audit-collision.py
+        "--min-x",  // audit-collision.py
+        "--max-x",  // audit-collision.py
+        "--min-y",  // audit-collision.py
+        "--max-y",  // audit-collision.py
+        "--out",    // audit-collision.py
+        "--expect-solid", // audit-collision.py
+        "--expect-passable", // audit-collision.py
+        "--original", // audit_asset_sizes.py
+        "--json",   // audit_asset_sizes.py
         "--candidate-inventory", // audit-riverwood-reuse.py
         "--reference-inventory", // audit-riverwood-reuse.py
-        "--manifest",            // audit-riverwood-reuse.py
-        "--locked",              // cargo run
-        "--manifest-path",       // cargo run
-        "--cpu-jobs",            // converter
-        "--io-jobs",             // converter
-        "--binary",              // git diff
-        "--porcelain",           // git status
-        "--engine",              // repeat-terrain-startup.py
-        "--repeats",             // repeat-terrain-startup.py
-        "--upload-budgets",      // repeat-terrain-startup.py
-        "--warmup",              // repeat-terrain-startup.py
-        "--duration",            // repeat-terrain-startup.py
-        "--timeout",             // repeat-terrain-startup.py
-        "--launch-prefix",       // repeat-terrain-startup.py
-        "--commit",              // repeat-terrain-startup.py
+        "--manifest", // audit-riverwood-reuse.py
+        "--include", // audit-z-fighting.py
+        "--materials-only", // audit-z-fighting.py
+        "--no-placements", // audit-z-fighting.py
+        "--plane-tolerance", // audit-z-fighting.py
+        "--min-overlap-area", // audit-z-fighting.py
+        "--max-triangles", // audit-z-fighting.py
+        "--max-comparisons", // audit-z-fighting.py
+        "--max-examples", // audit-z-fighting.py
+        "--progress", // audit-z-fighting.py
+        "--jobs",   // audit-z-fighting.py
+        "--locked", // cargo run
+        "--manifest-path", // cargo run
+        "--cpu-jobs", // converter
+        "--io-jobs", // converter
+        "--binary", // git diff
+        "--porcelain", // git status
+        "--engine", // repeat-terrain-startup.py
+        "--repeats", // repeat-terrain-startup.py
+        "--upload-budgets", // repeat-terrain-startup.py
+        "--warmup", // repeat-terrain-startup.py
+        "--duration", // repeat-terrain-startup.py
+        "--timeout", // repeat-terrain-startup.py
+        "--launch-prefix", // repeat-terrain-startup.py
+        "--commit", // repeat-terrain-startup.py
     ];
 
     fn run_config(arguments: &[&str]) -> EngineConfig {
@@ -1417,6 +1444,14 @@ mod tests {
         ]);
         assert_eq!(config.benchmark_jump, None);
         assert!(config.shots.is_some());
+        for list in [
+            ["--benchmark-jump", "3,4", "--matched-route", "route.json"],
+            ["--matched-route", "route.json", "--benchmark-jump", "3,4"],
+        ] {
+            let config = args(&list);
+            assert_eq!(config.benchmark_jump, None, "{list:?}");
+            assert_eq!(config.matched_route, Some(PathBuf::from("route.json")));
+        }
         // A synthetic benchmark loads no world, so no streaming system would issue the jump.
         let config = args(&[
             "--benchmark-only",
@@ -1545,6 +1580,18 @@ mod tests {
             "Mudcrab - shots: riverwood"
         );
         assert_eq!(args(&[]).window_title(), "Mudcrab");
+    }
+
+    #[test]
+    fn matched_route_is_a_separate_automated_camera_mode() {
+        let config = run_config(&["--matched-route", "route.json"]);
+        assert_eq!(config.matched_route, Some(PathBuf::from("route.json")));
+        assert!(!config.interactive_world_physics());
+        assert!(
+            run_config(&["--matched-route", "route.json", "--run-label", "test"])
+                .window_title()
+                .contains("matched-route")
+        );
     }
 
     /// A shots path left out does not swallow the next option, and it is an error rather than a
@@ -2092,6 +2139,8 @@ mod tests {
 
     /// Utility `.ps1`, `.sh` and `.py` files under `root`, subdirectories included,
     /// in a stable order. Hidden directories and script tests are excluded.
+    /// Converter-only profiling tools stay in the scan; their flags are checked
+    /// only on lines that invoke the engine (see `checked_script_engine_flags`).
     fn script_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut paths = Vec::new();
         let mut pending = vec![root.to_owned()];
@@ -2105,8 +2154,7 @@ mod tests {
                 // loop the walk; hidden folders (`.venv`) hold no project scripts.
                 if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                     let name = entry.file_name();
-                    // Tests inspect script text, including deliberately unsupported engine
-                    // options; they are not utility command lines.
+                    // Tests inspect deliberately unsupported engine options.
                     if !name.to_string_lossy().starts_with('.') && name != "tests" {
                         pending.push(path);
                     }
@@ -2122,13 +2170,84 @@ mod tests {
         paths
     }
 
+    fn checked_script_engine_flags(script: &str, path: &std::path::Path) -> usize {
+        let options = parser_options();
+        let mut checked = 0;
+        // lod-performance tools parse converter options. Only their lines that
+        // name the engine are engine invocations; the rest is not checked.
+        let converter_tool = path
+            .components()
+            .any(|part| part.as_os_str() == "lod-performance");
+        let engine_lines: String;
+        let scanned = if converter_tool {
+            engine_lines = script
+                .lines()
+                .filter(|line| {
+                    line.split(|c: char| !c.is_alphanumeric())
+                        .any(|word| word == "engine")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            engine_lines.as_str()
+        } else {
+            script
+        };
+        for flag in option_tokens(scanned) {
+            // This database-only tool owns --verify. Keep it scoped to the tool:
+            // an engine launcher passing --verify must still fail the audit.
+            let observation_option = path.file_name().is_some_and(|name| {
+                name == "reference-enable-observations.py" && flag == "--verify"
+            });
+            if NON_ENGINE_FLAGS.contains(&flag) || observation_option {
+                continue;
+            }
+            assert!(
+                options.contains(&flag),
+                "{} passes {flag}, which the parser refuses",
+                path.display()
+            );
+            checked += 1;
+        }
+        checked
+    }
+
+    #[test]
+    fn the_script_audit_scopes_observation_options_and_rejects_unknown_engine_flags() {
+        let observation = std::path::Path::new("reference-enable-observations.py");
+        assert_eq!(
+            checked_script_engine_flags(
+                "--output manifest.json --verify manifest.json",
+                observation
+            ),
+            0
+        );
+        assert_eq!(
+            checked_script_engine_flags("engine --headless", observation),
+            1
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                checked_script_engine_flags("engine --unknown-engine-option", observation)
+            })
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                checked_script_engine_flags(
+                    "engine --verify manifest.json",
+                    std::path::Path::new("launch.sh"),
+                )
+            })
+            .is_err()
+        );
+    }
+
     /// Every utility `.ps1`, `.sh` and `.py` file in `scripts/`, subdirectories
     /// included, is read from disk, so a script added later cannot pass an
     /// option the parser refuses without failing this test. The scan is skipped
     /// when the repository's `scripts/` is not next to this crate.
     #[test]
     fn the_scripts_only_pass_options_the_parser_accepts() {
-        let options = parser_options();
         let Some(scripts) = scripts_directory() else {
             return;
         };
@@ -2136,17 +2255,7 @@ mod tests {
         for path in script_paths(&scripts) {
             let script = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
-            for flag in option_tokens(&script) {
-                if NON_ENGINE_FLAGS.contains(&flag) {
-                    continue;
-                }
-                assert!(
-                    options.contains(&flag),
-                    "{} passes {flag}, which the parser refuses",
-                    path.display()
-                );
-                checked += 1;
-            }
+            checked += checked_script_engine_flags(&script, &path);
         }
         assert!(
             checked >= 20,
@@ -2237,14 +2346,42 @@ mod tests {
     }
 
     #[test]
-    fn script_v89_scan_excludes_tests_and_keeps_nested_utilities() {
+    fn script_v89_scan_excludes_other_tool_scopes_and_keeps_nested_utilities() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("tests")).unwrap();
+        std::fs::create_dir(directory.path().join("lod-performance")).unwrap();
         std::fs::create_dir(directory.path().join("utils")).unwrap();
         std::fs::write(directory.path().join("tests/check.py"), "--log-file").unwrap();
+        std::fs::write(
+            directory.path().join("lod-performance/audit.py"),
+            "--data-root --expected-chunks --lod-encoder",
+        )
+        .unwrap();
         let utility = directory.path().join("utils/capture.sh");
         std::fs::write(&utility, "--headless").unwrap();
-        assert_eq!(script_paths(directory.path()), vec![utility]);
+        assert_eq!(
+            script_paths(directory.path()),
+            vec![directory.path().join("lod-performance/audit.py"), utility]
+        );
+    }
+
+    #[test]
+    fn lod_performance_flags_are_checked_only_on_engine_lines() {
+        let tool = std::path::Path::new("scripts/lod-performance/run_conversion_observed.py");
+        assert_eq!(
+            checked_script_engine_flags("converter --data-root x --lod-encoder cpu", tool),
+            0
+        );
+        assert_eq!(
+            checked_script_engine_flags("engine --headless\nconverter --data-root x", tool),
+            1
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                checked_script_engine_flags("engine --unknown-engine-option", tool)
+            })
+            .is_err()
+        );
     }
 
     /// True when a script spells out a finite number.

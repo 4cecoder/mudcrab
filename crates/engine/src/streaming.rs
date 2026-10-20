@@ -2,6 +2,7 @@ use crate::nif_material::EffectPaletteMaterial;
 use crate::physics::{DebugTankard, PlayerBody, PlayerControlsSystems};
 use crate::{
     config::EngineConfig,
+    nif_depth::NifDepthMaterialSource,
     profiling::ProfilingState,
     render::{
         PLACED_OBJECT_RENDER_LAYERS, QUADRANT_WEIGHT_SAMPLES, TerrainExtension, TerrainMaterial,
@@ -58,7 +59,7 @@ pub struct TerrainCollider;
 
 /// Grid cell and quadrant covered by a terrain surface at one LOD tier.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
-struct TerrainCoverage {
+pub(crate) struct TerrainCoverage {
     grid: IVec2,
     quadrant: u8,
     tier: Option<LodTier>,
@@ -97,11 +98,12 @@ impl Plugin for StreamingPlugin {
                     collect_cells,
                     lod::collect_lod_chunks,
                     arm_pending_models,
-                    finish_streaming_commit_budget,
                     track_asset_readiness,
                     track_surface_readiness,
                     lod::track_lod_readiness,
+                    lod::batch_ready_lod_chunks,
                     lod::update_terrain_lod_visibility,
+                    finish_streaming_commit_budget,
                     update_render_origin,
                     validate_streaming_lifecycle,
                 )
@@ -1186,7 +1188,12 @@ fn spawn_cell(
     profiler: &mut ProfilingState,
 ) -> Result<Entity, String> {
     let spawn_started = Instant::now();
-    let reference_count = payload.references.len();
+    let reference_count = payload
+        .references
+        .iter()
+        .filter(|row| row.initially_enabled)
+        .count();
+    let suppressed_count = payload.references.len() - reference_count;
     let root_translation = cell_translation(payload.key, origin);
     let terrain_started = Instant::now();
     let terrain_grid = match payload.key {
@@ -1347,6 +1354,9 @@ fn spawn_cell(
         let references_started = Instant::now();
         let mut model_loads = 0u64;
         for reference in payload.references {
+            if !reference.initially_enabled {
+                continue;
+            }
             let creation_position = Vec3::from_array(reference.position);
             let world_position = WorldPosition::from_creation_units(creation_position);
             let translation = match payload.key {
@@ -1451,6 +1461,7 @@ fn spawn_cell(
         );
     });
     profiler.increment("streaming/references_spawned", reference_count as u64);
+    profiler.increment("streaming/references_suppressed", suppressed_count as u64);
     profiler.record_elapsed("streaming/spawn_cell", spawn_started);
     Ok(root)
 }
@@ -1553,10 +1564,14 @@ fn static_proxy_from_hierarchy(
             .get(entity)
             .map_err(|_| format!("static proxy node {entity:?} has no transform"))?;
         let node_to_root = parent_to_root * local.compute_affine();
-        if let Ok((mesh_handle, material_handle, material_name, extras)) = primitives.get(entity)
+        if let Ok((mesh_handle, material_handle, material_name, extras, native_source)) =
+            primitives.get(entity)
             && !extras.is_some_and(has_explicit_material_exclusion)
         {
-            let material = material_handle.and_then(|handle| materials.get(handle));
+            let material = material_handle
+                .map(|handle| &handle.0)
+                .or_else(|| native_source.map(|source| &source.0))
+                .and_then(|handle| materials.get(handle));
             if material.is_some_and(|material| {
                 static_proxy_material_allowed(
                     path,
@@ -2136,6 +2151,7 @@ type RenderPrimitiveQuery<'world, 'state> = Query<
         Option<&'static MeshMaterial3d<StandardMaterial>>,
         Option<&'static GltfMaterialName>,
         Option<&'static GltfExtras>,
+        Option<&'static NifDepthMaterialSource>,
     ),
 >;
 
@@ -3017,7 +3033,7 @@ fn accumulate_relative_bounds(
         validate_transform(&format!("hierarchy node {entity:?}"), local, global)?;
         *nodes += 1;
         let relative_to_root = parent_to_root * local.compute_affine();
-        if let Ok((mesh_handle, _, _, _)) = primitives.get(entity) {
+        if let Ok((mesh_handle, _, _, _, _)) = primitives.get(entity) {
             let mesh = meshes.get(mesh_handle).ok_or_else(|| {
                 format!(
                     "mesh {:?} is absent while validating bounds",
@@ -3092,7 +3108,8 @@ fn validate_spawned_asset(
 ) -> Result<AssetValidationSummary, String> {
     let mut summary = AssetValidationSummary::default();
     for descendant in children.iter_descendants(root) {
-        let Ok((mesh, material_handle, _, extras)) = primitives.get(descendant) else {
+        let Ok((mesh, material_handle, _, extras, native_source)) = primitives.get(descendant)
+        else {
             continue;
         };
         if meshes.get(mesh).is_none() {
@@ -3115,7 +3132,10 @@ fn validate_spawned_asset(
             summary.materials += 1;
             continue;
         }
-        let Some(material_handle) = material_handle else {
+        let Some(material_handle) = material_handle
+            .map(|handle| &handle.0)
+            .or_else(|| native_source.map(|source| &source.0))
+        else {
             if extras.is_some_and(has_explicit_material_exclusion) {
                 summary.excluded_materials += 1;
                 continue;
@@ -4082,6 +4102,16 @@ fn validate_streaming_lifecycle(
     profiler.set_gauge("streaming/resident_roots", root_entries.len() as f64);
 }
 
+impl TerrainCoverage {
+    pub(crate) fn receipt(&self) -> serde_json::Value {
+        serde_json::json!({
+            "cell": self.grid.to_array(),
+            "quadrant": self.quadrant,
+            "tier": format!("{:?}", self.tier)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4149,6 +4179,32 @@ mod tests {
         );
         budget.remaining = 0;
         assert_eq!(budget.remaining_for_cells(), 0);
+    }
+
+    /// The converter writes a sphere as a zero-length capsule (a = b); Rapier must take it as a
+    /// sphere of that radius.
+    #[test]
+    fn zero_length_authored_capsule_becomes_a_sphere() {
+        let asset = CollisionAsset {
+            version: COLLISION_ASSET_VERSION,
+            authored: true,
+            shapes: vec![CollisionShape::Capsule {
+                a: [1.0, 2.0, 3.0],
+                b: [1.0, 2.0, 3.0],
+                radius: 5.0,
+            }],
+            skipped: Vec::new(),
+            bodies: Vec::new(),
+        };
+        let parts = collider_parts_from_authored(&asset).unwrap();
+        assert_eq!(parts.len(), 1);
+        let aabb = parts[0].collider.raw.compute_local_aabb();
+        let (mins, maxs) = (aabb.mins, aabb.maxs);
+        assert!(
+            (mins - Vec3::new(-4.0, -3.0, -2.0)).length() < 1e-4
+                && (maxs - Vec3::new(6.0, 7.0, 8.0)).length() < 1e-4,
+            "{mins:?} {maxs:?}"
+        );
     }
 
     #[test]
@@ -6241,6 +6297,7 @@ mod tests {
                 cell_id: 0x02D4E0,
                 references: vec![ReferenceRow {
                     form_id: 0x00F9907,
+                    initially_enabled: true,
                     cell_id: 0x02D4E0,
                     base_form_id: 0x00EF957,
                     base_record_type: None,
@@ -6887,7 +6944,7 @@ mod tests {
         let mut old_min = Vec3::splat(f32::INFINITY);
         let mut old_max = Vec3::splat(f32::NEG_INFINITY);
         for descendant in children.iter_descendants(root) {
-            let Ok((mesh_handle, _, _, _)) = primitives.get(descendant) else {
+            let Ok((mesh_handle, _, _, _, _)) = primitives.get(descendant) else {
                 continue;
             };
             let mesh = meshes.get(mesh_handle).unwrap();
@@ -7064,6 +7121,7 @@ mod tests {
     ) -> ReferenceRow {
         ReferenceRow {
             form_id,
+            initially_enabled: true,
             cell_id: 99,
             base_form_id: 0x200 + form_id,
             base_record_type: None,
@@ -7867,6 +7925,83 @@ mod tests {
                     .is_some_and(|id| id.0 == form_id)
             })
             .expect("the reference spawned")
+    }
+
+    #[test]
+    fn disabled_references_spawn_no_roots_models_lights_or_collider_work() {
+        let mut hidden = lit_reference(1, Some(light_row(256.0, [255; 3], 0)), None);
+        hidden.initially_enabled = false;
+        hidden.model_path = Some("architecture/hidden-wall.nif".to_owned());
+        hidden.base_record_type = Some("STAT".to_owned());
+        let visible = lit_reference(2, Some(light_row(256.0, [255; 3], 0)), None);
+        let mut app = spawn_reference_cell_app(vec![hidden, visible], true);
+        let mut ids = app.world_mut().query::<&FormId>();
+        assert_eq!(
+            ids.iter(app.world()).map(|id| id.0).collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(
+            app.world_mut()
+                .query::<&PointLight>()
+                .iter(app.world())
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.world_mut()
+                .query::<&PendingModel>()
+                .iter(app.world())
+                .count(),
+            0
+        );
+        assert_eq!(
+            app.world_mut()
+                .query::<&PendingAssetProfile>()
+                .iter(app.world())
+                .count(),
+            0
+        );
+        assert_eq!(
+            app.world_mut()
+                .query::<&Collider>()
+                .iter(app.world())
+                .count(),
+            0
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            profile_output_dir: Some(directory.path().to_owned()),
+            ..default()
+        };
+        let profiler = app.world().resource::<ProfilingState>();
+        profiler
+            .write_bundle(&config, &serde_json::json!({}), None, &default(), None)
+            .unwrap();
+        let profile: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("cpu-spans.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(profile["counters"]["streaming/references_spawned"], 1);
+        assert_eq!(profile["counters"]["streaming/references_suppressed"], 1);
+    }
+
+    #[test]
+    fn a_cell_with_only_disabled_references_still_loads() {
+        let mut hidden = lit_reference(1, None, None);
+        hidden.initially_enabled = false;
+        let mut app = spawn_reference_cell_app(vec![hidden], false);
+        let root = app.world().resource::<SpawnedCellRoot>().0.unwrap();
+        assert_eq!(
+            app.world()
+                .entity(root)
+                .get::<Children>()
+                .map_or(0, |children| children.len()),
+            0
+        );
+        assert_eq!(
+            app.world_mut().query::<&FormId>().iter(app.world()).count(),
+            0
+        );
     }
 
     /// A spawned reference with a resolvable `door_links` row carries `LoadDoor`; one whose link

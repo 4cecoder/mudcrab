@@ -74,11 +74,13 @@ fn write_dds(data: &Path, relative: &str, format: dds::Format) {
 }
 
 /// Stores an opaque entry whose extraction counts are independent of asset conversion.
+/// The entry is an opaque `.lod` input: `ConverterInputs` selects it and the
+/// extractor copies it unparsed, so each archive still yields one converted file.
 fn write_archive(data: &Path, name: &str, payload: &[u8]) {
     fs::write(
         data.join(name),
         ba2::general(
-            &[Entry::new("docs/review.txt", payload)],
+            &[Entry::new("lodsettings/review.lod", payload)],
             ba2::Compression::None,
         )
         .unwrap(),
@@ -495,12 +497,21 @@ async fn corrupted_archive_blob_misses_while_unchanged_archive_survives_config_c
     config.texture_zstd_level = 0;
     assert!(config.verify_cache);
 
-    let rebuilt = publish(config).await;
+    let rebuilt = publish(config.clone()).await;
+    // Sealed packs are the authoritative archive copy. The damaged per-file blob
+    // fails hash verification and is never trusted, so the archive restores from
+    // its verified pack instead of being extracted again.
     assert_eq!(
-        rebuilt.converted, 1,
-        "hash verification must reject the corrupted blob"
+        rebuilt.converted, 0,
+        "a corrupted derived blob must not force an extraction"
     );
-    assert_eq!(rebuilt.cache_hits, 1, "the intact archive remains reusable");
+    assert_eq!(rebuilt.cache_hits, 2, "both archives remain reusable");
+    let entry = &manifest(&config.output_dir).archives[ARCHIVE_NAME].files[0];
+    assert_eq!(
+        hash_file(&archive_blob(&config, ARCHIVE_NAME)).unwrap(),
+        entry.hash,
+        "the damaged blob is repaired from the verified pack"
+    );
 }
 
 /// Explicit invalidation continues to force extraction even when the source is unchanged.
@@ -822,7 +833,7 @@ async fn unknown_retained_script_producer_does_not_gain_current_metadata_eligibi
         "the test isolates original producer policy"
     );
 
-    // Producer 25 is outside the existing known script set12..24/current26 but
+    // Producer 25 is outside the existing known script set 12..24 and 26 (current 27) but
     // below the metadata stamp, so rejecting producer>metadata cannot hide a
     // mistaken decision based only on the metadata producer. Preserve any new
     // kind map; its script ABI proof deliberately still matches.

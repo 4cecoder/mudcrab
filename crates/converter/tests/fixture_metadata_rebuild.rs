@@ -1,3 +1,5 @@
+mod common;
+
 use converter::{
     AssetPipeline, PipelineConfig,
     cache::{ConversionManifest, hash_file},
@@ -137,7 +139,7 @@ fn generate(data: &Path) {
 async fn convert(data: &Path, output: &Path) -> converter::PipelineReport {
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let report = AssetPipeline::run_async(PipelineConfig::new(data, output), tx)
+    let report = AssetPipeline::run_async(common::cpu_lod_config(data, output), tx)
         .await
         .unwrap();
     drain.await.unwrap();
@@ -153,7 +155,8 @@ async fn rebuild(
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result =
-        AssetPipeline::rebuild_metadata_async(PipelineConfig::new(data, output), source, tx).await;
+        AssetPipeline::rebuild_metadata_async(common::cpu_lod_config(data, output), source, tx)
+            .await;
     drain.await.unwrap();
     result
 }
@@ -208,7 +211,7 @@ async fn native_retained_configuration_survives_rebuilds_without_becoming_cache_
     let repeated = directory.path().join("derived-again");
     generate(&data);
     convert(&data, &source).await;
-    let config = PipelineConfig::new(&data, &output);
+    let config = common::cpu_lod_config(&data, &output);
     let producer_hash = native_configuration_hash(&config, 6);
     assert_eq!(
         producer_hash,
@@ -279,7 +282,7 @@ async fn metadata_rebuild_rejects_changed_native_producer_settings() {
         serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     for (index, retained) in [false, true].into_iter().enumerate() {
         let output = directory.path().join(format!("rejected-{index}"));
-        let changed = native_configuration_hash(&PipelineConfig::new(&data, &output), 7);
+        let changed = native_configuration_hash(&common::cpu_lod_config(&data, &output), 7);
         if retained {
             manifest.schema_version = converter::cache::CONVERTER_SCHEMA_VERSION;
             let mut legacy_config = PipelineConfig::new(&data, &output);
@@ -374,7 +377,8 @@ async fn metadata_rebuild_reuses_bytes_and_recovers_authoritative_flags() {
     assert!(output.join("lod-manifest.json").is_file());
 }
 
-/// Retained asset provenance allows proven producer-24 GLBs but rebuilds its textures.
+/// Retained asset provenance keeps the original producer; only current-producer GLBs are cache
+/// hits, since producer 27 changed the GLB collision data of every earlier producer.
 #[tokio::test]
 async fn metadata_rebuild_preserves_retained_mesh_cache_contract() {
     for source_schema in [
@@ -386,6 +390,7 @@ async fn metadata_rebuild_preserves_retained_mesh_cache_contract() {
         22,
         23,
         24,
+        26,
         converter::cache::CONVERTER_SCHEMA_VERSION,
     ] {
         let directory = tempfile::tempdir().unwrap();
@@ -435,12 +440,12 @@ async fn metadata_rebuild_preserves_retained_mesh_cache_contract() {
                 .values()
                 .filter(|entry| entry.output.ends_with(".glb"))
                 .count(),
-            if source_schema == 24 || source_schema == converter::cache::CONVERTER_SCHEMA_VERSION {
+            if source_schema == converter::cache::CONVERTER_SCHEMA_VERSION {
                 meshes
             } else {
                 0
             },
-            "metadata-only upgrades preserve original provenance; only known compatible producer meshes are normal cache hits"
+            "metadata-only upgrades preserve original provenance; only current producer meshes are normal cache hits"
         );
         let report = convert(&data, &repeated).await;
         let regenerated = if source_schema == converter::cache::CONVERTER_SCHEMA_VERSION {
@@ -449,10 +454,7 @@ async fn metadata_rebuild_preserves_retained_mesh_cache_contract() {
             retained
                 .entries
                 .values()
-                .filter(|entry| {
-                    let output = entry.output.to_ascii_lowercase();
-                    !output.ends_with(".luau") && !(source_schema == 24 && output.ends_with(".glb"))
-                })
+                .filter(|entry| !entry.output.to_ascii_lowercase().ends_with(".luau"))
                 .count()
         };
         let current: ConversionManifest =
@@ -481,6 +483,7 @@ async fn metadata_rebuild_rejects_unsupported_mesh_provenance() {
         (21, 17),
         (21, 18),
         (24, 25),
+        (26, 27),
         (
             converter::cache::CONVERTER_SCHEMA_VERSION,
             converter::cache::CONVERTER_SCHEMA_VERSION + 1,
@@ -1151,7 +1154,7 @@ async fn v91_metadata_rebuild_rejects_ambiguous_lod_and_lighting_producers() {
             .to_string();
         assert!(
             error.contains(&format!(
-                "complete converter schema 15, 16, 19 through 24 or {}",
+                "complete converter schema 15, 16, 19 through 24, 26 or {}",
                 converter::cache::CONVERTER_SCHEMA_VERSION
             )),
             "{error}"
