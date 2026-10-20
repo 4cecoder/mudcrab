@@ -3348,12 +3348,7 @@ fn publish_runtime_pack(
         // Generate before the directory swap so readers never see a mismatched
         // catalog/manifest pair and failures preserve the previous published pack.
         timings.measure("runtime_pack_costs", || {
-            let catalog = crate::streaming_costs::analyze_pack(&pack_staging)?;
-            fs::write(
-                pack_staging.join(shared::streaming_costs::STREAMING_COST_FILE_NAME),
-                serde_json::to_vec_pretty(&catalog)?,
-            )?;
-            Ok(())
+            write_streaming_cost_catalog(&pack_staging)
         })?;
         publish_directory_locked_with_timings(&pack_staging, output, true, lock, &mut timings)
     })();
@@ -3362,6 +3357,21 @@ fn publish_runtime_pack(
     }
     published?;
     Ok(timings.elapsed_ms)
+}
+
+/// Writes the streaming cost sidecar for an assembled, immutable-until-published pack. Call only
+/// after the final `conversion-manifest.json` bytes are in place: the catalog fingerprint is that
+/// file's hash. A sidecar linked from another pack is unlinked first, never written through.
+pub(crate) fn write_streaming_cost_catalog(pack: &Path) -> Result<()> {
+    let destination = pack.join(shared::streaming_costs::STREAMING_COST_FILE_NAME);
+    match fs::remove_file(&destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let catalog = crate::streaming_costs::analyze_pack(pack)?;
+    fs::write(destination, serde_json::to_vec_pretty(&catalog)?)?;
+    Ok(())
 }
 
 /// Publishes ingestion blobs into the persistent cache, repairing corrupt copies.
