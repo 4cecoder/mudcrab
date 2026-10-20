@@ -31,6 +31,8 @@ IO threads are created at startup. Changing that value requires Save and a resta
 
 Save writes a validated JSON file through a temporary file and rename. Reset defaults applies defaults to the session; Save persists that reset. Read or write failures appear in the menu. Invalid saved files are ignored without changing launch configuration.
 
+A field that an explicit launch option sets is not written from the running value. Save keeps the value the file held before that run, or the menu default when no valid file existed. The running settings keep the launch value, and the file stays valid for a later run without the option. An explicit option still wins on the next launch that passes it. Other fields save as shown in the menu.
+
 | Platform | File |
 | --- | --- |
 | macOS | `~/Library/Application Support/Mudcrab/settings.json` |

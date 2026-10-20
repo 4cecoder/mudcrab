@@ -422,46 +422,39 @@ impl RenderingSettings {
     }
 
     fn retain_explicit_launch_values(&mut self, config: &EngineConfig) {
-        for flag in &config.settings_overrides {
+        let mut launch = RenderingSettings::default();
+        launch.take_launch_values(config);
+        self.take_launch_owned_values(&launch, &config.settings_overrides);
+    }
+
+    /// Copies from `source` the fields that the explicit launch `overrides` own.
+    fn take_launch_owned_values(&mut self, source: &RenderingSettings, overrides: &[String]) {
+        for flag in overrides {
             match flag.as_str() {
-                "--lights" => self.point_lights = config.lights,
+                "--lights" => self.point_lights = source.point_lights,
                 "--stream-radius" => {
-                    self.stream_radius = config.stream_radius;
-                    self.unload_radius = config.unload_radius;
+                    self.stream_radius = source.stream_radius;
+                    self.unload_radius = source.unload_radius;
                 }
                 "ini:stream-radius" => {
-                    if !config
-                        .settings_overrides
-                        .iter()
-                        .any(|s| s == "--stream-radius")
-                    {
-                        self.stream_radius = config.stream_radius;
-                        self.unload_radius = config.unload_radius;
+                    if !overrides.iter().any(|s| s == "--stream-radius") {
+                        self.stream_radius = source.stream_radius;
+                        self.unload_radius = source.unload_radius;
                     }
                 }
-                "ini:fBlockLevel0Distance" => {
-                    self.lod_level0_distance = config.terrain_lod.block_level0_distance
-                }
-                "ini:fBlockLevel1Distance" => {
-                    self.lod_level1_distance = config.terrain_lod.block_level1_distance
-                }
+                "ini:fBlockLevel0Distance" => self.lod_level0_distance = source.lod_level0_distance,
+                "ini:fBlockLevel1Distance" => self.lod_level1_distance = source.lod_level1_distance,
                 "ini:fBlockMaximumDistance" => {
-                    self.lod_maximum_distance = config.terrain_lod.block_maximum_distance
+                    self.lod_maximum_distance = source.lod_maximum_distance
                 }
-                "ini:fSplitDistanceMult" => {
-                    self.lod_multiplier = config.terrain_lod.split_distance_mult
-                }
-                "--max-commit-ms" => {
-                    self.commit_ms = config.max_commit_micros_per_frame as f64 / 1000.0
-                }
-                "--max-unloads-per-frame" => self.cell_unloads = config.max_cell_unloads_per_frame,
-                "--max-model-spawns-per-frame" => {
-                    self.model_spawns = config.max_model_spawns_per_frame
-                }
-                "--max-upload-mib-per-frame" => self.upload_mib = config.max_upload_mib_per_frame,
-                "--io-threads" => self.io_threads = config.io_threads,
+                "ini:fSplitDistanceMult" => self.lod_multiplier = source.lod_multiplier,
+                "--max-commit-ms" => self.commit_ms = source.commit_ms,
+                "--max-unloads-per-frame" => self.cell_unloads = source.cell_unloads,
+                "--max-model-spawns-per-frame" => self.model_spawns = source.model_spawns,
+                "--max-upload-mib-per-frame" => self.upload_mib = source.upload_mib,
+                "--io-threads" => self.io_threads = source.io_threads,
                 "--diagnostic-asset-fallbacks" => {
-                    self.diagnostic_asset_fallbacks = config.diagnostic_asset_fallbacks
+                    self.diagnostic_asset_fallbacks = source.diagnostic_asset_fallbacks
                 }
                 _ => {}
             }
@@ -505,6 +498,11 @@ impl RenderingSettings {
 pub struct SettingsFile {
     pub path: Option<PathBuf>,
     pub status: String,
+    /// The preferences the file held before explicit launch options replaced them in the running
+    /// settings. A save writes these values back for the fields those options own.
+    stored: RenderingSettings,
+    /// The explicit launch options from the run that loaded `stored`.
+    launch_overrides: Vec<String>,
 }
 
 impl SettingsFile {
@@ -512,17 +510,29 @@ impl SettingsFile {
         Self {
             path: None,
             status: "Changes apply now. This preview does not save preferences.".into(),
+            stored: RenderingSettings::default(),
+            launch_overrides: Vec::new(),
         }
     }
 
     pub fn save(&mut self, settings: &RenderingSettings) {
         self.status = match self.path.as_ref() {
-            Some(path) => match save_settings(path, settings) {
+            Some(path) => match save_settings(path, &self.persisted(settings)) {
                 Ok(()) => "Settings saved. IO-thread changes apply after restart.".into(),
                 Err(error) => format!("Could not save settings: {error}"),
             },
             None => "Saving is unavailable for this session.".into(),
         };
+    }
+
+    /// What the file should hold for these settings. A field owned by an explicit launch option
+    /// keeps the value the file held before the run, or the menu default when there was no valid
+    /// file, so a launch value is never written. The running settings are not changed, and the
+    /// launch value stays in effect until the next run.
+    fn persisted(&self, settings: &RenderingSettings) -> RenderingSettings {
+        let mut persisted = settings.clone();
+        persisted.take_launch_owned_values(&self.stored, &self.launch_overrides);
+        persisted
     }
 }
 
@@ -553,6 +563,8 @@ fn prepare_settings_at(
     let mut file = SettingsFile {
         path,
         status: "Changes apply now. Choose Save to keep them across runs.".into(),
+        stored: RenderingSettings::default(),
+        launch_overrides: config.settings_overrides.clone(),
     };
     if let Some(path) = &file.path {
         match std::fs::read(path) {
@@ -562,6 +574,7 @@ fn prepare_settings_at(
                     .and_then(|s| s.validate().map(|()| s));
                 match saved {
                     Ok(saved) => {
+                        file.stored = saved.clone();
                         settings = saved;
                         settings.retain_explicit_launch_values(config);
                     }
@@ -896,6 +909,100 @@ mod tests {
         assert!(file.status.contains("ignored"));
     }
 
+    /// Explicit launch values outside the menu's ranges stay in the running settings, while the file
+    /// keeps the values saved before the run. The persisted bytes validate, and an unrelated change
+    /// still saves.
+    #[test]
+    fn save_keeps_launch_owned_fields_out_of_the_file_and_the_running_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let saved = RenderingSettings {
+            stream_radius: 3,
+            unload_radius: 4,
+            commit_ms: 2.5,
+            ..RenderingSettings::default()
+        };
+        save_settings(&path, &saved).unwrap();
+        let launch_args = ["--stream-radius", "20", "--max-commit-ms", "250"].map(String::from);
+
+        let (mut active, mut file) =
+            prepare_settings_at(&mut launch(&launch_args), Some(path.clone()));
+        assert_eq!(
+            active.stream_radius, 20,
+            "the launch value is the running value"
+        );
+        assert_eq!(
+            active.commit_ms, 250.0,
+            "the launch budget is the running value"
+        );
+        active.hud = !active.hud;
+        let running = active.clone();
+
+        file.save(&active);
+        assert!(file.status.starts_with("Settings saved"), "{}", file.status);
+        assert_eq!(
+            active, running,
+            "saving leaves the running settings unchanged"
+        );
+        let written = serde_json::from_slice::<RenderingSettings>(&std::fs::read(&path).unwrap())
+            .expect("the persisted bytes parse");
+        written.validate().expect("the persisted bytes validate");
+        assert_eq!(
+            (
+                written.stream_radius,
+                written.unload_radius,
+                written.commit_ms
+            ),
+            (3, 4, 2.5),
+            "the file keeps the values saved before the run"
+        );
+        assert_eq!(written.hud, running.hud, "the unrelated change is saved");
+
+        let (reloaded, _) = prepare_settings_at(&mut EngineConfig::default(), Some(path.clone()));
+        assert_eq!(reloaded.hud, running.hud, "the unrelated change reloads");
+        assert_eq!((reloaded.stream_radius, reloaded.commit_ms), (3, 2.5));
+
+        let (overridden, _) = prepare_settings_at(&mut launch(&launch_args), Some(path));
+        assert_eq!(
+            (overridden.stream_radius, overridden.commit_ms),
+            (20, 250.0),
+            "the explicit launch values still win on reload"
+        );
+    }
+
+    /// Without a valid file, the saved baseline for launch-owned fields is the menu default, and the
+    /// bytes written still validate.
+    #[test]
+    fn save_without_a_file_writes_valid_defaults_for_launch_owned_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let launch_args = ["--stream-radius", "20", "--max-commit-ms", "250"].map(String::from);
+        let (mut active, mut file) =
+            prepare_settings_at(&mut launch(&launch_args), Some(path.clone()));
+        active.hud = !active.hud;
+
+        file.save(&active);
+        assert!(file.status.starts_with("Settings saved"), "{}", file.status);
+        let written = serde_json::from_slice::<RenderingSettings>(&std::fs::read(&path).unwrap())
+            .expect("the persisted bytes parse");
+        written.validate().expect("the persisted bytes validate");
+        let defaults = RenderingSettings::default();
+        assert_eq!(
+            (
+                written.stream_radius,
+                written.unload_radius,
+                written.commit_ms
+            ),
+            (
+                defaults.stream_radius,
+                defaults.unload_radius,
+                defaults.commit_ms
+            ),
+            "a launch value is never written when there was no saved baseline"
+        );
+        assert_eq!(written.hud, active.hud);
+    }
+
     #[test]
     fn rejected_save_keeps_previous_file_and_reports_error() {
         let directory = tempfile::tempdir().unwrap();
@@ -909,11 +1016,24 @@ mod tests {
         let mut file = SettingsFile {
             path: Some(path.clone()),
             status: String::new(),
+            stored: RenderingSettings::default(),
+            launch_overrides: Vec::new(),
         };
         file.save(&invalid);
         assert!(file.status.contains("Could not save"));
-        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        let wrong_version = RenderingSettings {
+            version: 2,
+            ..RenderingSettings::default()
+        };
+        file.save(&wrong_version);
+        assert!(
+            file.status.contains("unsupported settings version"),
+            "{}",
+            file.status
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[test]
