@@ -21,11 +21,17 @@ This captures DXVK's translated Vulkan commands and SPIR-V, rather than the
 native D3D11 command stream or original DXBC bytes.
 
 Campaign controls are recorded under
-`data/visual-comparisons/tonemap-gpu-20261015T230233Z`: native console readback of
-`fShadowDistance:Display` is `8000`, game hour is `12`, weather `81a` is current
-with transition fraction `1`, and the camera export is verified. These checks
-constrain the scene; they do not identify a shader, establish cross-renderer
-projection parity, or attribute settings to earlier screenshots.
+`data/visual-comparisons/tonemap-gpu-20261015T230233Z`: later native console
+readback of `fShadowDistance:Display` is `8000`, game hour is `12`, weather `81a`
+is current with transition fraction `1`, and the camera export is verified.
+The earlier campaign's Documents INI on disk recorded `fShadowDistance=23200`
+([earlier runtime state](runtime_state.md#capture-linkage-and-remaining-limits)).
+Neither observation establishes the shadow distance consumed by the captured
+frame, and the later console query does not prove an override mechanism. The
+native controlling input for the capture and the historical reference remains
+unresolved. These checks constrain the session; they do not identify a shader,
+establish cross-renderer projection parity, or attribute settings to earlier
+screenshots.
 
 Sources: [GE-Proton submodule](https://github.com/GloriousEggroll/proton-ge-custom/tree/GE-Proton11-5/dxvk),
 [DXVK compiler submodule](https://github.com/doitsujin/dxvk/tree/3a4c6fa3cb1548d56a90a38dd8f526b6c13e63fd/subprojects/dxbc-spirv),
@@ -109,9 +115,9 @@ it does not by itself establish Skyrim scene parity in Mudcrab.
 
 ## Captured camera projection: event 11359
 
-The [event receipt](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/events-01/receipt.json)
+The `event receipt` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/events-01/receipt.json`)
 exports the pixel-stage `cb12` descriptor from `ResourceId::464`, backing-buffer
-offset `2121728`, length `720`. The [raw buffer slice](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/events-01/event-11359-Pixel-constant_blocks-2.bin)
+offset `2121728`, length `720`. The `raw buffer slice` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/events-01/event-11359-Pixel-constant_blocks-2.bin`)
 has SHA256 `7b3c22ea6f541a2dffe1eb75b45ab224b8d1c54bc05a9629abf9a46fc7d69cf6`.
 Independent little-endian binary32 decoding gives:
 
@@ -142,7 +148,7 @@ has negative height for its coordinate flip; its magnitude is `1080`.
 | Frozen Mudcrab camera | `72.73435310118231` | `45.00000125223908` |
 | Native minus frozen Mudcrab | `7.265645323338262` | `5.534008934944254` |
 
-The frozen [Mudcrab camera file](../../data/visual-comparisons/brightness-plus20-20261014T162641Z/camera.json)
+The frozen `Mudcrab camera file` (private historical evidence outside Git: `data/visual-comparisons/brightness-plus20-20261014T162641Z/camera.json`)
 uses the same output dimensions and position, but a narrower FOV. Its implied
 projection scales are approximately `1.139493` times the native scales. This
 closes the horizontal/vertical convention for the native projection stored in

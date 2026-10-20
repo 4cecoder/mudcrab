@@ -3,7 +3,8 @@
 Follow-up: [captured GPU state](gpu_state.md) identifies the selected program,
 bound inputs, and a five-pixel arithmetic check for the later frame 59881.
 Statements below about unobserved GPU state describe this earlier CPU/capture
-campaign. The historical reference screenshot's effective inputs remain unknown.
+campaign. The historical reference screenshot's effective inputs remain unknown,
+including its native controlling shadow-distance input.
 
 Research date: 2026-10-15. The isolated Fiji session now supplies observed
 settings, resolved image-space fields, and CPU parameter tuples. Independent
@@ -81,9 +82,14 @@ rotation `[6.2308254, 1.5707964]` radians, FOV `80`, and roll `0`.
 Normalized pitch is approximately -3 degrees; yaw is approximately 90 degrees.
 This reproduces the previous Skyrim camera export. Skyrim-to-Mudcrab projection,
 sunlight, weather, fog and exposure calibration remains incomplete.
-The captured native Documents INI contains `fShadowDistance=23200`, while the
-frozen Mudcrab INI uses `8000`. Native consumption of that setting was not read
-back. These captures therefore do not establish matched shadow-distance inputs.
+The captured native Documents INI on disk contains `fShadowDistance=23200`,
+while the frozen Mudcrab INI uses `8000`. A later campaign's console readback
+reported `getini "fShadowDistance:Display"` as `8000` (see [the later captured
+GPU state](gpu_state.md#capture-identity-and-scene-controls)); it does not show
+that Skyrim consumed that value for these earlier captures. The native
+controlling input for the primary and repeat captures remains unresolved, as it
+does for the historical reference screenshot. The INI and later console values
+cannot establish matched shadow-distance inputs or an override mechanism.
 
 Two fresh 1920×1080 Gamescope captures were retained with Photo Mode UI and HUD
 visually hidden. Their SHA-256 values are:
@@ -151,7 +157,7 @@ finding. Normal Skyrim/FUS game files were not edited, and no game save was made
 
 ## Local receipts
 
-Evidence root: [tonemap-runtime-20261015T204321Z](../../data/visual-comparisons/tonemap-runtime-20261015T204321Z/).
+Evidence root: `tonemap-runtime-20261015T204321Z` (private historical evidence outside Git: `data/visual-comparisons/tonemap-runtime-20261015T204321Z`).
 Original PNGs, raw native reads, logs and deployed-helper backups remain outside
 Git. Important files under that root are:
 

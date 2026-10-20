@@ -65,11 +65,10 @@ primary shader receiver. The last helper dispatches primary virtual `+0x30`.
 For group 26/27, the original primary vtables resolve that method to
 `0x141564A80`, the generic geometry/constant setup described below.
 
-Private receipts: [query 02](</Users/taylor/Library/Application Support/MudcrabResearch/tonemap-binding-20261015/binding-query-02.json>),
-[query 03](</Users/taylor/Library/Application Support/MudcrabResearch/tonemap-binding-20261015/binding-query-03.json>),
-[query 04](</Users/taylor/Library/Application Support/MudcrabResearch/tonemap-binding-20261015/binding-query-04.json>),
-[query 05](</Users/taylor/Library/Application Support/MudcrabResearch/tonemap-binding-20261015/binding-query-05.json>).
-Prior registration evidence: [native object map](/Users/taylor/.t3/worktrees/mudcrab/t3-4d431c98/docs/research/skyrim-render-map/native-image-space-connections.json).
+Private historical receipts outside this repository: binding queries 02–05 under
+`MudcrabResearch/tonemap-binding-20261015/`. Prior registration evidence was
+recorded in `native-image-space-connections.json` in a separate historical
+worktree; that file is not present in this checkout.
 
 ## Serialized metadata supplies the missing offsets
 
@@ -92,9 +91,10 @@ helper `0x141010290` stores the selected pixel object at `0x1420CFF50`; generic
 setup subsequently reads that same global. Package record identity is already
 linked to native shader construction in the existing loader audit.
 
-Private verification preserves metadata hashes, full first-20 remap values,
-selector bytes, original primary-vtable pointers, and bytecode hashes:
-[binding verification](</Users/taylor/Library/Application Support/MudcrabResearch/tonemap-binding-20261015/binding-verification.json>).
+Private historical verification outside this repository preserves metadata
+hashes, full first-20 remap values, selector bytes, original primary-vtable
+pointers, and bytecode hashes. It is stored as
+`MudcrabResearch/tonemap-binding-20261015/binding-verification.json`.
 
 ## Upload and slot binding
 
@@ -122,8 +122,9 @@ The pinned D3D11 ABI identifies `+0x80` as `PSSetConstantBuffers`. That closes
 the connection to shader constant-buffer slot 2, rather than guessing that an
 object's channel number equals a GPU slot.
 
-API mapping source: [pinned D3D11 ABI](/Users/taylor/.t3/worktrees/mudcrab/t3-4d431c98/docs/research/skyrim-render-map/d3d11-abi.json).
-Shader consumers: [audited retail arithmetic](/Users/taylor/.t3/worktrees/mudcrab/t3-4d431c98/docs/research/skyrim-render-map/image-space-arithmetic.md).
+API mapping source: `d3d11-abi.json` in a separate historical worktree; it is
+not present in this checkout. Shader consumers are described by the audited
+retail arithmetic note in that worktree, also not present here.
 
 ## Adaptation producer scope
 
@@ -163,9 +164,18 @@ ordinary = read_u64(parameters + 2*8)
 fade = read_u64(parameters + 3*8)
 adaptation = read_u64(parameters + 8*8)
 
-require read_u64(parameter) == relocate(0x141B40A38)
-float4Count = read_u32(parameter + 0x48)
-float4Array = read_u64(parameter + 0x40)
+for (name, parameter, minimumCount) in [
+    ("ordinary", ordinary, 4),
+    ("fade", fade, 4),
+    ("adaptation", adaptation, 3),
+]:
+    require parameter != 0
+    require read_u64(parameter) == relocate(0x141B40A38)
+    float4Count = read_u32(parameter + 0x48)
+    require float4Count >= minimumCount
+    float4Array = read_u64(parameter + 0x40)
+    require float4Array != 0
+    retain name, float4Count, float4Array
 ```
 
 The factory's HDR-constructor call at `0x1414EF07A` and slot-30 store at

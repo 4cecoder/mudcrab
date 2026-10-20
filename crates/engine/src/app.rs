@@ -76,7 +76,11 @@ fn prepare_start_camera(config: &mut EngineConfig) -> Result<Option<InitialWorld
             && !config.benchmark_only
             && config.benchmark_frames.is_none()
             && config.benchmark_duration_secs.is_none()
+            && config.benchmark_jump.is_none()
             && config.auto_fly_speed == 0.0
+            && config.route.is_none()
+            && config.acceptance_screenshot.is_none()
+            && config.streaming_benchmark_route_speed.is_none()
             && !config.material_fixture
             && !config.terrain_water_fixture
             && !config.transform_bounds_fixture
@@ -2986,6 +2990,96 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("--matched-route"));
         assert!(message.contains("benchmark"));
+    }
+
+    #[test]
+    fn live_start_pose_rejects_modes_that_replace_its_world_location() {
+        let directory = tempfile::tempdir().unwrap();
+        let pose_file = directory.path().join("pose.json");
+        std::fs::write(
+            &pose_file,
+            r#"{"width":1920,"height":1080,"shots":[{"name":"inn","worldspace_id":60,"position":[21750,-44530,140],"yaw":90,"pitch":-3,"hfov":80}]}"#,
+        )
+        .unwrap();
+        let conflicting_modes = [
+            (
+                "camera route",
+                EngineConfig {
+                    route: Some("missing-route.json".into()),
+                    ..default()
+                },
+            ),
+            (
+                "acceptance screenshot",
+                EngineConfig {
+                    acceptance_screenshot: Some("acceptance.png".into()),
+                    ..default()
+                },
+            ),
+            (
+                "streaming route benchmark",
+                EngineConfig {
+                    streaming_benchmark_route_speed: Some(100.0),
+                    ..default()
+                },
+            ),
+            (
+                "benchmark jump",
+                EngineConfig {
+                    benchmark_jump: Some((12, -7)),
+                    ..default()
+                },
+            ),
+            (
+                "matched route",
+                EngineConfig {
+                    matched_route: Some("missing-route.json".into()),
+                    ..default()
+                },
+            ),
+        ];
+
+        for (mode, mut config) in conflicting_modes {
+            config.start_shot = Some(pose_file.clone());
+            config.worldspace_id = 60;
+            config.start_grid = (5, -11);
+            let original_worldspace = config.worldspace_id;
+            let original_grid = config.start_grid;
+
+            let Err(error) = prepare_start_camera(&mut config) else {
+                panic!("{mode} must be rejected before loading the camera pose");
+            };
+
+            assert!(
+                error.to_string().contains("another automated camera mode"),
+                "{mode} should fail at the mode guard, got: {error}"
+            );
+            assert_eq!(config.worldspace_id, original_worldspace, "{mode}");
+            assert_eq!(config.start_grid, original_grid, "{mode}");
+        }
+    }
+
+    #[test]
+    fn no_start_pose_leaves_existing_camera_modes_unchanged() {
+        let mut config = EngineConfig {
+            route: Some("route.json".into()),
+            acceptance_screenshot: Some("acceptance.png".into()),
+            streaming_benchmark_route_speed: Some(100.0),
+            benchmark_jump: Some((12, -7)),
+            ..default()
+        };
+
+        assert!(prepare_start_camera(&mut config).unwrap().is_none());
+        assert_eq!(
+            config.route.as_deref(),
+            Some(std::path::Path::new("route.json"))
+        );
+        assert_eq!(
+            config.acceptance_screenshot.as_deref(),
+            Some(std::path::Path::new("acceptance.png"))
+        );
+        assert_eq!(config.streaming_benchmark_route_speed, Some(100.0));
+        assert_eq!(config.benchmark_jump, Some((12, -7)));
     }
 
     /// A capture window remains hidden if an update system tries to show it.

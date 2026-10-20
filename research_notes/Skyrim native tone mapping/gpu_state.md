@@ -14,7 +14,7 @@ Original captures and exported GPU resources remain private evidence outside Git
 ## Capture identity and scene controls
 
 Evidence root:
-[tonemap-gpu-20261015T230233Z](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/).
+`tonemap-gpu-20261015T230233Z` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z`).
 RenderDoc 1.45 captured DXVK's Vulkan translation of the isolated Fiji session.
 The original `skyrim_frame59881.rdc` is **2,879,141,326 bytes**, about 2.88 GB,
 and remains on Fiji at:
@@ -25,7 +25,7 @@ and remains on Fiji at:
 
 Its SHA-256 is
 `96ad236ca05c52c4ef66ef0a54648576e7634ca84630bf5e1695773769f728c0`.
-The [probe receipt](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/sample-probes-02/receipt.json)
+The `probe receipt` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/sample-probes-02/receipt.json`)
 checks that hash before and after replay. The capture was not copied into the
 local worktree. Exported resources, original and instrumented shaders, logs, and
 images remain private evidence outside Git.
@@ -34,11 +34,15 @@ Nearby console observations read game hour `12`, current weather `81a` as `1.00`
 weather transition fraction `1.00`, and
 `getini "fShadowDistance:Display"` as `8000`. The raw console images and OCR are
 retained under `console/`, with the shadow query separately recorded in
-[shadow-readback.json](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/shadow-readback.json).
-These are session controls, not frame-synchronized reads of shader weather or
-sun inputs. They do not recover settings of the older Skyrim reference image.
+`shadow-readback.json` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/shadow-readback.json`).
+These later session observations do not establish what value Skyrim consumed
+for this frame: the earlier capture campaign's Documents INI on disk recorded
+`23200` (see [the earlier runtime state](runtime_state.md#capture-linkage-and-remaining-limits)).
+The controlling native input for that frame and the older reference screenshots
+remains unresolved; the console query does not prove an override mechanism.
+Weather and sun observations are also not frame-synchronized shader inputs.
 
-The [native camera export](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/native-camera-export.json)
+The `native camera export` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/native-camera-export.json`)
 has position `[21750, -44530, 140]`, rotation `[6.2308254, 1.5707964]` radians,
 FOV `80`, and roll `0`. The independently decoded camera block gives horizontal
 FOV `79.99999842452057` degrees and vertical FOV `50.534010187183334` degrees.
@@ -48,7 +52,7 @@ for matrix offsets, inverse checks, and the remaining scene-geometry binding
 limit. The frozen references were preserved.
 
 The comparison profile's temporary preference change was restored after capture.
-The [shutdown receipt](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/shutdown.json)
+The `shutdown receipt` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/shutdown.json`)
 records comparison game, Steam, and display services inactive, and the runtime
 launch override removed. Offline replay does not launch or attach to Skyrim.
 
@@ -63,7 +67,7 @@ This is source-name correlation to the audited retail shader, not an independent
 dump and hash of the original runtime DXBC. The [DXVK mapping note](dxvk_capture_mapping.md)
 documents that distinction and the translator revision.
 
-The [event receipt](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/events-01/receipt.json)
+The `event receipt` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/events-01/receipt.json`)
 and its SPIR-V disassembly name the original registers explicitly. Their
 descriptor decorations, rather than Vulkan binding numbers alone, connect the
 shader operands to these resources:
@@ -102,7 +106,7 @@ This does not select Reinhard for every Skyrim configuration or frame.
 The stored 2×2 adaptation texture has red/green pairs
 `(0.359375, 0.359375)`, `(0.375, 0.375)`,
 `(0.36328125, 0.36328125)`, and `(0.37109375, 0.37109375)`.
-The [storage analysis](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/adaptation-storage-analysis.json)
+The `storage analysis` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/adaptation-storage-analysis.json`)
 retains every packed word and its independently tested unsigned-float decoding.
 The GPU sampling probes then measured the following values, rather than
 substituting raw texels for filtered samples:
@@ -139,7 +143,7 @@ adaptation producer and its temporal history still require separate validation.
 
 RenderDoc's shader debugger rejected this module's `SPV_KHR_float_controls2`
 extension and associated capabilities. That failure is retained in
-[pixel-probes-01.json](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/pixel-probes-01.json).
+`pixel-probes-01.json` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/pixel-probes-01.json`).
 PixelHistory remained available.
 
 The sampling collector pins the original SPIR-V hash, DXVK source name, entry
@@ -158,7 +162,7 @@ UNORM target conversion and must not be substituted for sampled inputs.
 See RenderDoc's [float output attachment](https://github.com/baldurk/renderdoc/blob/v1.45/renderdoc/driver/vulkan/vk_pixelhistory.cpp#L3233)
 and [blend override](https://github.com/baldurk/renderdoc/blob/v1.45/renderdoc/driver/vulkan/vk_pixelhistory.cpp#L3711).
 
-The [probe receipt](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/sample-probes-02/receipt.json)
+The `probe receipt` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/sample-probes-02/receipt.json`)
 records all three replacement removals and resource frees as successful. Original
 shader outputs match before and after restoration, and the capture hash is
 unchanged. If replacement removal fails, the collector retains the possibly
@@ -170,7 +174,7 @@ optimization. The independent comparison is between CPU arithmetic using those
 measured inputs and PixelHistory's replay of the unmodified shader at the same
 pixels. Five successful pixels do not constitute a full-frame arithmetic proof.
 
-The [vertex evidence](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/tonemap-vertex-evidence.json)
+The `vertex evidence` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/tonemap-vertex-evidence.json`)
 also retains post-VS bytes and indices. The fullscreen quad has clip-space
 corners at ±1, clip `w=1`, UV corners 0–1, and a viewport with `y=1080` and
 height `-1080`. These establish affine pixel-center UVs for this draw; UVs were
@@ -185,7 +189,7 @@ complete pass graph or reconstruction of bloom and adaptation history.
 
 At presentation event 11430, all **2,073,600 pixels** have identical stored RGBA
 channel bytes between its `R8G8B8A8_UNORM` input and `B8G8R8A8_SRGB` output
-after accounting for channel order. The [byte comparison](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/presentation-byte-comparison.json)
+after accounting for channel order. The `byte comparison` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/presentation-byte-comparison.json`)
 records both storage hashes. This closes the stored-byte comparison for that
 draw only. It does not establish display color management, the earlier scene
 numeric domain, or the behavior of intervening post-processing.
@@ -194,7 +198,7 @@ Two Metal captures use the corrected horizontal FOV 80: the approved Tony/sRGB
 control and the record/Reinhard experiment. Both captured cameras report vertical
 FOV `50.53401176308017` degrees. Their camera, source, readiness,
 grading, backend, and reference checks are retained in
-[hfov80-validation.json](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/hfov80-validation.json).
+`hfov80-validation.json` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/hfov80-validation.json`).
 That bounded validation does not establish visual parity. The record/Reinhard
 experiment still uses Bevy scene inputs, its existing grading domain, fixed
 sample/target luminance, and the artistic pivot; it does not consume the new
@@ -260,7 +264,7 @@ python3 scripts/replay_skyrim_tonemap.py \
 ```
 
 The authoritative retained result is
-[native-arithmetic-replay-02.json](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/native-arithmetic-replay-02.json),
-using [sampled-native-inputs-02.json](../../data/visual-comparisons/tonemap-gpu-20261015T230233Z/sampled-native-inputs-02.json).
+`native-arithmetic-replay-02.json` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/native-arithmetic-replay-02.json`),
+using `sampled-native-inputs-02.json` (private historical evidence outside Git: `data/visual-comparisons/tonemap-gpu-20261015T230233Z/sampled-native-inputs-02.json`).
 The record keeps input/script hashes, individual component errors, the arithmetic
 policy, and the limits of the measurement.
