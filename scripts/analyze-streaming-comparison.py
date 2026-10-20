@@ -28,6 +28,7 @@ EMPTY_STREAMING = (
 EMPTY_ADMISSION = ("active_jobs", "queued_jobs", "orphan_active_jobs")
 # Identity a run must carry consistently in the manifest and its own run.json before pairing.
 PAIR_IDENTITY_KEYS = ("run_id", "pair_id", "scenario", "mode")
+ROUTE_SCENARIOS = ("normal", "stress", "ablation", "smoke-route")
 FAILURE_KEYS = (
     "failed_cells", "asset_load_failures", "material_validation_failures", "diagnostic_fallbacks",
     "terrain_validation_failures", "water_validation_failures", "transform_bounds_validation_failures",
@@ -457,8 +458,11 @@ def rss_metrics(document, run, warnings):
     if not number(interval) or interval <= 0:
         warnings.append("OS RSS sampling interval is invalid")
         return unavailable
+    # Memory metrics are only comparable over complete coverage. Gaps invalidate the memory
+    # metrics (not the timing run) and the samples stay recorded as evidence.
+    gaps = []
     if intervals and max(intervals) > interval * 1.5:
-        warnings.append("OS RSS sampling has gaps exceeding 1.5 times its requested interval")
+        gaps.append("internal sampling gap exceeds 1.5 times the requested interval")
     if clock != "monotonic":
         warnings.append("OS RSS uses wall-clock timestamps; monotonic timestamps unavailable")
     values = [s["rss_bytes"] for s in samples]
@@ -478,10 +482,13 @@ def rss_metrics(document, run, warnings):
     result["last_sample_before_exit_seconds"] = end - samples[-1][clock] if number(end) else None
     for name in ("first_sample_after_launch_seconds", "last_sample_before_exit_seconds"):
         if number(result[name]) and result[name] > interval * 1.5:
-            warnings.append(f"OS RSS coverage gap: {name}={result[name]:.3f}")
+            gaps.append(f"coverage gap: {name}={result[name]:.3f}")
     if result["pid_count"] != 1:
-        warnings.append("OS RSS sampled more than one PID; memory comparison unavailable")
+        gaps.append("more than one PID sampled")
+    if gaps:
+        warnings.append("OS RSS memory metrics unavailable: " + "; ".join(gaps))
         result["available"] = False
+        result["unavailable_reasons"] = gaps
     return result
 
 
@@ -572,6 +579,9 @@ def analyze_run(experiment, record):
         censored.append("process did not finish")
     if record.get("status") in ("pending", "running", "scheduled", "failed", "error"):
         errors.append(f"run status is {record['status']}")
+    if record.get("scenario") in ROUTE_SCENARIOS and route.get("phase") != "finished":
+        # Counters are still analysed below as evidence; the run cannot pass as a completed route.
+        errors.append(f"route did not finish before the engine deadline (phase {route.get('phase')!r})")
     # The manifest's pairing identity must match what the engine run recorded. run.json is the
     # launcher's own record, so a missing field there cannot be certified: it fails closed. The
     # profile metadata only carries run_id by contract, so the other fields are compared if present.

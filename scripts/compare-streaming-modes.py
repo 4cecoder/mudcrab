@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -105,6 +106,9 @@ MODES = {
                    "backlog": 256, "memory_mib": 16384},
 }
 EXPECTED = {"cells": 25, "models": 2029, "lod_chunks": 176, "terrain": 100, "water": 25}
+# The engine stops a route at this many real seconds, so its report and profile bundle are written
+# before the launch timeout kills the process. A hung process can still be killed before export.
+ENGINE_DEADLINE_GRACE_SECONDS = 30
 
 
 def schedule(repeats, ablation_repeats, seed, smoke):
@@ -139,6 +143,11 @@ def schedule(repeats, ablation_repeats, seed, smoke):
     return runs
 
 
+def engine_deadline(timeout):
+    """The engine's real-time deadline, kept below the launch timeout by the documented grace."""
+    return f"{timeout - ENGINE_DEADLINE_GRACE_SECONDS:g}"
+
+
 def command(args, run, directory):
     mode = MODES[run["mode"]]
     result = [str(args.engine), "--assets", str(args.assets), "--worldspace", "0x3c",
@@ -156,7 +165,7 @@ def command(args, run, directory):
               "--streaming-benchmark-expected-lod-chunks", str(EXPECTED["lod_chunks"]),
               "--streaming-benchmark-expected-terrain", str(EXPECTED["terrain"]),
               "--streaming-benchmark-expected-water", str(EXPECTED["water"]),
-              "--benchmark-vsync", "--benchmark-duration", "300",
+              "--benchmark-vsync", "--benchmark-duration", engine_deadline(args.timeout),
               "--benchmark-warmup-frames", "0", "--benchmark-output", str(directory / "report.json"),
               "--benchmark-frame-times", str(directory / "frames.csv"),
               "--profile-output", str(directory / "profile"),
@@ -288,8 +297,10 @@ def main():
         if value is not None:
             setattr(args, name, value.resolve())
     signal.signal(signal.SIGTERM, interrupt_campaign)
-    if args.repeats < 1 or args.ablation_repeats < 0 or args.timeout <= 0:
-        parser.error("repeats/timeout must be positive and ablation repeats nonnegative")
+    if args.repeats < 1 or args.ablation_repeats < 0:
+        parser.error("repeats must be positive and ablation repeats nonnegative")
+    if not math.isfinite(args.timeout) or args.timeout <= ENGINE_DEADLINE_GRACE_SECONDS + 1:
+        parser.error(f"timeout must be finite and more than {ENGINE_DEADLINE_GRACE_SECONDS + 1} seconds")
     if not args.resume:
         args.output.mkdir(parents=True, exist_ok=False)
     module_spec = importlib.util.spec_from_file_location(
@@ -339,7 +350,8 @@ def new_experiment(args, hashes):
                                "route_height": "initial terrain center +6000 units; fixed elevated -Z view",
                                "collision_physics": False, "screenshot_capture": False,
                                "gpu_inventory": False, "seed": args.seed, "smoke": args.smoke,
-                               "rss_interval_seconds": 1, "timeout_seconds": args.timeout},
+                               "rss_interval_seconds": 1, "timeout_seconds": args.timeout,
+                               "engine_deadline_seconds": float(engine_deadline(args.timeout))},
                   "host_initial": host_snapshot(args.thermal_probe), "runs": runs,
                   "status": "running"}
     protocol = Path(__file__).parents[1] / "docs/research/streaming-comparison-protocol.md"

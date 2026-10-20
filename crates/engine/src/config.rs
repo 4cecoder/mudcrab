@@ -303,7 +303,7 @@ Streaming:
 Benchmark and profiling:
   --benchmark-only                      run the synthetic benchmark; opens no world database
   --benchmark-frames <count>            stop after this many measured frames
-  --benchmark-duration <seconds>        stop after this many measured seconds
+  --benchmark-duration <seconds>        stop after this many measured seconds (a route run: real seconds since start)
   --benchmark-warmup-frames <count>     frames discarded before measuring (default: 60)
   --benchmark-vsync                     use the interactive app's vsync during benchmarks
   --streaming-benchmark-route-speed <units/s>  start a real-time route after CPU settlement; 0 is stationary
@@ -1025,6 +1025,15 @@ impl EngineConfig {
                 "a world camera route without screenshots, shots, synthetic mode or fixtures",
             ));
         }
+        // A route waits for CPU settlement with no other bound, so it needs the real-time deadline.
+        if config.streaming_benchmark_route_speed.is_some()
+            && config.benchmark_duration_secs.is_none()
+        {
+            return Err(ConfigError::MissingRequirement {
+                option: "--streaming-benchmark-route-speed",
+                requires: "--benchmark-duration",
+            });
+        }
         if let Some(speed) = config.streaming_benchmark_route_speed
             && (!(speed * config.streaming_benchmark_route_secs).is_finite()
                 || !(config.streaming_benchmark_route_secs + config.streaming_benchmark_tail_secs)
@@ -1517,6 +1526,8 @@ mod tests {
             "--streaming-benchmark-expected-water",
             "25",
             "--benchmark-vsync",
+            "--benchmark-duration",
+            "210",
         ]);
         assert_eq!(config.streaming_benchmark_route_speed, Some(0.0));
         assert_eq!(config.streaming_benchmark_route_secs, 45.0);
@@ -1528,6 +1539,25 @@ mod tests {
         assert!(config.benchmark_vsync);
         assert!(!config.interactive_world_physics());
         assert!(!config.streaming_controls_enabled());
+    }
+
+    #[test]
+    fn benchmark_route_requires_a_real_time_deadline() {
+        let error = parse_error(&["--streaming-benchmark-route-speed", "370"]);
+        assert!(matches!(
+            error,
+            ConfigError::MissingRequirement {
+                option: "--streaming-benchmark-route-speed",
+                requires: "--benchmark-duration",
+            }
+        ));
+        let config = run_config(&[
+            "--streaming-benchmark-route-speed",
+            "370",
+            "--benchmark-duration",
+            "210",
+        ]);
+        assert_eq!(config.benchmark_duration_secs, Some(210.0));
     }
 
     #[test]
@@ -1580,6 +1610,8 @@ mod tests {
                 "1e308",
             ],
         ] {
+            let mut args = args;
+            args.extend(["--benchmark-duration", "60"]);
             assert!(matches!(
                 parse_error(&args),
                 ConfigError::InvalidValue { .. }

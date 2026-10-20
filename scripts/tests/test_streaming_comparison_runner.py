@@ -138,7 +138,7 @@ runner.run_one(args, {{'cache_policy': 'test'}}, run, lambda: {{}})
 
     def test_expanded_flags_preserve_actual_static_and_matched_controls(self):
         args = SimpleNamespace(engine=Path("/tmp/engine"), assets=Path("/tmp/assets"),
-                               costs=Path("/tmp/costs.json"), commit="test")
+                               costs=Path("/tmp/costs.json"), commit="test", timeout=240)
         commands = {}
         for mode in RUNNER.MODES:
             run = {"mode": mode, "scenario": "normal", "run_id": mode,
@@ -157,6 +157,18 @@ runner.run_one(args, {{'cache_policy': 'test'}}, run, lambda: {{}})
         self.assertNotIn("--adaptive-streaming", commands["controlled64"])
         self.assertIn("--adaptive-streaming", commands["adaptive64"])
 
+
+    def test_engine_deadline_stays_below_the_launch_timeout(self):
+        for timeout in (90.5, 240, 300):
+            deadline = float(RUNNER.engine_deadline(timeout))
+            self.assertLess(deadline, timeout)
+            self.assertGreaterEqual(timeout - deadline, RUNNER.ENGINE_DEADLINE_GRACE_SECONDS)
+        args = SimpleNamespace(engine=Path("/tmp/engine"), assets=Path("/tmp/assets"),
+                               costs=Path("/tmp/costs.json"), commit="test", timeout=240)
+        run = {"mode": "adaptive128", "scenario": "normal", "run_id": "run",
+               "speed": 370, "route_secs": 45, "tail_secs": 10}
+        command = RUNNER.command(args, run, Path("/tmp/run"))
+        self.assertEqual(command[command.index("--benchmark-duration") + 1], "210")
 
 if __name__ == "__main__":
     unittest.main()

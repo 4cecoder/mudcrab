@@ -193,6 +193,41 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(result["comparisons"][0]["paired_count"], 0)
         self.assertEqual(result["comparisons"][0]["excluded_pair_ids"], ["01"])
 
+    def test_route_that_did_not_finish_is_invalid_but_keeps_its_counters(self):
+        record, _ = self.fixture()
+        self.mutate(record, "route.json", lambda r: r.update(phase="waiting"))
+        result = self.analyze(record)
+        self.assertFalse(result["valid"])
+        self.assertFalse(result["comparison_eligible"])
+        self.assertTrue(any("route did not finish" in error for error in result["errors"]), result["errors"])
+        self.assertIn("moving.frame_ms_p95", result["metrics"])
+
+    def test_truncated_rss_coverage_drops_only_memory_metrics(self):
+        record, _ = self.fixture()
+        self.mutate(record, "run.json", lambda r: r.update(end_monotonic=110.0))
+        result = self.analyze(record)
+        self.assertTrue(result["valid"], result["errors"])
+        self.assertTrue(result["comparison_eligible"])
+        self.assertFalse(result["os_rss"]["available"])
+        self.assertFalse(result["phase_os_rss"]["available"])
+        self.assertNotIn("rss.sampled_peak_bytes", result["metrics"])
+        self.assertIn("moving.frame_ms_p95", result["metrics"])
+
+    def test_internal_rss_gap_cannot_yield_a_paired_memory_comparison(self):
+        self.fixture()
+        treatment, _ = self.fixture("adaptive128")
+        self.mutate(treatment, "rss.json", lambda r: r.update(samples=[
+            {"utc_epoch": 999.01, "monotonic": 100.01, "pid": 99, "rss_bytes": 100},
+            {"utc_epoch": 1003.0, "monotonic": 104.0, "pid": 99, "rss_bytes": 500}]))
+        result = ANALYSIS.analyze_experiment(self.experiment, comparisons=[("fixed64", "adaptive128")], iterations=20)
+        comparison = result["comparisons"][0]
+        self.assertEqual(comparison["paired_count"], 1)
+        self.assertIn("moving.frame_ms_p95", comparison["metrics"])
+        self.assertFalse(any("rss" in name for name in comparison["metrics"]), sorted(comparison["metrics"]))
+        treated = next(r for r in result["runs"] if r["run_id"] == treatment["run_id"])
+        self.assertTrue(treated["comparison_eligible"])
+        self.assertFalse(treated["os_rss"]["available"])
+
     def test_wrong_pair_label_in_manifest_cannot_produce_a_paired_comparison(self):
         self.fixture()
         treatment, _ = self.fixture("adaptive128")

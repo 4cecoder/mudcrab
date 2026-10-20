@@ -37,7 +37,7 @@ Use the opt-in `--streaming-benchmark-route-speed` driver. It computes position 
 
 The normal speed matches the converted pack's forward-run value of 370 units/s in [the movement record map](../player-movement-record-map.md). This remains camera flight at an elevated view. It does not exercise the player, terrain collision, building collision or walking safety. The stress route measures rapid turnover, rather than normal play.
 
-Exit after the prescribed tail. The common external timeout is 240 seconds per launch. Keep failed, incomplete and timed-out runs with their logs and counters; unresolved demand at the deadline is a result, not permission to extend that arm's warmup.
+Exit after the prescribed tail. The common external timeout is 240 seconds per launch. The runner passes the engine a real-time deadline 30 seconds earlier (210 seconds), so a route that has not finished by then still writes its profile bundle and a report marked as failed, with its phase recorded as `waiting`, `moving` or `tail`. Only a route that reaches `finished` can pass acceptance. Keep failed, incomplete and timed-out runs with their logs and counters; unresolved demand at the deadline is a result, not permission to extend that arm's warmup.
 
 ## Measurements
 
@@ -77,3 +77,12 @@ Apply this rule before choosing a default:
 4. Confidence must support the benefit and the absence of a material regression. Show whether benefit intervals exclude no improvement and whether regression intervals remain within the 10% margin. Wide or contradictory intervals leave the choice inconclusive; they do not force a winner. The absolute cutoffs are project decision thresholds, not universal perceptual limits.
 
 When both configurations pass and the evidence is tied or inconclusive, keep the simpler static configuration. If static fails a safety or functional gate, that tie rule cannot qualify it; evaluate the controlled static alternative on its own evidence. Publish functional completion, pacing, measured memory and drawing/collision limits separately. A result from this Mac and quick build supports that scoped choice, not an unconditional performance claim for release builds or other machines.
+
+## Limitations
+
+- The CPU trace is a proxy. Spans and completion latencies measure instrumented engine work on the CPU; they do not measure GPU work, presentation or pixel coverage.
+- The reported build profile is imprecise: a `quick` binary is stamped by its profile name. The binary SHA-256 in the run receipt is the identity guard, and comparisons across builds must match it.
+- A hung process can still be killed by the runner before its report and profile bundle are written. The engine deadline is best effort: it finalises a live engine, not a frozen one, and an interrupted run is recorded as failed rather than resumed or rerun automatically.
+- Memory is OS-sampled RSS, a lower bound on peak use. Samples with coverage gaps invalidate only the memory metrics; the timing measurements of the same run remain usable.
+- Historical records are interpreted under their original deadline (the earlier 300-second engine duration, which did not bound route completion). Their conclusions are not revised by this change, and no new native campaign is implied by it.
+- Five primary pairs give coarse, uncertain intervals. The paired measures are not corrected for multiple comparisons.

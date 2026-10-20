@@ -409,10 +409,16 @@ fn collect_and_finish(
         let duration_reached = config
             .benchmark_duration_secs
             .is_some_and(|limit| samples.frame_ms.iter().sum::<f64>() / 1000.0 >= limit);
+        // A route is bounded by real elapsed time from engine start, so a route that never settles
+        // (or stops advancing) still reaches the bundle and report before the runner's own timeout.
+        let route_deadline_reached = config
+            .benchmark_duration_secs
+            .is_some_and(|limit| real_time.elapsed_secs_f64() >= limit);
         let complete = route
             .as_ref()
             .map_or(frame_limit_reached || duration_reached, |route| {
                 route.phase == crate::app::StreamingBenchmarkPhase::Finished
+                    || route_deadline_reached
             });
         if !complete {
             return;
@@ -494,7 +500,10 @@ fn collect_and_finish(
         && commit_budget_respected
         && streaming_lifecycle_validated
         && renderer_path_active
-        && screenshot_captured;
+        && screenshot_captured
+        && route
+            .as_ref()
+            .is_none_or(|route| route.phase == crate::app::StreamingBenchmarkPhase::Finished);
     let system_snapshot = system.map(|value| SystemSnapshot {
         os: value.os.clone(),
         kernel: value.kernel.clone(),
@@ -833,6 +842,51 @@ mod tests {
         assert_eq!(samples.frame_ms, vec![600.0]);
         assert_eq!(samples.measured_seconds, 0.6);
         assert!(app.world().resource::<Time>().delta_secs_f64() < 0.6);
+    }
+
+    /// A route whose CPU never settles still finalises at its real-time deadline: the profile
+    /// bundle and the report are written, and acceptance fails because the route did not finish.
+    #[test]
+    fn unsettled_route_writes_bundle_and_fails_at_its_real_time_deadline() {
+        use crate::{app::StreamingBenchmarkRoute, profiling::ProfilingPlugin};
+        use bevy::time::TimeUpdateStrategy;
+
+        let directory = tempfile::tempdir().unwrap();
+        let report_path = directory.path().join("report.json");
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(EngineConfig {
+                streaming_benchmark_route_speed: Some(370.0),
+                benchmark_duration_secs: Some(1.0),
+                benchmark_output: report_path.clone(),
+                profile_output_dir: Some(directory.path().join("profile")),
+                ..default()
+            })
+            .insert_resource(StreamingBenchmarkRoute::default())
+            .insert_resource(TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_millis(600),
+            ))
+            .init_resource::<DiagnosticsStore>()
+            .init_resource::<RendererMetrics>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<Image>>()
+            .add_plugins((AcceptanceMetricsPlugin, ProfilingPlugin));
+        // The deadline is 1 s of real time, so the second 600 ms update reaches it.
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(
+            directory.path().join("profile/metadata.json").is_file(),
+            "the profile bundle must be written at the deadline"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report_path).expect("report written")).unwrap();
+        assert_eq!(
+            report["passed"], false,
+            "an unfinished route cannot pass acceptance"
+        );
+        assert_eq!(report["streaming_benchmark_route"]["phase"], "waiting");
+        assert!(app.world().resource::<BenchmarkSamples>().finished);
     }
 
     #[test]
