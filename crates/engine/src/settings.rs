@@ -322,6 +322,7 @@ pub static SETTING_SPECS: &[SettingSpec] = &[
             "Khronos PBR neutral",
         ]
     ),
+    number!(Graphics, "Image", "Vertical field of view (degrees)", fov_degrees; 30.0, 110.0, 5.0),
     choice!("Color grading", "Grade mode", color_grade, &["Off", "Saturation", "Full", "Approved sRGB", "Snapshot linear", "Record sRGB"]),
     choice!("Color grading", "Sky and fog preset", visual_preset, &["Vivid", "Cool Gray"]),
     grade_number!("Grade saturation", grade_saturation, 0; 0.0, 3.0, 0.05).when(|s| s.color_grade != 0),
@@ -332,7 +333,6 @@ pub static SETTING_SPECS: &[SettingSpec] = &[
     grade_number!("Grade tint green", grade_tint_green, 5; 0.0, 1.0, 0.025).when(|s| s.color_grade >= 2),
     grade_number!("Grade tint blue", grade_tint_blue, 6; 0.0, 1.0, 0.025).when(|s| s.color_grade >= 2),
     grade_number!("Grade pivot", grade_pivot, 7; 0.01, 0.99, 0.01).when(|s| s.color_grade >= 2),
-    number!(Graphics, "Image", "Vertical field of view (degrees)", fov_degrees; 30.0, 110.0, 5.0),
     toggle!("Window", "VSync", vsync),
     choice!(
         "Window",
@@ -1235,7 +1235,7 @@ mod tests {
             .iter()
             .find(|spec| spec.label == "Grade brightness")
             .unwrap();
-        assert_eq!((spec.read)(&settings), 1.42);
+        assert_eq!((spec.read)(&settings), f64::from(grade.brightness));
         assert_eq!(spec.value_label(&settings), "1.42");
         assert!(!spec.is_modified(&settings));
         assert_eq!(settings.grade_override_mask, 0);
