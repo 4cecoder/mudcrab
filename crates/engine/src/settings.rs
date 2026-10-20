@@ -1552,7 +1552,7 @@ mod tests {
         active.hud = true;
         file.save(&active);
         let persisted =
-            serde_json::from_slice::<RenderingSettings>(&std::fs::read(path).unwrap()).unwrap();
+            serde_json::from_slice::<RenderingSettings>(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(persisted.color_grade, saved.color_grade);
         assert!(persisted.point_lights);
         assert!(persisted.hud);

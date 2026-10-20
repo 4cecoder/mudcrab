@@ -275,7 +275,7 @@ fn extract_capture_frames(
     let offset = shot_camera_translation([0.0; 3], origin.0);
     let absolute = transform.translation - offset;
     let pose = shared::coordinates::runtime_to_creation_vector(absolute.to_array());
-    for ticket in &tickets {
+    for ticket in tickets {
         if ticket.receipt().is_some() {
             continue;
         }
