@@ -822,6 +822,16 @@ mod tests {
     #[test]
     #[ignore = "requires an idle hardware GPU; run with --ignored --nocapture"]
     fn gpu_atlas_quality_preserves_mips_gutters_padding_and_reusable_slots() {
+        assert_gpu_atlas_quality(GpuUastc::new(crate::texture_gpu::DEFAULT_QUALITY, 1).unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires a software Vulkan adapter; CI runs explicitly"]
+    fn gpu_authored_atlas_software_vulkan_preserves_mips_gutters_padding_and_slots() {
+        assert_gpu_atlas_quality(GpuUastc::new_software_for_test().unwrap());
+    }
+
+    fn assert_gpu_atlas_quality(gpu: GpuUastc) {
         let mut inputs: Vec<_> = (0..3)
             .map(|index| {
                 let mut input = cell(Vec::new());
@@ -867,7 +877,6 @@ mod tests {
             TextureEncoding::ColorSrgb,
         )
         .unwrap();
-        let gpu = GpuUastc::new(crate::texture_gpu::DEFAULT_QUALITY, 1).unwrap();
         let encoded = TerrainAtlas::encode_batch(vec![bake()], Some(&gpu), 1).unwrap();
         assert!(encoded[0].gpu_used, "{:?}", encoded[0].fallback_reason);
         let gpu_bytes = &encoded[0].bytes;

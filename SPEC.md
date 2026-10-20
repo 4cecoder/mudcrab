@@ -227,12 +227,17 @@ V171: LOD chunk reuse ! current explicit compiler/producer identity, exact consu
 V172: LOD pipeline retains ≤ CPU worker count completed chunk payloads per batch; invalid content rolls back entire world & removes partial payloads; cancellation/input mutation/publication/DB errors remain fatal. SQLite transaction never crosses an await; intermediate batch progress best-effort, committed world totals reliable.
 V173: LAND selected by highest plugin priority, then native source position when available, then highest FormID as a deterministic fallback. Deleted candidates excluded. Both terrain projections share selection; unrelated cells & raw records still publish. LOD cell-cache snapshot read/validated once per stage; each winning diffuse source read once & each selected authored DDS mip decoded once per stage; tier images shared across worlds/FormIDs; source bytes reverified before publication.
 V174: Complete XESP ! little-endian parent FormID bytes 0–3 & flags byte 4; bytes 5–7 unused, excluded from typed/exported flags. Raw flags/unused bytes retained; normal load-order path remaps parent only & drops non-eight-byte XESP. Missing/truncated XESP → absent parent/flags.
+V175: New PipelineConfig/CLI terrain atlases default to GPU; explicit --lod-encoder cpu & omitted legacy serialized encoder retain CPU. Ordinary texture selection independent; --no-lod skips GPU initialization; verified all-hit terrain builds do not initialize encoder.
+V176: Terrain encoder version/quality participates in chunk & LOD build proof, not ordinary asset configuration. GPU-requested CPU fallback stays drawable but publishes no reusable chunk-input proof; next GPU-requested run retries; explicit CPU permits verified reuse. Fresh GPU, fallback & reused counters remain distinct.
+V177: GPU terrain atlases encode the supplied three authored/baked mip levels once each with border padding and CPU decode validation; failed GPU initialization/encode/validation uses the existing CPU route. Bounded CPU-worker chunk batches, per-world rollback & fatal publication/input/cancellation semantics retained.
+V178: Terrain performance converter commands validated by converter parse_command; Engine CLI drift scanner checks only lod-performance lines that name the engine, so no whole LOD script directory is exempt (main's line-scoped scanner).
 
 V210: CI ! dispatch software Vulkan UASTC encoder, decode synthetic color/alpha/normal/mip/partial-block cases with CPU comparison; absent adapter fails explicit run; production CPU-adapter rejection retained.
 V190: Record-aware remap ! exact faction SNAM length 8; rank/padding unchanged; WRLD RNAM coordinates & TNAM strings unchanged; consumed single links remap under relocated full/light slots.
 
 V200: Real-output timing validation ! propagate full selected-set failure; missing configuration, empty selection & semantics collection errors fail; diagnostics never certify passing subset.
 V201: Converter producer 28 ! KTX2 texture containers store mip level data smallest-first; uncompressed levels use exact lcm(texel block bytes, 4) alignment and supercompressed levels are contiguous (KTX 2.0 sections 3.7, 3.9.7). Producer-27 textures are never reused: a warm rerun regenerates them through normal conversion, and metadata rebuild accepts only current-schema sources, so pre-28 KTX2 is never relabeled. Producer-27 GLBs stay reusable only through the explicit (27, 28) pair and producer-27 scripts through the script gate; producers 24 and 26 never reach 28 meshes. Settings proofs keep their per-kind producer. World database stays 9; regression: fixture_texture_layout_migration.
+V182: Terrain blocking worker ! current-thread progress/cancellation responsive; caller drop cancels while normal output/repair or metadata source/destination leases remain owned until worker stops; full progress wait interruptible; per-world rollback & proofs unchanged.
 
 ## §T TASKS
 
@@ -281,11 +286,13 @@ T40|.|Deferred by owner 2026-10-03: PR105 final-head Fiji stationary/moving/reco
 T41|x|Separate test-job kache cache; action input verified against upstream action.yml; main CI log confirms shared-key save collision and 0/778 hits|V117
 T42|x|Strengthen quaternion/performance regressions & preserve both legacy schema gates|V118
 T70|x|Remove redundant atlas compression; fuse diffuse decode/tier resizing; share stage inputs; bounded transactional chunk batches; verified prior-package chunk reuse; correctness regressions & cold/warm Fiji measurements|V29,V72,V92,V93,V100,V103,V105,V114,V115,V170,V171,V172,V173
+T71|~|Isolate GPU-default terrain encoding from archive/cache integration; preserve legacy/CPU selection, authored mips & safe non-reusable fallback; focused converter/launcher/CLI checks & three native Metal correctness fixtures; quiet-host performance remains separate|V175,V176,V177,V178,V210
 
 T110|x|Exercise actual GPU batch/dispatch/readback with software Vulkan in CI|V210
 T90|x|Fix faction remap & reject aliased non-FormID fields; independent full/light field regressions|V190
 
 T100|x|Make validation timing fail on bad output; valid/broken generated artifact regression|V200
+T74|x|Move terrain compiler into owned blocking pool; retain leases on abort, cancel channel waits & verify current-thread regressions|V182
 
 ## §B BUGS
 
@@ -382,5 +389,6 @@ B210|2026-10-05|GPU tests validated shader/container without dispatching encoder
 B211|2026-10-05|New GPU fixture used constant chunks_exact under Rust1.98 strict Clippy|use as_chunks::<4>(); mechanical lint fix, V210 unchanged
 
 B212|2026-10-05|Package-only ignored GPU step changed feature unification & rebuilt after workspace tests; cold combined CI exceeded30min|V210,V118; same workspace/target selection for both test steps
+B213|2026-10-12|Synchronous world compilation prevented current-thread progress/Stop; detached worker could release publication locks before writes ceased|V182; owned leases, drop cancellation, interruptible progress & bounded transactional checks
 B190|2026-10-05|Four-byte global guard skipped NPC faction structures; WRLD RNAM/TNAM mistaken for links|V190
 B200|2026-10-05|Timing harness discarded invalid artifacts & asserted passing subset|V200

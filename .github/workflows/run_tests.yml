@@ -126,6 +126,9 @@ jobs:
       - name: Verify LOD acceptance summary checks
         run: python3 -m unittest discover -s scripts/tests -p test_lod_acceptance_summary.py -v
 
+      - name: Verify terrain LOD helper commands
+        run: python3 -m unittest discover -s scripts/lod-performance -p test_helpers.py -v
+
   native_profiling:
     needs: [orchestrate]
     if: needs.orchestrate.outputs.check_native_profiling == 'true'
@@ -262,7 +265,7 @@ jobs:
           NEXTEST_NO_TESTS: warn
 
       - name: Test GPU texture encoder on software Vulkan
-        run: cargo nextest run --locked --workspace --lib --bins --tests --examples --run-ignored only -E 'test(v210_software_gpu_encodes_and_decodes_color_alpha_normals_and_mips)'
+        run: cargo nextest run --locked --workspace --lib --bins --tests --examples --run-ignored only -E 'test(v210_software_gpu_encodes_and_decodes_color_alpha_normals_and_mips) | test(gpu_authored_atlas_software_vulkan_preserves_mips_gutters_padding_and_slots)'
         env:
           WGPU_BACKEND: vulkan
 

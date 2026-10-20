@@ -17,10 +17,10 @@ use crate::{
     lod::albedo::terrain_diffuse_paths,
     mesh::{MeshConverter, nif_source_hash, nif_unrepaired_source_hash, prune_glb_texture_bytes},
     pipeline::{
-        archive_load_order_priority, compile_lod_chunks, conversion_is_complete, discover,
-        installed_archive_owners, non_mo2_archive_is_active, overlay_loose_assets,
-        publish_new_directory, sort_archives_by_load_order, staging_path, validate_artifacts,
-        write_streaming_cost_catalog,
+        LodWorkerOwnership, archive_load_order_priority, compile_lod_chunks,
+        conversion_is_complete, discover, installed_archive_owners, non_mo2_archive_is_active,
+        overlay_loose_assets, publish_new_directory, sort_archives_by_load_order, staging_path,
+        validate_artifacts, write_streaming_cost_catalog,
     },
     records::addons::RuntimeSchemas,
 };
@@ -93,8 +93,9 @@ impl AssetPipeline {
         let source = fs::canonicalize(source_assets)?;
         config.data_dir = fs::canonicalize(&config.data_dir)?;
         config.output_dir = new_output_path(&config.output_dir, &source, &config.data_dir)?;
-        let _source_lock = AssetLock::acquire_shared(&source)?;
-        let output_lock = AssetLock::acquire_exclusive(&config.output_dir)?;
+        // Both leases stay with the rebuild until publication; the terrain worker holds clones.
+        let source_lock = Arc::new(AssetLock::acquire_shared(&source)?);
+        let output_lock = Arc::new(AssetLock::acquire_exclusive(&config.output_dir)?);
         let source_manifest = fs::read(source.join("conversion-manifest.json"))?;
         // Read the original version; normal cache loading deliberately invalidates
         // incompatible assets during migration, which this explicit route verifies instead.
@@ -186,6 +187,10 @@ impl AssetPipeline {
                 retained_schemas: &retained_schemas,
             },
             &progress_tx,
+            Arc::new(LodWorkerOwnership {
+                _runtime: vec![source_lock.clone(), output_lock.clone()],
+                _repair: None,
+            }),
         )
         .await;
         let mut report = match result {
@@ -407,6 +412,7 @@ async fn rebuild_into(
     matched: &(Vec<PathBuf>, Vec<String>),
     metadata: SourceMetadata<'_>,
     progress: &Sender<ProgressEvent>,
+    ownership: Arc<LodWorkerOwnership>,
 ) -> Result<PipelineReport> {
     let SourceMetadata {
         manifest_bytes: source_manifest,
@@ -620,6 +626,7 @@ async fn rebuild_into(
         plugin_hashes,
         progress,
         &mut report,
+        Some(ownership),
     )
     .await?;
     report.lod_elapsed_ms = lod_started.elapsed().as_millis();

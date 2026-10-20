@@ -162,6 +162,7 @@ pub(crate) fn conversion_is_complete(report: &PipelineReport) -> bool {
 #[derive(Clone, Default)]
 pub struct Cancellation {
     flag: Arc<AtomicBool>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl Cancellation {
@@ -171,10 +172,24 @@ impl Cancellation {
 
     pub fn cancel(&self) {
         self.flag.store(true, Ordering::Relaxed);
+        self.changed.notify_waiters();
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
+    }
+
+    /// Resolves once `cancel` has run, including a cancel that raced the first check.
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -311,24 +326,26 @@ impl AssetPipeline {
                 .ok_or_else(|| color_eyre::eyre::eyre!("output has no parent"))?,
         )
         .wrap_err("failed to create asset output parent")?;
-        let output_lock = AssetLock::acquire_exclusive(&config.output_dir).map_err(|error| {
-            let message = if error.is_held() {
-                format!(
-                    "asset output {} is in use; close its engine or inspector before conversion",
-                    config.output_dir.display()
-                )
-            } else {
-                format!(
-                    "failed to lock asset output {} before conversion",
-                    config.output_dir.display()
-                )
-            };
-            color_eyre::Report::from(error).wrap_err(message)
-        })?;
+        let output_lock = Arc::new(AssetLock::acquire_exclusive(&config.output_dir).map_err(
+            |error| {
+                let message = if error.is_held() {
+                    format!(
+                        "asset output {} is in use; close its engine or inspector before conversion",
+                        config.output_dir.display()
+                    )
+                } else {
+                    format!(
+                        "failed to lock asset output {} before conversion",
+                        config.output_dir.display()
+                    )
+                };
+                color_eyre::Report::from(error).wrap_err(message)
+            },
+        )?);
         // Hold the runtime lock before repair-journal recovery can write the pack,
         // and the distinct repair lock before directory recovery or publication.
         // Both guards remain alive through cache cleanup; publication reuses output_lock.
-        let ownership = crate::repair::OutputOwnership::acquire(&config.output_dir)?;
+        let ownership = Arc::new(crate::repair::OutputOwnership::acquire(&config.output_dir)?);
         config.output_dir = ownership.output().to_path_buf();
         recover_interrupted_publication(&config.output_dir)?;
         let started = Instant::now();
@@ -361,12 +378,19 @@ impl AssetPipeline {
         // folder is everything the run has done so far, and the caller reports the command that
         // resumes from it. Only a successful publish removes it, once the runtime pack is out.
         let setup_elapsed_ms = started.elapsed().as_millis();
+        // The terrain worker keeps the runtime and repair leases until it has stopped, even if
+        // this caller is dropped first; publication below still reuses the same guards.
+        let lod_ownership = Arc::new(LodWorkerOwnership {
+            _runtime: vec![output_lock.clone()],
+            _repair: Some(ownership.clone()),
+        });
         let run_result = Self::run_into(
             &config,
             &staging,
             &previous_manifest,
             &progress_tx,
             &cancellation,
+            lod_ownership,
         )
         .await;
         let mut report = match run_result {
@@ -463,6 +487,7 @@ impl AssetPipeline {
         previous: &ConversionManifest,
         progress_tx: &Sender<ProgressEvent>,
         cancellation: &Cancellation,
+        lod_ownership: Arc<LodWorkerOwnership>,
     ) -> Result<PipelineReport> {
         let mut report = PipelineReport::default();
         let initialization_started = Instant::now();
@@ -1409,6 +1434,7 @@ impl AssetPipeline {
             progress_tx,
             cancellation,
             &mut report,
+            Some(lod_ownership),
         )
         .await?;
         report.lod_elapsed_ms = lod_started.elapsed().as_millis();
@@ -3453,6 +3479,7 @@ fn persist_ingestion_cache(staging_cache: &Path, cache_root: &Path) -> Result<()
 /// compiled chunk's content hash, the configuration hash, and the converter
 /// schema (BUILD-01/02). It is written to `lod_build` and to the published
 /// manifest; the runtime refuses chunks whose manifest identity differs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn compile_lod_chunks(
     config: &PipelineConfig,
     staging: &Path,
@@ -3461,6 +3488,7 @@ pub(crate) async fn compile_lod_chunks(
     plugin_hashes: &[String],
     progress_tx: &Sender<ProgressEvent>,
     report: &mut PipelineReport,
+    ownership: Option<Arc<LodWorkerOwnership>>,
 ) -> Result<()> {
     compile_lod_chunks_with_cancel(
         config,
@@ -3471,12 +3499,113 @@ pub(crate) async fn compile_lod_chunks(
         progress_tx,
         &Cancellation::new(),
         report,
+        ownership,
     )
     .await
 }
 
+/// The blocking compiler retains its publication leases if its caller is dropped.
+pub(crate) struct LodWorkerOwnership {
+    pub(crate) _runtime: Vec<Arc<AssetLock>>,
+    pub(crate) _repair: Option<Arc<crate::repair::OutputOwnership>>,
+}
+
+struct CancelLodWorkerOnDrop(Option<Cancellation>);
+
+impl Drop for CancelLodWorkerOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.0 {
+            cancellation.cancel();
+        }
+    }
+}
+
+async fn run_owned_lod_worker<T: Send + 'static>(
+    cancellation: Cancellation,
+    ownership: Option<Arc<LodWorkerOwnership>>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let mut guard = CancelLodWorkerOnDrop(Some(cancellation));
+    let worker = spawn_blocking(move || {
+        let _ownership = ownership;
+        work()
+    });
+    let result = worker.await.wrap_err("terrain LOD worker failed");
+    guard.0 = None;
+    result
+}
+
+/// Runs terrain compilation on Tokio's blocking pool with owned inputs and report state, so a
+/// dropped caller cancels the worker without releasing its publication leases early.
 #[allow(clippy::too_many_arguments)]
 async fn compile_lod_chunks_with_cancel(
+    config: &PipelineConfig,
+    staging: &Path,
+    reuse_root: &Path,
+    plugins: &[PathBuf],
+    plugin_hashes: &[String],
+    progress_tx: &Sender<ProgressEvent>,
+    cancellation: &Cancellation,
+    report: &mut PipelineReport,
+    ownership: Option<Arc<LodWorkerOwnership>>,
+) -> Result<()> {
+    let config = config.clone();
+    let staging = staging.to_path_buf();
+    let reuse_root = reuse_root.to_path_buf();
+    let plugins = plugins.to_vec();
+    let plugin_hashes = plugin_hashes.to_vec();
+    let progress_tx = progress_tx.clone();
+    let worker_cancellation = cancellation.clone();
+    let mut worker_report = std::mem::take(report);
+    let runtime = tokio::runtime::Handle::current();
+    #[cfg(test)]
+    let fail_gpu_init = FAIL_LOD_GPU_INIT.with(std::cell::Cell::get);
+    #[cfg(test)]
+    let wait_ready = LOD_PROGRESS_WAIT_READY.with(|ready| ready.borrow_mut().take());
+    let (result, returned_report) =
+        run_owned_lod_worker(cancellation.clone(), ownership, move || {
+            #[cfg(test)]
+            let _gpu_override = LodGpuInitOverride::new(fail_gpu_init);
+            #[cfg(test)]
+            LOD_PROGRESS_WAIT_READY.with(|ready| *ready.borrow_mut() = wait_ready);
+            let result = runtime.block_on(async {
+                // Cancellation must also release a worker waiting for a full progress
+                // channel. Synchronous transactions poll the same flag between batches.
+                tokio::select! {
+                    biased;
+                    _ = worker_cancellation.cancelled() => Err(Interrupted::new().into()),
+                    result = compile_lod_chunks_inline(
+                        &config, &staging, &reuse_root, &plugins, &plugin_hashes,
+                        &progress_tx, &worker_cancellation, &mut worker_report,
+                    ) => result,
+                }
+            });
+            (result, worker_report)
+        })
+        .await?;
+    *report = returned_report;
+    result
+}
+
+#[cfg(test)]
+struct LodGpuInitOverride(bool);
+
+#[cfg(test)]
+impl LodGpuInitOverride {
+    fn new(value: bool) -> Self {
+        Self(FAIL_LOD_GPU_INIT.with(|flag| flag.replace(value)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for LodGpuInitOverride {
+    fn drop(&mut self) {
+        FAIL_LOD_GPU_INIT.with(|flag| flag.set(self.0));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compile_lod_chunks_inline(
     config: &PipelineConfig,
     staging: &Path,
     reuse_root: &Path,
@@ -3490,6 +3619,12 @@ async fn compile_lod_chunks_with_cancel(
         interrupt(cancellation)?;
         let message = "Terrain LOD compilation disabled by --no-lod";
         report.notices.push(message.to_owned());
+        #[cfg(test)]
+        LOD_PROGRESS_WAIT_READY.with(|ready| {
+            if let Some(ready) = ready.borrow_mut().take() {
+                let _ = ready.send(());
+            }
+        });
         let _ = progress_tx
             .send(ProgressEvent::notice(
                 ProgressStage::LodChunks,
@@ -3986,6 +4121,10 @@ async fn compile_lod_chunks_with_cancel(
 #[cfg(test)]
 thread_local! {
     static FAIL_LOD_GPU_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Fired once compilation has passed its early cancellation check and is about to wait on
+    /// the progress channel, so a test can cancel a compile that is genuinely blocked there.
+    static LOD_PROGRESS_WAIT_READY: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn create_lod_gpu(quality: u32, batch_mb: u64) -> Result<GpuUastc> {
@@ -4803,6 +4942,128 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn lod_worker_leaves_current_thread_free_and_retains_leases_after_abort() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("modern");
+        let ownership = Arc::new(LodWorkerOwnership {
+            _runtime: vec![Arc::new(AssetLock::acquire_exclusive(&output).unwrap())],
+            _repair: Some(Arc::new(
+                crate::repair::OutputOwnership::acquire(&output).unwrap(),
+            )),
+        });
+        let cancellation = Cancellation::new();
+        let observed = cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let worker_output = output.clone();
+        let task = tokio::spawn(run_owned_lod_worker(
+            cancellation,
+            Some(ownership),
+            move || {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                if !observed.is_cancelled() {
+                    fs::create_dir_all(&worker_output).unwrap();
+                    fs::write(worker_output.join("unexpected-write"), b"bad").unwrap();
+                }
+                finished_tx.send(()).unwrap();
+            },
+        ));
+        // The worker waits synchronously. A current-thread runtime must still
+        // deliver this signal and run the abort rather than block in compilation.
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(AssetLock::acquire_shared(&output).is_err());
+        assert!(crate::repair::OutputOwnership::acquire(&output).is_err());
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if AssetLock::acquire_exclusive(&output).is_ok()
+                    && crate::repair::OutputOwnership::acquire(&output).is_ok()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !output.exists(),
+            "aborted worker must observe cancellation before writing"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lod_worker_cancellation_releases_a_full_progress_channel() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = PipelineConfig {
+            no_lod: true,
+            ..cpu_lod_config(temp.path(), temp.path().join("out"))
+        };
+        // The receiver stays alive and undrained, so the next send can only complete by
+        // cancellation.
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(ProgressEvent::notice(
+            ProgressStage::LodChunks,
+            None,
+            "full",
+        ))
+        .await
+        .unwrap();
+        let probe = tx.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let cancellation = Cancellation::new();
+        let trigger = cancellation.clone();
+        let task = tokio::spawn(async move {
+            // Same-thread hand-off: the current-thread runtime runs this task and the compiler here.
+            LOD_PROGRESS_WAIT_READY.with(|ready| *ready.borrow_mut() = Some(ready_tx));
+            compile_lod_chunks_with_cancel(
+                &config,
+                temp.path(),
+                temp.path(),
+                &[],
+                &[],
+                &tx,
+                &cancellation,
+                &mut PipelineReport::default(),
+                None,
+            )
+            .await
+        });
+        // Cancel only once compilation has passed its early check and is waiting on the full channel.
+        tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await
+            .expect("compiler never reached the progress wait")
+            .unwrap();
+        assert!(
+            probe
+                .try_send(ProgressEvent::notice(
+                    ProgressStage::LodChunks,
+                    None,
+                    "probe"
+                ))
+                .is_err(),
+            "the progress channel must still be full while compilation waits"
+        );
+        trigger.cancel();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("cancellation did not release the blocked progress send")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.downcast_ref::<Interrupted>().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn no_lod_skips_initialization_with_the_default_gpu_encoder() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path().join("staging");
@@ -4815,8 +5076,17 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let mut report = PipelineReport::default();
         FAIL_LOD_GPU_INIT.with(|fail| fail.set(true));
-        let result =
-            compile_lod_chunks(&config, &staging, &staging, &[], &[], &tx, &mut report).await;
+        let result = compile_lod_chunks(
+            &config,
+            &staging,
+            &staging,
+            &[],
+            &[],
+            &tx,
+            &mut report,
+            None,
+        )
+        .await;
         FAIL_LOD_GPU_INIT.with(|fail| fail.set(false));
         result.unwrap();
         assert_eq!(report.lod_chunks, 0);
@@ -5597,6 +5867,7 @@ mod tests {
             &hashes,
             &tx,
             &mut report,
+            None,
         )
         .await
         .unwrap();
@@ -5648,6 +5919,7 @@ mod tests {
             &hashes,
             &tx,
             &mut mixed,
+            None,
         )
         .await
         .unwrap();
@@ -5753,6 +6025,7 @@ mod tests {
             &hashes,
             &tx,
             &mut report,
+            None,
         )
         .await
         .unwrap();
