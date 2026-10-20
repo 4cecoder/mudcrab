@@ -1667,81 +1667,81 @@ mod tests {
         "--output-dir", // analyze-streaming-comparison.py
         "--bootstrap-samples", // analyze-streaming-comparison.py
         "--comparison", // analyze-streaming-comparison.py
-        "--output",              // world inspection, profiling, startup runner
-        "--pairs-output",        // correlate_drawables.py
-        "--native-preset",       // prepare_skyrim_comparison.py
-        "--calibration",         // prepare_skyrim_comparison.py
-        "--timeout",             // run_skyrim_comparison.py
-        "--user",                // systemctl
-        "--property",            // systemctl
-        "--value",               // systemctl
-        "--onlyvisible",         // xdotool
-        "--name",                // xdotool
-        "--sync",                // xdotool
-        "--psm",                 // tesseract
-        "--radius",              // world-inspect
-        "--library-path",        // ld-linux
-        "--meshes",              // audit-collision.py
-        "--min-x",               // audit-collision.py
-        "--max-x",               // audit-collision.py
-        "--min-y",               // audit-collision.py
-        "--max-y",               // audit-collision.py
-        "--out",                 // audit-collision.py
-        "--expect-solid",        // audit-collision.py
-        "--expect-passable",     // audit-collision.py
-        "--original",            // audit_asset_sizes.py
-        "--json",                // audit_asset_sizes.py
+        "--output", // world inspection, profiling, startup runner
+        "--pairs-output", // correlate_drawables.py
+        "--native-preset", // prepare_skyrim_comparison.py
+        "--calibration", // prepare_skyrim_comparison.py
+        "--timeout", // run_skyrim_comparison.py
+        "--user",   // systemctl
+        "--property", // systemctl
+        "--value",  // systemctl
+        "--onlyvisible", // xdotool
+        "--name",   // xdotool
+        "--sync",   // xdotool
+        "--psm",    // tesseract
+        "--radius", // world-inspect
+        "--library-path", // ld-linux
+        "--meshes", // audit-collision.py
+        "--min-x",  // audit-collision.py
+        "--max-x",  // audit-collision.py
+        "--min-y",  // audit-collision.py
+        "--max-y",  // audit-collision.py
+        "--out",    // audit-collision.py
+        "--expect-solid", // audit-collision.py
+        "--expect-passable", // audit-collision.py
+        "--original", // audit_asset_sizes.py
+        "--json",   // audit_asset_sizes.py
         "--candidate-inventory", // audit-riverwood-reuse.py
         "--reference-inventory", // audit-riverwood-reuse.py
-        "--manifest",            // audit-riverwood-reuse.py
-        "--include",             // audit-z-fighting.py
-        "--materials-only",      // audit-z-fighting.py
-        "--no-placements",       // audit-z-fighting.py
-        "--plane-tolerance",     // audit-z-fighting.py
-        "--min-overlap-area",    // audit-z-fighting.py
-        "--max-triangles",       // audit-z-fighting.py
-        "--max-comparisons",     // audit-z-fighting.py
-        "--max-examples",        // audit-z-fighting.py
-        "--progress",            // audit-z-fighting.py
-        "--jobs",                // audit-z-fighting.py
-        "--locked",              // cargo run
-        "--manifest-path",       // cargo run
-        "--cpu-jobs",            // converter
-        "--io-jobs",             // converter
-        "--binary",              // git diff
-        "--porcelain",           // git status
-        "--engine",              // repeat-terrain-startup.py
-        "--repeats",             // repeat-terrain-startup.py
-        "--upload-budgets",      // repeat-terrain-startup.py
-        "--warmup",              // repeat-terrain-startup.py
-        "--duration",            // repeat-terrain-startup.py
-        "--timeout",             // repeat-terrain-startup.py
-        "--launch-prefix",       // repeat-terrain-startup.py
-        "--commit",              // repeat-terrain-startup.py
-        "--config",              // capture_tonemap_tuning.py
-        "--validate-only",       // capture_tonemap_tuning.py
-        "--clearmodifiers",      // xdotool
-        "--delay",               // xdotool
-        "--console-open",        // capture_skyrim_tonemap_state.py
-        "--event",               // inspect_skyrim_gpu_capture.py, sample_skyrim_tonemap_gpu.py
-        "--max-actions",         // inspect_skyrim_gpu_capture.py
-        "--max-resource-mib",    // inspect_skyrim_gpu_capture.py
-        "--max-resources",       // inspect_skyrim_gpu_capture.py
-        "--max-total-mib",       // inspect_skyrim_gpu_capture.py
-        "--previews",            // inspect_skyrim_gpu_capture.py
-        "--tail",                // inspect_skyrim_gpu_capture.py
-        "--exe",                 // inspect_skyrim_tonemap_memory.py
-        "--pid",                 // inspect_skyrim_tonemap_memory.py
-        "--atol",                // replay_skyrim_tonemap.py
-        "--dot-mode",            // replay_skyrim_tonemap.py
-        "--input",               // replay_skyrim_tonemap.py
-        "--mad-mode",            // replay_skyrim_tonemap.py
-        "--rtol",                // replay_skyrim_tonemap.py
-        "--capture-sha256",      // sample_skyrim_tonemap_gpu.py
-        "--output-id",           // sample_skyrim_tonemap_gpu.py
-        "--pixel",               // sample_skyrim_tonemap_gpu.py
-        "--shader-id",           // sample_skyrim_tonemap_gpu.py
-        "--source-shader",       // sample_skyrim_tonemap_gpu.py
+        "--manifest", // audit-riverwood-reuse.py
+        "--include", // audit-z-fighting.py
+        "--materials-only", // audit-z-fighting.py
+        "--no-placements", // audit-z-fighting.py
+        "--plane-tolerance", // audit-z-fighting.py
+        "--min-overlap-area", // audit-z-fighting.py
+        "--max-triangles", // audit-z-fighting.py
+        "--max-comparisons", // audit-z-fighting.py
+        "--max-examples", // audit-z-fighting.py
+        "--progress", // audit-z-fighting.py
+        "--jobs",   // audit-z-fighting.py
+        "--locked", // cargo run
+        "--manifest-path", // cargo run
+        "--cpu-jobs", // converter
+        "--io-jobs", // converter
+        "--binary", // git diff
+        "--porcelain", // git status
+        "--engine", // repeat-terrain-startup.py
+        "--repeats", // repeat-terrain-startup.py
+        "--upload-budgets", // repeat-terrain-startup.py
+        "--warmup", // repeat-terrain-startup.py
+        "--duration", // repeat-terrain-startup.py
+        "--timeout", // repeat-terrain-startup.py
+        "--launch-prefix", // repeat-terrain-startup.py
+        "--commit", // repeat-terrain-startup.py
+        "--config", // capture_tonemap_tuning.py
+        "--validate-only", // capture_tonemap_tuning.py
+        "--clearmodifiers", // xdotool
+        "--delay",  // xdotool
+        "--console-open", // capture_skyrim_tonemap_state.py
+        "--event",  // inspect_skyrim_gpu_capture.py, sample_skyrim_tonemap_gpu.py
+        "--max-actions", // inspect_skyrim_gpu_capture.py
+        "--max-resource-mib", // inspect_skyrim_gpu_capture.py
+        "--max-resources", // inspect_skyrim_gpu_capture.py
+        "--max-total-mib", // inspect_skyrim_gpu_capture.py
+        "--previews", // inspect_skyrim_gpu_capture.py
+        "--tail",   // inspect_skyrim_gpu_capture.py
+        "--exe",    // inspect_skyrim_tonemap_memory.py
+        "--pid",    // inspect_skyrim_tonemap_memory.py
+        "--atol",   // replay_skyrim_tonemap.py
+        "--dot-mode", // replay_skyrim_tonemap.py
+        "--input",  // replay_skyrim_tonemap.py
+        "--mad-mode", // replay_skyrim_tonemap.py
+        "--rtol",   // replay_skyrim_tonemap.py
+        "--capture-sha256", // sample_skyrim_tonemap_gpu.py
+        "--output-id", // sample_skyrim_tonemap_gpu.py
+        "--pixel",  // sample_skyrim_tonemap_gpu.py
+        "--shader-id", // sample_skyrim_tonemap_gpu.py
+        "--source-shader", // sample_skyrim_tonemap_gpu.py
     ];
 
     fn run_config(arguments: &[&str]) -> EngineConfig {

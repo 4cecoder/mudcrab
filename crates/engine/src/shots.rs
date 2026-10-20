@@ -1769,7 +1769,7 @@ mod tests {
         let mut world = bevy::ecs::world::World::new();
         {
             let mut commands = world.commands();
-            request_capture(&mut commands, &mut run, 7);
+            request_capture(&mut commands, &mut run, 7, &Handle::<Image>::default());
         }
         world.flush();
         let mut query = world.query::<&crate::capture_frame::CaptureTicket>();

@@ -136,6 +136,11 @@ impl CaptureTicket {
     pub(crate) fn receipt(&self) -> Option<CaptureFrame> {
         self.receipt.lock().unwrap().clone()
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_receipt(&self, frame: CaptureFrame) {
+        *self.receipt.lock().unwrap() = Some(frame);
+    }
 }
 
 pub(crate) struct CaptureFramePlugin;
@@ -488,6 +493,8 @@ mod tests {
             captured_work(&ticket, &pending_lod, &renderer, &profiler, &uploads, true);
         observed(&mut pending);
         assert!(!pending.is_quiet(), "{}", pending.describe());
+    }
+
     #[test]
     fn source_must_match_extracted_camera_before_it_can_label_a_capture() {
         let source = SceneGradeSource::default();

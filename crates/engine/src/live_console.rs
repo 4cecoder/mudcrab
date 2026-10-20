@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn live_receipt_uses_captured_grading_after_request_state_changes() {
         let ticket = crate::capture_frame::CaptureTicket::default();
-        *ticket.0.lock().unwrap() = Some(captured_frame());
+        ticket.set_receipt(captured_frame());
         // The console can select another grade/source while GPU readback is pending.
         let requested_state = serde_json::json!({
             "ready": true,
