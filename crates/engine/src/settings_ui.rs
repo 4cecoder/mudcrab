@@ -1341,6 +1341,54 @@ mod tests {
         assert!(!app.world().resource::<Time<Virtual>>().is_paused());
     }
 
+    /// A saved vsync and window size reach the window on the first frame. The run fingerprint must
+    /// describe that window, not the one the renderer created before the settings were applied.
+    #[test]
+    fn run_fingerprint_records_the_window_the_first_frame_applies() {
+        use bevy::window::{PresentMode, PrimaryWindow, Window};
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::input::InputPlugin, ConsolePlugin))
+            .insert_resource(EngineConfig::default())
+            .insert_resource(RenderingSettings {
+                vsync: false,
+                window_size: 2,
+                ..RenderingSettings::default()
+            })
+            .add_plugins(SettingsPlugin)
+            .add_plugins(crate::fingerprint::RunFingerprintPlugin);
+        app.world_mut().spawn((
+            PrimaryWindow,
+            Window {
+                present_mode: PresentMode::AutoVsync,
+                resolution: (1280, 720).into(),
+                ..Window::default()
+            },
+        ));
+        app.finish();
+        app.update();
+
+        let world = app.world_mut();
+        let window = world
+            .query_filtered::<&Window, With<PrimaryWindow>>()
+            .single(world)
+            .unwrap();
+        let fingerprint = world.resource::<crate::fingerprint::RunFingerprint>();
+        assert_eq!(
+            fingerprint.graphics.present_mode.as_deref(),
+            Some(format!("{:?}", window.present_mode).as_str()),
+            "the fingerprint records the vsync the first frame applied"
+        );
+        assert_eq!(
+            fingerprint.resolution,
+            Some([
+                window.resolution.physical_width(),
+                window.resolution.physical_height(),
+            ]),
+            "the fingerprint records the window size the first frame applied"
+        );
+    }
+
     #[test]
     fn opening_menu_mid_jump_keeps_the_airborne_state_for_resume() {
         let mut app = menu_app();
