@@ -1,4 +1,5 @@
 use crate::{
+    color_pipeline::{SceneGradeSource, SkyrimCinematicPostPlugin},
     config::{EngineConfig, MAX_IO_THREADS},
     console::{ConsolePlugin, console_closed},
     metrics::AcceptanceMetricsPlugin,
@@ -11,12 +12,13 @@ use crate::{
     },
     renderer_init::RendererInitPlugin,
     route::{RouteGround, RoutePlan, RouteRunner, drive_route},
-    shots::{ShotsFile, ShotsPlugin, ShotsRun, default_output_dir},
+    shots::{ShotOutputImage, ShotsFile, ShotsPlugin, ShotsRun, default_output_dir},
     sky::{FogCamera, SkyCamera, SkyPlugin},
     streaming::{
         AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, StreamingWorld,
         build_terrain_quadrant_mesh, streaming_center, validate_standard_material,
     },
+    tone_mapping::SceneToneMapSource,
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
@@ -58,6 +60,53 @@ use std::{
 struct InitialCameraGroundHeight(f32);
 
 #[derive(Resource)]
+struct InitialWorldCameraPose {
+    shot: crate::shots::Shot,
+    aspect: f32,
+    resolution: bevy::window::WindowResolution,
+}
+
+fn prepare_start_camera(config: &mut EngineConfig) -> Result<Option<InitialWorldCameraPose>> {
+    let Some(path) = &config.start_shot else {
+        return Ok(None);
+    };
+    color_eyre::eyre::ensure!(
+        config.shots.is_none()
+            && config.matched_route.is_none()
+            && !config.benchmark_only
+            && config.benchmark_frames.is_none()
+            && config.benchmark_duration_secs.is_none()
+            && config.benchmark_jump.is_none()
+            && config.auto_fly_speed == 0.0
+            && config.route.is_none()
+            && config.acceptance_screenshot.is_none()
+            && config.streaming_benchmark_route_speed.is_none()
+            && !config.material_fixture
+            && !config.terrain_water_fixture
+            && !config.transform_bounds_fixture
+            && !config.renderer_fixture
+            && !config.streaming_fixture
+            && !config.physics_fixture,
+        "--start-shot requires a live world run without another automated camera mode"
+    );
+    let file = ShotsFile::load(path)?;
+    color_eyre::eyre::ensure!(
+        file.shots.len() == 1 && file.shots[0].is_exterior(),
+        "--start-shot requires exactly one exterior camera pose"
+    );
+    let (worldspace, grid) = file.start().expect("validated exterior camera pose");
+    config.start_grid = grid;
+    if let Some(worldspace) = worldspace {
+        config.worldspace_id = worldspace;
+    }
+    Ok(Some(InitialWorldCameraPose {
+        shot: file.shots[0].clone(),
+        aspect: file.aspect(),
+        resolution: file.window_resolution(),
+    }))
+}
+
+#[derive(Resource)]
 struct AssetDirectoryReadLock {
     _guard: shared::asset_lock::AssetLock,
 }
@@ -67,6 +116,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let preferences = config
         .interactive_world_physics()
         .then(|| crate::settings::prepare_settings(&mut config));
+    config.image_space_selection()?;
+    let start_camera = prepare_start_camera(&mut config)?;
     let shots = prepare_shots(&mut config)?;
     let shots_active = shots.is_some();
     let route = prepare_route(&mut config)?;
@@ -153,6 +204,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let terrain_merge = runtime_data
         .is_some()
         .then(|| crate::terrain_merge::TerrainMerge::open(&config.assets_dir));
+    let grade_source =
+        SceneGradeSource::load(&config, runtime_data.is_some() && !config.streaming_fixture)?;
+    let tone_map_source = SceneToneMapSource::load(&config, &grade_source)?;
+    let sky_palette = grade_source.sky_palette(config.visual_preset);
     let movement_tuning = (interactive_world_physics
         && runtime_data.is_some()
         && !config.streaming_fixture)
@@ -165,11 +220,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let window = (!config.headless || shots_active || config.hidden_window).then(|| Window {
         title: config.window_title(),
         visible: !config.hidden_window,
-        // A shots file's frame is the size its reference screenshots were taken at, so the window,
-        // and every PNG taken of it, is exactly that many pixels.
+        // Start the window at the reference size; shots use an independent exact-size image target.
         resolution: match &shots {
             Some(run) => run.file.window_resolution(),
-            None => (1600, 900).into(),
+            None => start_camera
+                .as_ref()
+                .map_or_else(|| (1600, 900).into(), |pose| pose.resolution.clone()),
         },
         // Visible timing and shots runs open in the middle of the primary screen.
         position: if benchmark_active || shots_active {
@@ -189,6 +245,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     if let Some((settings, file)) = preferences {
         app.insert_resource(settings).insert_resource(file);
     }
+    if let Some(pose) = start_camera {
+        app.insert_resource(pose);
+    }
+    if config.stdin_console {
+        app.add_plugins(crate::live_console::StdinConsolePlugin);
+    }
     if let Some(tuning) = movement_tuning {
         app.insert_resource(tuning);
     }
@@ -207,7 +269,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // The run fingerprint is measurement data: an ordinary play session neither builds one nor
     // pays for the startup system that reads it.
     let records_measurements = crate::fingerprint::records_measurements(&config);
-    app.insert_resource(config)
+    app.insert_resource(config.color_grade)
+        .insert_resource(config.visual_preset)
+        .insert_resource(sky_palette)
+        .insert_resource(grade_source)
+        .insert_resource(tone_map_source)
+        .insert_resource(config)
         .insert_resource(origin)
         .insert_resource(render_asset_budget)
         .init_resource::<StreamingMetrics>()
@@ -236,7 +303,6 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             },
             AcceptanceMetricsPlugin,
             ProfilingPlugin,
-            RenderDiagnosticsPlugin,
         ))
         .add_plugins((
             VercidiumRendererPlugin,
@@ -245,6 +311,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
             crate::mesh_residency_audit::MeshResidencyAuditPlugin,
             SkyPlugin,
+            SkyrimCinematicPostPlugin,
             ConsolePlugin,
             crate::bug_report::BugReportPlugin,
             crate::nif_material::NifMaterialPlugin,
@@ -337,6 +404,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         app.add_systems(Startup, setup_world);
         app.add_systems(Startup, setup_synthetic_benchmark);
+    }
+    if !app.world().resource::<EngineConfig>().no_render_diagnostics {
+        app.add_plugins(RenderDiagnosticsPlugin);
+    }
+    if app.world().resource::<EngineConfig>().stdin_console && !shots_active {
+        app.add_plugins(crate::capture_frame::CaptureFramePlugin);
     }
     if let Some(run) = shots {
         info!(
@@ -478,6 +551,7 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         .unwrap_or_else(|| default_output_dir(&path));
     let mut run = ShotsRun::new(file, output_dir, config.worldspace_id);
     run.route_checkpoints = checkpoints;
+    run.settle_timeout_seconds = config.shots_settle_timeout;
     Ok(Some(run))
 }
 
@@ -2040,16 +2114,18 @@ const SUN_SHADOW_MAX_GRID_CELLS: i32 = 256;
 /// no shadow is drawn, which is the same 10 cm Bevy's default works at. The overlap between
 /// cascades is left at the builder's default; only the distances are fitted to this world.
 ///
-/// [`maximum_distance`] is not a conversion but a property of the drawn world:
+/// [`maximum_distance`] starts as a property of the drawn world:
 /// `streaming::plan_cells` requests `config.stream_radius` cells around the camera's cell and keeps
 /// them until they leave `config.unload_radius`, which the command line sets one ring wider, so
 /// cells - and the geometry they carry - keep drawing out to the unload ring rather than to the
 /// requested radius. The camera stands somewhere inside its own cell, so that grid is at most
 /// `unload_radius + 1` cells from it to the edge and [sqrt(2)] times that to the far corner, and
 /// the range is the distance from the camera to that corner, the camera being [`camera_offset`]
-/// above the point it looks at. It stops there: nothing is drawn past the corner, so a wider range
-/// would only spend the same shadow map on coarser cascades. Terrain standing above the ground
-/// plane at the corner is further from the camera than the corner and is not accounted for.
+/// above the point it looks at. `[Display] fShadowDistance` may cap that range to match Skyrim's
+/// configured exterior shadow draw distance. Without that INI key it stops at the drawn grid:
+/// nothing is drawn past the corner, so a wider range would only spend the same shadow map on
+/// coarser cascades. Terrain standing above the ground plane at the corner is further from the
+/// camera than the corner and is not accounted for.
 /// [SUN_SHADOW_MAX_GRID_CELLS] caps the fit for radii the command line accepts but nothing could
 /// stream. At the default `unload_radius` of 3 the last bound is about 23,200 units, a third of a
 /// kilometre.
@@ -2079,14 +2155,36 @@ pub(crate) fn sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig 
     let unload_cells = config.unload_radius.saturating_add(1);
     let cells = unload_cells.clamp(1, SUN_SHADOW_MAX_GRID_CELLS);
     let corner = crate::world::components::CELL_SIZE * cells as f32 * std::f32::consts::SQRT_2;
+    let grid_distance = corner.hypot(camera_offset(config).y);
+    let maximum_distance = config
+        .sun_shadow_distance_limit
+        .map_or(grid_distance, |limit| grid_distance.min(limit));
     CascadeShadowConfigBuilder {
         minimum_distance: 0.1 * CREATION_UNITS_PER_METRE,
-        maximum_distance: corner.hypot(camera_offset(config).y),
-        first_cascade_far_bound: 10.0 * CREATION_UNITS_PER_METRE,
+        maximum_distance,
+        first_cascade_far_bound: (10.0 * CREATION_UNITS_PER_METRE).min(maximum_distance * 0.5),
         num_cascades: SUN_SHADOW_CASCADES,
         ..default()
     }
     .into()
+}
+
+/// Rotation for a sun at the configured Creation bearing and elevation. Directional lights emit
+/// along local -Z, so that vector points from the sun toward the ground, opposite its position.
+fn sun_rotation(config: &EngineConfig) -> Quat {
+    let Some((azimuth_degrees, elevation_degrees)) = config.sun_position else {
+        return Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0);
+    };
+    let azimuth = azimuth_degrees.to_radians();
+    let elevation = elevation_degrees.to_radians();
+    let (sin_azimuth, cos_azimuth) = azimuth.sin_cos();
+    let (sin_elevation, cos_elevation) = elevation.sin_cos();
+    let sun_direction = Vec3::new(
+        sin_azimuth * cos_elevation,
+        sin_elevation,
+        -cos_azimuth * cos_elevation,
+    );
+    Quat::from_rotation_arc(Vec3::NEG_Z, -sun_direction)
 }
 
 /// Where `setup_world` stands the camera relative to the point it looks at, the centre of the cell
@@ -2108,9 +2206,11 @@ fn camera_offset(config: &EngineConfig) -> Vec3 {
 
 fn setup_world(
     mut commands: Commands,
+    shot_output: Option<Res<ShotOutputImage>>,
     config: Res<EngineConfig>,
     ground_height: Option<Res<InitialCameraGroundHeight>>,
     tuning: Option<Res<MovementTuning>>,
+    start_camera: Option<Res<InitialWorldCameraPose>>,
 ) {
     let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
     let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
@@ -2122,7 +2222,7 @@ fn setup_world(
     };
     let camera_position = target + camera_offset;
     let far = crate::world::components::CELL_SIZE * (config.stream_radius.max(1) + 2) as f32 * 2.0;
-    let camera_transform = if config.interactive_world_physics() {
+    let mut camera_transform = if config.interactive_world_physics() {
         Transform::from_translation(camera_position)
             .looking_at(camera_position + Vec3::NEG_Z, Vec3::Y)
     } else if config.streaming_benchmark_route_speed.is_some() {
@@ -2131,10 +2231,21 @@ fn setup_world(
     } else {
         Transform::from_translation(camera_position).looking_at(target, Vec3::Y)
     };
-    commands.spawn((
+    let mut perspective = PerspectiveProjection { far, ..default() };
+    if let Some(pose) = start_camera {
+        camera_transform.translation = crate::shots::shot_camera_translation(
+            pose.shot.position,
+            IVec2::new(config.start_grid.0, config.start_grid.1),
+        );
+        camera_transform.rotation =
+            crate::shots::shot_camera_rotation(pose.shot.yaw, pose.shot.pitch);
+        perspective.fov =
+            crate::shots::vertical_fov_degrees(pose.shot.hfov, pose.aspect).to_radians();
+    }
+    let mut camera = commands.spawn((
         Camera3d::default(),
         crate::color_pipeline::SceneColorPipeline::default(),
-        Projection::Perspective(PerspectiveProjection { far, ..default() }),
+        Projection::Perspective(perspective),
         camera_transform,
         StreamingCamera,
         IsDefaultUiCamera,
@@ -2147,6 +2258,12 @@ fn setup_world(
         OcclusionCulling,
         RenderLayers::from_layers(MAIN_VIEW_LAYERS),
     ));
+    if let Some(output) = shot_output {
+        camera.insert((
+            bevy::camera::RenderTarget::Image(output.0.clone().into()),
+            bevy::camera::ShadowLodOrigin,
+        ));
+    }
     // The sun's shadows. `shadow_maps_enabled` was never the missing piece - the cascades were:
     // without a configuration of its own the sun gets Bevy's, which reaches 150 metres of a world
     // whose unit is 1.43 cm, and a shadow map spent on that patch is a world lit flat
@@ -2167,7 +2284,7 @@ fn setup_world(
         },
         sun_shadow_cascades(&config),
         RenderLayers::from_layers(LIGHT_LAYERS),
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
+        Transform::from_rotation(sun_rotation(&config)),
     ));
     commands.insert_resource(GlobalAmbientLight {
         color: weather_lighting.mean_ambient(),
@@ -2873,6 +2990,96 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("--matched-route"));
         assert!(message.contains("benchmark"));
+    }
+
+    #[test]
+    fn live_start_pose_rejects_modes_that_replace_its_world_location() {
+        let directory = tempfile::tempdir().unwrap();
+        let pose_file = directory.path().join("pose.json");
+        std::fs::write(
+            &pose_file,
+            r#"{"width":1920,"height":1080,"shots":[{"name":"inn","worldspace_id":60,"position":[21750,-44530,140],"yaw":90,"pitch":-3,"hfov":80}]}"#,
+        )
+        .unwrap();
+        let conflicting_modes = [
+            (
+                "camera route",
+                EngineConfig {
+                    route: Some("missing-route.json".into()),
+                    ..default()
+                },
+            ),
+            (
+                "acceptance screenshot",
+                EngineConfig {
+                    acceptance_screenshot: Some("acceptance.png".into()),
+                    ..default()
+                },
+            ),
+            (
+                "streaming route benchmark",
+                EngineConfig {
+                    streaming_benchmark_route_speed: Some(100.0),
+                    ..default()
+                },
+            ),
+            (
+                "benchmark jump",
+                EngineConfig {
+                    benchmark_jump: Some((12, -7)),
+                    ..default()
+                },
+            ),
+            (
+                "matched route",
+                EngineConfig {
+                    matched_route: Some("missing-route.json".into()),
+                    ..default()
+                },
+            ),
+        ];
+
+        for (mode, mut config) in conflicting_modes {
+            config.start_shot = Some(pose_file.clone());
+            config.worldspace_id = 60;
+            config.start_grid = (5, -11);
+            let original_worldspace = config.worldspace_id;
+            let original_grid = config.start_grid;
+
+            let Err(error) = prepare_start_camera(&mut config) else {
+                panic!("{mode} must be rejected before loading the camera pose");
+            };
+
+            assert!(
+                error.to_string().contains("another automated camera mode"),
+                "{mode} should fail at the mode guard, got: {error}"
+            );
+            assert_eq!(config.worldspace_id, original_worldspace, "{mode}");
+            assert_eq!(config.start_grid, original_grid, "{mode}");
+        }
+    }
+
+    #[test]
+    fn no_start_pose_leaves_existing_camera_modes_unchanged() {
+        let mut config = EngineConfig {
+            route: Some("route.json".into()),
+            acceptance_screenshot: Some("acceptance.png".into()),
+            streaming_benchmark_route_speed: Some(100.0),
+            benchmark_jump: Some((12, -7)),
+            ..default()
+        };
+
+        assert!(prepare_start_camera(&mut config).unwrap().is_none());
+        assert_eq!(
+            config.route.as_deref(),
+            Some(std::path::Path::new("route.json"))
+        );
+        assert_eq!(
+            config.acceptance_screenshot.as_deref(),
+            Some(std::path::Path::new("acceptance.png"))
+        );
+        assert_eq!(config.streaming_benchmark_route_speed, Some(100.0));
+        assert_eq!(config.benchmark_jump, Some((12, -7)));
     }
 
     /// A capture window remains hidden if an update system tries to show it.
@@ -3836,6 +4043,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_skyrim_ini_shadow_distance_caps_the_grid_range() {
+        let cap = EngineConfig {
+            sun_shadow_distance_limit: Some(8_000.0),
+            ..EngineConfig::default()
+        };
+        let cascades = sun_shadow_cascades(&cap);
+        assert!((cascades.bounds[3] - 8_000.0).abs() < 0.01);
+        assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let max_grid = EngineConfig {
+            sun_shadow_distance_limit: Some(23_200.0),
+            ..EngineConfig::default()
+        };
+        let cascades = sun_shadow_cascades(&max_grid);
+        assert!((cascades.bounds[3] - 23_200.0).abs() < 0.01);
+
+        let short_range = EngineConfig {
+            sun_shadow_distance_limit: Some(700.0),
+            ..EngineConfig::default()
+        };
+        let cascades = sun_shadow_cascades(&short_range);
+        assert!((cascades.bounds[3] - 700.0).abs() < 0.01);
+        assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn sun_position_maps_clockwise_bearing_and_elevation_to_light_rays() {
+        for (azimuth, elevation, expected) in [
+            (0.0, 0.0, Vec3::Z),
+            (90.0, 0.0, Vec3::NEG_X),
+            (180.0, 0.0, Vec3::NEG_Z),
+            (270.0, 0.0, Vec3::X),
+            (0.0, 90.0, Vec3::NEG_Y),
+        ] {
+            let config = EngineConfig {
+                sun_position: Some((azimuth, elevation)),
+                ..EngineConfig::default()
+            };
+            let rays = sun_rotation(&config) * Vec3::NEG_Z;
+            assert!(
+                rays.distance(expected) < 1.0e-5,
+                "{azimuth},{elevation}: {rays:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_sun_position_preserves_the_existing_light_rotation() {
+        assert_eq!(
+            sun_rotation(&EngineConfig::default()),
+            Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)
+        );
+    }
+
     /// The range is the camera's own distance to the far corner of the drawn grid, not the corner's
     /// distance from the grid centre: the acceptance screenshot camera is 20,000 units above the
     /// grid it looks at, and its shadows have to reach as far down and out as it looks.
@@ -4019,6 +4281,65 @@ mod tests {
                 "the streaming camera must render layer {layer}"
             );
         }
+    }
+
+    #[test]
+    fn live_start_pose_seeds_streaming_and_camera_without_selecting_shots_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("pose.json");
+        std::fs::write(&file, r#"{"width":1920,"height":1080,"shots":[{"name":"inn","worldspace_id":60,"position":[21750,-44530,140],"yaw":90,"pitch":-3,"hfov":80}]}"#).unwrap();
+        let mut config = EngineConfig {
+            start_shot: Some(file),
+            ..default()
+        };
+        let pose = prepare_start_camera(&mut config).unwrap().unwrap();
+        assert_eq!(config.start_grid, (5, -11));
+        assert_eq!(config.worldspace_id, 60);
+        assert!(config.interactive_world_physics());
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(pose)
+            .add_systems(Startup, setup_world);
+        app.update();
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<(&Transform, &Projection), With<StreamingCamera>>();
+        let (transform, projection) = cameras.single(app.world()).unwrap();
+        assert_eq!(
+            transform.translation,
+            crate::shots::shot_camera_translation([21750.0, -44530.0, 140.0], IVec2::new(5, -11))
+        );
+        assert_eq!(
+            transform.rotation,
+            crate::shots::shot_camera_rotation(90.0, -3.0)
+        );
+        let Projection::Perspective(projection) = projection else {
+            panic!("perspective camera")
+        };
+        assert_eq!(
+            projection.fov,
+            crate::shots::vertical_fov_degrees(80.0, 1920.0 / 1080.0).to_radians()
+        );
+        assert!(app.world().get_resource::<ShotsRun>().is_none());
+    }
+
+    #[test]
+    fn shots_camera_uses_capture_image_and_drives_shadow_lod() {
+        let mut app = App::new();
+        let output = Handle::<Image>::default();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(ShotOutputImage(output.clone()))
+            .add_systems(Startup, setup_world);
+        app.update();
+        let mut query = app.world_mut().query_filtered::<(
+            &bevy::camera::RenderTarget,
+            Has<bevy::camera::ShadowLodOrigin>,
+        ), With<StreamingCamera>>();
+        let (target, shadow_origin) = query.single(app.world()).unwrap();
+        assert!(
+            matches!(target, bevy::camera::RenderTarget::Image(image) if image.handle == output)
+        );
+        assert!(shadow_origin);
     }
 
     #[test]
