@@ -5397,7 +5397,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let vfs = directory.path();
-        let default_path = vfs.join("textures/landscape/Dirt02.dds");
+        let default_path = vfs.join("textures/landscape/dirt02.dds");
         let grass_path = vfs.join("textures/landscape/grass.dds");
         fs::create_dir_all(default_path.parent().unwrap()).unwrap();
         let grass_bytes = dummy_content::dds::generate(
