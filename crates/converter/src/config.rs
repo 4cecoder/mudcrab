@@ -235,6 +235,29 @@ impl PipelineConfig {
             self.schema_addons.is_empty() || self.record_reader == RecordReader::Inhouse,
             "schema add-ons require --record-reader inhouse"
         );
+        // The merged-terrain settings only mean something to a merged-terrain build, and the
+        // Skyrim.ini only to the skyrim-ini default. Checked here so a programmatic config is held to
+        // the same rules as the command line.
+        let terrain_default = TerrainDefaultTexture::default();
+        color_eyre::eyre::ensure!(
+            self.merged_terrain
+                || (self.terrain_default_texture == terrain_default
+                    && self.terrain_ini.is_none()
+                    && !self.terrain_allow_downscale),
+            "merged terrain settings require merged_terrain"
+        );
+        if let Some(ini) = &self.terrain_ini {
+            color_eyre::eyre::ensure!(
+                self.merged_terrain
+                    && self.terrain_default_texture == TerrainDefaultTexture::SkyrimIni,
+                "terrain_ini requires merged_terrain and the skyrim-ini default texture"
+            );
+            color_eyre::eyre::ensure!(
+                ini.is_file(),
+                "terrain_ini is not a readable file: {}",
+                ini.display()
+            );
+        }
         color_eyre::eyre::ensure!(
             self.data_dir.is_dir(),
             "Skyrim Data directory does not exist: {}",
@@ -528,6 +551,44 @@ mod tests {
             let error = config.validate().unwrap_err().to_string();
             assert!(error.contains("language must be"), "{language:?}: {error}");
         }
+    }
+
+    /// The merged-terrain settings are accepted only with the option, the ini only with the
+    /// skyrim-ini default, and the ini must be a file that exists.
+    #[test]
+    fn terrain_settings_need_the_merged_terrain_option_and_an_existing_ini() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("Data");
+        std::fs::create_dir(&data).unwrap();
+        let ini = dir.path().join("Skyrim.ini");
+        std::fs::write(&ini, "[Landscape]\n").unwrap();
+        let mut config = PipelineConfig::new(&data, dir.path().join("pack"));
+        config.validate().unwrap();
+
+        config.terrain_allow_downscale = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("require merged_terrain"), "{error}");
+        config.terrain_allow_downscale = false;
+        config.terrain_default_texture = TerrainDefaultTexture::SkyrimIni;
+        assert!(config.validate().is_err());
+        config.terrain_default_texture = TerrainDefaultTexture::White;
+
+        // An ini needs the option and the skyrim-ini default; white with an ini is refused.
+        config.terrain_ini = Some(ini.clone());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("merged_terrain"), "{error}");
+        config.merged_terrain = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("skyrim-ini default texture"), "{error}");
+
+        config.terrain_default_texture = TerrainDefaultTexture::SkyrimIni;
+        config.validate().unwrap();
+        config.terrain_ini = Some(dir.path().join("Missing.ini"));
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("not a readable file"), "{error}");
+        config.terrain_ini = Some(dir.path().to_path_buf());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("not a readable file"), "{error}");
     }
 
     /// New and older unstamped configurations use in-house while explicit legacy stays selected.
