@@ -492,6 +492,11 @@ def rss_metrics(document, run, warnings):
     return result
 
 
+def profile_scenario_label(record):
+    """The --profile-scenario label the runner passes to the engine for this run."""
+    return f"comparison-{record.get('scenario')}-{record.get('mode')}"
+
+
 def verify_identity(experiment, record, run, errors, warnings):
     baseline = experiment.get("input_hashes") or {}
     before = run.get("input_hashes_before", record.get("input_hashes_before"))
@@ -583,14 +588,20 @@ def analyze_run(experiment, record):
         # Counters are still analysed below as evidence; the run cannot pass as a completed route.
         errors.append(f"route did not finish before the engine deadline (phase {route.get('phase')!r})")
     # The manifest's pairing identity must match what the engine run recorded. run.json is the
-    # launcher's own record, so a missing field there cannot be certified: it fails closed. The
-    # profile metadata only carries run_id by contract, so the other fields are compared if present.
+    # launcher's own record, so a missing field there cannot be certified: it fails closed.
     for key in PAIR_IDENTITY_KEYS:
         if run.get(key) is None:
             errors.append(f"run provenance lacks {key}")
         elif record.get(key) != run[key]:
             errors.append(f"run provenance mismatch: {key}")
-    for key in PAIR_IDENTITY_KEYS:
+    # The engine's profile metadata carries the runner's --profile-scenario label, which differs
+    # from the bare scenario in run.json. The runner always passes it, so a missing label fails closed.
+    if metadata is not None:
+        if metadata.get("scenario") is None:
+            errors.append("profile provenance lacks scenario")
+        elif metadata["scenario"] != profile_scenario_label(record):
+            errors.append("profile provenance mismatch: scenario")
+    for key in ("run_id", "pair_id", "mode"):
         if metadata and metadata.get(key) is not None and record.get(key) != metadata[key]:
             errors.append(f"profile provenance mismatch: {key}")
     if trace.get("format_version") != 1 or trace.get("dropped_samples") != 0:

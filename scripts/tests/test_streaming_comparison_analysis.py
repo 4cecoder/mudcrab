@@ -92,7 +92,12 @@ class CampaignTests(unittest.TestCase):
         for name, value in {"run.json": run, "route.json": route, "report.json": report, "rss.json": rss,
                             "profile/streaming-frames.json": trace, "profile/streaming.json": {"aggregate": aggregate, "timeline": timeline},
                             "profile/cpu-spans.json": cpu,
-                            "profile/metadata.json": {"run_id": run_id, "build_profile": "quick", "window": {"physical_resolution": [3200, 1802]}}}.items():
+                            "profile/metadata.json": {"run_id": run_id, "scenario": f"comparison-{scenario}-{mode}",
+                                                                    "commit": "test", "build_profile": "quick",
+                                                                    "resolution": [3200, 1802],
+                                                                    "window": {"physical_resolution": [3200, 1802]},
+                                                                    "worldspace_id": 60, "start_grid": [5, -12],
+                                                                    "stream_radius": 2}}.items():
             write_json(directory / name, value)
         return record, trace
 
@@ -192,6 +197,36 @@ class CampaignTests(unittest.TestCase):
         self.assertTrue(all(r["valid"] for r in result["runs"]))
         self.assertEqual(result["comparisons"][0]["paired_count"], 0)
         self.assertEqual(result["comparisons"][0]["excluded_pair_ids"], ["01"])
+
+    def test_real_profile_scenario_label_is_the_runner_label_and_pairs(self):
+        self.fixture()
+        self.fixture("adaptive128")
+        result = ANALYSIS.analyze_experiment(self.experiment, comparisons=[("fixed64", "adaptive128")], iterations=20)
+        self.assertTrue(all(r["comparison_eligible"] for r in result["runs"]), [r["errors"] for r in result["runs"]])
+        self.assertEqual(result["comparisons"][0]["paired_count"], 1)
+
+    def test_profile_scenario_must_be_the_exact_runner_label(self):
+        for label in ("normal-fixed64", "comparison-stress-fixed64", "comparison-normal-adaptive128"):
+            record, _ = self.fixture()
+            self.mutate(record, "profile/metadata.json", lambda m: m.update(scenario=label))
+            result = self.analyze(record)
+            self.assertFalse(result["comparison_eligible"], label)
+            self.assertIn("profile provenance mismatch: scenario", result["errors"], label)
+
+    def test_profile_metadata_without_scenario_label_fails_closed(self):
+        record, _ = self.fixture()
+        self.mutate(record, "profile/metadata.json", lambda m: m.pop("scenario"))
+        result = self.analyze(record)
+        self.assertFalse(result["comparison_eligible"])
+        self.assertIn("profile provenance lacks scenario", result["errors"])
+
+    def test_profile_pairing_fields_reject_a_relabelled_pair_in_a_paired_comparison(self):
+        self.fixture()
+        treatment, _ = self.fixture("adaptive128")
+        self.mutate(treatment, "profile/metadata.json", lambda m: m.update(pair_id="unrelated-repetition"))
+        result = ANALYSIS.analyze_experiment(self.experiment, comparisons=[("fixed64", "adaptive128")], iterations=20)
+        self.assertEqual(result["comparisons"][0]["paired_count"], 0)
+        self.assertIn("profile provenance mismatch: pair_id", result["runs"][1]["errors"])
 
     def test_route_that_did_not_finish_is_invalid_but_keeps_its_counters(self):
         record, _ = self.fixture()

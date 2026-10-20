@@ -27,10 +27,11 @@ class CampaignTests(unittest.TestCase):
             pending = {"status": "pending", "artifact_dir": str(directory / "pending")}
             experiment = {"status": "interrupted", "commit": "original",
                           "input_hashes": {"engine": "same"},
-                          "protocol": {"modes": RUNNER.MODES},
+                          "protocol": {"modes": RUNNER.MODES, "timeout_seconds": 240,
+                                       "engine_deadline_seconds": 210.0},
                           "runner_sha256": "original-runner", "runs": [completed, pending]}
             RUNNER.write_json(directory / "experiment.json", experiment)
-            args = SimpleNamespace(output=directory, commit="original", thermal_probe=None)
+            args = SimpleNamespace(output=directory, commit="original", thermal_probe=None, timeout=240)
             with patch.object(RUNNER, "host_snapshot", return_value={}):
                 resumed = RUNNER.resume_experiment(args, lambda: {"engine": "same"})
             self.assertEqual(resumed["runs"], [completed, pending])
@@ -47,6 +48,33 @@ class CampaignTests(unittest.TestCase):
             RUNNER.write_json(directory / "experiment.json", experiment)
             with self.assertRaisesRegex(ValueError, "running or partial"):
                 RUNNER.resume_experiment(args, lambda: {"engine": "same"})
+
+    def test_resume_rejects_changed_or_unrecorded_watchdog_and_engine_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            experiment = {"status": "interrupted", "commit": "original", "input_hashes": {"engine": "same"},
+                          "protocol": {"modes": RUNNER.MODES, "timeout_seconds": 240,
+                                       "engine_deadline_seconds": 210.0},
+                          "runner_sha256": "original-runner", "runs": []}
+            RUNNER.write_json(directory / "experiment.json", experiment)
+
+            def resume(timeout):
+                args = SimpleNamespace(output=directory, commit="original", thermal_probe=None, timeout=timeout)
+                with patch.object(RUNNER, "host_snapshot", return_value={}):
+                    return RUNNER.resume_experiment(args, lambda: {"engine": "same"})
+
+            self.assertEqual(resume(240)["status"], "running")
+            with self.assertRaisesRegex(ValueError, "original timeout_seconds"):
+                resume(300)
+            changed_deadline = dict(experiment, protocol=dict(experiment["protocol"], engine_deadline_seconds=270.0))
+            RUNNER.write_json(directory / "experiment.json", changed_deadline)
+            with self.assertRaisesRegex(ValueError, "original engine_deadline_seconds"):
+                resume(240)
+            for missing in ("timeout_seconds", "engine_deadline_seconds"):
+                protocol = {key: value for key, value in experiment["protocol"].items() if key != missing}
+                RUNNER.write_json(directory / "experiment.json", dict(experiment, protocol=protocol))
+                with self.assertRaisesRegex(ValueError, f"recorded {missing}.*cannot be verified"):
+                    resume(240)
 
     def isolated_runner(self, directory, timeout):
         source = str(Path(__file__).parents[1] / "compare-streaming-modes.py")

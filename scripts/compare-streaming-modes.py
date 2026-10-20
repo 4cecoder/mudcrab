@@ -263,6 +263,16 @@ def resume_experiment(args, hashes):
         raise ValueError("Resume requires the original commit, binary, and asset inputs")
     if experiment["protocol"]["modes"] != MODES:
         raise ValueError("Resume requires the original mode configurations")
+    # The watchdog and the engine's deadline set how far each run may go; a resumed run under other
+    # values would not be comparable with the completed ones, and an unrecorded value cannot be checked.
+    for key, current in (("timeout_seconds", float(args.timeout)),
+                         ("engine_deadline_seconds", float(engine_deadline(args.timeout)))):
+        recorded = experiment["protocol"].get(key)
+        if isinstance(recorded, bool) or not isinstance(recorded, (int, float)):
+            raise ValueError(f"Resume requires the recorded {key}; this campaign does not record it, "
+                             "so its deadline cannot be verified")
+        if float(recorded) != current:
+            raise ValueError(f"Resume requires the original {key} ({float(recorded):g}); got {current:g}")
     for run in experiment["runs"]:
         if run["status"] not in ("completed", "failed", "timed_out", "pending"):
             raise ValueError("Resolve running or partial records and add replacements before resuming")

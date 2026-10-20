@@ -37,7 +37,7 @@ Use the opt-in `--streaming-benchmark-route-speed` driver. It computes position 
 
 The normal speed matches the converted pack's forward-run value of 370 units/s in [the movement record map](../player-movement-record-map.md). This remains camera flight at an elevated view. It does not exercise the player, terrain collision, building collision or walking safety. The stress route measures rapid turnover, rather than normal play.
 
-Exit after the prescribed tail. The common external timeout is 240 seconds per launch. The runner passes the engine a real-time deadline 30 seconds earlier (210 seconds), so a route that has not finished by then still writes its profile bundle and a report marked as failed, with its phase recorded as `waiting`, `moving` or `tail`. Only a route that reaches `finished` can pass acceptance. Keep failed, incomplete and timed-out runs with their logs and counters; unresolved demand at the deadline is a result, not permission to extend that arm's warmup.
+Exit after the prescribed tail. The common external timeout is 240 seconds per launch. The runner passes the engine a real-time deadline 30 seconds earlier (210 seconds), so a route that has not finished by then still writes its profile bundle and a report marked as failed, with its phase recorded as `waiting`, `moving` or `tail`. Only a route that reaches `finished` can pass acceptance. A resumed campaign must use the same timeout and engine deadline as the original, which it records; a campaign without them cannot be resumed. Keep failed, incomplete and timed-out runs with their logs and counters; unresolved demand at the deadline is a result, not permission to extend that arm's warmup.
 
 ## Measurements
 
