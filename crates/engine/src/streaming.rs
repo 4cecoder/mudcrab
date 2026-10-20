@@ -8393,7 +8393,14 @@ mod tests {
         };
         let profiler = app.world().resource::<ProfilingState>();
         profiler
-            .write_bundle(&config, &serde_json::json!({}), None, &default(), None)
+            .write_bundle(
+                &config,
+                &serde_json::json!({}),
+                None,
+                &default(),
+                None,
+                None,
+            )
             .unwrap();
         let profile: serde_json::Value = serde_json::from_slice(
             &std::fs::read(directory.path().join("cpu-spans.json")).unwrap(),
