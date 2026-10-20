@@ -531,9 +531,11 @@ async fn rebuild_into(
     manifest.record_data_complete = Some(conversion.warnings.is_empty());
     report.warnings.extend(conversion.warnings);
     report.notices.extend(conversion.notices);
+    let phases = conversion.phases;
     let merged = conversion.records;
     validate_database(&Connection::open(&database)?)?;
     if config.record_reader == crate::config::RecordReader::Inhouse {
+        crate::esm::inhouse::write_database_profile(staging, &database, &phases)?;
         crate::esm::inhouse::write_terrain_caches(&merged, &database, staging)?;
     } else {
         write_cell_cache(&merged, &staging.join("cell_cache.rkyv"))?;
@@ -541,6 +543,9 @@ async fn rebuild_into(
     crate::esm::inhouse::write_configured_reader_identity(staging, config)?;
     report.artifacts.push(PathBuf::from("record-reader.json"));
     if config.record_reader == crate::config::RecordReader::Inhouse {
+        report
+            .artifacts
+            .push(PathBuf::from(crate::esm::inhouse::DATABASE_PROFILE_FILE));
         report
             .artifacts
             .push(PathBuf::from("inhouse-reader-diagnostics.json"));

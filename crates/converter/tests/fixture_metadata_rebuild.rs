@@ -440,12 +440,13 @@ async fn metadata_rebuild_preserves_retained_mesh_cache_contract() {
                 .values()
                 .filter(|entry| entry.output.ends_with(".glb"))
                 .count(),
+            // Producer 27 changed GLB collision data; only current-producer GLBs remain reusable.
             if source_schema == converter::cache::CONVERTER_SCHEMA_VERSION {
                 meshes
             } else {
                 0
             },
-            "metadata-only upgrades preserve original provenance; only current producer meshes are normal cache hits"
+            "metadata-only upgrades preserve original provenance; only known compatible producer meshes are normal cache hits"
         );
         let report = convert(&data, &repeated).await;
         let regenerated = if source_schema == converter::cache::CONVERTER_SCHEMA_VERSION {
@@ -454,7 +455,10 @@ async fn metadata_rebuild_preserves_retained_mesh_cache_contract() {
             retained
                 .entries
                 .values()
-                .filter(|entry| !entry.output.to_ascii_lowercase().ends_with(".luau"))
+                .filter(|entry| {
+                    let output = entry.output.to_ascii_lowercase();
+                    !output.ends_with(".luau")
+                })
                 .count()
         };
         let current: ConversionManifest =

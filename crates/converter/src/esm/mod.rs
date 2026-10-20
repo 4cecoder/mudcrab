@@ -47,6 +47,8 @@ pub(crate) struct RecordConversion {
     pub(crate) records: HashMap<u32, RawRecord>,
     pub(crate) warnings: Vec<String>,
     pub(crate) notices: Vec<String>,
+    /// In-house stage seconds for the database profile; legacy exports record none.
+    pub(crate) phases: std::collections::BTreeMap<String, f64>,
 }
 
 /// Populate the common plugin metadata contract without allocating each complete input.
@@ -300,6 +302,7 @@ impl EsmParser {
             records: merged,
             warnings: summaries,
             notices,
+            phases: std::collections::BTreeMap::new(),
         })
     }
 }

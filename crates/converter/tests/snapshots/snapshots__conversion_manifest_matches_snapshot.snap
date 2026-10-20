@@ -1,6 +1,6 @@
 ---
 source: crates/converter/tests/snapshots.rs
-assertion_line: 215
+assertion_line: 218
 expression: manifest
 ---
 {
@@ -13,7 +13,8 @@ expression: manifest
           "size": 721
         }
       ],
-      "recipe": "converter-inputs-v1",
+      "recipe": "runtime-english-v1",
+      "selection": "runtime_english_v1",
       "source_hash": "[source_hash]"
     },
     "skyrim - misc.bsa": {
@@ -29,7 +30,8 @@ expression: manifest
           "size": 131
         }
       ],
-      "recipe": "converter-inputs-v1",
+      "recipe": "runtime-english-v1",
+      "selection": "runtime_english_v1",
       "source_hash": "[source_hash]"
     },
     "skyrim - textures.ba2": {
@@ -60,7 +62,8 @@ expression: manifest
           "size": 2876
         }
       ],
-      "recipe": "converter-inputs-v1",
+      "recipe": "runtime-english-v1",
+      "selection": "runtime_english_v1",
       "source_hash": "[source_hash]"
     }
   },

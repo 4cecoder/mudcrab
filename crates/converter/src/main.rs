@@ -2,6 +2,7 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, bail},
 };
+use converter::archive::IngestionSync;
 use converter::config::RecordReader;
 use converter::{
     AssetPipeline, PipelineConfig, PipelineReport, ProgressEvent, ProgressStage, TextureEncoder,
@@ -32,6 +33,8 @@ struct Cli {
     report_json: Option<PathBuf>,
     cpu_jobs: Option<usize>,
     io_jobs: Option<usize>,
+    ingestion_sync: IngestionSync,
+    extract_all_archive_files: bool,
     texture_encoder: TextureEncoder,
     lod_texture_encoder: TextureEncoder,
     record_reader: RecordReader,
@@ -63,6 +66,8 @@ impl Cli {
         config.invalidate_cache = self.invalidate_cache;
         config.verify_cache = self.verify_cache;
         config.no_lod = self.no_lod;
+        config.ingestion_sync = self.ingestion_sync;
+        config.extract_all_archive_files = self.extract_all_archive_files;
         config.texture_encoder = self.texture_encoder;
         config.lod_texture_encoder = self.lod_texture_encoder;
         if let Some(language) = &self.language {
@@ -559,6 +564,14 @@ fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
             command.push_str(&format!(" {flag} \"{}\"", path.display()));
         }
     }
+    if cli.extract_all_archive_files {
+        command.push_str(" --extract-all-archive-files");
+    }
+    match cli.ingestion_sync {
+        IngestionSync::PerFile => command.push_str(" --ingestion-sync per-file"),
+        IngestionSync::Archive => command.push_str(" --ingestion-sync archive"),
+        IngestionSync::None => command.push_str(" --ingestion-sync none"),
+    }
     if cli.no_lod {
         command.push_str(" --no-lod");
     }
@@ -821,6 +834,8 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut skyrim_ini_file = None;
     let mut cpu_jobs = None;
     let mut io_jobs = None;
+    let mut ingestion_sync = IngestionSync::Archive;
+    let mut extract_all_archive_files = false;
     let mut use_gpu = false;
     let mut use_lod_gpu = true;
     let mut record_reader = RecordReader::default();
@@ -888,8 +903,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
                 };
             }
             Some("--lod-encoder") => {
-                let value = next_value(&mut args, "--lod-encoder")?;
-                use_lod_gpu = match value.to_str() {
+                use_lod_gpu = match next_value(&mut args, "--lod-encoder")?.to_str() {
                     Some("cpu") => false,
                     Some("gpu") => true,
                     _ => bail!("--lod-encoder must be cpu or gpu"),
@@ -937,6 +951,15 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
             Some("--invalidate-cache") => invalidate_cache = true,
             Some("--no-verify-cache") => verify_cache = false,
             Some("--no-lod") => no_lod = true,
+            Some("--ingestion-sync") => {
+                ingestion_sync = match next_value(&mut args, "--ingestion-sync")?.to_str() {
+                    Some("per-file") => IngestionSync::PerFile,
+                    Some("archive") => IngestionSync::Archive,
+                    Some("none") => IngestionSync::None,
+                    _ => bail!("--ingestion-sync must be per-file, archive, or none"),
+                };
+            }
+            Some("--extract-all-archive-files") => extract_all_archive_files = true,
             Some("--language") => {
                 let value = next_value(&mut args, "--language")?;
                 language =
@@ -961,6 +984,9 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         bail!(
             "--gpu-quality and --gpu-batch-mb require --texture-encoder gpu or --lod-encoder gpu"
         );
+    }
+    if ingestion_sync == IngestionSync::None && !verify_cache {
+        bail!("--ingestion-sync none requires verified cache reuse; omit --no-verify-cache");
     }
     if reuse_assets.is_some() && mo2_instance.is_some() {
         bail!(
@@ -1022,6 +1048,8 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         report_json,
         cpu_jobs,
         io_jobs,
+        ingestion_sync,
+        extract_all_archive_files,
         texture_encoder,
         lod_texture_encoder,
         record_reader,
@@ -1096,6 +1124,7 @@ fn usage() -> &'static str {
                  [--invalidate-cache] [--no-verify-cache] [--resume-staging DIR]
                  [--report-json FILE] [--verbose] [--reuse-assets DIR] [--no-lod]
                  [--record-reader legacy|inhouse] [--language NAME]
+                 [--ingestion-sync per-file|archive|none] [--extract-all-archive-files]
                  [--schema-addon JSON]
                  [--mo2-instance DIR] [--mo2-profile NAME]
                  [--plugins-file FILE] [--skyrim-ccc-file FILE] [--skyrim-ini-file FILE]
@@ -1151,8 +1180,11 @@ when neither selection is supplied.
 extend fields. The full batch is checked before conversion starts. Schema add-ons
 cannot be combined with --record-reader legacy.
 
-Terrain LOD uses the GPU by default, with CPU fallback if GPU initialization fails.
---lod-encoder cpu selects CPU LOD. Ordinary textures default to the CPU independently.
+Archive ingestion extracts the formats used by conversion and English string banks.
+--extract-all-archive-files retains every archive entry for compatibility and comparisons.
+--ingestion-sync defaults to archive: sealed packs provide batch durability. per-file also
+flushes each unique derived payload; none skips extraction flushes for regenerable bytes
+and requires verified reuse. Runtime package publication keeps its durability contract.
 
 --no-lod skips terrain LOD compilation in conversion and metadata rebuilds. Full-detail
 terrain and ordinary assets remain available. Omit it on a later run to build LOD.
@@ -1830,6 +1862,8 @@ mod tests {
             report_json: None,
             cpu_jobs: None,
             io_jobs: None,
+            ingestion_sync: IngestionSync::PerFile,
+            extract_all_archive_files: false,
             texture_encoder: TextureEncoder::Cpu,
             lod_texture_encoder: TextureEncoder::Cpu,
             record_reader: RecordReader::Legacy,
@@ -1847,12 +1881,12 @@ mod tests {
         let staging = Path::new("C:/Modding/SkyrimConverted.staging-1-2");
         assert_eq!(
             resume_command("converter.exe", &cli, staging),
-            "converter.exe \"C:/Games/Skyrim/Data\" \"C:/Modding/SkyrimConverted\" --resume-staging \"C:/Modding/SkyrimConverted.staging-1-2\" --lod-encoder cpu --record-reader legacy"
+            "converter.exe \"C:/Games/Skyrim/Data\" \"C:/Modding/SkyrimConverted\" --resume-staging \"C:/Modding/SkyrimConverted.staging-1-2\" --lod-encoder cpu --ingestion-sync per-file --record-reader legacy"
         );
         // A renamed binary is named as it is, quoted when its name has a space.
         assert_eq!(
             resume_command("mudcrab converter", &cli, staging),
-            "\"mudcrab converter\" \"C:/Games/Skyrim/Data\" \"C:/Modding/SkyrimConverted\" --resume-staging \"C:/Modding/SkyrimConverted.staging-1-2\" --lod-encoder cpu --record-reader legacy"
+            "\"mudcrab converter\" \"C:/Games/Skyrim/Data\" \"C:/Modding/SkyrimConverted\" --resume-staging \"C:/Modding/SkyrimConverted.staging-1-2\" --lod-encoder cpu --ingestion-sync per-file --record-reader legacy"
         );
         // The test binary itself stands in for the running converter.
         assert!(!program_name().is_empty());
@@ -1894,8 +1928,52 @@ mod tests {
             ..cli
         };
         assert!(resume_command("converter.exe", &gpu, staging).ends_with(
-            " --texture-encoder gpu --gpu-quality 2 --gpu-batch-mb 256 --lod-encoder cpu --record-reader legacy"
+            " --texture-encoder gpu --gpu-quality 2 --gpu-batch-mb 256 --lod-encoder cpu --ingestion-sync per-file --record-reader legacy"
         ));
+    }
+
+    #[test]
+    fn parses_and_preserves_ingestion_options_on_resume() {
+        let staging = Path::new("assets.staging");
+        let defaults = parse_cli(vec!["Data".into()]).unwrap();
+        assert_eq!(defaults.ingestion_sync, IngestionSync::Archive);
+        assert!(!defaults.extract_all_archive_files);
+        for (value, policy) in [
+            ("per-file", IngestionSync::PerFile),
+            ("archive", IngestionSync::Archive),
+            ("none", IngestionSync::None),
+        ] {
+            let cli = parse_cli(vec![
+                "Data".into(),
+                "--ingestion-sync".into(),
+                value.into(),
+                "--extract-all-archive-files".into(),
+            ])
+            .unwrap();
+            assert_eq!(cli.ingestion_sync, policy);
+            assert!(cli.extract_all_archive_files);
+            let command = resume_command("converter", &cli, staging);
+            assert!(command.contains(" --extract-all-archive-files"));
+            assert!(command.contains(&format!(" --ingestion-sync {value}")));
+        }
+        assert!(parse_cli(vec!["Data".into(), "--ingestion-sync".into()]).is_err());
+        assert!(
+            parse_cli(vec![
+                "Data".into(),
+                "--ingestion-sync".into(),
+                "invalid".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_cli(vec![
+                "Data".into(),
+                "--ingestion-sync".into(),
+                "none".into(),
+                "--no-verify-cache".into()
+            ])
+            .is_err()
+        );
     }
 
     /// Integration failures count as failures without skipped inputs and point to the
@@ -2076,7 +2154,7 @@ mod tests {
         assert_eq!(cpu.lod_texture_encoder, TextureEncoder::Cpu);
         assert!(
             resume_command("converter", &cpu, Path::new("staging"))
-                .ends_with(" --lod-encoder cpu --record-reader inhouse")
+                .ends_with(" --lod-encoder cpu --ingestion-sync archive --record-reader inhouse")
         );
         let resumed = parse_cli(
             [
@@ -2165,7 +2243,7 @@ mod tests {
         );
         assert!(
             resume_command("converter", &lod, Path::new("staging")).ends_with(
-                " --lod-encoder gpu --gpu-quality 3 --gpu-batch-mb 256 --record-reader inhouse"
+                " --lod-encoder gpu --gpu-quality 3 --gpu-batch-mb 256 --ingestion-sync archive --record-reader inhouse"
             )
         );
     }
