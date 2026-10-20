@@ -1410,3 +1410,79 @@ async fn addon_preflight_freezes_publication_bytes_before_discovery_progress() {
         .unwrap();
     assert_eq!(saved, (expected_hash, original_bytes));
 }
+
+/// A cached database is keyed by its schema add-ons: a base bundle never restores for an add-on
+/// configuration, an unchanged add-on bundle restores with its own typed records, editing the
+/// add-on rebuilds, and returning to the base reproduces the base database, never the add-on one.
+#[tokio::test]
+async fn database_cache_keys_and_restores_by_schema_addon_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("Data");
+    generate_mod(&data, false);
+    let addon = temp.path().join("schema.json");
+    fs::write(&addon, addon_bytes()).unwrap();
+    let output = temp.path().join("pack");
+    let original = custom_fields("CustomBefore", 0x1801u32.to_le_bytes().to_vec());
+    let mut remapped = original.clone();
+    remapped[2].1 = 0x0200_1801u32.to_le_bytes().to_vec();
+    let stamp = |output: &Path| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(output.join("record-reader.json")).unwrap()).unwrap()
+    };
+
+    let base_cold = run_config(mod_config(&data, &output, &[])).await.unwrap();
+    assert!(!base_cold.database_cache_hit);
+    let base_warm = run_config(mod_config(&data, &output, &[])).await.unwrap();
+    assert!(base_warm.database_cache_hit, "unchanged base restores");
+    assert_eq!(
+        base_warm.warnings, base_cold.warnings,
+        "restore repeats base findings once"
+    );
+    let base_stamp = stamp(&output);
+    assert!(base_stamp.get("schema_addons").is_none());
+    assert!(history_record(&output, 0x0300_1820).supported == false);
+
+    let typed = run_config(mod_config(&data, &output, &[&addon]))
+        .await
+        .unwrap();
+    assert!(
+        !typed.database_cache_hit,
+        "add-on configuration must not restore the base bundle"
+    );
+    assert_ne!(stamp(&output)["schema_sha256"], base_stamp["schema_sha256"]);
+    let typed_stamp = stamp(&output);
+    assert!(stamp(&output)["schema_addons"].is_array());
+    assert_eq!(canonical_fields(&output, 0x0300_1820), remapped);
+    assert!(history_record(&output, 0x0300_1820).supported);
+
+    let typed_warm = run_config(mod_config(&data, &output, &[&addon]))
+        .await
+        .unwrap();
+    assert!(
+        typed_warm.database_cache_hit,
+        "unchanged add-on bundle restores"
+    );
+    assert_eq!(canonical_fields(&output, 0x0300_1820), remapped);
+    assert_eq!(stamp(&output), typed_stamp);
+    assert_eq!(typed_warm.warnings, typed.warnings);
+
+    fs::write(&addon, metadata_addon_bytes()).unwrap();
+    let edited = run_config(mod_config(&data, &output, &[&addon]))
+        .await
+        .unwrap();
+    assert!(!edited.database_cache_hit, "an edited add-on must rebuild");
+    assert_ne!(
+        stamp(&output),
+        typed_stamp,
+        "the stamp must describe the edited add-on"
+    );
+    fs::write(&addon, addon_bytes()).unwrap();
+
+    let back = run_config(mod_config(&data, &output, &[])).await.unwrap();
+    assert!(
+        !back.database_cache_hit,
+        "returning to base must not reuse the add-on bundle"
+    );
+    assert_eq!(stamp(&output), base_stamp);
+    assert_eq!(canonical_fields(&output, 0x0300_1820), original);
+    assert!(!history_record(&output, 0x0300_1820).supported);
+}

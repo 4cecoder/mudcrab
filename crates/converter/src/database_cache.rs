@@ -195,7 +195,7 @@ pub(super) fn identity(
         "cache_format": FORMAT,
         "converter_schema": CONVERTER_SCHEMA_VERSION,
         "database_schema": shared::WORLD_DATABASE_SCHEMA_VERSION,
-        "reader": inhouse::reader_identity(config.record_reader),
+        "reader": inhouse::configured_reader_identity(config)?,
         "language": config.language,
         "native_sources_sha256": source_fingerprint(),
         "compiled_program_sha256": hash_file(&std::env::current_exe()?)?,
@@ -352,12 +352,8 @@ fn validate_bundle(directory: &Path, identity: &Identity) -> Result<()> {
     validate_cell_cache(&directory.join("cell_cache.rkyv"))?;
     let reader: serde_json::Value =
         serde_json::from_slice(&fs::read(directory.join("record-reader.json"))?)?;
-    // The stamp carries the selected language, so it is checked against that language.
-    let language = identity.inputs["language"].as_str().unwrap_or_default();
-    ensure!(
-        reader == inhouse::reader_identity_in_language(identity.reader, language),
-        "reader stamp mismatch"
-    );
+    // The stamp is the configured identity bound into the key: reader, add-ons and language.
+    ensure!(reader == identity.inputs["reader"], "reader stamp mismatch");
     Ok(())
 }
 
@@ -678,7 +674,7 @@ mod tests {
         .unwrap();
         inhouse::write_terrain_caches(&records, &staging.join("skyrim_world.db"), &staging)
             .unwrap();
-        inhouse::write_reader_identity(&staging, config.record_reader).unwrap();
+        inhouse::write_configured_reader_identity(&staging, &config).unwrap();
         write_conversion_notes(&staging, &ConversionNotes::default()).unwrap();
         let cache = directory.path().join("cache");
         Fixture {
