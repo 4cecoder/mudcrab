@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# mudcrab-cli-owner: lod-performance
 """Print an isolated validation matrix. This script never starts workloads."""
 import argparse
 import json

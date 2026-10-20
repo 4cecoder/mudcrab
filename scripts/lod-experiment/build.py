@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# mudcrab-cli-owner: lod-experiment
 """Build the offline adapter from an existing, clean pinned checkout; no network."""
 import argparse
 import hashlib

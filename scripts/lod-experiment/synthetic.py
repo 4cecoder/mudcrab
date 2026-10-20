@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# mudcrab-cli-owner: lod-experiment
 """Write an original curved-grid GLB fixture; contains no game assets."""
 import argparse
 import json

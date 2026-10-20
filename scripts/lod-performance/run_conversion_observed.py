@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# mudcrab-cli-owner: lod-performance
 """Observe one explicit conversion on macOS using time -l, caffeinate, and iostat."""
 import argparse
 from contextlib import ExitStack

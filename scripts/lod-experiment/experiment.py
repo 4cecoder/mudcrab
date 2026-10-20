@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# mudcrab-cli-owner: lod-experiment
 """Compare conventional index LODs with a cluster DAG without modifying GLBs."""
 import argparse
 import copy
