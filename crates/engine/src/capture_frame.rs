@@ -5,7 +5,10 @@
 //! ScreenshotCaptured for the identical entity certifies completion of its readback.
 //! Automated runners serialize primary-window requests and keep the pose frozen.
 use crate::{
-    color_pipeline::{SceneGradeMode, SceneGradeSource, SceneVisualPreset, SkyrimCinematicPost},
+    color_pipeline::{
+        SceneGradeMode, SceneGradeOverrides, SceneGradeSource, SceneVisualPreset,
+        SkyrimCinematicPost,
+    },
     shots::shot_camera_translation,
     streaming::RenderOrigin,
     tone_mapping::SceneToneMapSource,
@@ -74,10 +77,39 @@ fn capture_grade(
     exposure: Option<&Exposure>,
     compositing: Option<&CompositingSpace>,
 ) -> Option<CaptureGrade> {
+    capture_grade_with_overrides(
+        source,
+        tone_source,
+        mode,
+        preset,
+        grading,
+        post,
+        tonemapping,
+        exposure,
+        compositing,
+        SceneGradeOverrides::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_grade_with_overrides(
+    source: Option<&SceneGradeSource>,
+    tone_source: Option<&SceneToneMapSource>,
+    mode: Option<&SceneGradeMode>,
+    preset: Option<&SceneVisualPreset>,
+    grading: Option<&ColorGrading>,
+    post: Option<&SkyrimCinematicPost>,
+    tonemapping: Option<&Tonemapping>,
+    exposure: Option<&Exposure>,
+    compositing: Option<&CompositingSpace>,
+    overrides: SceneGradeOverrides,
+) -> Option<CaptureGrade> {
     let (source, mode, preset, grading, post) = (source?, *mode?, *preset?, grading?, post?);
     let fallback = SceneToneMapSource::default();
     let tone = tone_source.unwrap_or(&fallback);
-    let resolved = tone.resolve(source, mode, preset).ok()?;
+    let resolved = tone
+        .resolve_with_overrides(source, mode, preset, overrides)
+        .ok()?;
     let (tonemapping, exposure, compositing) = (tonemapping?, exposure?, compositing?);
     // A source describes this frame only after its settings reached the camera.
     if grading.global.post_saturation != resolved.bevy_saturation
@@ -88,7 +120,7 @@ fn capture_grade(
         return None;
     }
     let grade = resolved.grade;
-    let mut evidence = tone.evidence(source, mode, preset);
+    let mut evidence = tone.evidence_with_overrides(source, mode, preset, overrides);
     evidence["exposure_ev100"] = exposure.ev100.into();
     evidence["actual_camera"] = serde_json::json!({
         "tonemapping": format!("{tonemapping:?}"),
@@ -214,6 +246,7 @@ fn extract_capture_frames(
     grade_mode: Extract<Option<Res<SceneGradeMode>>>,
     visual_preset: Extract<Option<Res<SceneVisualPreset>>>,
     tone_source: Extract<Option<Res<SceneToneMapSource>>>,
+    grade_overrides: Extract<Option<Res<SceneGradeOverrides>>>,
 ) {
     extracted.render_frame += 1;
     extracted.captures.clear();
@@ -253,7 +286,7 @@ fn extract_capture_frames(
             render_origin: origin.0.to_array(),
             pending_specializations: None,
             work,
-            grading: capture_grade(
+            grading: capture_grade_with_overrides(
                 grade_source.as_deref(),
                 tone_source.as_deref(),
                 grade_mode.as_deref(),
@@ -263,6 +296,7 @@ fn extract_capture_frames(
                 tonemapping,
                 exposure,
                 compositing,
+                grade_overrides.as_deref().copied().unwrap_or_default(),
             ),
             terrain_gauges: profiler.terrain_gauges(),
             terrain_coverage: surfaces
@@ -340,6 +374,48 @@ mod tests {
     fn incomplete_capture_has_no_receipt() {
         assert!(validate_receipt(&CaptureTicket::default(), [0.0; 3]).is_err());
     }
+
+    #[test]
+    fn tuned_camera_and_capture_evidence_share_effective_resolution() {
+        let source = SceneGradeSource::default();
+        let tone = SceneToneMapSource::default();
+        let mode = SceneGradeMode::SnapshotSrgb;
+        let preset = SceneVisualPreset::CoolGray;
+        let overrides = SceneGradeOverrides {
+            brightness: Some(1.74),
+            tint_green: Some(0.67),
+            pivot: Some(0.29),
+            ..default()
+        };
+        let resolved = tone
+            .resolve_with_overrides(&source, mode, preset, overrides)
+            .unwrap();
+        let mut grading = ColorGrading::default();
+        grading.global.post_saturation = resolved.bevy_saturation;
+        let exposure = Exposure {
+            ev100: crate::color_pipeline::DEFAULT_SCENE_EV100,
+        };
+        let capture = capture_grade_with_overrides(
+            Some(&source),
+            Some(&tone),
+            Some(&mode),
+            Some(&preset),
+            Some(&grading),
+            Some(&resolved.post),
+            Some(&resolved.tonemapping),
+            Some(&exposure),
+            Some(&CompositingSpace::Linear),
+            overrides,
+        )
+        .expect("the same resolved grade labels the camera frame");
+        assert_eq!(capture.resolved_grade["brightness"], 1.74);
+        assert_eq!(capture.resolved_grade["tint_rgb"][1], 0.67);
+        assert_eq!(capture.resolved_grade["pivot"], 0.29);
+        assert_eq!(capture.source["grade_overrides"]["brightness"], 1.74);
+        assert_eq!(capture.source["effective_grade"]["brightness"], 1.74);
+        assert_eq!(capture.source["effective_stages"]["pivot"], 0.29);
+    }
+
     #[test]
     fn render_receipt_is_immutable_across_callback_delay() {
         let ticket = CaptureTicket::default();

@@ -7,7 +7,10 @@
 //! provenance. The approved TonyMcMapface path remains the default.
 
 use crate::{
-    color_pipeline::{ResolvedSceneGrade, SceneGradeMode, SceneGradeSource, SceneVisualPreset},
+    color_pipeline::{
+        ResolvedSceneGrade, SceneGradeMode, SceneGradeOverrides, SceneGradeSource,
+        SceneVisualPreset,
+    },
     config::EngineConfig,
 };
 use bevy::{core_pipeline::tonemapping::Tonemapping, prelude::Resource};
@@ -186,8 +189,19 @@ impl SceneToneMapSource {
         mode: SceneGradeMode,
         preset: SceneVisualPreset,
     ) -> std::result::Result<ResolvedSceneGrade, String> {
+        self.resolve_with_overrides(grade_source, mode, preset, SceneGradeOverrides::default())
+    }
+
+    pub fn resolve_with_overrides(
+        &self,
+        grade_source: &SceneGradeSource,
+        mode: SceneGradeMode,
+        preset: SceneVisualPreset,
+        overrides: SceneGradeOverrides,
+    ) -> std::result::Result<ResolvedSceneGrade, String> {
+        overrides.validate()?;
         if self.mode == SceneToneMapMode::Tony {
-            return grade_source.resolve(mode, preset);
+            return grade_source.resolve_with_overrides(mode, preset, overrides);
         }
         if !matches!(
             mode,
@@ -209,7 +223,7 @@ impl SceneToneMapSource {
             .as_ref()
             .ok_or("retail-curve requires IMGS.HNAM.White; the selected record has no HNAM")?;
         let coefficient = parameters.coefficient(hdr.white)?;
-        let mut resolved = grade_source.resolve(mode, preset)?;
+        let mut resolved = grade_source.resolve_with_overrides(mode, preset, overrides)?;
         resolved.tonemapping = Tonemapping::None;
         resolved.bevy_saturation = 1.0;
         resolved.post.tone_operator = parameters.curve.operator();
@@ -225,8 +239,18 @@ impl SceneToneMapSource {
         mode: SceneGradeMode,
         preset: SceneVisualPreset,
     ) -> serde_json::Value {
-        let mut evidence = grade_source.evidence(mode, preset);
-        let resolved = self.resolve(grade_source, mode, preset);
+        self.evidence_with_overrides(grade_source, mode, preset, SceneGradeOverrides::default())
+    }
+
+    pub fn evidence_with_overrides(
+        &self,
+        grade_source: &SceneGradeSource,
+        mode: SceneGradeMode,
+        preset: SceneVisualPreset,
+        overrides: SceneGradeOverrides,
+    ) -> serde_json::Value {
+        let mut evidence = grade_source.evidence_with_overrides(mode, preset, overrides);
+        let resolved = self.resolve_with_overrides(grade_source, mode, preset, overrides);
         let active = self.mode == SceneToneMapMode::RetailCurve && resolved.is_ok();
         let white = grade_source
             .record
@@ -494,6 +518,48 @@ mod tests {
                 .coefficient(f32::MAX)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn grade_overrides_preserve_retail_curve_white_and_luminance_parameters() {
+        let tone = experiment(RetailCurveKind::Filmic);
+        let source = grade_source(Some(1.05));
+        let overrides = SceneGradeOverrides {
+            brightness: Some(1.8),
+            pivot: Some(0.29),
+            ..default()
+        };
+        let resolved = tone
+            .resolve_with_overrides(
+                &source,
+                SceneGradeMode::RecordSrgb,
+                SceneVisualPreset::CoolGray,
+                overrides,
+            )
+            .unwrap();
+        assert_eq!(resolved.grade.brightness, 1.8);
+        assert_eq!(resolved.post.pivot, 0.29);
+        assert_eq!(resolved.post.tone_operator, 2);
+        assert_eq!(resolved.post.sampled_luminance, 0.2);
+        assert_eq!(resolved.post.target_luminance, 0.3);
+        assert!(
+            (resolved.post.tone_coefficient
+                - parameters(RetailCurveKind::Filmic)
+                    .coefficient(1.05)
+                    .unwrap())
+            .abs()
+                < f32::EPSILON
+        );
+        let evidence = tone.evidence_with_overrides(
+            &source,
+            SceneGradeMode::RecordSrgb,
+            SceneVisualPreset::CoolGray,
+            overrides,
+        );
+        assert_eq!(evidence["loaded_record"]["hdr"]["white"], 1.05);
+        assert_eq!(evidence["tone_mapping"]["loaded_white"], 1.05);
+        assert_eq!(evidence["grade_overrides"]["brightness"], 1.8);
+        assert_eq!(evidence["effective_stages"]["tone_operator"], 2);
     }
 
     #[test]

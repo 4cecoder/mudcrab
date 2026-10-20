@@ -205,8 +205,12 @@ fn scene_state(world: &World, baseline: crate::shots::Failures) -> serde_json::V
         .get_resource::<SceneToneMapSource>()
         .cloned()
         .unwrap_or_default();
+    let overrides = world
+        .get_resource::<crate::color_pipeline::SceneGradeOverrides>()
+        .copied()
+        .unwrap_or_default();
     let resolved = tone
-        .resolve(&source, mode, preset)
+        .resolve_with_overrides(&source, mode, preset, overrides)
         .expect("validated scene grade source");
     let grade = resolved.grade;
     serde_json::json!({
@@ -214,7 +218,7 @@ fn scene_state(world: &World, baseline: crate::shots::Failures) -> serde_json::V
         "saturation": grade.saturation, "brightness": grade.brightness, "contrast": grade.contrast,
         "tint_amount": grade.tint_amount, "tint_rgb": grade.tint_rgb,
         "tone_map": tone.mode.name(),
-        "grading_source": tone.evidence(&source, mode, preset),
+        "grading_source": tone.evidence_with_overrides(&source, mode, preset, overrides),
         "pending_terrain_uploads": pending_terrain,
         "pending_specializations": pending_specializations,
         "pending_render_transfers": pending_transfers,
