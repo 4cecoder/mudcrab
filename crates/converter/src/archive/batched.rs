@@ -1005,57 +1005,20 @@ pub(crate) fn sync_pack_file(path: &Path) -> Result<()> {
         .wrap_err_with(|| format!("failed to sync archive pack {}", path.display()))
 }
 
-fn read_pack(
-    path: &Path,
-    source_hash: &str,
-    reader_version: u32,
-    selection: ArchiveSelection,
-) -> Result<Vec<(PathBuf, PackedFile)>> {
-    let file = File::open(path)?;
-    let bytes = unsafe { Mmap::map(&file) }?;
-    ensure!(
-        bytes.len() >= 16 && &bytes[..8] == PACK_MAGIC,
-        "invalid archive pack header"
-    );
-    ensure!(
-        bytes.len() <= MAX_FILE_BYTES + MAX_INDEX_BYTES + 16,
-        "archive pack exceeds payload limit"
-    );
-    let expected_hash = path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| color_eyre::eyre::eyre!("invalid archive pack filename"))?;
-    ensure!(
-        hash_bytes(&bytes) == expected_hash,
-        "archive pack digest mismatch"
-    );
-    let length = usize::try_from(u64::from_le_bytes(bytes[8..16].try_into().unwrap()))?;
-    ensure!(
-        length <= MAX_INDEX_BYTES && length <= bytes.len() - 16,
-        "invalid archive pack index length"
-    );
-    let index: PackIndex = serde_json::from_slice(&bytes[16..16 + length])?;
-    ensure!(
-        matches!(index.version, 1 | PACK_VERSION)
-            && index.source_hash == source_hash
-            && !index.recipe.is_empty()
-            && selection.accepts_recipe(&index.recipe),
-        "archive pack recipe or source does not match"
-    );
-    ensure!(
-        index.reader_version == reader_version,
-        "archive pack was decoded by a different archive reader"
-    );
+fn validate_pack_layout(
+    index: &PackIndex,
+    base: usize,
+    bytes_len: usize,
+) -> Result<Vec<(PathBuf, usize, usize)>> {
     ensure!(
         index.files.len() <= BATCH_FILES,
         "archive pack file count exceeds limit"
     );
-    let base = 16 + length;
     let mut seen = BTreeMap::new();
-    let mut packed = Vec::new();
     let mut expected_offset = 0u64;
     let mut payloads = BTreeMap::new();
-    for item in index.files {
+    let mut layout = Vec::with_capacity(index.files.len());
+    for item in &index.files {
         let relative = safe_relative_path(&item.path)?;
         detect_archive_collision(&mut seen, &relative, &item.path)?;
         ensure!(
@@ -1084,6 +1047,66 @@ fn read_pack(
         let end = start
             .checked_add(usize::try_from(item.size)?)
             .ok_or_else(|| color_eyre::eyre::eyre!("archive pack range overflow"))?;
+        ensure!(end <= bytes_len, "truncated archive pack payload");
+        layout.push((relative, start, end));
+    }
+    ensure!(
+        base as u64 + expected_offset == bytes_len as u64,
+        "archive pack has trailing or missing bytes"
+    );
+    Ok(layout)
+}
+
+fn read_pack(
+    path: &Path,
+    source_hash: &str,
+    reader_version: u32,
+    selection: ArchiveSelection,
+) -> Result<Vec<(PathBuf, PackedFile)>> {
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    ensure!(
+        (16..=(MAX_FILE_BYTES + MAX_INDEX_BYTES + 16) as u64).contains(&file_len),
+        "archive pack size exceeds limit"
+    );
+    let bytes = unsafe { Mmap::map(&file) }?;
+    ensure!(
+        bytes.len() <= MAX_FILE_BYTES + MAX_INDEX_BYTES + 16,
+        "archive pack exceeds payload limit"
+    );
+    ensure!(
+        bytes.len() >= 16 && &bytes[..8] == PACK_MAGIC,
+        "invalid archive pack header"
+    );
+    let length = usize::try_from(u64::from_le_bytes(bytes[8..16].try_into().unwrap()))?;
+    ensure!(
+        length <= MAX_INDEX_BYTES && length <= bytes.len() - 16,
+        "invalid archive pack index length"
+    );
+    let index: PackIndex = serde_json::from_slice(&bytes[16..16 + length])?;
+    ensure!(
+        matches!(index.version, 1 | PACK_VERSION)
+            && index.source_hash == source_hash
+            && !index.recipe.is_empty()
+            && selection.accepts_recipe(&index.recipe),
+        "archive pack recipe or source does not match"
+    );
+    ensure!(
+        index.reader_version == reader_version,
+        "archive pack was decoded by a different archive reader"
+    );
+    let base = 16 + length;
+    let layout = validate_pack_layout(&index, base, bytes.len())?;
+    let expected_hash = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| color_eyre::eyre::eyre!("invalid archive pack filename"))?;
+    ensure!(
+        hash_bytes(&bytes) == expected_hash,
+        "archive pack digest mismatch"
+    );
+    let mut packed = Vec::new();
+    for (item, (relative, start, end)) in index.files.into_iter().zip(layout) {
         let payload = bytes
             .get(start..end)
             .ok_or_else(|| color_eyre::eyre::eyre!("truncated archive pack payload"))?;
@@ -1102,11 +1125,84 @@ fn read_pack(
             ));
         }
     }
-    ensure!(
-        base as u64 + expected_offset == bytes.len() as u64,
-        "archive pack has trailing or missing bytes"
-    );
     Ok(packed)
+}
+
+/// Removes only known pre-reader-version BSA packs from the writable current cache.
+/// Previous generations and malformed or future pack formats remain untouched.
+pub(crate) fn prune_stale_reader_packs(
+    cache_root: &Path,
+    live_sources: &BTreeMap<String, u32>,
+) -> Result<()> {
+    let batches = cache_root.join("batches");
+    if !fs::symlink_metadata(&batches).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+        return Ok(());
+    }
+    for (source_hash, current_reader) in live_sources {
+        if *current_reader != super::BSA_READER_VERSION {
+            continue;
+        }
+        let source_dir = batches.join(source_hash);
+        if !fs::symlink_metadata(&source_dir).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+            continue;
+        }
+        for recipe in [
+            ArchiveSelection::RuntimeEnglishV1.recipe(),
+            ArchiveSelection::ConverterInputsV1.recipe(),
+            ArchiveSelection::All.recipe(),
+        ] {
+            let recipe_dir = source_dir.join(recipe);
+            if !fs::symlink_metadata(&recipe_dir)
+                .is_ok_and(|metadata| metadata.file_type().is_dir())
+            {
+                continue;
+            }
+            for entry in fs::read_dir(&recipe_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file()
+                    || entry
+                        .path()
+                        .extension()
+                        .is_none_or(|extension| extension != "pack")
+                {
+                    continue;
+                }
+                if pack_reader_version(&entry.path(), source_hash, recipe) == Some(0) {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pack_reader_version(path: &Path, source_hash: &str, recipe: &str) -> Option<u32> {
+    let file = File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if !(16..=(MAX_FILE_BYTES + MAX_INDEX_BYTES + 16) as u64).contains(&file_len) {
+        return None;
+    }
+    let bytes = unsafe { Mmap::map(&file) }.ok()?;
+    if bytes.len() < 16
+        || bytes.len() > MAX_FILE_BYTES + MAX_INDEX_BYTES + 16
+        || &bytes[..8] != PACK_MAGIC
+    {
+        return None;
+    }
+    let length = usize::try_from(u64::from_le_bytes(bytes[8..16].try_into().ok()?)).ok()?;
+    if length > MAX_INDEX_BYTES || length > bytes.len() - 16 {
+        return None;
+    }
+    let index: PackIndex = serde_json::from_slice(&bytes[16..16 + length]).ok()?;
+    if !matches!(index.version, 1 | PACK_VERSION)
+        || index.source_hash != source_hash
+        || index.recipe != recipe
+    {
+        return None;
+    }
+    let base = 16 + length;
+    validate_pack_layout(&index, base, bytes.len()).ok()?;
+    Some(index.reader_version)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1422,7 +1518,7 @@ mod tests {
         assert_eq!(restored[0].1.item.sha256, hash_bytes(data));
     }
 
-    fn write_test_pack(root: &Path, source: &str, reader_version: u32, data: &[u8]) {
+    fn write_test_pack(root: &Path, source: &str, reader_version: u32, data: &[u8]) -> PathBuf {
         let index = PackIndex {
             version: PACK_VERSION,
             source_hash: source.to_owned(),
@@ -1440,16 +1536,91 @@ mod tests {
         bytes.extend_from_slice(&(index.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&index);
         bytes.extend_from_slice(data);
+        let path = root
+            .join("batches")
+            .join(source)
+            .join("converter-inputs-v1")
+            .join(format!("{}.pack", hash_bytes(&bytes)));
         let directory = root
             .join("batches")
             .join(source)
             .join("converter-inputs-v1");
         fs::create_dir_all(&directory).unwrap();
-        fs::write(
-            directory.join(format!("{}.pack", hash_bytes(&bytes))),
-            &bytes,
+        fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    fn pack_path(root: &Path, source: &str, reader_version: u32, data: &[u8]) -> PathBuf {
+        write_test_pack(root, source, reader_version, data)
+    }
+
+    #[test]
+    fn incompatible_pack_metadata_is_rejected_before_full_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = "ab".repeat(32);
+        let path = pack_path(directory.path(), &source, 0, b"payload");
+        let renamed = path.with_file_name("not-the-content-digest.pack");
+        fs::rename(&path, &renamed).unwrap();
+
+        let error = read_pack(
+            &renamed,
+            &source,
+            BSA_READER_VERSION,
+            ArchiveSelection::ConverterInputsV1,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("different archive reader"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn compatible_pack_still_rejects_a_corrupt_full_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = "ab".repeat(32);
+        let path = pack_path(directory.path(), &source, BSA_READER_VERSION, b"payload");
+        let mut bytes = fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(&path, bytes).unwrap();
+
+        let error = read_pack(
+            &path,
+            &source,
+            BSA_READER_VERSION,
+            ArchiveSelection::ConverterInputsV1,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("digest mismatch"));
+    }
+
+    #[test]
+    fn pruning_removes_only_old_live_bsa_reader_packs() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = "ab".repeat(32);
+        let ba2_source = "cd".repeat(32);
+        let old_bsa = pack_path(directory.path(), &source, 0, b"old");
+        let current_bsa = pack_path(directory.path(), &source, BSA_READER_VERSION, b"current");
+        let future_bsa = pack_path(directory.path(), &source, BSA_READER_VERSION + 1, b"future");
+        let current_ba2 = pack_path(directory.path(), &ba2_source, 0, b"ba2");
+        let malformed = directory
+            .path()
+            .join("batches")
+            .join(&source)
+            .join("converter-inputs-v1/unknown.pack");
+        fs::write(&malformed, b"unknown future pack").unwrap();
+
+        prune_stale_reader_packs(
+            directory.path(),
+            &BTreeMap::from([(source, BSA_READER_VERSION), (ba2_source, 0)]),
         )
         .unwrap();
+
+        assert!(!old_bsa.exists());
+        assert!(current_bsa.is_file());
+        assert!(future_bsa.is_file());
+        assert!(current_ba2.is_file());
+        assert!(malformed.is_file());
     }
 
     #[test]

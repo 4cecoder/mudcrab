@@ -3,7 +3,7 @@ mod batched;
 mod bsa;
 mod bsa_name;
 
-pub(crate) use batched::{sync_directory, sync_pack_file};
+pub(crate) use batched::{prune_stale_reader_packs, sync_directory, sync_pack_file};
 
 use crate::{
     asset_path::{AssetKind, canonical_asset_path},
