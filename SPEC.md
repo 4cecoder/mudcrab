@@ -238,6 +238,7 @@ V181: Offline meshoptimizer experiment pins v1.3 commit, builder/driver/settings
 V210: CI ! dispatch software Vulkan UASTC encoder, decode synthetic color/alpha/normal/mip/partial-block cases with CPU comparison; absent adapter fails explicit run; production CPU-adapter rejection retained.
 V190: Record-aware remap ! exact faction SNAM length 8; rank/padding unchanged; WRLD RNAM coordinates & TNAM strings unchanged; consumed single links remap under relocated full/light slots.
 
+V191: Jump ascent ! proximity grounded feedback cannot reset positive jump velocity or allow airborne relaunch; descending contact resets motion; movement ordered before Rapier SyncBackend.
 V200: Real-output timing validation ! propagate full selected-set failure; missing configuration, empty selection & semantics collection errors fail; diagnostics never certify passing subset.
 V201: Converter producer 28 ! KTX2 texture containers store mip level data smallest-first; uncompressed levels use exact lcm(texel block bytes, 4) alignment and supercompressed levels are contiguous (KTX 2.0 sections 3.7, 3.9.7). Producer-27 textures are never reused: a warm rerun regenerates them through normal conversion, and metadata rebuild accepts only current-schema sources, so pre-28 KTX2 is never relabeled. Producer-27 GLBs stay reusable only through the explicit (27, 28) pair and producer-27 scripts through the script gate; producers 24 and 26 never reach 28 meshes. Settings proofs keep their per-kind producer. World database stays 9; regression: fixture_texture_layout_migration.
 V182: Terrain blocking worker ! current-thread progress/cancellation responsive; caller drop cancels while normal output/repair or metadata source/destination leases remain owned until worker stops; full progress wait interruptible; per-world rollback & proofs unchanged.
@@ -296,6 +297,7 @@ T73|~|Implement opt-in pinned offline conventional/cluster comparison from immut
 T110|x|Exercise actual GPU batch/dispatch/readback with software Vulkan in CI|V210
 T90|x|Fix faction remap & reject aliased non-FormID fields; independent full/light field regressions|V190
 
+T91|x|Preserve jump ascent through Rapier ground-probe overlap in current source: headless integration ascent/descent/relaunch regression & walk feed ordered before SyncBackend; no new native or 48-check acceptance claimed|V191
 T100|x|Make validation timing fail on bad output; valid/broken generated artifact regression|V200
 T74|x|Move terrain compiler into owned blocking pool; retain leases on abort, cancel channel waits & verify current-thread regressions|V182
 
@@ -396,4 +398,6 @@ B211|2026-10-05|New GPU fixture used constant chunks_exact under Rust1.98 strict
 B212|2026-10-05|Package-only ignored GPU step changed feature unification & rebuilt after workspace tests; cold combined CI exceeded30min|V210,V118; same workspace/target selection for both test steps
 B213|2026-10-12|Synchronous world compilation prevented current-thread progress/Stop; detached worker could release publication locks before writes ceased|V182; owned leases, drop cancellation, interruptible progress & bounded transactional checks
 B190|2026-10-05|Four-byte global guard skipped NPC faction structures; WRLD RNAM/TNAM mistaken for links|V190
+
+B191|2026-10-12|Rapier ground proximity stayed true after upward launch; next WALK integration zeroed velocity at 5.666668-unit rise|V191; ascent guard, deterministic feed ordering & descent/relaunch regression
 B200|2026-10-05|Timing harness discarded invalid artifacts & asserted passing subset|V200
