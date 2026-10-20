@@ -3,7 +3,7 @@
 //! The caller owns frame ordering and enables collection explicitly. Scene IDs identify
 //! observed scene assets, not files, decode jobs, dependencies, or drawable placements.
 
-use crate::streaming::StreamingMetrics;
+use crate::streaming::{StreamingMetrics, admission::AdmissionStats};
 use bevy::{asset::AssetId, prelude::Resource, world_serialization::WorldAsset};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -119,6 +119,14 @@ pub(crate) struct SceneCounts {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct SceneAdmissionSnapshot {
+    pub configured_job_limit: usize,
+    pub prioritization_enabled: bool,
+    #[serde(flatten)]
+    pub jobs: AdmissionStats,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct StreamingFrameSample {
     pub main_frame: u64,
     pub elapsed_ms: f64,
@@ -127,6 +135,7 @@ pub(crate) struct StreamingFrameSample {
     pub benchmark_window: BenchmarkWindow,
     pub camera: Option<CameraObservation>,
     pub streaming: Option<StreamingSnapshot>,
+    pub scene_admission: Option<SceneAdmissionSnapshot>,
     /// Populated by `push_frame` from the bounded scene ledger.
     pub scenes: SceneCounts,
     pub process_memory_gib: Option<f64>,
@@ -326,6 +335,7 @@ mod tests {
             benchmark_window,
             camera: None,
             streaming: None,
+            scene_admission: None,
             scenes: SceneCounts::default(),
             process_memory_gib: None,
             cpu_spans_ms: BTreeMap::new(),

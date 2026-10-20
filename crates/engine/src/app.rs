@@ -95,6 +95,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         None
     };
+    if reads_asset_tree {
+        crate::streaming::requests::validate_pack_identity(&config).wrap_err_with(|| {
+            format!(
+                "cannot read the converted pack manifest under {}",
+                config.assets_dir.display()
+            )
+        })?;
+    }
     let runtime_data = if config.streaming_fixture {
         let database_path = config.assets_dir.join("skyrim_world.db");
         Some((
@@ -2264,7 +2272,7 @@ fn capture_acceptance_screenshot(
     streaming: Option<Res<StreamingMetrics>>,
     world_database: Option<Res<WorldDatabase>>,
     renderer: Res<RendererMetrics>,
-    windows: Query<(), With<Window>>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
 ) {
     let Some(path) = &config.acceptance_screenshot else {
         return;
