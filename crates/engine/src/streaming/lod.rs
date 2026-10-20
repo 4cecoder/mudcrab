@@ -293,6 +293,7 @@ pub(super) fn plan_lod_chunks(
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
     runtime: Option<Res<super::runtime::StreamingRuntime>>,
+    mut previous_distances: Local<Option<crate::config::TerrainLodDistances>>,
 ) {
     let started = Instant::now();
     let Ok(camera) = camera.single() else {
@@ -323,7 +324,17 @@ pub(super) fn plan_lod_chunks(
     };
 
     let center = streaming_center(config.acceptance_screenshot.is_some(), origin.0, camera);
-    if streaming.center != Some(center) || streaming.worldspace_id != Some(worldspace_id) {
+    let distances_changed = previous_distances.as_ref() != Some(&config.terrain_lod);
+    *previous_distances = Some(config.terrain_lod);
+    if distances_changed {
+        // Resident patches keep their chunks when a distance changes, so no load or removal event
+        // would otherwise re-select their tier while the camera stands still.
+        streaming.visibility_dirty = true;
+    }
+    if streaming.center != Some(center)
+        || streaming.worldspace_id != Some(worldspace_id)
+        || distances_changed
+    {
         streaming.move_center(center, worldspace_id, &config.terrain_lod);
     }
     let generation = streaming.generation;
@@ -2648,6 +2659,96 @@ mod tests {
             21_999,
             "removing a patch refreshes visibility metrics"
         );
+    }
+
+    #[test]
+    fn stationary_camera_reselects_resident_tiers_when_lod_distances_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lod-distances.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER NOT NULL);
+                 INSERT INTO schema_info VALUES({});",
+                shared::WORLD_DATABASE_SCHEMA_VERSION,
+            ))
+            .unwrap();
+        drop(connection);
+        let mut config = EngineConfig {
+            headless: true,
+            ..default()
+        };
+        // Cell reach 4 for the fine tier and 8 for the coarse one, so a patch six cells away
+        // selects the coarse tier until the fine tier's distance is raised.
+        config.terrain_lod = TerrainLodDistances {
+            block_level0_distance: 4.0 * CELL_SIZE,
+            block_level1_distance: 8.0 * CELL_SIZE,
+            block_maximum_distance: 16.0 * CELL_SIZE,
+            split_distance_mult: 1.0,
+        };
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(LodStreaming::default())
+            .insert_resource(StreamingCommitBudget::default())
+            .insert_resource(StreamingMetrics::default())
+            .insert_resource(ProfilingState::default())
+            .add_systems(
+                Update,
+                (plan_lod_chunks, update_terrain_lod_visibility).chain(),
+            );
+        let camera = Transform::from_xyz(CELL_SIZE * 0.5, 0.0, CELL_SIZE * 0.5);
+        let center = streaming_center(false, IVec2::ZERO, &camera);
+        let grid = center + IVec2::new(6, 0);
+        let world = app.world_mut();
+        world.spawn((StreamingCamera, camera));
+        // Both tiers are resident for the same quadrant, and neither the camera nor any readiness
+        // or removal event changes after the first frame.
+        let fine = world
+            .spawn((
+                TerrainCoverage {
+                    grid,
+                    quadrant: 0,
+                    tier: Some(LodTier::Tier4),
+                },
+                TerrainSurfaceReady,
+                Visibility::Hidden,
+            ))
+            .id();
+        let coarse = world
+            .spawn((
+                TerrainCoverage {
+                    grid,
+                    quadrant: 0,
+                    tier: Some(LodTier::Tier8),
+                },
+                TerrainSurfaceReady,
+                Visibility::Hidden,
+            ))
+            .id();
+        let visibility =
+            |app: &App, entity: Entity| *app.world().get::<Visibility>(entity).unwrap();
+
+        app.update();
+        assert_eq!(visibility(&app, fine), Visibility::Hidden);
+        assert_eq!(
+            visibility(&app, coarse),
+            Visibility::Inherited,
+            "six cells is past the fine tier's reach, so the coarse tier draws"
+        );
+
+        app.world_mut()
+            .resource_mut::<EngineConfig>()
+            .terrain_lod
+            .block_level0_distance = 6.0 * CELL_SIZE;
+        app.update();
+        assert_eq!(
+            visibility(&app, fine),
+            Visibility::Inherited,
+            "raising the fine tier's distance re-selects it on the next frame"
+        );
+        assert_eq!(visibility(&app, coarse), Visibility::Hidden);
     }
 
     #[test]
