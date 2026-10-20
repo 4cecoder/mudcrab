@@ -21,7 +21,8 @@
 //!   wait at all. Frame times are scored from the first full frame on the route.
 //! * The route ends when the last waypoint is reached, and the benchmark window with it, so the
 //!   report covers the route and nothing after it. A looped route never ends; the benchmark's own
-//!   duration does.
+//!   duration does, counted in real seconds from the start of the process, and so does a route that
+//!   never becomes ready or never reaches its end.
 //!
 //! The distance travelled follows the real clock (`Time<Real>`), not Bevy's virtual clock, which is
 //! clamped at 250 ms: a long hitch must cost the camera its distance, as it would a player's.
@@ -982,6 +983,9 @@ mod tests {
         // Waiting before the start is not a route frame even when there is no ground.
         assert_eq!(runner.step(1.0, false, 0.0).eye_height, Some(600.0));
         assert_eq!(runner.report().route_frames_without_ground, 0);
+        // The start frame stands at the first waypoint and is not a route frame either.
+        assert_eq!(runner.step(1.0, true, 0.0).position.x, 0.0);
+        assert_eq!(runner.report().route_frames_without_ground, 0);
         for second in 1..=4 {
             let frame = runner.step(1.0, true, 0.0);
             assert_eq!(frame.position.x, 1000.0 * second as f32);
@@ -1001,6 +1005,8 @@ mod tests {
     #[test]
     fn a_route_that_never_finds_ground_has_no_eye_height_to_offer() {
         let mut runner = runner(GOOD, RouteGround::default());
+        // The start frame walks nothing, so it has no ground to count either.
+        runner.step(1.0, true, 0.0);
         let frame = runner.step(1.0, true, 0.0);
         assert_eq!(
             frame.eye_height, None,
@@ -1028,6 +1034,7 @@ mod tests {
         let ground = RouteGround::from_cells([((0, 0), flat(0.0))]);
         let mut runner = runner(GOOD, ground);
         runner.step(0.5, true, 10.0);
+        runner.step(0.5, true, 510.0);
         let json = serde_json::to_value(runner.report()).unwrap();
         assert_eq!(json["name"], "test");
         assert_eq!(json["start"], "world_ready");
