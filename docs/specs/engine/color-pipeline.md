@@ -21,7 +21,7 @@ Code baseline: `a9f2310ccfc691eebb97fde18df1e8d334b7d744`; Bevy 0.19. The source
 | `DistanceFog` | Exposed surface RGB + linear fog palette → fogged linear RGB | Existing Bevy visibility-based atmospheric fog toward Fog Far stays explicit. Interior fog removal is current behavior, not complete Skyrim interior semantics. L2 owns the correction. |
 | `render.rs` reflection camera | Scene at main-view exposure → `Rgba16Float`, tone mapping disabled | Floating linear target preserves values above 1. Reflection gate copies exposure even while inactive. Existing reflected layers and geometry selection remain unchanged. |
 | `shaders/water.wgsl` | Exposed water lighting + exposed linear reflection → blend → surface fog | Reflection receives neither a second lighting evaluation nor a display transform. Existing Fresnel/waves and reflection coverage are approximations. |
-| `color_pipeline.rs` / scene cameras | HDR composition → `TonyMcMapface` → selected post-tonemap grade → display encoding | Runtime starts with Cool Gray sky and the Sleeping Giant sRGB snapshot described below. The saved `full` grade uses Bevy linear `post_saturation`, followed by sRGB brightness/contrast/tint from reported `ISSkyrimClearDAY` (0x00012F88, `Update.esm` winner) CNAM 1.5/1.135/1.4 and TNAM 0.42 toward 0.894/0.839/0.773. Contrast uses an artistic pivot of 0.18. The default tone curve and EV100 remain pinned Bevy baselines; `HNAM` stays unapplied on that path. The separate retail-curve experiment below uses White only. L4 owns adaptation and effective native state. |
+| `color_pipeline.rs` / scene cameras | HDR composition → selected Bevy transform (Tony by default) or explicit retail curve → selected post-tonemap grade → display encoding | Runtime starts with Cool Gray sky and the Sleeping Giant sRGB snapshot described below. The settings menu can select a Bevy transform on the Tony path. Explicit retail-curve selection owns camera tonemapping and stays active across unrelated settings changes. The saved `full` grade uses Bevy linear `post_saturation`, followed by sRGB brightness/contrast/tint from reported `ISSkyrimClearDAY` (0x00012F88, `Update.esm` winner) CNAM 1.5/1.135/1.4 and TNAM 0.42 toward 0.894/0.839/0.773. Contrast uses an artistic pivot of 0.18. EV100 remains a pinned Bevy baseline unless changed in the interactive settings. `HNAM` stays unapplied on the Tony path. The separate retail-curve experiment below uses White only. L4 owns adaptation and effective native state. |
 
 The previous non-HDR mesh path tone-mapped in each material shader. The custom sky shader bypassed that operation, and reflection RGB passed through tone mapping in both the reflection and water passes. HDR composition moves the tone transform after composition. The experimental cinematic grade adds a fullscreen shader pass. It changes images and consumes more render-target memory; target-hardware performance remains an acceptance requirement.
 
@@ -246,7 +246,13 @@ tone mapping, camera pose, lighting and fog remain fixed. Reflections stay ungra
 and newly spawned scene cameras inherit the current mode. The runtime default is
 `snapshot-srgb` with Cool Gray.
 
-Use `--color-grade off|saturation|full` for startup selection. For a repeatable
+Use `--color-grade off|saturation|full|snapshot-srgb|snapshot-linear|record-srgb`
+for startup selection. The settings menu persists these six modes. Its optional
+field mask distinguishes user tuning from the displayed resolved base: unedited
+fields keep the active approved or loaded record value, and one edited field
+overrides only that field. Source evidence records the base identity, raw record
+and provenance, applied override mask/values, and effective grade. Camera
+application and capture receipts use the same central resolver. For a repeatable
 three-mode capture, run:
 
 ```bash

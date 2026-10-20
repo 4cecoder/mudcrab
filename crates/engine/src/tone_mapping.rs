@@ -155,6 +155,9 @@ impl RetailCurveParameters {
 #[derive(Resource, Clone, Debug, Default)]
 pub struct SceneToneMapSource {
     pub mode: SceneToneMapMode,
+    /// Bevy's menu-selected transform for the approved Tony path. The explicit retail curve
+    /// continues to resolve to `None` regardless of this preference.
+    pub bevy_tonemapping: Tonemapping,
     pub parameters: Option<RetailCurveParameters>,
     pub parameters_path: Option<PathBuf>,
 }
@@ -174,6 +177,7 @@ impl SceneToneMapSource {
             .transpose()?;
         let source = Self {
             mode: config.tone_map,
+            bevy_tonemapping: Tonemapping::TonyMcMapface,
             parameters,
             parameters_path: config.tone_map_params.clone(),
         };
@@ -201,7 +205,9 @@ impl SceneToneMapSource {
     ) -> std::result::Result<ResolvedSceneGrade, String> {
         overrides.validate()?;
         if self.mode == SceneToneMapMode::Tony {
-            return grade_source.resolve_with_overrides(mode, preset, overrides);
+            let mut resolved = grade_source.resolve_with_overrides(mode, preset, overrides)?;
+            resolved.tonemapping = self.bevy_tonemapping;
+            return Ok(resolved);
         }
         if !matches!(
             mode,
@@ -272,8 +278,12 @@ impl SceneToneMapSource {
         }
         evidence["tone_map_mode"] = self.mode.name().into();
         evidence["tonemapping"] = match self.mode {
-            SceneToneMapMode::Tony => "TonyMcMapface",
-            SceneToneMapMode::RetailCurve => "RetailCurveExperiment",
+            SceneToneMapMode::Tony => resolved
+                .as_ref()
+                .ok()
+                .map(|resolved| format!("{:?}", resolved.tonemapping))
+                .unwrap_or_else(|| "unresolved".into()),
+            SceneToneMapMode::RetailCurve => "RetailCurveExperiment".into(),
         }
         .into();
         evidence["bevy_tonemapping"] = resolved
@@ -393,6 +403,7 @@ mod tests {
     fn experiment(curve: RetailCurveKind) -> SceneToneMapSource {
         SceneToneMapSource {
             mode: SceneToneMapMode::RetailCurve,
+            bevy_tonemapping: Tonemapping::TonyMcMapface,
             parameters: Some(parameters(curve)),
             parameters_path: Some("explicit-test-parameters.json".into()),
         }
@@ -691,5 +702,43 @@ mod tests {
 
         std::fs::write(&path, "{}").unwrap();
         assert!(SceneToneMapSource::load(&config, &source).is_err());
+    }
+
+    #[test]
+    fn approved_tonemap_selection_flows_through_shared_grade_resolution() {
+        let source = SceneGradeSource::default();
+        let tone = SceneToneMapSource {
+            bevy_tonemapping: Tonemapping::AgX,
+            ..default()
+        };
+        let resolved = tone
+            .resolve(
+                &source,
+                SceneGradeMode::SnapshotSrgb,
+                SceneVisualPreset::CoolGray,
+            )
+            .unwrap();
+        assert_eq!(resolved.tonemapping, Tonemapping::AgX);
+        assert_eq!(
+            tone.evidence(
+                &source,
+                SceneGradeMode::SnapshotSrgb,
+                SceneVisualPreset::CoolGray
+            )["tonemapping"],
+            "AgX"
+        );
+        let retail = experiment(RetailCurveKind::Reinhard);
+        assert_eq!(
+            retail
+                .resolve(
+                    &grade_source(Some(1.05)),
+                    SceneGradeMode::SnapshotSrgb,
+                    SceneVisualPreset::CoolGray,
+                )
+                .unwrap()
+                .tonemapping,
+            Tonemapping::None,
+            "the explicit curve owns camera tonemapping"
+        );
     }
 }

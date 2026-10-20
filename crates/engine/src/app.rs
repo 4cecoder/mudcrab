@@ -113,7 +113,7 @@ struct AssetDirectoryReadLock {
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
     validate_fixture_selection(&config)?;
-    let preferences = config
+    let mut preferences = config
         .interactive_world_physics()
         .then(|| crate::settings::prepare_settings(&mut config));
     config.image_space_selection()?;
@@ -206,7 +206,22 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .then(|| crate::terrain_merge::TerrainMerge::open(&config.assets_dir));
     let grade_source =
         SceneGradeSource::load(&config, runtime_data.is_some() && !config.streaming_fixture)?;
-    let tone_map_source = SceneToneMapSource::load(&config, &grade_source)?;
+    let mut tone_map_source = SceneToneMapSource::load(&config, &grade_source)?;
+    if let Some((settings, _)) = preferences.as_mut() {
+        tone_map_source.bevy_tonemapping = crate::settings::TONE_MAPS[settings.tone_map];
+        if let Some(mode) = crate::color_pipeline::SceneGradeMode::from_index(settings.color_grade)
+        {
+            let resolved = tone_map_source
+                .resolve_with_overrides(
+                    &grade_source,
+                    mode,
+                    config.visual_preset,
+                    settings.grade_overrides(),
+                )
+                .map_err(color_eyre::eyre::Error::msg)?;
+            settings.show_resolved_grade(resolved.grade, resolved.post.pivot);
+        }
+    }
     let sky_palette = grade_source.sky_palette(config.visual_preset);
     let movement_tuning = (interactive_world_physics
         && runtime_data.is_some()

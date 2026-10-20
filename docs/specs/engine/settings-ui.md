@@ -17,7 +17,7 @@ Settings are grouped under headings (for example Point lights, Sun shadows, Wate
 - Water reflections and reflection multiplier; waves, flow normals, wave scale, speed and strength. The reflection multiplier layers over each water's converted Fresnel and reflectivity values.
 - CPU frustum culling, GPU indirect drawing, GPU occlusion culling and depth prepass. Enabling occlusion enables its depth-prepass and indirect-drawing dependencies; disabling either dependency disables occlusion.
 - MSAA, exposure, tone mapping, vertical FOV, VSync, window mode and windowed resolution. Walking sprint adds its existing FOV bonus to the chosen base FOV.
-- Color grading: Off, Saturation only, Full (legacy), Approved sRGB and Snapshot linear, with live saturation, brightness, contrast, pivot, tint amount and tint RGB. Defaults preserve the approved Sleeping Giant sRGB appearance and Cool Gray sky/fog. Stage-dependent rows dim while inactive. Reflections stay ungraded. Console commands synchronize the menu. See the integration contract below for domains, persistence, launch precedence and capture isolation.
+- Color grading: Off, Saturation, Full (legacy), Approved sRGB, Snapshot linear and Record sRGB, with live saturation, brightness, contrast, pivot, tint amount and tint RGB. Defaults preserve the approved Sleeping Giant sRGB appearance and Cool Gray sky/fog. Stage-dependent rows dim while inactive. Reflections stay ungraded. Console commands synchronize the menu. See the integration contract below for domains, persistence, launch precedence and capture isolation.
 - Status HUD and diagnostic asset fallbacks for subsequent loads. Existing failed instances keep their current fallback state. Collision outlines remain a session-only toggle available in the Graphics tab and the console.
 
 The panel lists room culling as unavailable until #188 supplies an implementation. HDR scene composition stays enabled. Renderer backend and adapter information are displayed; backend/device capabilities require renderer initialization. Authored material colors, texture tiling, and per-water factors remain asset data.
@@ -50,12 +50,12 @@ The Controls tab lists menu/cursor keys, console entry and completion, mouse loo
 
 ## Native preview
 
-`cargo run --profile quick -p engine --example settings_menu` opens the actual menu over an asset-free scene using the real sky, fog, water, and renderer systems. It does not load or save personal preferences.
+`python3 scripts/workspace.py cargo run --profile quick -p engine --example settings_menu` opens the actual menu over an asset-free scene using the real sky, fog, water, and renderer systems. It does not load or save personal preferences.
 
 For a bounded capture of all three tabs:
 
 ```sh
-MUDCRAB_UI_PREVIEW_DIR=/tmp/mudcrab-ui cargo run --profile quick -p engine --example settings_menu
+MUDCRAB_UI_PREVIEW_DIR=/tmp/mudcrab-ui python3 scripts/workspace.py cargo run --profile quick -p engine --example settings_menu
 ```
 
 The preview saves `graphics.png`, `streaming.png`, and `controls.png`, then exits after the final screenshot completes. This verifies the native UI/render path; it is not a gameplay or performance acceptance run.
@@ -74,19 +74,43 @@ to be copied back into #257.
 | Full (legacy) | Bevy linear post-tonemap | sRGB post pass |
 | Approved sRGB | sRGB post pass | sRGB post pass |
 | Snapshot linear | Linear post pass | Linear post pass |
+| Record sRGB | Loaded IMGS CNAM/TNAM in sRGB post pass | sRGB post pass |
 
 Fresh interactive preferences and Reset defaults select Approved sRGB and Cool
 Gray: saturation 1.66, brightness 1.38, contrast 1.50, tint amount 0.56 toward RGB
 (0.88, 0.81, 0.72), pivot 0.18. Cool Gray retains #257's quarter-density blue-white
 fog. The menu's sky/fog preset does not discard custom grading values.
 
-All five modes, preset, tuning and pivot persist in the existing validated JSON.
-Previously saved explicit values remain player preferences. Console SceneGrade
-and ScenePreset select the canonical mode/preset grade and synchronize the menu
-and tuning; rejected commands leave them unchanged. Explicit launch mode selects
-its canonical grade even when preferences exist, and explicit preset wins over
-the saved preset. Legacy Vivid is available with --visual-preset vivid
---color-grade full.
+All six modes, preset, tuning and pivot persist in the existing validated JSON.
+The override mask records only fields explicitly changed by the user. Unedited
+rows display the resolved source values, including authored values outside the
+menu's edit range; loading those values does not turn them into overrides.
+Console SceneGrade and ScenePreset select the canonical mode/preset grade and
+synchronize the menu and tuning. Rejected commands leave source and settings
+unchanged. Reset clears the override mask and restores the approved sRGB / Cool
+Gray defaults.
+
+Startup precedence is field-specific. Valid INI values and explicit CLI options
+overlay saved preferences for their corresponding fields. `--color-grade`
+owns the active mode and clears saved numeric overrides for that launch, so the
+selected source supplies canonical values. `--visual-preset` owns only the
+preset and keeps saved mode and tuning. Explicit `--grade-preset`, image-space,
+`--tone-map` and `--tone-map-params` sources protect the active mode and numeric
+overrides from stale saved values. An image-space selector supplies source data;
+it does not select Record sRGB by itself. Saved Record sRGB without an explicit
+image-space selection reports unavailability and uses the approved default.
+The grade source and tuning resolve before the first visible camera frame.
+
+Save preserves the stored grade mode and override values for fields owned by
+launch sources, while saving unrelated menu changes. It does not write the
+current CLI/source-derived grade into preferences. Legacy Vivid is available
+with `--visual-preset vivid --color-grade full`.
+
+The Bevy tone-map menu selection flows through the shared resolver. Explicit
+`--tone-map retail-curve` owns camera tonemapping (`None`) and keeps its loaded
+HNAM White and curve parameters across unrelated menu edits; the Bevy tone-map
+choice remains available on the Tony path. Exposure still applies to scene and
+reflection cameras, while reflections remain ungraded.
 
 Interactive tuning exists only in interactive world runs (and the asset-free
 preview). Hidden-window, shots, acceptance, benchmark and fixture runs do not load
@@ -101,13 +125,10 @@ settings foundation's earlier white/blue approximations. The fog-density slider
 scales atmospheric extinction and inscattering while retaining the preset,
 including its quarter-density Cool Gray baseline.
 
-Integration checks in the Linux editing environment: 10 comparison tests and
-2 capture tests pass; Python compileall and Rust syntax parsing pass. Added Rust
-regressions cover all-mode console synchronization, reset to approved appearance,
-custom tuning and reflection exclusions, saved settings round trips, explicit
-launch precedence and automated-run isolation. cargo fmt --all -- --check passes. cargo test -p engine --lib settings was
-attempted but stopped in wayland-sys because pkg-config/Wayland development
-dependencies are missing; installing system packages is unavailable in this
-container. Rust tests, clippy and engine builds remain unverified.
-Native Metal, grading-section UI visibility, converted-scene appearance,
-gameplay and performance have not been verified on this integration.
+Historical validation from the earlier settings-UI integration reported 12
+Python comparison/capture tests (10 comparison and 2 capture), Python compileall, Rust syntax parsing and
+`cargo fmt --all -- --check` as passing. Its `cargo test -p engine --lib settings`
+attempt stopped in `wayland-sys` because pkg-config/Wayland development
+dependencies were unavailable. Those results predate this PR #262 integration
+and do not validate its current Rust source. Current Rust tests, builds, native
+Metal, converted-scene appearance, gameplay and performance remain unverified.

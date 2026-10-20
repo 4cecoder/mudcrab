@@ -502,6 +502,18 @@ impl RenderingSettings {
         self.grade_override_mask = saved.grade_override_mask;
     }
 
+    fn restore_grade_values(&mut self, saved: &Self) {
+        self.grade_saturation = saved.grade_saturation;
+        self.grade_brightness = saved.grade_brightness;
+        self.grade_contrast = saved.grade_contrast;
+        self.grade_tint_amount = saved.grade_tint_amount;
+        self.grade_tint_red = saved.grade_tint_red;
+        self.grade_tint_green = saved.grade_tint_green;
+        self.grade_tint_blue = saved.grade_tint_blue;
+        self.grade_pivot = saved.grade_pivot;
+        self.grade_override_mask = saved.grade_override_mask;
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.version != 1 {
             return Err("unsupported settings version".into());
@@ -534,6 +546,12 @@ impl RenderingSettings {
     }
 
     fn take_launch_values(&mut self, config: &EngineConfig) {
+        self.color_grade = config.color_grade.index();
+        self.visual_preset =
+            usize::from(config.visual_preset == crate::color_pipeline::SceneVisualPreset::CoolGray);
+        if grade_source_is_launch_owned(&config.settings_overrides) {
+            self.grade_override_mask = 0;
+        }
         self.point_lights = config.lights;
         self.stream_radius = config.stream_radius;
         self.unload_radius = config.unload_radius;
@@ -558,6 +576,13 @@ impl RenderingSettings {
 
     /// Copies from `source` the fields that the explicit launch `overrides` own.
     fn take_launch_owned_values(&mut self, source: &RenderingSettings, overrides: &[String]) {
+        if overrides.iter().any(|flag| flag == "--visual-preset") {
+            self.visual_preset = source.visual_preset;
+        }
+        if grade_source_is_launch_owned(overrides) {
+            self.color_grade = source.color_grade;
+            self.restore_grade_values(source);
+        }
         for flag in overrides {
             match flag.as_str() {
                 "--lights" => self.point_lights = source.point_lights,
@@ -591,6 +616,14 @@ impl RenderingSettings {
     }
 
     pub(crate) fn apply_config(&self, config: &mut EngineConfig) {
+        if let Some(mode) = crate::color_pipeline::SceneGradeMode::from_index(self.color_grade) {
+            config.color_grade = mode;
+        }
+        config.visual_preset = if self.visual_preset == 0 {
+            crate::color_pipeline::SceneVisualPreset::Vivid
+        } else {
+            crate::color_pipeline::SceneVisualPreset::CoolGray
+        };
         config.lights = self.point_lights;
         config.stream_radius = self.stream_radius;
         config.unload_radius = self.unload_radius;
@@ -607,7 +640,12 @@ impl RenderingSettings {
     }
 
     fn config_differs(&self, config: &EngineConfig) -> bool {
-        self.point_lights != config.lights
+        self.color_grade != config.color_grade.index()
+            || self.visual_preset
+                != usize::from(
+                    config.visual_preset == crate::color_pipeline::SceneVisualPreset::CoolGray,
+                )
+            || self.point_lights != config.lights
             || self.stream_radius != config.stream_radius
             || self.unload_radius != config.unload_radius
             || self.lod_level0_distance != config.terrain_lod.block_level0_distance
@@ -623,6 +661,20 @@ impl RenderingSettings {
     }
 }
 
+fn grade_source_is_launch_owned(overrides: &[String]) -> bool {
+    [
+        "--color-grade",
+        "--grade-preset",
+        "--image-space",
+        "--image-space-weather",
+        "--image-space-slot",
+        "--tone-map",
+        "--tone-map-params",
+    ]
+    .iter()
+    .any(|flag| overrides.iter().any(|value| value == flag))
+}
+
 #[derive(Resource)]
 pub struct SettingsFile {
     pub path: Option<PathBuf>,
@@ -632,6 +684,7 @@ pub struct SettingsFile {
     stored: RenderingSettings,
     /// The explicit launch options from the run that loaded `stored`.
     launch_overrides: Vec<String>,
+    preserve_unavailable_record_mode: bool,
 }
 
 impl SettingsFile {
@@ -641,6 +694,7 @@ impl SettingsFile {
             status: "Changes apply now. This preview does not save preferences.".into(),
             stored: RenderingSettings::default(),
             launch_overrides: Vec::new(),
+            preserve_unavailable_record_mode: false,
         }
     }
 
@@ -661,6 +715,9 @@ impl SettingsFile {
     fn persisted(&self, settings: &RenderingSettings) -> RenderingSettings {
         let mut persisted = settings.clone();
         persisted.take_launch_owned_values(&self.stored, &self.launch_overrides);
+        if self.preserve_unavailable_record_mode {
+            persisted.color_grade = self.stored.color_grade;
+        }
         persisted
     }
 }
@@ -694,6 +751,7 @@ fn prepare_settings_at(
         status: "Changes apply now. Choose Save to keep them across runs.".into(),
         stored: RenderingSettings::default(),
         launch_overrides: config.settings_overrides.clone(),
+        preserve_unavailable_record_mode: false,
     };
     if let Some(path) = &file.path {
         match std::fs::read(path) {
@@ -706,6 +764,18 @@ fn prepare_settings_at(
                         file.stored = saved.clone();
                         settings = saved;
                         settings.retain_explicit_launch_values(config);
+                        if settings.color_grade
+                            == crate::color_pipeline::SceneGradeMode::RecordSrgb.index()
+                            && config.image_space_selection().ok().flatten().is_none()
+                            && !config
+                                .settings_overrides
+                                .iter()
+                                .any(|flag| flag == "--color-grade")
+                        {
+                            settings.color_grade = config.color_grade.index();
+                            file.preserve_unavailable_record_mode = true;
+                            file.status = "Saved record-srgb grade is unavailable without an explicit image-space selection; using the approved default.".into();
+                        }
                     }
                     Err(error) => {
                         file.status = format!("Saved settings ignored: {error}");
@@ -755,7 +825,7 @@ pub(crate) fn apply_render_settings(
     mut config: ResMut<EngineConfig>,
     mut commands: Commands,
     grade_source: Option<Res<crate::color_pipeline::SceneGradeSource>>,
-    tone_map_source: Option<Res<crate::tone_mapping::SceneToneMapSource>>,
+    mut tone_map_source: Option<ResMut<crate::tone_mapping::SceneToneMapSource>>,
     current_mode: Option<Res<crate::color_pipeline::SceneGradeMode>>,
     current_preset: Option<Res<crate::color_pipeline::SceneVisualPreset>>,
     mut sky_palette: Option<ResMut<crate::sky::SkyPalette>>,
@@ -799,7 +869,12 @@ pub(crate) fn apply_render_settings(
         crate::color_pipeline::SceneVisualPreset::CoolGray
     };
     let source = grade_source.as_deref().cloned().unwrap_or_default();
-    let tone = tone_map_source.as_deref().cloned().unwrap_or_default();
+    let mut tone = tone_map_source.as_deref().cloned().unwrap_or_default();
+    let selected_tonemapping = TONE_MAPS[settings.tone_map];
+    tone.bevy_tonemapping = selected_tonemapping;
+    if let Some(source) = tone_map_source.as_deref_mut() {
+        source.bevy_tonemapping = selected_tonemapping;
+    }
     let overrides = settings.grade_overrides();
     let resolved = mode
         .ok_or_else(|| "unsupported persisted grade mode".to_owned())
@@ -855,7 +930,9 @@ pub(crate) fn apply_render_settings(
     }
     for (entity, mut exposure, mut tone_map, mut msaa, mut projection) in &mut cameras {
         exposure.ev100 = settings.exposure_ev100;
-        *tone_map = TONE_MAPS[settings.tone_map];
+        if tone.mode == crate::tone_mapping::SceneToneMapMode::Tony {
+            *tone_map = TONE_MAPS[settings.tone_map];
+        }
         *msaa = MSAA_MODES[settings.msaa];
         if let Projection::Perspective(p) = &mut *projection {
             p.fov = settings.fov_degrees.to_radians();
@@ -1107,6 +1184,10 @@ mod tests {
                 .resource::<crate::color_pipeline::SceneGradeOverrides>(),
             crate::color_pipeline::SceneGradeOverrides::default()
         );
+        assert_eq!(
+            app.world().resource::<EngineConfig>().color_grade,
+            crate::color_pipeline::SceneGradeMode::SnapshotSrgb
+        );
     }
 
     #[test]
@@ -1209,6 +1290,218 @@ mod tests {
         assert!(config.lights);
         assert_eq!(loaded.exposure_ev100, 8.0);
         assert_eq!(config.max_upload_bytes_per_frame(), None);
+    }
+
+    #[test]
+    fn saved_grade_selection_is_applied_before_scene_sources_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let saved = RenderingSettings {
+            color_grade: crate::color_pipeline::SceneGradeMode::SnapshotLinear.index(),
+            visual_preset: 0,
+            grade_brightness: 1.7,
+            grade_override_mask: 1 << 1,
+            ..default()
+        };
+        save_settings(&path, &saved).unwrap();
+
+        let mut config = EngineConfig::default();
+        let (active, _) = prepare_settings_at(&mut config, Some(path));
+        assert_eq!(
+            config.color_grade,
+            crate::color_pipeline::SceneGradeMode::SnapshotLinear
+        );
+        assert_eq!(
+            config.visual_preset,
+            crate::color_pipeline::SceneVisualPreset::Vivid
+        );
+        assert_eq!(active.color_grade, config.color_grade.index());
+        assert_eq!(active.grade_overrides().brightness, Some(1.7));
+        let source = crate::color_pipeline::SceneGradeSource::load(&config, false).unwrap();
+        let tone = crate::tone_mapping::SceneToneMapSource::load(&config, &source).unwrap();
+        let resolved = tone
+            .resolve_with_overrides(
+                &source,
+                config.color_grade,
+                config.visual_preset,
+                active.grade_overrides(),
+            )
+            .unwrap();
+        assert_eq!(resolved.grade.brightness, 1.7);
+        assert_eq!(resolved.post.linear_domain, 1);
+    }
+
+    #[test]
+    fn explicit_grade_launch_ownership_preserves_only_its_owned_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let saved = RenderingSettings {
+            color_grade: crate::color_pipeline::SceneGradeMode::Full.index(),
+            visual_preset: 1,
+            tone_map: 3,
+            grade_brightness: 1.8,
+            grade_override_mask: 1 << 1,
+            ..default()
+        };
+        save_settings(&path, &saved).unwrap();
+
+        let mut custom_grade = launch(&[
+            "--color-grade".into(),
+            "snapshot-linear".into(),
+            "--visual-preset".into(),
+            "vivid".into(),
+        ]);
+        let (mut active, mut file) = prepare_settings_at(&mut custom_grade, Some(path.clone()));
+        assert_eq!(
+            active.color_grade,
+            crate::color_pipeline::SceneGradeMode::SnapshotLinear.index()
+        );
+        assert_eq!(active.visual_preset, 0);
+        assert_eq!(active.grade_override_mask, 0);
+        active.hud = !active.hud;
+        file.save(&active);
+        let persisted =
+            serde_json::from_slice::<RenderingSettings>(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted.color_grade, saved.color_grade);
+        assert_eq!(persisted.visual_preset, saved.visual_preset);
+        assert_eq!(persisted.grade_override_mask, saved.grade_override_mask);
+        assert_eq!(persisted.grade_brightness, saved.grade_brightness);
+        assert_eq!(persisted.hud, active.hud);
+
+        let mut visual_only = launch(&["--visual-preset".into(), "vivid".into()]);
+        let (active, _) = prepare_settings_at(&mut visual_only, Some(path));
+        assert_eq!(active.color_grade, saved.color_grade);
+        assert_eq!(active.visual_preset, 0);
+        assert_eq!(active.grade_override_mask, saved.grade_override_mask);
+    }
+
+    #[test]
+    fn source_launch_options_do_not_infer_record_mode_or_apply_stale_tuning() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let saved = RenderingSettings {
+            color_grade: crate::color_pipeline::SceneGradeMode::RecordSrgb.index(),
+            grade_brightness: 2.2,
+            grade_override_mask: 1 << 1,
+            ..default()
+        };
+        save_settings(&path, &saved).unwrap();
+
+        for args in [
+            vec!["--image-space".into(), "0x12F88".into()],
+            vec!["--grade-preset".into(), "custom.json".into()],
+            vec!["--tone-map".into(), "retail-curve".into()],
+            vec!["--tone-map-params".into(), "curve.json".into()],
+        ] {
+            let mut config = launch(&args);
+            let (mut active, mut file) = prepare_settings_at(&mut config, Some(path.clone()));
+            assert_eq!(active.color_grade, config.color_grade.index());
+            assert_ne!(
+                config.color_grade,
+                crate::color_pipeline::SceneGradeMode::RecordSrgb
+            );
+            assert_eq!(active.grade_override_mask, 0);
+            active.hud = !active.hud;
+            file.save(&active);
+            let persisted =
+                serde_json::from_slice::<RenderingSettings>(&std::fs::read(&path).unwrap())
+                    .unwrap();
+            assert_eq!(persisted.color_grade, saved.color_grade);
+            assert_eq!(persisted.grade_override_mask, saved.grade_override_mask);
+            assert_eq!(persisted.grade_brightness, saved.grade_brightness);
+            assert_eq!(persisted.hud, active.hud);
+            save_settings(&path, &saved).unwrap();
+        }
+    }
+
+    #[test]
+    fn saved_record_mode_without_selection_falls_back_and_preserves_other_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let saved = RenderingSettings {
+            color_grade: crate::color_pipeline::SceneGradeMode::RecordSrgb.index(),
+            point_lights: true,
+            hud: false,
+            ..default()
+        };
+        save_settings(&path, &saved).unwrap();
+        let mut config = EngineConfig::default();
+        let (mut active, mut file) = prepare_settings_at(&mut config, Some(path.clone()));
+        assert_eq!(
+            active.color_grade,
+            crate::color_pipeline::SceneGradeMode::SnapshotSrgb.index()
+        );
+        assert_eq!(
+            config.color_grade,
+            crate::color_pipeline::SceneGradeMode::SnapshotSrgb
+        );
+        assert!(active.point_lights);
+        assert!(!active.hud);
+        assert!(file.status.contains("record-srgb"));
+        active.hud = true;
+        file.save(&active);
+        let persisted =
+            serde_json::from_slice::<RenderingSettings>(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(persisted.color_grade, saved.color_grade);
+        assert!(persisted.point_lights);
+        assert!(persisted.hud);
+    }
+
+    #[test]
+    fn old_settings_schema_defaults_new_grade_fields_without_overriding_custom_values() {
+        let old = r#"{"version":1,"color_grade":2,"visual_preset":0,"grade_brightness":2.75}"#;
+        let settings = serde_json::from_str::<RenderingSettings>(old).unwrap();
+        settings.validate().unwrap();
+        assert_eq!(settings.grade_override_mask, 0);
+        assert_eq!(settings.grade_brightness, 2.75);
+        assert_eq!(settings.grade_overrides().brightness, None);
+    }
+
+    #[test]
+    fn invalid_grade_mask_and_explicit_value_leave_saved_file_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        save_settings(&path, &RenderingSettings::default()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for invalid in [
+            RenderingSettings {
+                grade_override_mask: 1 << 12,
+                ..default()
+            },
+            RenderingSettings {
+                grade_brightness: f32::INFINITY,
+                grade_override_mask: 1 << 1,
+                ..default()
+            },
+        ] {
+            let mut file = SettingsFile {
+                path: Some(path.clone()),
+                status: String::new(),
+                stored: RenderingSettings::default(),
+                launch_overrides: Vec::new(),
+                preserve_unavailable_record_mode: false,
+            };
+            file.save(&invalid);
+            assert!(file.status.contains("Could not save"));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn preference_loading_excludes_automated_runs() {
+        for args in [
+            vec!["--headless".into()],
+            vec!["--hidden-window".into()],
+            vec!["--benchmark-only".into()],
+            vec!["--benchmark-frames".into(), "2".into()],
+            vec!["--acceptance-screenshot".into(), "capture.png".into()],
+            vec!["--shots".into(), "shots.json".into()],
+            vec!["--matched-route".into(), "route.json".into()],
+            vec!["--streaming-fixture".into()],
+            vec!["--auto-fly-speed".into(), "1".into()],
+        ] {
+            assert!(!launch(&args).interactive_world_physics(), "{args:?}");
+        }
     }
 
     #[test]
@@ -1367,6 +1660,7 @@ mod tests {
             status: String::new(),
             stored: RenderingSettings::default(),
             launch_overrides: Vec::new(),
+            preserve_unavailable_record_mode: false,
         };
         file.save(&invalid);
         assert!(file.status.contains("Could not save"));
