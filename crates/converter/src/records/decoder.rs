@@ -1370,7 +1370,7 @@ fn value_inner(
     }
     if field.definition.is_some() {
         return value(
-            &schema.resolve(field)?,
+            schema.resolve_borrowed(field)?.as_ref(),
             bytes,
             schema,
             context,

@@ -565,11 +565,17 @@ impl Plugin for PlayerControlsPlugin {
                     overlay_system,
                 )
                     .chain()
+                    .after(crate::settings_ui::SettingsUiSet)
                     .in_set(PlayerControlsSystems),
             )
             .add_systems(
                 FixedUpdate,
-                walk_movement_system.run_if(crate::door_crossing::no_door_crossing),
+                // Rapier consumes this tick's displacement during SyncBackend. Feeding it after
+                // that phase leaves grounded output one tick behind a newly launched jump.
+                walk_movement_system
+                    .run_if(crate::door_crossing::no_door_crossing)
+                    .run_if(console_closed)
+                    .before(PhysicsSet::SyncBackend),
             );
     }
 }
@@ -592,11 +598,8 @@ impl Plugin for WorldPlayerPlugin {
             .add_systems(PostStartup, setup_world_player)
             .add_systems(
                 Update,
-                (
-                    toggle_collision_debug_system.run_if(console_closed),
-                    update_collision_debug_visibility,
-                )
-                    .chain()
+                update_collision_debug_visibility
+                    .after(crate::settings_ui::SettingsUiSet)
                     .before(overlay_system),
             )
             .add_systems(
@@ -605,7 +608,8 @@ impl Plugin for WorldPlayerPlugin {
                     world_tankard_input.run_if(console_closed),
                     move_held_tankard,
                 )
-                    .chain(),
+                    .chain()
+                    .after(crate::settings_ui::SettingsUiSet),
             );
     }
 }
@@ -1495,7 +1499,7 @@ pub struct WalkIntent {
 
 /// WALK sprint toggle; cleared whenever movement or controls stop.
 #[derive(Debug, Clone, Copy, Default, Resource)]
-struct SprintLatch(bool);
+pub(crate) struct SprintLatch(pub(crate) bool);
 
 /// Live walk state: horizontal velocity + vertical velocity (V10, V11).
 #[derive(Debug, Clone, Copy, Default, Component)]
@@ -1549,6 +1553,9 @@ pub fn integrate_walk(
     dt: f32,
     grounded: bool,
 ) {
+    // Rapier's ground probe can remain true for several steps after takeoff.
+    // Upward jump velocity must survive that proximity signal until ascent ends.
+    let grounded = grounded && !(state.jump_active && state.vertical_velocity > 0.0);
     state.grounded = grounded;
     let wish = intent.wish_dir * intent.target_speed;
     let current = state.horizontal_velocity;
@@ -1658,21 +1665,26 @@ pub fn try_enter_walk(
     Err("no free capsule placement nearby".to_owned())
 }
 
-/// Everything `clear_motion_state` touches, optional so the console works in partial apps.
+/// The pending-input state a pause drops, optional so the console works in partial apps.
 #[derive(SystemParam)]
 pub(crate) struct MotionReset<'w, 's> {
     intent: Option<ResMut<'w, WalkIntent>>,
     sprint: Option<ResMut<'w, SprintLatch>>,
-    states: Query<'w, 's, &'static mut WalkState>,
     controllers: Query<'w, 's, &'static mut KinematicCharacterController>,
 }
 
 impl MotionReset<'_, '_> {
-    pub(crate) fn clear(&mut self) {
-        if let (Some(intent), Some(sprint)) =
-            (self.intent.as_deref_mut(), self.sprint.as_deref_mut())
-        {
-            clear_motion_state(intent, sprint, &mut self.states, &mut self.controllers);
+    /// Drops pending input only: walk intent, the sprint latch and the queued controller
+    /// translation. Velocity and jump state stay, so a pause resumes the motion where it stopped.
+    pub(crate) fn clear_input(&mut self) {
+        if let Some(intent) = self.intent.as_deref_mut() {
+            *intent = WalkIntent::default();
+        }
+        if let Some(sprint) = self.sprint.as_deref_mut() {
+            sprint.0 = false;
+        }
+        for mut controller in &mut self.controllers {
+            controller.translation = None;
         }
     }
 }
@@ -2277,6 +2289,71 @@ mod simulation_tests {
     }
 
     #[test]
+    fn jump_ascent_survives_ground_probe_and_lands_on_descent() {
+        let tuning = MovementTuning::default();
+        let mut state = WalkState::default();
+        integrate_walk(
+            &mut state,
+            &WalkIntent {
+                jump_pressed: true,
+                ..default()
+            },
+            &tuning,
+            PHYSICS_TIMESTEP,
+            true,
+        );
+        for step in 1..=10 {
+            integrate_walk(
+                &mut state,
+                &WalkIntent::default(),
+                &tuning,
+                PHYSICS_TIMESTEP,
+                true,
+            );
+            assert!(state.jump_active);
+            assert!(!state.grounded);
+            assert!(
+                (state.vertical_velocity
+                    - (tuning.jump_launch - tuning.gravity * PHYSICS_TIMESTEP * step as f32))
+                    .abs()
+                    < 0.01
+            );
+        }
+        // A new press cannot relaunch while the ground probe overlaps ascent.
+        let before = state.vertical_velocity;
+        integrate_walk(
+            &mut state,
+            &WalkIntent {
+                jump_pressed: true,
+                ..default()
+            },
+            &tuning,
+            PHYSICS_TIMESTEP,
+            true,
+        );
+        assert!(state.vertical_velocity < before);
+        while state.vertical_velocity > 0.0 {
+            integrate_walk(
+                &mut state,
+                &WalkIntent::default(),
+                &tuning,
+                PHYSICS_TIMESTEP,
+                false,
+            );
+        }
+        integrate_walk(
+            &mut state,
+            &WalkIntent::default(),
+            &tuning,
+            PHYSICS_TIMESTEP,
+            true,
+        );
+        assert!(state.grounded);
+        assert!(!state.jump_active);
+        assert_eq!(state.vertical_velocity, 0.0);
+    }
+
+    #[test]
     fn jump_launches_and_returns_to_ground() {
         let mut app = headless::fixture_app();
         headless::place_player(&mut app, Vec3::new(120.0, 200.0, 120.0));
@@ -2392,25 +2469,16 @@ pub fn noclip_displacement(
 
 fn noclip_overlay_text(mode: MoveMode, status: &WalkEntryStatus) -> String {
     let base = match mode {
-        MoveMode::Noclip => "NOCLIP: ON  [V]",
-        MoveMode::Walk => "NOCLIP: OFF  [V]",
+        MoveMode::Noclip => "NOCLIP: ON",
+        MoveMode::Walk => "NOCLIP: OFF",
     };
     match &status.blocked_reason {
-        Some(reason) => format!("{base}  [T] tankard  [E] grab/drop  WALK blocked: {reason}"),
-        None => format!("{base}  [T] tankard  [E] grab/drop"),
+        Some(reason) => format!("{base}  WALK blocked: {reason}"),
+        None => base.to_owned(),
     }
 }
 
-fn toggle_collision_debug_system(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    mut debug: ResMut<DebugRenderContext>,
-) {
-    if keyboard.just_pressed(KeyCode::F3) {
-        flip_collision_debug(&mut debug);
-    }
-}
-
-/// Flip the rapier collider outlines; shared by the F3 key and the `tcg` command.
+/// Flip the Rapier collider outlines for the `tcg` command.
 fn flip_collision_debug(debug: &mut DebugRenderContext) {
     debug.enabled = !debug.enabled;
 }
@@ -2504,7 +2572,7 @@ fn setup_controlled_player(
     commands.spawn((
         Name::new("Noclip overlay"),
         NoclipOverlay,
-        Text::new("NOCLIP: ON  [V]    [T] tankard  [E] grab/drop"),
+        Text::new("NOCLIP: ON"),
         TextFont::from_font_size(18.0),
         TextColor(Color::WHITE),
         Node {
@@ -2668,14 +2736,23 @@ fn cursor_lifecycle_system(
     mut states: Query<&mut WalkState>,
     mut controllers: Query<&mut KinematicCharacterController>,
     console: Option<Res<ConsoleState>>,
+    menu: Option<Res<crate::settings_ui::SettingsMenuState>>,
 ) {
-    // Focus loss or Escape releases; click recaptures (V6). While the console is open, and on the
-    // frame it closes, it owns the capture state, so none of that applies; the cursor options
-    // below still follow it.
+    // Focus loss or F3 releases; click recaptures (V6). The console and settings menu own capture
+    // while open and on their closing frame; the cursor options below still follow that state.
     let focused = windows.iter().all(|window| window.focused);
-    let console_owns_capture = console.is_some_and(|console| console.open || console.closing);
+    let reporting_capture = console
+        .as_ref()
+        .is_some_and(|console| console.capture_suppressed);
+    let console_owns_capture = console
+        .is_some_and(|console| console.open || console.closing || console.capture_suppressed)
+        || menu.is_some_and(|menu| menu.blocks_gameplay());
+    if reporting_capture {
+        *capture = CursorCapture::Released;
+        clear_motion_state(&mut intent, &mut sprint, &mut states, &mut controllers);
+    }
     if !console_owns_capture {
-        if !focused || keyboard.just_pressed(KeyCode::Escape) {
+        if !focused || keyboard.just_pressed(KeyCode::F3) {
             if *capture == CursorCapture::Captured {
                 *capture = CursorCapture::Released;
                 clear_motion_state(&mut intent, &mut sprint, &mut states, &mut controllers);
@@ -2932,13 +3009,13 @@ fn toggle_collision_command() -> ConsoleCommand {
     }
 }
 
-/// Skyrim's `ToggleCollisionGeometry` / `tcg`; the `F3` key runs the same effect.
+/// Skyrim's `ToggleCollisionGeometry` / `tcg`; also available in the Graphics settings tab.
 fn toggle_collision_geometry_command() -> ConsoleCommand {
     ConsoleCommand {
         name: "ToggleCollisionGeometry",
         short: Some("tcg"),
         usage: "ToggleCollisionGeometry",
-        help: "toggle the collision outlines (key F3)",
+        help: "toggle the collision outlines (also in Graphics settings)",
         handler: Box::new(|world, args| {
             no_args(args, "ToggleCollisionGeometry")?;
             let Some(mut debug) = world.get_resource_mut::<DebugRenderContext>() else {
@@ -2969,15 +3046,13 @@ fn overlay_system(
     if *mode == MoveMode::Walk {
         let speed = actual_walk_speed(player.single().ok().flatten());
         let sprint_status = if sprint.0 { "ON" } else { "OFF" };
-        label.push_str(&format!(
-            "  SPRINT: {sprint_status}  [ALT]  SPEED: {speed:.0} u/s"
-        ));
+        label.push_str(&format!("  SPRINT: {sprint_status}  SPEED: {speed:.0} u/s"));
     }
     if let Some(debug) = collision_debug {
         label.push_str(if debug.enabled {
-            "  COLLISION: ON  [F3]"
+            "  COLLISION: ON"
         } else {
-            "  COLLISION: OFF  [F3]"
+            "  COLLISION: OFF"
         });
     }
     if crossing.is_some_and(|crossing| crossing.needs_recovery()) {
@@ -3011,6 +3086,7 @@ fn sprint_fov_system(
     time: Res<Time>,
     player: Query<Option<&KinematicCharacterControllerOutput>, With<PlayerBody>>,
     mut camera: Query<&mut Projection, (With<StreamingCamera>, With<ControlledCamera>)>,
+    settings: Option<Res<crate::settings::RenderingSettings>>,
 ) {
     let Ok(mut projection) = camera.single_mut() else {
         return;
@@ -3018,7 +3094,11 @@ fn sprint_fov_system(
     let Projection::Perspective(perspective) = &mut *projection else {
         return;
     };
-    let base_fov = PerspectiveProjection::default().fov;
+    let base_fov = settings
+        .as_deref()
+        .map_or(PerspectiveProjection::default().fov, |settings| {
+            settings.fov_degrees.to_radians()
+        });
     let moving = actual_walk_speed(player.single().ok().flatten()) > 1.0;
     let target_fov = if *mode == MoveMode::Walk && sprint.0 && moving {
         base_fov + SPRINT_FOV_BONUS_DEGREES.to_radians()
@@ -3304,16 +3384,10 @@ mod noclip_tests {
     }
 
     #[test]
-    fn overlay_reports_mode_with_key_hint_and_block_reason() {
+    fn overlay_reports_mode_and_block_reason_without_control_hints() {
         let status = WalkEntryStatus::default();
-        assert_eq!(
-            noclip_overlay_text(MoveMode::Noclip, &status),
-            "NOCLIP: ON  [V]  [T] tankard  [E] grab/drop"
-        );
-        assert_eq!(
-            noclip_overlay_text(MoveMode::Walk, &status),
-            "NOCLIP: OFF  [V]  [T] tankard  [E] grab/drop"
-        );
+        assert_eq!(noclip_overlay_text(MoveMode::Noclip, &status), "NOCLIP: ON");
+        assert_eq!(noclip_overlay_text(MoveMode::Walk, &status), "NOCLIP: OFF");
         let blocked = WalkEntryStatus {
             blocked_reason: Some("no free capsule placement nearby".to_owned()),
         };
@@ -3698,10 +3772,7 @@ mod gate_tests {
             .world_mut()
             .query_filtered::<&Text, With<NoclipOverlay>>();
         let text = query.single(app.world()).expect("overlay").clone();
-        assert_eq!(
-            text.as_str(),
-            "NOCLIP: OFF  [V]  [T] tankard  [E] grab/drop  SPRINT: OFF  [ALT]  SPEED: 0 u/s"
-        );
+        assert_eq!(text.as_str(), "NOCLIP: OFF  SPRINT: OFF  SPEED: 0 u/s");
         app.insert_resource(MoveMode::Noclip);
         for _ in 0..5 {
             app.update();
@@ -3710,7 +3781,7 @@ mod gate_tests {
             .world_mut()
             .query_filtered::<&Text, With<NoclipOverlay>>();
         let text = query.single(app.world()).expect("overlay").clone();
-        assert_eq!(text.as_str(), "NOCLIP: ON  [V]  [T] tankard  [E] grab/drop");
+        assert_eq!(text.as_str(), "NOCLIP: ON");
     }
 
     #[test]
@@ -3832,8 +3903,7 @@ mod console_tests {
             // `ToggleCollision`/`tcl` comes in with `PlayerControlsPlugin` through the fixture.
             app.add_plugins(ConsolePlugin)
                 .add_console_command(toggle_collision_geometry_command())
-                .insert_resource(DebugRenderContext::default())
-                .add_systems(Update, toggle_collision_debug_system.run_if(console_closed));
+                .insert_resource(DebugRenderContext::default());
         });
         app.update();
         app
@@ -3875,7 +3945,7 @@ mod console_tests {
             "Help [text] - ",
             "ClearConsole - ",
             "ToggleCollision [tcl] - toggle noclip flight and walking (key V)",
-            "ToggleCollisionGeometry [tcg] - toggle the collision outlines (key F3)",
+            "ToggleCollisionGeometry [tcg] - toggle the collision outlines (also in Graphics settings)",
         ] {
             assert!(text.contains(line), "Help is missing {line}: {text}");
         }
@@ -4005,16 +4075,10 @@ mod console_tests {
     }
 
     #[test]
-    fn key_and_command_agree_on_collision_outlines() {
-        let mut keyed = console_fixture();
-        let before = keyed.world().resource::<DebugRenderContext>().enabled;
-        press(&mut keyed, KeyCode::F3);
-        keyed
-            .world_mut()
-            .run_system_once(toggle_collision_debug_system)
-            .unwrap();
+    fn command_toggles_collision_outlines() {
         let mut commanded = console_fixture();
-        // The removed `f3` alias is unknown; Skyrim's `tcg` runs the key's effect.
+        let before = commanded.world().resource::<DebugRenderContext>().enabled;
+        // F3 releases the mouse; Skyrim's `tcg` controls collision outlines.
         execute_line(commanded.world_mut(), "f3");
         assert!(scrollback(&commanded).contains("unknown command \"f3\""));
         assert_eq!(
@@ -4022,11 +4086,9 @@ mod console_tests {
             before
         );
         execute_line(commanded.world_mut(), "tcg");
-        let key_state = keyed.world().resource::<DebugRenderContext>().enabled;
-        assert_ne!(key_state, before);
-        assert_eq!(
-            key_state,
-            commanded.world().resource::<DebugRenderContext>().enabled
+        assert_ne!(
+            commanded.world().resource::<DebugRenderContext>().enabled,
+            before
         );
         execute_line(commanded.world_mut(), "ToggleCollisionGeometry");
         assert_eq!(
@@ -4159,10 +4221,15 @@ mod console_tests {
         app.insert_resource(CursorCapture::Captured);
         let before = app.world().resource::<DebugRenderContext>().enabled;
         send_key(&mut app, KeyCode::KeyV);
-        send_key(&mut app, KeyCode::F3);
         app.update();
         assert_eq!(mode(&app), MoveMode::Walk, "{}", scrollback(&app));
-        assert_ne!(app.world().resource::<DebugRenderContext>().enabled, before);
+        send_key(&mut app, KeyCode::F3);
+        app.update();
+        assert_eq!(
+            *app.world().resource::<CursorCapture>(),
+            CursorCapture::Released
+        );
+        assert_eq!(app.world().resource::<DebugRenderContext>().enabled, before);
     }
 
     fn send_state(app: &mut App, key_code: KeyCode, state: bevy::input::ButtonState) {
@@ -4207,6 +4274,60 @@ mod console_tests {
         send_state(&mut app, KeyCode::Backquote, Released);
         send_state(&mut app, KeyCode::KeyV, Pressed);
         assert_eq!(mode(&app), MoveMode::Walk);
+    }
+
+    #[test]
+    fn bug_report_capture_keeps_input_blocked_after_console_dismissal() {
+        use bevy::input::ButtonState::{Pressed, Released};
+        let mut app = console_fixture();
+        app.insert_resource(CursorCapture::Captured);
+        send_state(&mut app, KeyCode::Backquote, Pressed);
+        send_state(&mut app, KeyCode::Backquote, Released);
+        app.world_mut()
+            .resource_mut::<ConsoleState>()
+            .capture_suppressed = true;
+        send_state(&mut app, KeyCode::Backquote, Pressed);
+        send_state(&mut app, KeyCode::Backquote, Released);
+        assert!(!app.world().resource::<ConsoleState>().open);
+        assert!(!app.world().resource::<Time<Virtual>>().is_paused());
+        let camera_before = {
+            let mut query = app
+                .world_mut()
+                .query_filtered::<&Transform, With<ControlledCamera>>();
+            *query.single(app.world()).unwrap()
+        };
+        send_key(&mut app, KeyCode::KeyW);
+        send_key(&mut app, KeyCode::KeyV);
+        app.world_mut()
+            .write_message(bevy::input::mouse::MouseButtonInput {
+                button: MouseButton::Left,
+                state: Pressed,
+                window: Entity::PLACEHOLDER,
+            });
+        app.world_mut().write_message(MouseMotion {
+            delta: Vec2::new(40.0, 10.0),
+        });
+        app.update();
+        assert_eq!(
+            *app.world().resource::<CursorCapture>(),
+            CursorCapture::Released
+        );
+        assert_eq!(mode(&app), MoveMode::Noclip);
+        let mut query = app
+            .world_mut()
+            .query_filtered::<&Transform, With<ControlledCamera>>();
+        assert_eq!(*query.single(app.world()).unwrap(), camera_before);
+        send_state(&mut app, KeyCode::KeyW, Released);
+        send_state(&mut app, KeyCode::KeyV, Released);
+        app.world_mut()
+            .resource_mut::<ConsoleState>()
+            .capture_suppressed = false;
+        app.update();
+        assert_eq!(
+            *app.world().resource::<CursorCapture>(),
+            CursorCapture::Captured
+        );
+        assert!(!app.world().resource::<ConsoleState>().open);
     }
 
     #[test]

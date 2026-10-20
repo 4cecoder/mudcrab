@@ -28,6 +28,7 @@ pub mod mmap_reader;
 pub mod plugins_txt;
 pub mod records;
 pub mod rooms;
+pub mod terrain_mesh;
 pub mod types;
 pub use plugins_txt::{
     OFFICIAL_MASTERS, read_plugins_txt, read_plugins_txt_with_options, read_skyrim_ccc,
@@ -47,6 +48,8 @@ pub(crate) struct RecordConversion {
     pub(crate) records: HashMap<u32, RawRecord>,
     pub(crate) warnings: Vec<String>,
     pub(crate) notices: Vec<String>,
+    /// In-house stage seconds for the database profile; legacy exports record none.
+    pub(crate) phases: std::collections::BTreeMap<String, f64>,
 }
 
 /// Populate the common plugin metadata contract without allocating each complete input.
@@ -101,24 +104,30 @@ impl EsmParser {
             db_path,
             reader,
             strings_root,
+            crate::config::DEFAULT_LANGUAGE,
             None,
         )
         .map(|conversion| conversion.records)
     }
 
     /// Publish with one immutable schema batch and retain summaries for the pipeline report.
+    /// Localized names come from `strings_root`'s tables in `language`.
     pub(crate) fn convert_plugins_with_reader_and_schemas(
         plugin_paths: &[PathBuf],
         db_path: &Path,
         reader: crate::config::RecordReader,
         strings_root: &Path,
+        language: &str,
         schemas: Option<&crate::records::addons::RuntimeSchemas>,
     ) -> Result<RecordConversion> {
         Self::convert_plugins_with_reader_and_schemas_with_string_sources(
             plugin_paths,
             db_path,
             reader,
-            inhouse::StringSources::PluginLooseFirst(strings_root),
+            inhouse::StringSources {
+                roots: inhouse::StringRoots::PluginLooseFirst(strings_root),
+                language,
+            },
             schemas,
         )
     }
@@ -294,6 +303,7 @@ impl EsmParser {
             records: merged,
             warnings: summaries,
             notices,
+            phases: std::collections::BTreeMap::new(),
         })
     }
 }
