@@ -120,7 +120,7 @@ fn cell_pipeline_fixture(
 ) {
     use crate::{
         render::WaterReflectionTexture,
-        streaming::{StreamingCommitBudget, TerrainContinuity},
+        streaming::{ActiveSpace, StreamingCommitBudget, TerrainContinuity},
         world::{cache::CellCache, database::AssetCatalog},
     };
     let (mut app, directory) = fixture(true);
@@ -157,6 +157,7 @@ fn cell_pipeline_fixture(
         .insert_resource(CellCache::open(&cache_path).unwrap())
         .insert_resource(RenderOrigin(IVec2::ZERO))
         .insert_resource(WaterReflectionTexture(Handle::default()))
+        .init_resource::<ActiveSpace>()
         .init_resource::<StreamingCommitBudget>()
         .init_resource::<TerrainContinuity>();
     app.world_mut()
