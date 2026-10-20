@@ -1,4 +1,6 @@
 //! Native visual-family variants and actual publication with corrupt mod data.
+mod common;
+
 use converter::{
     AssetPipeline, PipelineConfig,
     config::RecordReader,
@@ -97,9 +99,9 @@ fn every_visual_type_preserves_native_values_and_context() {
     };
     assert!(!colors.iter().any(|(n, _)| n == "water_multiplier"));
     let animation = &result.records[&(visual::FIRST_ID + 3)];
-    let Value::Array(keys) = named(animation, "eye_adaptation_speed_multiply") else {
-        panic!("curve lost")
-    };
+    let keys = named(animation, "eye_adaptation_speed_multiply")
+        .materialized_array()
+        .expect("curve lost");
     assert_eq!(keys.len(), 2);
     assert_eq!(member(&keys[0], "time"), &Value::Float(-1.875));
     assert_eq!(member(&keys[0], "value"), &Value::Float(-1.5));
@@ -312,7 +314,7 @@ async fn broken_visual_mod_publishes_neighbors_prior_winners_and_safe_fields() {
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let report = AssetPipeline::run_async(config, tx).await.unwrap();
     drain.await.unwrap();
-    assert!(report.complete, "{:?}", report.warnings);
+    common::assert_reader_warning_publication(&report, &output);
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     let malformed_blob: Vec<u8> = db
         .query_row(

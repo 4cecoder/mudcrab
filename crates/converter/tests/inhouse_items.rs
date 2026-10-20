@@ -1,4 +1,6 @@
 //! Item-family typed decoding and real publication from independently authored fixtures.
+mod common;
+
 use converter::{
     AssetPipeline, PipelineConfig,
     config::RecordReader,
@@ -308,7 +310,12 @@ async fn malformed_item_override_preserves_prior_winner_and_publishes_neighbors(
         ],
     );
     let list = fixture.directory.path().join("plugins.txt");
-    fs::write(&list, "Skyrim.esm\nFiller.esm\n*Items.esp\n*BadItems.esp\n").unwrap();
+    // Checked selection keeps the filler slot used by the native/global ownership witness.
+    fs::write(
+        &list,
+        "Skyrim.esm\n*Filler.esm\n*Items.esp\n*BadItems.esp\n",
+    )
+    .unwrap();
     let output = fixture.directory.path().join("published");
     let mut config = PipelineConfig::new(&fixture.data, &output);
     config.record_reader = RecordReader::Inhouse;
@@ -318,7 +325,7 @@ async fn malformed_item_override_preserves_prior_winner_and_publishes_neighbors(
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let report = AssetPipeline::run_async(config, tx).await.unwrap();
     drain.await.unwrap();
-    assert!(report.complete, "{:?}", report.warnings);
+    common::assert_reader_warning_publication(&report, &output);
     let database = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
     for id in [0x0200_0900_u32, 0x0200_0901, 0x0300_0930] {
         assert_eq!(
@@ -608,7 +615,12 @@ async fn every_item_family_preserves_prior_winners_after_corrupt_compressed_over
     ));
     fixture.add("BadItems.esp", &["Skyrim.esm", "Items.esp"], &patch);
     let list = fixture.directory.path().join("plugins.txt");
-    fs::write(&list, "Skyrim.esm\nFiller.esm\n*Items.esp\n*BadItems.esp\n").unwrap();
+    // Checked selection matches the direct control's distinct full slots and prior winners.
+    fs::write(
+        &list,
+        "Skyrim.esm\n*Filler.esm\n*Items.esp\n*BadItems.esp\n",
+    )
+    .unwrap();
     let output = fixture.directory.path().join("published-compressed");
     let mut config = PipelineConfig::new(&fixture.data, &output);
     config.record_reader = RecordReader::Inhouse;
@@ -618,7 +630,7 @@ async fn every_item_family_preserves_prior_winners_after_corrupt_compressed_over
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let report = AssetPipeline::run_async(config, tx).await.unwrap();
     drain.await.unwrap();
-    assert!(report.complete, "{:?}", report.warnings);
+    common::assert_reader_warning_publication(&report, &output);
     let database = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
     for (index, signature) in signatures.iter().enumerate() {
         let id = 0x0200_0900_u32 + index as u32;

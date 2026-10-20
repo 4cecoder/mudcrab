@@ -506,6 +506,8 @@ impl ArchiveExtractor {
     /// by a previous run, including one interrupted before the archive completed.
     /// The source inode must stay immutable while its bytes are memory-mapped.
     /// A replaced or unreadable source path invalidates newly sealed checkpoints.
+    /// Reused sealed-pack bytes are always hashed, so `_verify_integrity` (the
+    /// `--no-verify-cache` setting) does not change this path.
     #[allow(clippy::too_many_arguments)]
     pub fn extract_batched(
         archive_path: &Path,
@@ -2514,6 +2516,43 @@ mod tests {
         let first = output.join("textures/first.dds");
         let second = output.join("textures/second.dds");
         assert_one_file(&[&blob, &first, &second]);
+    }
+
+    #[test]
+    fn a_later_archive_replaces_a_linked_vfs_file_without_changing_its_blob() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("vfs");
+        let cache = directory.path().join(".ingestion-cache");
+        let mut extracted = Vec::new();
+        for (name, bytes) in [("base.ba2", b"base"), ("override.ba2", b"over")] {
+            let archive = directory.path().join(name);
+            fs::write(
+                &archive,
+                dummy_content::ba2::general(
+                    &[dummy_content::Entry::new("textures/rock.dds", bytes)],
+                    dummy_content::ba2::Compression::None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            extracted.push(
+                ArchiveExtractor::extract_cached(
+                    &archive,
+                    &output,
+                    Path::new("unused"),
+                    &cache,
+                    None,
+                    true,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+
+        assert_eq!(fs::read(output.join("textures/rock.dds")).unwrap(), b"over");
+        let base_blob = blob_path(&cache, &extracted[0].files[0].sha256).unwrap();
+        assert_eq!(fs::read(base_blob).unwrap(), b"base");
     }
 
     #[test]

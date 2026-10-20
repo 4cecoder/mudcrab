@@ -1,12 +1,12 @@
 //! The authored, versioned schema contract shared by build validation and decoding.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
 };
 
 /// A complete schema, with reusable authored definitions and source citations.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Schema {
     pub version: u32,
@@ -20,7 +20,7 @@ pub struct Schema {
 }
 
 /// File-order subrecord definitions for one supported record signature.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordSchema {
     pub signature: String,
@@ -32,7 +32,7 @@ pub struct RecordSchema {
 }
 
 /// A typed subrecord, struct member, array element, union or subrecord group.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FieldSchema {
     pub signature: Option<String>,
@@ -245,6 +245,18 @@ impl Schema {
 
     /// Expand one shared entry, preserving its occurrence's signature and repetition.
     pub fn resolve(&self, field: &FieldSchema) -> Result<FieldSchema, String> {
+        let mut field = field.clone();
+        for _ in 0..32 {
+            if field.definition.is_none() {
+                return Ok(field);
+            }
+            field = self.resolve_once(&field)?;
+        }
+        Err("schema nesting or definition cycle exceeds 32 levels".into())
+    }
+
+    /// Retain one-hop expansion so validation counts definitions and nesting together.
+    fn resolve_once(&self, field: &FieldSchema) -> Result<FieldSchema, String> {
         let Some(name) = &field.definition else {
             return Ok(field.clone());
         };
@@ -298,7 +310,7 @@ impl Schema {
             return Err(format!("unknown string bank for {}", field.name));
         }
         if field.definition.is_some() {
-            return self.validate_field(&self.resolve(field)?, depth + 1);
+            return self.validate_field(&self.resolve_once(field)?, depth + 1);
         }
         if !matches!(
             field.kind.as_str(),
@@ -379,7 +391,104 @@ impl Schema {
         for child in field.members.iter().chain(&field.fields) {
             self.validate_field(child, depth + 1)?;
         }
+        if matches!(field.kind.as_str(), "struct" | "array") {
+            let member_payload_size = if field.kind == "array" {
+                field
+                    .count
+                    .as_ref()
+                    .and_then(|rule| rule.get("stride"))
+                    .and_then(|value| value.as_u64())
+                    .map(|value| {
+                        usize::try_from(value).map_err(|_| "array stride overflow".to_owned())
+                    })
+                    .transpose()?
+                    .or(field.size)
+            } else {
+                field.size
+            };
+            self.check_member_overlaps(field, member_payload_size)?;
+        }
         Ok(())
+    }
+
+    /// Reject aliases of writable link bytes while preserving nonlink overlays.
+    /// A runtime payload length completes spans that cannot be known at admission.
+    pub(crate) fn check_member_overlaps(
+        &self,
+        field: &FieldSchema,
+        payload_size: Option<usize>,
+    ) -> Result<(), String> {
+        let mut spans = Vec::new();
+        for member in &field.members {
+            let member = if member.definition.is_some() {
+                Cow::Owned(self.resolve(member)?)
+            } else {
+                Cow::Borrowed(member)
+            };
+            if member.optional && payload_size.is_some_and(|size| member.offset >= size) {
+                continue;
+            }
+            let size = field_width(&member)
+                .or_else(|| payload_size.and_then(|size| size.checked_sub(member.offset)));
+            let Some(size) = size else { continue };
+            let end = member
+                .offset
+                .checked_add(size)
+                .ok_or("member extent overflow")?;
+            if size == 0 {
+                continue;
+            }
+            let writable = self.may_rewrite_links(&member)?;
+            spans.push((member.offset, end, writable));
+        }
+        spans.sort_unstable_by_key(|&(start, end, _)| (start, end));
+        let mut previous_end = 0;
+        let mut previous_link_end = 0;
+        for (start, end, writable) in spans {
+            if start < previous_link_end || writable && start < previous_end {
+                return Err(format!("{} has overlapping link member spans", field.name));
+            }
+            previous_end = previous_end.max(end);
+            if writable {
+                previous_link_end = previous_link_end.max(end);
+            }
+        }
+        Ok(())
+    }
+
+    /// Include selector layouts and every alternative because either can own typed links.
+    fn may_rewrite_links(&self, field: &FieldSchema) -> Result<bool, String> {
+        let field = if field.definition.is_some() {
+            Cow::Owned(self.resolve(field)?)
+        } else {
+            Cow::Borrowed(field)
+        };
+        if field.kind == "form_id"
+            || field.decider.as_deref().is_some_and(|name| {
+                matches!(name, "alternate_textures" | "vmad")
+                    || super::deciders::world_extras::NAMES.contains(&name)
+                    || super::deciders::audio_extras::NAMES.contains(&name)
+            })
+        {
+            return Ok(true);
+        }
+        for child in field.members.iter().chain(&field.fields) {
+            if self.may_rewrite_links(child)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Match the decoder's primitive/member extent policy after definition resolution.
+pub(crate) fn field_width(field: &FieldSchema) -> Option<usize> {
+    match field.kind.as_str() {
+        "u8" | "i8" => Some(1),
+        "u16" | "i16" => Some(2),
+        "u32" | "i32" | "f32" | "form_id" => Some(4),
+        "u64" | "i64" => Some(8),
+        _ => field.size,
     }
 }
 

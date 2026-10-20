@@ -1,6 +1,8 @@
 //! Independent native actor fixtures exercised through the public reader.
 //! Format facts: pinned TES5 ACBS24, PLVD12, CRVA optional tails, RACE
 //! gender/repeat sections, and common CNTO/COED owner-dependent values.
+mod common;
+
 use converter::{
     esm::load_order::LoadOrder,
     records::{DecodedField, DecodedRecord, ReadResult, Value, read_plugins},
@@ -607,6 +609,38 @@ fn npc_attacks_perks_factions_and_body_part_links_preserve_padding() {
     assert_eq!(result.diagnostics["compound.esp"].invalid_links, 0);
 }
 
+/// Typed faction decoding rejects unknown widths and retains valid neighboring memberships.
+#[test]
+fn malformed_npc_factions_do_not_enter_canonical_actor_fields() {
+    let mut fixture = Fixture::new();
+    fixture.add("Owner.esm", &[], 1, &actor(b"FACT", 0x1600, &[]));
+    let valid = [0x1600u32.to_le_bytes(), [0xfc, 0xa1, 0xb2, 0xc3]].concat();
+    let mut fields = vec![native::subrecord(b"SNAM", &valid)];
+    for len in [0, 3, 4, 5, 9] {
+        fields.push(native::subrecord(b"SNAM", &vec![0xAB; len]));
+    }
+    fields.push(native::subrecord(b"SNAM", &valid));
+    fixture.add(
+        "Factions.esp",
+        &["Owner.esm"],
+        0,
+        &actor(b"NPC_", 0x0100_2a00, &fields),
+    );
+    let (_, result) = fixture.read();
+    let npc = &result.records[&0x0200_2a00];
+    let factions: Vec<_> = npc
+        .fields
+        .iter()
+        .filter(|field| &field.signature == b"SNAM")
+        .collect();
+    assert_eq!(factions.len(), 2);
+    for faction in factions {
+        assert_eq!(word(&faction.canonical_bytes, 0), 0x0100_1600);
+        assert_eq!(&faction.canonical_bytes[4..], &valid[4..]);
+    }
+    assert_eq!(result.diagnostics["factions.esp"].skipped_fields, 5);
+}
+
 /// Sequential PHWT roles retain both legacy and extended whole-tail layouts.
 #[test]
 fn race_phonemes_and_head_tints_preserve_occurrence_roles() {
@@ -747,7 +781,7 @@ async fn actor_corruption_is_local_through_real_pack_publication() {
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let report = AssetPipeline::run_async(config, tx).await.unwrap();
     drain.await.unwrap();
-    assert!(report.complete, "{:?}", report.warnings);
+    common::assert_reader_warning_publication(&report, &output);
     let db = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
     for id in [0x0100_3400u32, 0x0100_3402] {
         assert_eq!(
@@ -843,7 +877,7 @@ async fn all_actor_types_recover_bad_compressed_overrides_during_publication() {
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let report = AssetPipeline::run_async(config, tx).await.unwrap();
     drain.await.unwrap();
-    assert!(report.complete, "{:?}", report.warnings);
+    common::assert_reader_warning_publication(&report, &output);
     let db = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
     for (index, tag) in tags.iter().enumerate() {
         let id = 0x2400 + index as u32;

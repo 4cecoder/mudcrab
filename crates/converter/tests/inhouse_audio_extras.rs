@@ -1,4 +1,6 @@
 //! Typed audio layouts, repeated children and corrupt-mod publication regressions.
+mod common;
+
 use converter::{
     AssetPipeline, PipelineConfig,
     config::RecordReader,
@@ -133,9 +135,9 @@ fn all_audio_misc_types_preserve_packed_layouts_and_nonidentity_links() {
     let rotation = named(&result.records[&0x0200_5912], "initial_rotation_degrees");
     assert_eq!(member(rotation, "x"), &Value::Signed(-73));
     assert_eq!(member(rotation, "z"), &Value::Signed(137));
-    let Value::Array(objects) = named(&result.records[&0x0200_590a], "default_objects") else {
-        panic!("objects must be an array")
-    };
+    let objects = named(&result.records[&0x0200_590a], "default_objects")
+        .materialized_array()
+        .expect("objects must be an array");
     assert_eq!(
         member(&objects[0], "use_code"),
         &Value::Unsigned(u64::from(u32::from_le_bytes(*b"ZZ17")))
@@ -155,15 +157,15 @@ fn music_variants_reordered_fields_and_repeated_debris_perk_nodes_are_distinct()
     let result = fixture.read();
     let single = &result.records[&0x0200_5905];
     assert_eq!(named(single, "track_kind"), &Value::Unsigned(0x6ed7_e048));
-    let Value::Array(points) = named(single, "cue_points") else {
-        panic!("cue array")
-    };
+    let points = named(single, "cue_points")
+        .materialized_array()
+        .expect("cue array");
     assert_eq!(&points[1], &Value::Float(7.625));
     assert_eq!(member(named(single, "loop"), "count"), &Value::Unsigned(7));
     let palette = &result.records[&0x0200_5a00];
-    let Value::Array(tracks) = named(palette, "palette_tracks") else {
-        panic!("palette array")
-    };
+    let tracks = named(palette, "palette_tracks")
+        .materialized_array()
+        .expect("palette array");
     assert_eq!(&tracks[0], &Value::FormId(0x0200_5905));
     assert_eq!(&tracks[1], &Value::FormId(0));
     assert_eq!(
@@ -315,7 +317,12 @@ async fn corrupt_compressed_overrides_for_every_family_preserve_real_publication
     ));
     fixture.add("BadAudio.esp", &["Skyrim.esm", "Audio.esp"], &patch);
     let list = fixture.directory.path().join("plugins.txt");
-    fs::write(&list, "Skyrim.esm\nFiller.esm\n*Audio.esp\n*BadAudio.esp\n").unwrap();
+    // Player selection requires a checked filler to preserve the direct reader's asymmetric slots.
+    fs::write(
+        &list,
+        "Skyrim.esm\n*Filler.esm\n*Audio.esp\n*BadAudio.esp\n",
+    )
+    .unwrap();
     let output = fixture.directory.path().join("published-audio");
     let mut config = PipelineConfig::new(&fixture.data, &output);
     config.record_reader = RecordReader::Inhouse;
@@ -325,7 +332,7 @@ async fn corrupt_compressed_overrides_for_every_family_preserve_real_publication
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let report = AssetPipeline::run_async(config, tx).await.unwrap();
     drain.await.unwrap();
-    assert!(report.complete, "{:?}", report.warnings);
+    common::assert_reader_warning_publication(&report, &output);
     let database = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
     for (index, tag) in audio::SIGNATURES.iter().enumerate() {
         let id = 0x0200_5900 + index as u32;

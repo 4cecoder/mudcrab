@@ -255,7 +255,6 @@ async fn convert(data: &Path, output: &Path, reader: RecordReader) -> converter:
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let report = AssetPipeline::run_async(config, tx).await.unwrap();
     drain.await.unwrap();
-    assert!(report.complete, "{:?}", report.warnings);
     report
 }
 
@@ -266,7 +265,23 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
     let data = temp.path().join("Data");
     let output = temp.path().join("inhouse");
     generate(&data);
-    convert(&data, &output, RecordReader::Inhouse).await;
+    let report = convert(&data, &output, RecordReader::Inhouse).await;
+    assert!(!report.complete);
+    assert_eq!(report.skipped, 0);
+    assert!(
+        report.warnings.iter().any(|warning| {
+            warning.contains("skyrim.esm") && warning.contains("in-house reader skipped")
+        }),
+        "{:?}",
+        report.warnings
+    );
+    assert!(
+        report.warnings.iter().any(|warning| {
+            warning.contains("names.esp") && warning.contains("inhouse adapter reported")
+        }),
+        "{:?}",
+        report.warnings
+    );
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     let profile: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("inhouse-database-profile.json")).unwrap())
@@ -555,12 +570,19 @@ async fn inhouse_publishes_valid_neighbors_and_correct_typed_projections() {
     );
 }
 
-/// A reader change invalidates the shared cache proof while legacy hashes retain compatibility.
+/// Reader metadata changes while current texture settings proof stays reusable.
 #[test]
 fn reader_identity_separates_configuration_proofs() {
     let mut config = PipelineConfig::new("Data", "output");
+    config.record_reader = RecordReader::Legacy;
     let legacy = converter::cache::configuration_hash(&config).unwrap();
     assert_eq!(config.record_reader, RecordReader::Legacy);
+    let texture_settings = converter::cache::asset_configuration_hash_for_schema(
+        &config,
+        converter::cache::CONVERTER_SCHEMA_VERSION,
+        "dds",
+    )
+    .unwrap();
     config.record_reader = RecordReader::Inhouse;
     assert_ne!(
         legacy,
@@ -576,17 +598,25 @@ fn reader_identity_separates_configuration_proofs() {
     fs::write(&path, b"synthetic staged asset").unwrap();
     let staged = converter::cache::StagedOutput {
         schema_version: converter::cache::CONVERTER_SCHEMA_VERSION,
-        configuration_hash: legacy.clone(),
+        configuration_hash: texture_settings.clone(),
         source_hash: "source".into(),
         output_size: 22,
         output_hash: converter::cache::hash_file(&path).unwrap(),
     };
-    assert!(staged.is_current(&path, "source", &legacy));
-    assert!(!staged.is_current(
-        &path,
-        "source",
-        &converter::cache::configuration_hash(&config).unwrap()
-    ));
+    let current_texture_settings = converter::cache::asset_configuration_hash_for_schema(
+        &config,
+        converter::cache::CONVERTER_SCHEMA_VERSION,
+        "dds",
+    )
+    .unwrap();
+    assert_eq!(texture_settings, current_texture_settings);
+    assert!(staged.is_current(&path, "source", &texture_settings));
+    assert!(staged.is_current(&path, "source", &current_texture_settings));
+    let legacy_full_journal = converter::cache::StagedOutput {
+        configuration_hash: legacy,
+        ..staged
+    };
+    assert!(!legacy_full_journal.is_current(&path, "source", &current_texture_settings));
 }
 
 /// Malformed later candidates must not erase usable movement or terrain winners.
@@ -764,7 +794,18 @@ async fn inhouse_bad_overrides_preserve_prior_movement_and_authored_heights() {
         }
         fs::write(data.join(name), patch).unwrap();
     }
-    convert(&data, &output, RecordReader::Inhouse).await;
+    let report = convert(&data, &output, RecordReader::Inhouse).await;
+    assert!(!report.complete);
+    assert_eq!(report.skipped, 0);
+    for plugin in ["badnegative.esp", "badnonfinite.esp"] {
+        assert!(
+            report.warnings.iter().any(|warning| {
+                warning.contains(plugin) && warning.contains("in-house reader skipped")
+            }),
+            "{:?}",
+            report.warnings
+        );
+    }
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     let movement = db
         .query_row(
@@ -875,6 +916,25 @@ async fn inhouse_bad_overrides_preserve_prior_movement_and_authored_heights() {
             0
         )
     );
+    // History lists both versions; the torn one is skipped with its reason.
+    let mut chain = db
+        .prepare("SELECT status, reason FROM record_overrides WHERE form_id = 3072 ORDER BY chain_position")
+        .unwrap();
+    let chain: Vec<(String, Option<String>)> = chain
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        chain,
+        vec![
+            ("accepted".to_owned(), None),
+            (
+                "skipped".to_owned(),
+                Some("incomplete override keeps the earlier complete version".to_owned())
+            ),
+        ]
+    );
 }
 
 /// Repeated metadata rebuilds retain the original asset reader identity and verified bytes.
@@ -890,7 +950,9 @@ async fn metadata_reader_switch_preserves_retained_producer_identity() {
     )
     .unwrap();
     let original = temp.path().join("legacy");
-    convert(&data, &original, RecordReader::Legacy).await;
+    let report = convert(&data, &original, RecordReader::Legacy).await;
+    assert!(report.complete, "{:?}", report.warnings);
+    assert!(report.warnings.is_empty());
     let original_manifest: converter::cache::ConversionManifest =
         serde_json::from_slice(&fs::read(original.join("conversion-manifest.json")).unwrap())
             .unwrap();

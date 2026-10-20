@@ -20,7 +20,7 @@ use std::{
     time::Instant,
 };
 
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const KIND: &str = "mudcrab_base_database";
 const RECEIPT: &str = "receipt.json";
 
@@ -53,8 +53,37 @@ pub(super) struct Restored {
     pub validation_elapsed_ms: u128,
 }
 
+/// Conversion warnings and notices a restored bundle must repeat exactly once.
+pub(super) const CONVERSION_NOTES_FILE: &str = "conversion-notes.json";
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(super) struct ConversionNotes {
+    pub warnings: Vec<String>,
+    pub notices: Vec<String>,
+}
+
+/// Persist what the fresh reader reported, so a restore cannot mark incomplete data complete.
+pub(super) fn write_conversion_notes(staging: &Path, notes: &ConversionNotes) -> Result<()> {
+    fs::write(
+        staging.join(CONVERSION_NOTES_FILE),
+        serde_json::to_vec_pretty(notes)?,
+    )?;
+    Ok(())
+}
+
+pub(super) fn read_conversion_notes(staging: &Path) -> Result<ConversionNotes> {
+    Ok(serde_json::from_slice(&fs::read(
+        staging.join(CONVERSION_NOTES_FILE),
+    )?)?)
+}
+
 fn outputs(reader: RecordReader) -> Vec<&'static str> {
-    let mut files = vec!["skyrim_world.db", "cell_cache.rkyv", "record-reader.json"];
+    let mut files = vec![
+        "skyrim_world.db",
+        "cell_cache.rkyv",
+        "record-reader.json",
+        CONVERSION_NOTES_FILE,
+    ];
     if reader == RecordReader::Inhouse {
         files.extend([
             "cell_cache_preserved.rkyv",
@@ -74,31 +103,6 @@ fn cancelled(cancellation: &Cancellation) -> Result<()> {
 
 /// Resolve the same loose-before-VFS lookup as the reader. Ambiguous or unreadable banks
 /// prevent caching rather than pretending that a bank was absent.
-fn child(parent: &Path, name: &str) -> Result<Option<PathBuf>> {
-    let direct = parent.join(name);
-    if direct.exists() {
-        return Ok(Some(direct));
-    }
-    let entries = match fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let mut matches = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(name)
-        {
-            matches.push(entry.path());
-        }
-    }
-    ensure!(matches.len() <= 1, "ambiguous localized string path");
-    Ok(matches.pop())
-}
-
 fn source_fingerprint() -> String {
     // Include the native producers and dependency contracts; the compiled program digest in
     // the input identity also binds future modules, build flags and dependency code.
@@ -152,7 +156,7 @@ fn source_fingerprint() -> String {
 pub(super) fn identity(
     config: &PipelineConfig,
     plugins: &[PathBuf],
-    vfs: &Path,
+    sources: inhouse::StringSources<'_>,
     cancellation: &Cancellation,
 ) -> Result<Option<Identity>> {
     let mut plugin_inputs = Vec::new();
@@ -164,32 +168,24 @@ pub(super) fn identity(
             "size": fs::metadata(plugin)?.len(),
             "sha256": hash_file(plugin)?,
         }));
-        if config.record_reader != RecordReader::Inhouse {
-            continue;
-        }
         for bank in ["strings", "dlstrings", "ilstrings"] {
-            let name = format!(
-                "{}_english.{bank}",
-                plugin.file_stem().unwrap_or_default().to_string_lossy()
-            );
+            // The same resolver as both readers: the loose winner, else the archive VFS.
+            // An unreadable or ambiguous bank makes this run uncacheable rather than guessed.
             let lookup = (|| -> Result<serde_json::Value> {
-                for (origin, root) in [
-                    ("loose", plugin.parent().unwrap_or(Path::new("."))),
-                    ("vfs", vfs),
-                ] {
-                    if let Some(folder) = child(root, "strings")?
-                        && let Some(path) = child(&folder, &name)?
-                    {
-                        let metadata = fs::metadata(&path)?;
+                match inhouse::resolve_localized_bank(sources, plugin, bank)? {
+                    Some(found) => {
+                        let metadata = fs::metadata(&found.path)?;
                         ensure!(metadata.is_file(), "localized bank is not a file");
-                        return Ok(serde_json::json!({
-                            "plugin": index, "bank": bank, "state": "present", "origin": origin,
-                            "name": path.file_name().unwrap_or_default().to_string_lossy(),
-                            "size": metadata.len(), "sha256": hash_file(&path)?,
-                        }));
+                        Ok(serde_json::json!({
+                            "plugin": index, "bank": bank, "state": "present", "origin": found.origin,
+                            "name": found.path.file_name().unwrap_or_default().to_string_lossy(),
+                            "size": metadata.len(), "sha256": hash_file(&found.path)?,
+                        }))
+                    }
+                    None => {
+                        Ok(serde_json::json!({"plugin": index, "bank": bank, "state": "absent"}))
                     }
                 }
-                Ok(serde_json::json!({"plugin": index, "bank": bank, "state": "absent"}))
             })();
             let Ok(input) = lookup else { return Ok(None) };
             localization.push(input);
@@ -200,6 +196,7 @@ pub(super) fn identity(
         "converter_schema": CONVERTER_SCHEMA_VERSION,
         "database_schema": shared::WORLD_DATABASE_SCHEMA_VERSION,
         "reader": inhouse::reader_identity(config.record_reader),
+        "language": config.language,
         "native_sources_sha256": source_fingerprint(),
         "compiled_program_sha256": hash_file(&std::env::current_exe()?)?,
         "target": {"arch": std::env::consts::ARCH, "os": std::env::consts::OS,
@@ -219,10 +216,10 @@ pub(super) fn inputs_unchanged(
     expected: &Identity,
     config: &PipelineConfig,
     plugins: &[PathBuf],
-    vfs: &Path,
+    sources: inhouse::StringSources<'_>,
     cancellation: &Cancellation,
 ) -> Result<bool> {
-    Ok(identity(config, plugins, vfs, cancellation)?
+    Ok(identity(config, plugins, sources, cancellation)?
         .as_ref()
         .is_some_and(|current| current.key == expected.key))
 }
@@ -293,6 +290,14 @@ pub(super) fn clear_outputs(staging: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Counters the restored profile must carry, as the producing run wrote them from the database.
+const PROFILE_COUNTS: [&str; 4] = [
+    "decoded_winners",
+    "runtime_winners",
+    "localized_fields",
+    "source_payload_bytes",
+];
+
 fn validate_bundle(directory: &Path, identity: &Identity) -> Result<()> {
     let connection = Connection::open_with_flags(
         directory.join("skyrim_world.db"),
@@ -322,8 +327,24 @@ fn validate_bundle(directory: &Path, identity: &Identity) -> Result<()> {
         );
         let profile: serde_json::Value =
             serde_json::from_slice(&fs::read(directory.join(inhouse::DATABASE_PROFILE_FILE))?)?;
+        let counts_are_integers = profile["counts"]
+            .as_object()
+            .is_some_and(|counts| counts.values().all(|count| count.is_u64()));
+        let timings_are_finite = profile["elapsed_seconds"]
+            .as_object()
+            .is_some_and(|timings| {
+                timings
+                    .values()
+                    .all(|seconds| seconds.as_f64().is_some_and(f64::is_finite))
+            });
         ensure!(
-            profile["counts"].is_object() && profile["elapsed_seconds"].is_object(),
+            profile["schema_version"] == 1
+                && profile["reader"] == "inhouse"
+                && counts_are_integers
+                && timings_are_finite
+                && PROFILE_COUNTS
+                    .iter()
+                    .all(|name| profile["counts"][name].is_u64()),
             "incomplete database profile"
         );
         validate_cell_cache(&directory.join("cell_cache_preserved.rkyv"))?;
@@ -631,10 +652,11 @@ mod tests {
         let mut config = PipelineConfig::new(&data, directory.path().join("published"));
         config.record_reader = RecordReader::Inhouse;
         config.no_lod = true;
+        let vfs = staging.join("vfs");
         let identity = identity(
             &config,
             &plugins,
-            &staging.join("vfs"),
+            test_sources(&config, &vfs),
             &Cancellation::new(),
         )
         .unwrap()
@@ -646,9 +668,16 @@ mod tests {
             &staging.join("vfs"),
         )
         .unwrap();
+        inhouse::write_database_profile(
+            &staging,
+            &staging.join("skyrim_world.db"),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         inhouse::write_terrain_caches(&records, &staging.join("skyrim_world.db"), &staging)
             .unwrap();
         inhouse::write_reader_identity(&staging, config.record_reader).unwrap();
+        write_conversion_notes(&staging, &ConversionNotes::default()).unwrap();
         let cache = directory.path().join("cache");
         Fixture {
             directory,
@@ -686,7 +715,7 @@ mod tests {
                 &fixture.identity,
                 &fixture.config,
                 &fixture.plugins,
-                &fixture.staging.join("vfs"),
+                test_sources(&fixture.config, &fixture.staging.join("vfs")),
                 &cancellation,
             )
             .unwrap()
@@ -699,7 +728,7 @@ mod tests {
                 &fixture.identity,
                 &fixture.config,
                 &fixture.plugins,
-                &fixture.staging.join("vfs"),
+                test_sources(&fixture.config, &fixture.staging.join("vfs")),
                 &cancellation,
             )
             .unwrap()
@@ -892,12 +921,56 @@ mod tests {
         }
     }
 
+    /// Loose-first Data sources for the run's configured language, as an ordinary run builds them.
+    fn test_sources<'a>(config: &'a PipelineConfig, vfs: &'a Path) -> inhouse::StringSources<'a> {
+        inhouse::StringSources {
+            roots: inhouse::StringRoots::PluginLooseFirst(vfs),
+            language: &config.language,
+        }
+    }
+
+    #[test]
+    fn database_bundle_rejects_malformed_profile_even_if_receipt_hashes_match() {
+        let fixture = fixture();
+        let cancellation = Cancellation::new();
+        store(
+            &fixture.cache,
+            &fixture.identity,
+            &fixture.staging,
+            &cancellation,
+        )
+        .unwrap();
+        let bundle = fixture.cache.join(&fixture.identity.key);
+        let path = bundle.join(inhouse::DATABASE_PROFILE_FILE);
+        let mut profile: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        profile["counts"]["decoded_winners"] = serde_json::json!("not a count");
+        fs::write(&path, serde_json::to_vec(&profile).unwrap()).unwrap();
+        let mut receipt: Receipt =
+            serde_json::from_slice(&fs::read(bundle.join(RECEIPT)).unwrap()).unwrap();
+        receipt.files.insert(
+            inhouse::DATABASE_PROFILE_FILE.to_owned(),
+            Payload {
+                size: fs::metadata(&path).unwrap().len(),
+                sha256: hash_file(&path).unwrap(),
+            },
+        );
+        fs::write(bundle.join(RECEIPT), serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let target = destination(&fixture, "bad-profile");
+        assert!(
+            restore(&fixture.cache, &fixture.identity, &target, &cancellation)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn database_identity_tracks_ordered_plugins_reader_and_effective_localized_bank_coverage() {
         let fixture = fixture();
         let cancellation = Cancellation::new();
+        let vfs = fixture.staging.join("vfs");
         let key = |config: &PipelineConfig, plugins: &[PathBuf]| {
-            identity(config, plugins, &fixture.staging.join("vfs"), &cancellation)
+            identity(config, plugins, test_sources(config, &vfs), &cancellation)
                 .unwrap()
                 .unwrap()
                 .key

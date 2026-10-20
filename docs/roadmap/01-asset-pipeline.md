@@ -41,7 +41,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p converter -- <Skyrim Data> <output> --fail-fast --report-json conversion-report.json
 ```
 
-Use `--invalidate-cache` to force fresh archive extraction and asset conversion. Cache integrity is verified by default; `--no-verify-cache` skips blob hashing when the faster size-only check is acceptable.
+Use `--invalidate-cache` to force fresh archive extraction and asset conversion. Cache integrity is verified by default. Archive bytes reused from sealed packs are always hashed, so `--no-verify-cache` does not skip that check and currently changes no archive reuse.
 
 ### 1.1 BSA / BA2 Archive Extractor
 
