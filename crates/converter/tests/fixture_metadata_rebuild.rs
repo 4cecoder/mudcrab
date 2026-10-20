@@ -1,3 +1,5 @@
+mod common;
+
 use converter::{
     AssetPipeline, PipelineConfig,
     cache::{ConversionManifest, hash_file},
@@ -137,7 +139,7 @@ fn generate(data: &Path) {
 async fn convert(data: &Path, output: &Path) -> converter::PipelineReport {
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let report = AssetPipeline::run_async(PipelineConfig::new(data, output), tx)
+    let report = AssetPipeline::run_async(common::cpu_lod_config(data, output), tx)
         .await
         .unwrap();
     drain.await.unwrap();
@@ -153,7 +155,8 @@ async fn rebuild(
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let result =
-        AssetPipeline::rebuild_metadata_async(PipelineConfig::new(data, output), source, tx).await;
+        AssetPipeline::rebuild_metadata_async(common::cpu_lod_config(data, output), source, tx)
+            .await;
     drain.await.unwrap();
     result
 }
@@ -208,7 +211,7 @@ async fn native_retained_configuration_survives_rebuilds_without_becoming_cache_
     let repeated = directory.path().join("derived-again");
     generate(&data);
     convert(&data, &source).await;
-    let config = PipelineConfig::new(&data, &output);
+    let config = common::cpu_lod_config(&data, &output);
     let producer_hash = native_configuration_hash(&config, 6);
     assert_eq!(
         producer_hash,
@@ -279,7 +282,7 @@ async fn metadata_rebuild_rejects_changed_native_producer_settings() {
         serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     for (index, retained) in [false, true].into_iter().enumerate() {
         let output = directory.path().join(format!("rejected-{index}"));
-        let changed = native_configuration_hash(&PipelineConfig::new(&data, &output), 7);
+        let changed = native_configuration_hash(&common::cpu_lod_config(&data, &output), 7);
         if retained {
             manifest.schema_version = converter::cache::CONVERTER_SCHEMA_VERSION;
             let mut legacy_config = PipelineConfig::new(&data, &output);
@@ -437,12 +440,13 @@ async fn metadata_rebuild_preserves_retained_mesh_cache_contract() {
                 .values()
                 .filter(|entry| entry.output.ends_with(".glb"))
                 .count(),
+            // Producer 27 changed GLB collision data; only current-producer GLBs remain reusable.
             if source_schema == converter::cache::CONVERTER_SCHEMA_VERSION {
                 meshes
             } else {
                 0
             },
-            "metadata-only upgrades preserve original provenance; only current producer meshes are normal cache hits"
+            "metadata-only upgrades preserve original provenance; only known compatible producer meshes are normal cache hits"
         );
         let report = convert(&data, &repeated).await;
         let regenerated = if source_schema == converter::cache::CONVERTER_SCHEMA_VERSION {
@@ -451,7 +455,10 @@ async fn metadata_rebuild_preserves_retained_mesh_cache_contract() {
             retained
                 .entries
                 .values()
-                .filter(|entry| !entry.output.to_ascii_lowercase().ends_with(".luau"))
+                .filter(|entry| {
+                    let output = entry.output.to_ascii_lowercase();
+                    !output.ends_with(".luau")
+                })
                 .count()
         };
         let current: ConversionManifest =

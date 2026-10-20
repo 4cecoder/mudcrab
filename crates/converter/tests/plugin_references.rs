@@ -1,4 +1,6 @@
 //! Synthetic plugins only: no game data or copied assets.
+mod common;
+
 use converter::esm::{EsmParser, extractors::SubrecordView, load_order::LoadOrder};
 use std::{
     fs,
@@ -1239,7 +1241,7 @@ async fn legacy_pipeline_publishes_and_rebuilds_reference_and_cell_links() {
 async fn pipeline_publishes_and_rebuilds_reference_and_cell_links_with_reader(
     reader: Option<converter::config::RecordReader>,
 ) {
-    use converter::{AssetPipeline, PipelineConfig};
+    use converter::AssetPipeline;
     use rusqlite::Connection;
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("Data");
@@ -1421,7 +1423,7 @@ async fn pipeline_publishes_and_rebuilds_reference_and_cell_links_with_reader(
     )
     .unwrap();
     let output = dir.path().join("modern");
-    let mut config = PipelineConfig::new(&data, &output);
+    let mut config = common::cpu_lod_config(&data, &output);
     config.plugins_file = Some(list);
     if let Some(reader) = reader {
         config.record_reader = reader;

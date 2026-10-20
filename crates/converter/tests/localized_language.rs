@@ -1,6 +1,6 @@
 //! Localized plugins' names come from the string tables of the configured language (#195), read
 //! as UTF-8 or, failing that, Windows-1252. Synthetic plugins and tables; no game data.
-use converter::{AssetPipeline, PipelineConfig, PipelineReport};
+use converter::{AssetPipeline, PipelineConfig, PipelineReport, config::RecordReader};
 use dummy_content::{Entry, bsa};
 use rusqlite::Connection;
 use std::{fs, path::Path};
@@ -87,6 +87,23 @@ fn names(output: &Path) -> Vec<Option<String>> {
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap()
+}
+
+async fn convert_with(
+    data: &Path,
+    output: &Path,
+    language: &str,
+    reader: RecordReader,
+) -> PipelineReport {
+    let mut config = PipelineConfig::new(data, output);
+    config.no_lod = true;
+    config.language = language.to_owned();
+    config.record_reader = reader;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let report = AssetPipeline::run_async(config, tx).await.unwrap();
+    drain.await.unwrap();
+    report
 }
 
 fn reader_language(output: &Path) -> serde_json::Value {
@@ -244,4 +261,109 @@ fn only_another_language_changes_the_reader_identity() {
         inhouse::reader_identity_in_language(RecordReader::Legacy, "german"),
         inhouse::reader_identity(RecordReader::Legacy)
     );
+}
+
+/// A warm database follows the selected language and the winning German bank, for both readers:
+/// unchanged reruns restore, while a language switch, an edited loose winner, or the archive
+/// fallback after removing that winner each rebuild the database.
+#[tokio::test]
+async fn database_cache_follows_language_and_winning_bank_for_both_readers() {
+    for reader in [RecordReader::Inhouse, RecordReader::Legacy] {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("Data");
+        fs::create_dir_all(&data).unwrap();
+        localized_master(&data);
+        let english = table(&[(1, b"Lydia"), (2, b"Faendal"), (3, b"Prisoner")]);
+        let german = table(&[
+            (1, b"Lydia M\xfcller"),
+            (2, "Faendal der Jäger".as_bytes()),
+            (3, b"Gefangener"),
+        ]);
+        let archive = bsa::v105(
+            &[
+                Entry::new("strings/base_english.strings", &english),
+                Entry::new("strings/base_german.strings", &german),
+            ],
+            bsa::Compression::None,
+        )
+        .unwrap();
+        fs::write(data.join("Base.bsa"), archive).unwrap();
+        let output = dir.path().join("modern");
+
+        let cold = convert_with(&data, &output, "english", reader).await;
+        assert!(
+            cold.complete && !cold.database_cache_hit,
+            "{reader:?} cold english"
+        );
+        let warm = convert_with(&data, &output, "english", reader).await;
+        assert!(
+            warm.database_cache_hit,
+            "{reader:?} unchanged english restores"
+        );
+
+        let switched = convert_with(&data, &output, "german", reader).await;
+        assert!(
+            !switched.database_cache_hit,
+            "{reader:?} english to german must rebuild"
+        );
+        let german_warm = convert_with(&data, &output, "german", reader).await;
+        assert!(
+            german_warm.database_cache_hit,
+            "{reader:?} unchanged german restores: complete={} key={:?} warnings={:?} notices={:?}",
+            german_warm.complete,
+            german_warm.database_cache_key,
+            german_warm.warnings,
+            german_warm.notices
+        );
+        if reader == RecordReader::Inhouse {
+            assert_eq!(names(&output)[0], Some("Lydia Müller".into()));
+        }
+
+        // The loose German winner overrides the archive; editing it misses the cache.
+        fs::create_dir_all(data.join("Strings")).unwrap();
+        let loose = data.join("Strings/Base_German.STRINGS");
+        fs::write(
+            &loose,
+            table(&[
+                (1, b"Lydia die Huscarl"),
+                (2, b"Faendal"),
+                (3, b"Gefangener"),
+            ]),
+        )
+        .unwrap();
+        let added = convert_with(&data, &output, "german", reader).await;
+        assert!(
+            !added.database_cache_hit,
+            "{reader:?} loose winner must rebuild"
+        );
+        if reader == RecordReader::Inhouse {
+            assert_eq!(names(&output)[0], Some("Lydia die Huscarl".into()));
+        }
+        let repeated = convert_with(&data, &output, "german", reader).await;
+        assert!(
+            repeated.database_cache_hit,
+            "{reader:?} unchanged loose winner restores"
+        );
+        fs::write(
+            &loose,
+            table(&[(1, b"Lydia die Wache"), (2, b"Faendal"), (3, b"Gefangener")]),
+        )
+        .unwrap();
+        let edited = convert_with(&data, &output, "german", reader).await;
+        assert!(
+            !edited.database_cache_hit,
+            "{reader:?} edited loose winner must miss"
+        );
+
+        // Removing the loose winner falls back to the archive bank: a new origin, so a miss.
+        fs::remove_file(&loose).unwrap();
+        let fallback = convert_with(&data, &output, "german", reader).await;
+        assert!(
+            !fallback.database_cache_hit,
+            "{reader:?} archive fallback must miss"
+        );
+        if reader == RecordReader::Inhouse {
+            assert_eq!(names(&output)[0], Some("Lydia Müller".into()));
+        }
+    }
 }
