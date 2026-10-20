@@ -99,6 +99,7 @@ function Get-Spread($Values) {
         min = $ordered[0]
         max = $ordered[-1]
         samples = $numbers.Count
+        runs = @($Values).Count
     }
 }
 
@@ -453,13 +454,14 @@ function Get-SpreadPerName($Reports, [scriptblock]$Selector) {
 
 function Format-Spread($Spread, [string]$Format = "{0:N3}") {
     if ($null -eq $Spread) { return "n/a" }
-    return "$([string]::Format($Format, $Spread.median)) ($([string]::Format($Format, $Spread.min))-$([string]::Format($Format, $Spread.max)))"
+    # The coverage follows the range: how many of the window's repeats measured this value.
+    return "$([string]::Format($Format, $Spread.median)) ($([string]::Format($Format, $Spread.min))-$([string]::Format($Format, $Spread.max)), $($Spread.samples)/$($Spread.runs) samples)"
 }
 
 # A byte spread in MiB, or `n/a` when the repeats did not measure it.
 function Format-MiB($Spread) {
     if ($null -eq $Spread) { return "n/a" }
-    $mib = @{ median = $Spread.median / 1MB; min = $Spread.min / 1MB; max = $Spread.max / 1MB }
+    $mib = @{ median = $Spread.median / 1MB; min = $Spread.min / 1MB; max = $Spread.max / 1MB; samples = $Spread.samples; runs = $Spread.runs }
     return (Format-Spread $mib '{0:N2}')
 }
 
@@ -672,6 +674,15 @@ function Assert-Comparable($Old, $NewFingerprint, [string]$Path, [string]$NewHar
 # identity, stream radius, duration, warm-up), the effective graphics settings and the world database
 # opened must match.
 function Assert-WindowComparable($OldWindow, $NewWindow, [string]$Path, [string]$Scope) {
+    # Two unknown identities are not the same workload, even when they name one path and give the
+    # same reason, so an asset-backed window with no readable identity on either side is refused.
+    # A window with no assets (the synthetic scene) has no data set to identify and is not affected.
+    foreach ($side in @($OldWindow, $NewWindow)) {
+        $inputs = $side.scenario_inputs
+        if ($inputs.assets -and $inputs.assets_identity_unavailable) {
+            throw "Cannot compare $Scope with ${Path}: the data set at $($inputs.assets) has no known identity ($($inputs.assets_identity_unavailable)). A comparison needs both data sets identified; rerun the window on a data set whose conversion manifest records its configuration hash and schema version"
+        }
+    }
     $differences = @(Get-FieldDifferences $OldWindow.scenario_inputs $NewWindow.scenario_inputs)
     $differences += Get-FieldDifferences $OldWindow.fingerprint.graphics $NewWindow.fingerprint.graphics "graphics"
     $oldSchema = $OldWindow.fingerprint.opened_world_database_schema
@@ -697,9 +708,12 @@ function Get-ComparisonRefusal([scriptblock]$Check) {
 }
 
 # Per-metric comparison against an older baseline of the same machine and backend, reusing the
-# profiling campaign's noise floors.
+# profiling campaign's noise floors. A metric is scored only when both sides measured it in every
+# repeat: the median of a partial set is a different sample from a full one, so it is listed under
+# `unscored` with its coverage and the reason, rather than compared.
 function Get-Comparison($Old, $New) {
     $comparison = [ordered]@{}
+    $unscored = [ordered]@{}
     foreach ($name in @($New.scenarios.Keys)) {
         if (-not $Old.scenarios.ContainsKey($name)) { continue }
         foreach ($kind in @("standing_still", "streaming")) {
@@ -714,12 +728,22 @@ function Get-Comparison($Old, $New) {
                 process_memory_growth_gib = @($newWindow.memory.process_growth_gib, $oldWindow.memory.process_growth_gib)
             }
             $current = @{}
+            $skipped = [ordered]@{}
             foreach ($metric in @($metrics.Keys)) {
                 # Named `$newSpread`/`$oldSpread`, not `$new`/`$old`: variable names are
                 # case-insensitive, so `$new = ...` would overwrite the `$New` parameter and the next
                 # window would be read out of a metric spread.
                 $newSpread = $metrics[$metric][0]; $oldSpread = $metrics[$metric][1]
                 if ($null -eq $newSpread -or $null -eq $oldSpread -or $oldSpread.median -le 0) { continue }
+                if ($newSpread.samples -ne $New.repeats -or $oldSpread.samples -ne $Old.repeats) {
+                    $skipped[$metric] = [ordered]@{
+                        baseline = $oldSpread.median; current = $newSpread.median
+                        baseline_samples = $oldSpread.samples; baseline_repeats = $Old.repeats
+                        current_samples = $newSpread.samples; current_repeats = $New.repeats
+                        reason = "measured in $($newSpread.samples) of $($New.repeats) current repeats and $($oldSpread.samples) of $($Old.repeats) baseline repeats; a partial median is not compared"
+                    }
+                    continue
+                }
                 $regression = Get-RegressionComparison -Metric $metric -Old $oldSpread.median -New $newSpread.median
                 $current["$name/$kind/$metric"] = [ordered]@{
                     baseline = $oldSpread.median; current = $newSpread.median
@@ -730,9 +754,10 @@ function Get-Comparison($Old, $New) {
                 }
             }
             if ($current.Count -gt 0) { $comparison["$name/$kind"] = $current }
+            if ($skipped.Count -gt 0) { $unscored["$name/$kind"] = $skipped }
         }
     }
-    return $comparison
+    return [ordered]@{ metrics = $comparison; unscored = $unscored }
 }
 
 $windowsPerScenario = @{}
@@ -912,11 +937,13 @@ $baselineReport = [ordered]@{
     scenarios = $scenarioReports
 }
 if ($previous) {
+    $comparisons = Get-Comparison -Old $previous -New $baselineReport
     $baselineReport.comparison = [ordered]@{
         against = $comparePath
         against_commit = $previous.commit
         against_generated_at = $previous.generated_at
-        metrics = Get-Comparison -Old $previous -New $baselineReport
+        metrics = $comparisons.metrics
+        unscored = $comparisons.unscored
     }
 }
 $baselineReport | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $Out "baseline.json")
@@ -964,6 +991,12 @@ if ($previous) {
         foreach ($metric in @($baselineReport.comparison.metrics[$scope].Keys)) {
             $value = $baselineReport.comparison.metrics[$scope][$metric]
             $markdown += "| $scope | $metric | $([Math]::Round($value.baseline, 4)) | $([Math]::Round($value.current, 4)) | $([Math]::Round($value.regression_percent, 2)) | $($value.status) |"
+        }
+    }
+    foreach ($scope in @($baselineReport.comparison.unscored.Keys)) {
+        foreach ($metric in @($baselineReport.comparison.unscored[$scope].Keys)) {
+            $value = $baselineReport.comparison.unscored[$scope][$metric]
+            $markdown += "| $scope | $metric | $([Math]::Round($value.baseline, 4)) | $([Math]::Round($value.current, 4)) | n/a | unscored: $($value.reason) |"
         }
     }
 }
