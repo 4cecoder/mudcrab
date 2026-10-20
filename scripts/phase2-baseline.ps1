@@ -447,6 +447,17 @@ function Get-Acceptance($Reports) {
 # it was started with — so it can be set against another run's window. The maps are per pass, per
 # schedule and per span; everything the report left `null` stays `null` here, and every section
 # carries the report's `unavailable` reasons.
+# The shortfall of a route window, or `$null` when every run walked its whole route. A run that never
+# started, or stopped short of the route's end, scored only a part of it, which is not the workload the
+# window names, so such a window is never scored, published, or compared as a full route.
+function Get-RouteShortfall($Window) {
+    if ($null -eq $Window -or $null -eq $Window.route) { return $null }
+    $completed = [int]$Window.route.runs_completed
+    $runs = [int]$Window.runs
+    if ($completed -ge $runs) { return $null }
+    return "$($Window.route.file): $completed of $runs runs completed the route ($([int]$Window.route.runs_started) started)"
+}
+
 function Get-WindowReport($Reports, [string]$Kind, $Inputs) {
     $first = $Reports[0]
     $window = [ordered]@{
@@ -508,6 +519,10 @@ function Get-WindowReport($Reports, [string]$Kind, $Inputs) {
             frames_on_route = Get-Spread (Get-Values $Reports { param($report) $report.route.frames_on_route })
             route_frames_without_ground = Get-Spread (Get-Values $Reports { param($report) $report.route.route_frames_without_ground })
         }
+    }
+    $shortfall = Get-RouteShortfall $window
+    if ($shortfall) {
+        throw "Cannot score route window ${Kind}: $shortfall. A partial route is not the workload the window names; rerun the window with its time limit, or drop it from the selected set"
     }
     $window.gpu_passes = [ordered]@{
         # The frames the window's per-pass numbers rest on, kept beside them so a reader can tell a
@@ -791,6 +806,12 @@ function Get-BaselineProblem($Baseline) {
     }
     if ($null -eq $Baseline.fingerprint) { return "it recorded no run fingerprint, so the machine and build it ran on cannot be checked" }
     if ($null -eq $Baseline.scenarios) { return "it carries no scenarios map, so it holds no window to compare with" }
+    foreach ($scenario in @($Baseline.scenarios.Values)) {
+        foreach ($window in @($scenario.windows.Values)) {
+            $shortfall = Get-RouteShortfall $window
+            if ($shortfall) { return "it holds a partial route window ($shortfall), which is not a comparable full-route workload" }
+        }
+    }
     return $null
 }
 
@@ -851,6 +872,8 @@ function Assert-WindowComparable($OldWindow, $NewWindow, [string]$Path, [string]
     # A window with no assets (the synthetic scene) has no data set to identify and is not affected.
     foreach ($side in @($OldWindow, $NewWindow)) {
         Assert-AssetIdentityKnown $side.scenario_inputs $Path $Scope
+        $shortfall = Get-RouteShortfall $side
+        if ($shortfall) { throw "Cannot compare $Scope with ${Path}: a partial route window ($shortfall) is not a full-route workload" }
     }
     $differences = @(Get-FieldDifferences $OldWindow.scenario_inputs $NewWindow.scenario_inputs)
     # The frame budget is workload too — the report counts frames over it — and it is a number of the
@@ -1148,7 +1171,7 @@ $markdown = @(
     "- Commit: $($identity.commit) (dirty worktree: $($identity.dirty))",
     "- Machine: $hardware",
     "- Renderer: $rendererLine",
-    "- Repeats: $Repeats; window: $DurationSeconds s ($StabilitySeconds s for stability)",
+    "- Repeats: $Repeats; time limit: $DurationSeconds s per window ($StabilitySeconds s for stability); a route window runs at least its travel time plus $RouteReadinessSeconds s, so the actual length of a route window is not uniform",
     "- Frame budget: $FrameBudgetMs ms ($([Math]::Round(1000.0 / $FrameBudgetMs, 1)) fps); proposed bar: 99.9% of frames within it, none over twice it",
     "- Generated: $($baselineReport.generated_at)",
     "- Report bundles: $campaignRoot",

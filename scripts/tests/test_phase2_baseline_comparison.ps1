@@ -32,8 +32,31 @@ foreach ($text in @(Import-ScriptFunctions $profileScript @("Get-Median", "Get-R
 $baselineFunctions = @(
     "Get-Values", "Get-Spread", "Get-SummaryMap", "Get-CountMap", "Get-SummaryLine", "Format-Spread", "Get-FieldDifferences", "Format-FieldValue",
     "Get-LaggingPasses", "Assert-AssetIdentityKnown", "Assert-ComparisonAssetIdentities",
-    "Assert-WindowComparable", "Get-ComparisonRefusal", "Get-Comparison"
+    "Assert-WindowComparable", "Get-ComparisonRefusal", "Get-Comparison",
+    "Get-RouteShortfall", "Get-BaselineProblem", "Get-RouteTravelSeconds", "Get-WindowDuration", "Get-WindowReport"
 )
+# The constants the imported functions read, taken from the script's own assignments so a changed
+# value cannot leave the fixtures testing a different workload.
+$baselineText = Get-Content -LiteralPath $baselineScript -Raw
+function Get-ScriptConstant([string]$Name) {
+    $match = [regex]::Match($baselineText, '(?m)^\$(?:script:)?' + [regex]::Escape($Name) + ' = (\d+)')
+    if (-not $match.Success) { throw "$baselineScript does not assign `$$Name" }
+    return [int]$match.Groups[1].Value
+}
+$script:baselineFormatVersion = Get-ScriptConstant "baselineFormatVersion"
+$RouteReadinessSeconds = Get-ScriptConstant "RouteReadinessSeconds"
+$DurationSeconds = 120
+$StabilitySeconds = 1800
+$routeScenarios = @{ travel = "travel.json"; check = "check.json"; long = "long.json"; loop = "loop.json" }
+# Route files for the window fixtures: a long route, a looped one, and the shipped travel route.
+$fixtureDirectory = Join-Path ([IO.Path]::GetTempPath()) "phase2-route-fixtures-$PID"
+New-Item -ItemType Directory -Path $fixtureDirectory -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $fixtureDirectory "long.json") -Value '{"speed": 100, "loop": false, "waypoints": [[0, 0], [10000, 0]]}'
+Set-Content -LiteralPath (Join-Path $fixtureDirectory "loop.json") -Value '{"speed": 100, "loop": true, "waypoints": [[0, 0], [10000, 0], [0, 0]]}'
+function Get-RouteFilePath([string]$Name) {
+    if ($Name -in @("long", "loop")) { return Join-Path $fixtureDirectory $routeScenarios[$Name] }
+    return Join-Path $repository "scripts/routes/$($routeScenarios[$Name])"
+}
 foreach ($text in @(Import-ScriptFunctions $baselineScript $baselineFunctions)) {
     . ([scriptblock]::Create($text))
 }
@@ -214,6 +237,51 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($baselineScript
 $preflightCalls = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "Assert-ComparisonAssetIdentities" }, $true))
 $engineCalls = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "Invoke-EngineWindow" }, $true))
 Assert-True ($preflightCalls.Count -eq 1 -and $engineCalls.Count -eq 1 -and $preflightCalls[0].Extent.StartOffset -lt $engineCalls[0].Extent.StartOffset) "campaign identity preflight precedes its timed engine invocation"
+
+# --- Route windows: partial routes are never scored or compared as full ----------------------------
+
+function New-RouteWindow([int]$Runs, [int]$Completed, [int]$Started, [string]$File = "travel.json") {
+    return [ordered]@{ window = "streaming"; runs = $Runs; route = [ordered]@{ file = $File; runs_completed = $Completed; runs_started = $Started } }
+}
+
+Assert-True ($null -eq (Get-RouteShortfall (New-RouteWindow 3 3 3))) "a route window whose every run completed has no shortfall"
+Assert-True ((Get-RouteShortfall (New-RouteWindow 3 2 3)) -match "2 of 3 runs completed") "a route window with a run that stopped short names the shortfall" (Get-RouteShortfall (New-RouteWindow 3 2 3))
+Assert-True ((Get-RouteShortfall (New-RouteWindow 3 0 0)) -match "0 of 3 runs completed") "a route whose runs never started names the shortfall"
+Assert-True ($null -eq (Get-RouteShortfall ([ordered]@{ window = "standing_still"; runs = 3; route = $null }))) "a window with no route has no route shortfall"
+
+$partialBaseline = @{
+    format_version = $script:baselineFormatVersion
+    fingerprint = @{}
+    scenarios = @{ travel = @{ windows = @{ streaming = (New-RouteWindow 3 2 3) } } }
+}
+$completeBaseline = @{
+    format_version = $script:baselineFormatVersion
+    fingerprint = @{}
+    scenarios = @{ travel = @{ windows = @{ streaming = (New-RouteWindow 3 3 3) } } }
+}
+Assert-True ((Get-BaselineProblem $partialBaseline) -match "partial route window") "a baseline holding a partial route is refused before the campaign" (Get-BaselineProblem $partialBaseline)
+Assert-True ($null -eq (Get-BaselineProblem $completeBaseline)) "a baseline whose route windows all completed is accepted"
+Assert-Throws { Assert-WindowComparable (New-RouteWindow 3 2 3) (New-RouteWindow 3 3 3) "baseline.json" "travel/streaming" } "partial route window" "an explicit comparison refuses a partial baseline route window"
+Assert-Throws { Assert-WindowComparable (New-RouteWindow 3 3 3) (New-RouteWindow 3 0 0) "baseline.json" "travel/streaming" } "partial route window" "an explicit comparison refuses a current route that never started"
+
+# The window's time limit is a floor; a route window runs at least its travel time plus the readiness allowance.
+Assert-True ((Get-RouteTravelSeconds "travel") -eq 60) "the shipped travel route takes 60 s at its speed" "$(Get-RouteTravelSeconds 'travel')"
+Assert-True ((Get-WindowDuration "travel") -eq 120) "travel's window keeps the 120 s limit when travel plus 60 s is shorter" "$(Get-WindowDuration 'travel')"
+Assert-True ((Get-RouteTravelSeconds "long") -eq 100) "a 10000-unit route at 100 units/s takes 100 s"
+Assert-True ((Get-WindowDuration "long") -eq 160) "a route window adds the 60 s readiness allowance to its travel time" "$(Get-WindowDuration 'long')"
+$DurationSeconds = 300
+Assert-True ((Get-WindowDuration "travel") -eq 300) "a longer time limit is kept as the route window's minimum"
+$DurationSeconds = 120
+Assert-Throws { Get-RouteTravelSeconds "loop" } "loops" "a looped route has no travel time to allow for"
+
+# The scoring gate: the baseline's own window reader must check route completion before it scores.
+$windowReportAst = $null
+$tokens = $null; $errors = $null
+$windowReportAst = [System.Management.Automation.Language.Parser]::ParseFile($baselineScript, [ref]$tokens, [ref]$errors).FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Get-WindowReport" }, $true)[0]
+$shortfallCalls = @($windowReportAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "Get-RouteShortfall" }, $true))
+Assert-True ($shortfallCalls.Count -eq 1) "Get-WindowReport refuses a partial route before it builds the window's numbers"
+
+Remove-Item -LiteralPath $fixtureDirectory -Recurse -Force
 
 # --- Result ------------------------------------------------------------------------------------------
 
