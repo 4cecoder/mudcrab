@@ -2727,7 +2727,8 @@ mod tests {
                 Visibility::Hidden,
             ))
             .id();
-        let visibility = |app: &App, entity: Entity| *app.world().get::<Visibility>(entity).unwrap();
+        let visibility =
+            |app: &App, entity: Entity| *app.world().get::<Visibility>(entity).unwrap();
 
         app.update();
         assert_eq!(visibility(&app, fine), Visibility::Hidden);
