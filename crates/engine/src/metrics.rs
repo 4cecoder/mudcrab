@@ -17,6 +17,7 @@ use crate::{
     },
     world::components::{CELL_SIZE, StreamingCamera},
 };
+use bevy::ecs::system::SystemParam;
 use bevy::{
     diagnostic::{
         DiagnosticsStore, EntityCountDiagnosticsPlugin, SystemInfo,
@@ -419,6 +420,16 @@ struct Thresholds {
     screenshot_captured: bool,
 }
 
+/// The run's fingerprint, the render-world probe and the loaded assets, grouped so that
+/// `collect_and_finish` stays within Bevy's system-parameter limit.
+#[derive(SystemParam)]
+struct MeasurementInputs<'w> {
+    fingerprint: Option<Res<'w, RunFingerprint>>,
+    render_measurement_probe: Option<Res<'w, RenderMeasurementProbe>>,
+    meshes: Res<'w, Assets<Mesh>>,
+    images: Res<'w, Assets<Image>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_and_finish(
     time: Res<Time>,
@@ -431,10 +442,7 @@ fn collect_and_finish(
     renderer: Res<RendererMetrics>,
     render_timings: Res<RenderTimings>,
     pacing: Option<Res<PacingTracker>>,
-    fingerprint: Option<Res<RunFingerprint>>,
-    render_measurement_probe: Option<Res<RenderMeasurementProbe>>,
-    meshes: Res<Assets<Mesh>>,
-    images: Res<Assets<Image>>,
+    measurements: MeasurementInputs,
     mut samples: ResMut<BenchmarkSamples>,
     mut profiler: ResMut<ProfilingState>,
     mut exit: MessageWriter<AppExit>,
@@ -464,7 +472,8 @@ fn collect_and_finish(
             &diagnostics,
             process_memory,
             measuring,
-            render_measurement_probe
+            measurements
+                .render_measurement_probe
                 .as_deref()
                 .is_some_and(RenderMeasurementProbe::measured),
         );
@@ -593,12 +602,13 @@ fn collect_and_finish(
     // Whether the device can time GPU work is the device's own answer, recorded in the fingerprint
     // at startup. The GPU sections take the fingerprint whole, so a run with no renderer says so
     // rather than blaming a backend it never had.
-    let renderer_fingerprint = fingerprint
+    let renderer_fingerprint = measurements
+        .fingerprint
         .as_deref()
         .and_then(|value| value.renderer.as_ref());
     let gpu_passes = profiler.gpu_passes(renderer_fingerprint);
     let memory = MemoryReport {
-        cpu: cpu_asset_bytes(&meshes, &images),
+        cpu: cpu_asset_bytes(&measurements.meshes, &measurements.images),
         gpu: profiler.gpu_memory(renderer_fingerprint),
     };
     // Both sections report what the run measured, so a count that was never sampled stays `null`
@@ -675,7 +685,7 @@ fn collect_and_finish(
         render_world,
         render_pipelines,
         pacing: pacing_report,
-        fingerprint: fingerprint.as_deref().cloned(),
+        fingerprint: measurements.fingerprint.as_deref().cloned(),
         gpu_passes,
         scene,
         cpu,
@@ -725,7 +735,7 @@ fn collect_and_finish(
         streaming.as_deref(),
         &renderer,
         bundle_system,
-        fingerprint.as_deref(),
+        measurements.fingerprint.as_deref(),
     ) {
         error!(%error, "failed to write profiling bundle");
         exit.write(AppExit::error());
