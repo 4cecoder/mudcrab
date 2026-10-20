@@ -7,6 +7,13 @@ use shared::terrain_mesh::{
 };
 use std::{collections::BTreeSet, fs, path::Path};
 
+/// The default LOD atlas encoder is the GPU; these fixtures run on the CPU encoder only.
+fn cpu_config(data: &Path, output: &Path) -> converter::PipelineConfig {
+    let mut config = converter::PipelineConfig::new(data, output);
+    config.lod_texture_encoder = converter::TextureEncoder::Cpu;
+    config
+}
+
 fn generate_data(root: &Path) {
     layout::prepare_directory(root, false).unwrap();
     let formats = layout::Formats::parse("dds,pex,nif,esm").unwrap();
@@ -52,7 +59,7 @@ async fn merged_terrain_writes_the_table_arrays_and_chunk_files() {
     let data = directory.path().join("Data");
     let output = directory.path().join("assets");
     generate_data(&data);
-    let mut config = converter::PipelineConfig::new(&data, &output);
+    let mut config = cpu_config(&data, &output);
     config.merged_terrain = true;
     let report = convert_config(config).await;
     assert!(report.complete, "{:?}", report.warnings);
@@ -185,11 +192,11 @@ async fn a_metadata_rebuild_rebuilds_the_terrain_payloads() {
     let output = directory.path().join("assets");
     let rebuilt = directory.path().join("rebuilt");
     generate_data(&data);
-    let mut config = converter::PipelineConfig::new(&data, &output);
+    let mut config = cpu_config(&data, &output);
     config.merged_terrain = true;
     assert!(convert_config(config).await.terrain.is_some());
 
-    let mut config = converter::PipelineConfig::new(&data, &rebuilt);
+    let mut config = cpu_config(&data, &rebuilt);
     config.merged_terrain = true;
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -216,7 +223,7 @@ async fn without_the_option_no_terrain_output_is_written() {
     let data = directory.path().join("Data");
     let output = directory.path().join("assets");
     generate_data(&data);
-    let report = convert_config(converter::PipelineConfig::new(&data, &output)).await;
+    let report = convert_config(cpu_config(&data, &output)).await;
     assert!(report.complete, "{:?}", report.warnings);
     assert!(report.terrain.is_none());
     assert!(
@@ -229,7 +236,7 @@ async fn without_the_option_no_terrain_output_is_written() {
 
     // The same input with the option on does write it, so the pair discriminates.
     let with_option = directory.path().join("with-option");
-    let mut config = converter::PipelineConfig::new(&data, &with_option);
+    let mut config = cpu_config(&data, &with_option);
     config.merged_terrain = true;
     assert!(convert_config(config).await.terrain.is_some());
     assert!(with_option.join("terrain").is_dir());
