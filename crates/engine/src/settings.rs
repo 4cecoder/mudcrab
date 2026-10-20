@@ -68,6 +68,17 @@ pub struct RenderingSettings {
     pub msaa: usize,
     pub exposure_ev100: f32,
     pub tone_map: usize,
+    /// Persisted grade mode; existing indices 0 through 4 remain stable.
+    pub color_grade: usize,
+    pub visual_preset: usize,
+    pub grade_saturation: f32,
+    pub grade_brightness: f32,
+    pub grade_contrast: f32,
+    pub grade_tint_amount: f32,
+    pub grade_tint_red: f32,
+    pub grade_tint_green: f32,
+    pub grade_tint_blue: f32,
+    pub grade_pivot: f32,
     pub fov_degrees: f32,
     pub vsync: bool,
     pub window_mode: usize,
@@ -124,6 +135,16 @@ impl Default for RenderingSettings {
             msaa: 0,
             exposure_ev100: crate::color_pipeline::DEFAULT_SCENE_EV100,
             tone_map: 6,
+            color_grade: 3,
+            visual_preset: 1,
+            grade_saturation: 1.66,
+            grade_brightness: 1.38,
+            grade_contrast: 1.50,
+            grade_tint_amount: 0.56,
+            grade_tint_red: 0.88,
+            grade_tint_green: 0.81,
+            grade_tint_blue: 0.72,
+            grade_pivot: 0.18,
             fov_degrees: PerspectiveProjection::default().fov.to_degrees(),
             vsync: true,
             window_mode: 0,
@@ -278,6 +299,16 @@ pub static SETTING_SPECS: &[SettingSpec] = &[
             "Khronos PBR neutral",
         ]
     ),
+    choice!("Color grading", "Grade mode", color_grade, &["Off", "Saturation", "Full", "Approved sRGB", "Snapshot linear", "Record sRGB"]),
+    choice!("Color grading", "Sky and fog preset", visual_preset, &["Vivid", "Cool Gray"]),
+    number!(Graphics, "Color grading", "Grade saturation", grade_saturation; 0.0, 3.0, 0.05).when(|s| s.color_grade != 0),
+    number!(Graphics, "Color grading", "Grade brightness", grade_brightness; 0.0, 3.0, 0.025).when(|s| s.color_grade >= 2),
+    number!(Graphics, "Color grading", "Grade contrast", grade_contrast; 0.0, 3.0, 0.025).when(|s| s.color_grade >= 2),
+    number!(Graphics, "Color grading", "Grade tint amount", grade_tint_amount; 0.0, 1.0, 0.025).when(|s| s.color_grade >= 2),
+    number!(Graphics, "Color grading", "Grade tint red", grade_tint_red; 0.0, 1.0, 0.025).when(|s| s.color_grade >= 2),
+    number!(Graphics, "Color grading", "Grade tint green", grade_tint_green; 0.0, 1.0, 0.025).when(|s| s.color_grade >= 2),
+    number!(Graphics, "Color grading", "Grade tint blue", grade_tint_blue; 0.0, 1.0, 0.025).when(|s| s.color_grade >= 2),
+    number!(Graphics, "Color grading", "Grade pivot", grade_pivot; 0.01, 0.99, 0.01).when(|s| s.color_grade >= 2),
     number!(Graphics, "Image", "Vertical field of view (degrees)", fov_degrees; 30.0, 110.0, 5.0),
     toggle!("Window", "VSync", vsync),
     choice!(
@@ -625,6 +656,7 @@ pub(crate) fn apply_render_settings(
     mut settings: ResMut<RenderingSettings>,
     mut config: ResMut<EngineConfig>,
     mut commands: Commands,
+    grade_source: Option<Res<crate::color_pipeline::SceneGradeSource>>,
     mut cameras: Query<
         (
             Entity,
@@ -650,6 +682,30 @@ pub(crate) fn apply_render_settings(
     if !settings.is_changed() {
         return;
     }
+    let mode = crate::color_pipeline::SceneGradeMode::from_index(settings.color_grade)
+        .unwrap_or(crate::color_pipeline::SceneGradeMode::SnapshotSrgb);
+    if mode == crate::color_pipeline::SceneGradeMode::RecordSrgb {
+        let source = grade_source.as_deref().cloned().unwrap_or_default();
+        if let Err(error) = source.resolve(
+            mode,
+            if settings.visual_preset == 0 {
+                crate::color_pipeline::SceneVisualPreset::Vivid
+            } else {
+                crate::color_pipeline::SceneVisualPreset::CoolGray
+            },
+        ) {
+            settings.color_grade = crate::color_pipeline::SceneGradeMode::SnapshotSrgb.index();
+            if let Some(file) = file.as_deref_mut() {
+                file.status = format!("Record sRGB is unavailable: {error}");
+            }
+        }
+    }
+    commands.insert_resource(mode);
+    commands.insert_resource(if settings.visual_preset == 0 {
+        crate::color_pipeline::SceneVisualPreset::Vivid
+    } else {
+        crate::color_pipeline::SceneVisualPreset::CoolGray
+    });
     let samples = [1, 2, 4, 8][settings.msaa];
     if let Some(adapter) = adapter
         && [

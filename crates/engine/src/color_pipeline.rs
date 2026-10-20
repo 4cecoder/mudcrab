@@ -42,6 +42,29 @@ pub enum SceneGradeMode {
 }
 
 impl SceneGradeMode {
+    pub fn index(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Saturation => 1,
+            Self::Full => 2,
+            Self::SnapshotSrgb => 3,
+            Self::SnapshotLinear => 4,
+            Self::RecordSrgb => 5,
+        }
+    }
+
+    pub fn from_index(index: usize) -> Option<Self> {
+        Some(match index {
+            0 => Self::Off,
+            1 => Self::Saturation,
+            2 => Self::Full,
+            3 => Self::SnapshotSrgb,
+            4 => Self::SnapshotLinear,
+            5 => Self::RecordSrgb,
+            _ => return None,
+        })
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "off" => Some(Self::Off),
