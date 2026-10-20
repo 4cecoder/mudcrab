@@ -297,7 +297,7 @@ T73|~|Implement opt-in pinned offline conventional/cluster comparison from immut
 T110|x|Exercise actual GPU batch/dispatch/readback with software Vulkan in CI|V210
 T90|x|Fix faction remap & reject aliased non-FormID fields; independent full/light field regressions|V190
 
-T91|x|Preserve jump ascent through Rapier ground-probe overlap; reproduce native one-step apex & verify integration/48 physics checks|V191
+T91|x|Preserve jump ascent through Rapier ground-probe overlap in current source: headless integration ascent/descent/relaunch regression & walk feed ordered before SyncBackend; no new native or 48-check acceptance claimed|V191
 T100|x|Make validation timing fail on bad output; valid/broken generated artifact regression|V200
 T74|x|Move terrain compiler into owned blocking pool; retain leases on abort, cancel channel waits & verify current-thread regressions|V182
 
