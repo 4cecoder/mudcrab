@@ -1181,7 +1181,15 @@ fn finish_log(run: &mut ShotsRun) {
         error!(target: "shots", "could not write {}: {error}", path.display());
         run.failed = true;
     } else {
-        run.note(serde_json::json!({"run_complete": !run.failed, "poses_finished": run.shot, "expected_poses": run.file.shots.len(), "expected_captures": run.route_checkpoints.as_ref().map_or(run.file.shots.len(), |checkpoints| checkpoints.len() * 2)}).to_string());
+        // A route checkpoint takes a transition and a settled capture; indices past the
+        // file's shots are never reached, so they cannot count toward the expected total.
+        let expected_captures = run
+            .route_checkpoints
+            .as_ref()
+            .map_or(run.file.shots.len(), |checkpoints| {
+                checkpoints.range(..run.file.shots.len()).count() * 2
+            });
+        run.note(serde_json::json!({"run_complete": !run.failed, "poses_finished": run.shot, "expected_poses": run.file.shots.len(), "expected_captures": expected_captures}).to_string());
         info!(target: "shots", "shots log written to {}", path.display());
     }
 }
