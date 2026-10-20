@@ -7,6 +7,7 @@ pub mod console;
 pub mod door_crossing;
 pub mod doors;
 pub mod emittance;
+pub mod fingerprint;
 pub mod indirect_metrics;
 pub mod lights;
 mod matched_route;
