@@ -487,7 +487,7 @@ function Get-UnavailableItems($Window) {
     return $items
 }
 
-# The passes whose own sample count is below the window's measured frames, as `pass (samples)` items
+# The passes whose own sample count is below the window's measured frames, with frame and repeat coverage,
 # with the frame count they were set against, or `$null` when every pass was sampled as often as the
 # window had frames (or there is nothing to compare). The engine's `count` is the pass's real sample
 # count, so a smaller one means the GPU readback lagged or the pass did not run every frame.
@@ -504,7 +504,7 @@ function Get-LaggingPasses($Window) {
     return [ordered]@{
         frames = [string]::Format('{0:N0}', $measured)
         passes = @($passes | ForEach-Object {
-                "$_ ($([string]::Format('{0:N0}', $Window.gpu_passes.pass_samples[$_].median)))"
+                "$_ ($(Format-Spread $Window.gpu_passes.pass_samples[$_] '{0:N0}'))"
             })
     }
 }
@@ -669,6 +669,28 @@ function Assert-Comparable($Old, $NewFingerprint, [string]$Path, [string]$NewHar
     }
 }
 
+# A missing identity cannot establish an asset-backed comparison, even when the paths match.
+function Assert-AssetIdentityKnown($Inputs, [string]$Path, [string]$Scope) {
+    if ($Inputs.assets -and $Inputs.assets_identity_unavailable) {
+        throw "Cannot compare $Scope with ${Path}: the data set at $($Inputs.assets) has no known identity ($($Inputs.assets_identity_unavailable)). A comparison needs both data sets identified; rerun the window on a data set whose conversion manifest records its configuration hash and schema version"
+    }
+}
+
+# Asset identity needs no engine report, so refuse unusable comparisons before timed windows.
+function Assert-ComparisonAssetIdentities($Old, [string]$ResolvedAssets, $Requested, $WindowCounts, [string]$Path) {
+    foreach ($name in $Requested) {
+        if ($name -eq "synthetic" -or -not $Old.scenarios.ContainsKey($name)) { continue }
+        $kinds = if ($WindowCounts[$name] -eq 2) { @("standing_still", "streaming") } else { @("standing_still") }
+        foreach ($kind in $kinds) {
+            $oldWindow = $Old.scenarios[$name].windows[$kind]
+            if ($null -eq $oldWindow) { continue }
+            Assert-AssetIdentityKnown $oldWindow.scenario_inputs $Path "baseline $name/$kind"
+            $identity = Get-AssetsIdentity $ResolvedAssets
+            Assert-AssetIdentityKnown @{ assets = $ResolvedAssets; assets_identity_unavailable = $identity.unavailable } $Path "baseline $name/$kind"
+        }
+    }
+}
+
 # Refuses a comparison between two windows that are not the same workload: the scenario inputs
 # (worldspace, grid, flight speed, synthetic instance count, asset path and its conversion-manifest
 # identity, stream radius, duration, warm-up), the effective graphics settings and the world database
@@ -678,10 +700,7 @@ function Assert-WindowComparable($OldWindow, $NewWindow, [string]$Path, [string]
     # same reason, so an asset-backed window with no readable identity on either side is refused.
     # A window with no assets (the synthetic scene) has no data set to identify and is not affected.
     foreach ($side in @($OldWindow, $NewWindow)) {
-        $inputs = $side.scenario_inputs
-        if ($inputs.assets -and $inputs.assets_identity_unavailable) {
-            throw "Cannot compare $Scope with ${Path}: the data set at $($inputs.assets) has no known identity ($($inputs.assets_identity_unavailable)). A comparison needs both data sets identified; rerun the window on a data set whose conversion manifest records its configuration hash and schema version"
-        }
+        Assert-AssetIdentityKnown $side.scenario_inputs $Path $Scope
     }
     $differences = @(Get-FieldDifferences $OldWindow.scenario_inputs $NewWindow.scenario_inputs)
     $differences += Get-FieldDifferences $OldWindow.fingerprint.graphics $NewWindow.fingerprint.graphics "graphics"
@@ -829,6 +848,14 @@ if (Test-Path -LiteralPath $comparePath -PathType Leaf) {
         Write-Warning "Not comparing with ${comparePath}: $problem. The campaign runs without a comparison; pass -CompareTo to have a baseline like this refused instead"
     } else {
         $previous = $candidate
+    }
+}
+
+if ($previous) {
+    $refusal = Get-ComparisonRefusal { Assert-ComparisonAssetIdentities $previous $resolvedAssets $requested $windowsPerScenario $comparePath }
+    if ($refusal) {
+        Write-Warning "$refusal The campaign continues without a comparison"
+        $previous = $null
     }
 }
 
