@@ -2744,9 +2744,8 @@ fn cursor_lifecycle_system(
     let reporting_capture = console
         .as_ref()
         .is_some_and(|console| console.capture_suppressed);
-    let console_owns_capture = console.is_some_and(|console| {
-        console.open || console.closing || console.capture_suppressed
-    })
+    let console_owns_capture = console
+        .is_some_and(|console| console.open || console.closing || console.capture_suppressed)
         || menu.is_some_and(|menu| menu.blocks_gameplay());
     if reporting_capture {
         *capture = CursorCapture::Released;

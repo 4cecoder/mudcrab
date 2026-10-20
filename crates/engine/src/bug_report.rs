@@ -19,6 +19,7 @@ use bevy::{
 };
 use serde_json::{Value, json};
 use std::{
+    io,
     path::PathBuf,
     sync::{
         Arc,
@@ -349,7 +350,7 @@ fn remove_capture(world: &mut World, active: &mut ActiveReport) {
     suppress_console(world, false);
 }
 
-fn start_packaging(world: &World, active: &mut ActiveReport) {
+fn start_packaging(world: &mut World, service: &mut BugReportService, active: &mut ActiveReport) {
     // Only the two local paths are needed by the worker; never clone private profiling/CLI text.
     let (output_override, assets_dir) = world
         .get_resource::<EngineConfig>()
@@ -369,82 +370,146 @@ fn start_packaging(world: &World, active: &mut ActiveReport) {
     let logs = std::mem::take(&mut active.logs);
     active.phase = Phase::Packaging;
     active.phase_started = Instant::now();
-    active.worker = Some(thread::spawn(move || {
-        let result = (|| {
-            let check = || {
-                if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
-                    Err("Bug report collection canceled or timed out".to_owned())
-                } else {
-                    Ok(())
+    let worker = thread::Builder::new()
+        .name("mudcrab-bug-report-packaging".into())
+        .spawn(move || {
+            let result = (|| {
+                let check = || {
+                    if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+                        Err("Bug report collection canceled or timed out".to_owned())
+                    } else {
+                        Ok(())
+                    }
+                };
+                check()?;
+                let output_dir = match output_override {
+                    Some(path) => std::path::absolute(path).map_err(|e| e.to_string())?,
+                    None => export::default_report_dir()?,
+                };
+                let assets = std::path::absolute(&assets_dir).map_err(|e| e.to_string())?;
+                let mut roots = vec![
+                    (assets.clone(), "<assets>".into()),
+                    (output_dir.clone(), "<reports>".into()),
+                ];
+                for variable in ["HOME", "USERPROFILE"] {
+                    if let Some(home) = std::env::var_os(variable) {
+                        roots.push((PathBuf::from(home), "~".into()));
+                    }
                 }
-            };
-            check()?;
-            let output_dir = match output_override {
-                Some(path) => std::path::absolute(path).map_err(|e| e.to_string())?,
-                None => export::default_report_dir()?,
-            };
-            let assets = std::path::absolute(&assets_dir).map_err(|e| e.to_string())?;
-            let mut roots = vec![
-                (assets.clone(), "<assets>".into()),
-                (output_dir.clone(), "<reports>".into()),
-            ];
-            for variable in ["HOME", "USERPROFILE"] {
-                if let Some(home) = std::env::var_os(variable) {
-                    roots.push((PathBuf::from(home), "~".into()));
+                check()?;
+                if let Ok(canonical) = std::fs::canonicalize(&assets) {
+                    roots.push((canonical, "<assets>".into()));
                 }
-            }
-            check()?;
-            if let Ok(canonical) = std::fs::canonicalize(&assets) {
-                roots.push((canonical, "<assets>".into()));
-            }
-            check()?;
-            snapshot["content"] = snapshot::content_metadata(&assets);
-            check()?;
-            let mut warnings = Vec::new();
-            for (pointer, warning) in [
-                ("/build/git_commit", "Build commit is unavailable"),
-                ("/platform/gpu", "GPU adapter diagnostics are unavailable"),
-                (
-                    "/session/active_space",
-                    "Current active-space identity is unavailable",
-                ),
-                ("/pose/camera", "Camera pose is unavailable"),
-            ] {
-                if snapshot.pointer(pointer).is_none_or(Value::is_null) {
-                    warnings.push(warning);
+                check()?;
+                snapshot["content"] = snapshot::content_metadata(&assets);
+                check()?;
+                let mut warnings = Vec::new();
+                for (pointer, warning) in [
+                    ("/build/git_commit", "Build commit is unavailable"),
+                    ("/platform/gpu", "GPU adapter diagnostics are unavailable"),
+                    (
+                        "/session/active_space",
+                        "Current active-space identity is unavailable",
+                    ),
+                    ("/pose/camera", "Camera pose is unavailable"),
+                ] {
+                    if snapshot.pointer(pointer).is_none_or(Value::is_null) {
+                        warnings.push(warning);
+                    }
                 }
-            }
-            if snapshot
-                .pointer("/performance/sample_count")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                == 0
-            {
-                warnings.push("Recent frame-time diagnostics are unavailable");
-            }
-            snapshot["collection_warnings"] = json!(warnings);
-            Ok(BundleInput {
-                id,
-                created_unix_ms,
-                started,
-                deadline,
-                cancelled,
-                snapshot,
-                logs,
-                screenshot,
-                screenshot_error,
-                output_dir,
-                sanitizer: Sanitizer::new(roots),
+                if snapshot
+                    .pointer("/performance/sample_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    == 0
+                {
+                    warnings.push("Recent frame-time diagnostics are unavailable");
+                }
+                snapshot["collection_warnings"] = json!(warnings);
+                Ok(BundleInput {
+                    id,
+                    created_unix_ms,
+                    started,
+                    deadline,
+                    cancelled,
+                    snapshot,
+                    logs,
+                    screenshot,
+                    screenshot_error,
+                    output_dir,
+                    sanitizer: Sanitizer::new(roots),
+                })
+            })();
+            WorkerResult::Bundle(match result {
+                Ok(input) => export::publish(input),
+                Err(message) => Err(BundleError {
+                    message,
+                    recovered_directory: None,
+                }),
             })
-        })();
-        WorkerResult::Bundle(match result {
-            Ok(input) => export::publish(input),
-            Err(message) => Err(BundleError {
+        });
+    record_packaging_spawn_result(world, service, active, worker);
+}
+
+fn record_packaging_spawn_result(
+    world: &mut World,
+    service: &mut BugReportService,
+    active: &mut ActiveReport,
+    result: io::Result<JoinHandle<WorkerResult>>,
+) {
+    match result {
+        Ok(worker) => active.worker = Some(worker),
+        Err(error) => {
+            let message = format!("Could not start bug-report packaging: {error}");
+            console_output(world, &message);
+            suppress_console(world, false);
+            service.last_result = Some(ReportResult::Failed {
                 message,
                 recovered_directory: None,
-            }),
-        })
-    }));
+            });
+            active.phase = Phase::Retiring;
+            active.worker = None;
+        }
+    }
+}
+
+fn report_browser_handoff_failure(world: &mut World, active: &ActiveReport, reason: &str) {
+    console_output(
+        world,
+        &format!("Report saved; browser could not be opened: {reason}"),
+    );
+    if let Some(url) = &active.issue_url {
+        console_output(world, url);
+    }
+    if let Some(directory) = &active.saved_directory {
+        console_output(
+            world,
+            &format!("Issue draft: {}", directory.join("report.md").display()),
+        );
+    }
+}
+
+fn record_browser_spawn_result(
+    world: &mut World,
+    active: &mut ActiveReport,
+    result: io::Result<JoinHandle<WorkerResult>>,
+) -> bool {
+    match result {
+        Ok(worker) => {
+            active.worker = Some(worker);
+            false
+        }
+        Err(error) => {
+            report_browser_handoff_failure(
+                world,
+                active,
+                &format!("Could not start browser handoff: {error}"),
+            );
+            active.phase = Phase::Retiring;
+            active.worker = None;
+            true
+        }
+    }
 }
 
 fn timeout(world: &mut World, service: &mut BugReportService, active: &mut ActiveReport) {
@@ -474,7 +539,7 @@ fn saved(
     service: &mut BugReportService,
     active: &mut ActiveReport,
     outcome: BundleOutcome,
-) {
+) -> bool {
     let text = if outcome.partial {
         "Report saved with missing diagnostics"
     } else {
@@ -492,16 +557,18 @@ fn saved(
     });
     active.issue_url = Some(outcome.issue_url.clone());
     active.saved_directory = Some(outcome.directory);
-    if active.open_browser {
-        let url = outcome.issue_url;
-        active.cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled = active.cancelled.clone();
-        active.phase = Phase::Browser;
-        active.phase_started = Instant::now();
-        active.worker = Some(thread::spawn(move || {
-            WorkerResult::Browser(open_browser(&url, &cancelled))
-        }));
+    if !active.open_browser {
+        return true;
     }
+    let url = outcome.issue_url;
+    active.cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled = active.cancelled.clone();
+    active.phase = Phase::Browser;
+    active.phase_started = Instant::now();
+    let worker = thread::Builder::new()
+        .name("mudcrab-bug-report-browser".into())
+        .spawn(move || WorkerResult::Browser(open_browser(&url, &cancelled)));
+    record_browser_spawn_result(world, active, worker)
 }
 
 fn drive_reports(world: &mut World) {
@@ -523,7 +590,7 @@ fn drive_reports(world: &mut World) {
             && (active.image.is_some() || active.phase_started.elapsed() >= READBACK_TIMEOUT)
         {
             remove_capture(world, &mut active);
-            start_packaging(world, &mut active);
+            start_packaging(world, &mut service, &mut active);
         }
         let exceeded = match active.phase {
             Phase::Capturing | Phase::Packaging => Instant::now() >= active.deadline,
@@ -557,8 +624,7 @@ fn drive_reports(world: &mut World) {
             } else {
                 match result {
                     Ok(WorkerResult::Bundle(Ok(outcome))) => {
-                        saved(world, &mut service, &mut active, outcome);
-                        finished = !active.open_browser;
+                        finished = saved(world, &mut service, &mut active, outcome);
                     }
                     Ok(WorkerResult::Bundle(Err(error))) => {
                         console_output(world, &format!("Bug report failed: {}", error.message));
@@ -579,22 +645,7 @@ fn drive_reports(world: &mut World) {
                     }
                     Ok(WorkerResult::Browser(result)) => {
                         if let Err(reason) = result {
-                            console_output(
-                                world,
-                                &format!("Report saved; browser could not be opened: {reason}"),
-                            );
-                            if let Some(url) = &active.issue_url {
-                                console_output(world, url);
-                            }
-                            if let Some(directory) = &active.saved_directory {
-                                console_output(
-                                    world,
-                                    &format!(
-                                        "Issue draft: {}",
-                                        directory.join("report.md").display()
-                                    ),
-                                );
-                            }
+                            report_browser_handoff_failure(world, &active, &reason);
                         } else {
                             console_output(
                                 world,
@@ -630,9 +681,7 @@ fn capture_frame_metadata(world: &mut World) {
     let capture_sample_pending = world
         .get_resource::<BugReportService>()
         .and_then(|service| service.active.as_ref())
-        .is_some_and(|active| {
-            active.phase == Phase::Capturing && active.capture_sample_pending
-        });
+        .is_some_and(|active| active.phase == Phase::Capturing && active.capture_sample_pending);
     if !capture_sample_pending {
         return;
     }
@@ -803,17 +852,93 @@ mod tests {
 
         app.world_mut().clear_trackers();
         drive_reports(app.world_mut());
-        assert!(!app
-            .world()
-            .resource_ref::<BugReportService>()
-            .is_changed());
+        assert!(!app.world().resource_ref::<BugReportService>().is_changed());
 
         app.world_mut().clear_trackers();
         capture_frame_metadata(app.world_mut());
-        assert!(!app
-            .world()
-            .resource_ref::<BugReportService>()
-            .is_changed());
+        assert!(!app.world().resource_ref::<BugReportService>().is_changed());
+    }
+
+    #[test]
+    fn packaging_spawn_error_finishes_report_and_restores_console() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = test_app(directory.path());
+        let mut service = BugReportService::default();
+        let mut active = begin_report(app.world_mut(), false);
+        suppress_console(app.world_mut(), true);
+
+        record_packaging_spawn_result(
+            app.world_mut(),
+            &mut service,
+            &mut active,
+            Err(io::Error::other("simulated spawn failure")),
+        );
+
+        assert!(active.worker.is_none());
+        assert_eq!(active.phase, Phase::Retiring);
+        assert!(!app.world().resource::<ConsoleState>().capture_suppressed);
+        let Some(ReportResult::Failed {
+            message,
+            recovered_directory: None,
+        }) = &service.last_result
+        else {
+            panic!("packaging spawn failure must become a completed failed report");
+        };
+        assert!(message.contains("simulated spawn failure"));
+        assert!(
+            app.world()
+                .resource::<ConsoleState>()
+                .scrollback
+                .iter()
+                .any(|line| line.contains("Could not start bug-report packaging"))
+        );
+    }
+
+    #[test]
+    fn browser_spawn_error_keeps_saved_bundle_and_prints_recovery_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = test_app(directory.path());
+        let saved_directory = directory.path().join("saved-report");
+        let issue_url =
+            "https://github.com/Mudcrab-Team/mudcrab/issues/new?template=bug_report.yml";
+        let service = BugReportService {
+            queued: None,
+            active: None,
+            last_result: Some(ReportResult::Saved {
+                directory: saved_directory.clone(),
+                archive: saved_directory.join("report.zip"),
+                partial: false,
+                missing: Vec::new(),
+            }),
+        };
+        let mut active = begin_report(app.world_mut(), true);
+        active.issue_url = Some(issue_url.into());
+        active.saved_directory = Some(saved_directory.clone());
+        active.phase = Phase::Browser;
+
+        let finished = record_browser_spawn_result(
+            app.world_mut(),
+            &mut active,
+            Err(io::Error::other("simulated spawn failure")),
+        );
+
+        assert!(finished);
+        assert!(active.worker.is_none());
+        assert_eq!(active.phase, Phase::Retiring);
+        assert!(matches!(
+            service.last_result,
+            Some(ReportResult::Saved { ref directory, .. }) if directory == &saved_directory
+        ));
+        let output = &app.world().resource::<ConsoleState>().scrollback;
+        assert!(
+            output
+                .iter()
+                .any(|line| line.contains("Could not start browser handoff"))
+        );
+        assert!(output.iter().any(|line| line == issue_url));
+        assert!(output
+            .iter()
+            .any(|line| line.contains(&saved_directory.join("report.md").display().to_string())));
     }
 
     #[test]
