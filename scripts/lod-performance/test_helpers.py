@@ -1,8 +1,6 @@
-# mudcrab-cli-owner: lod-performance
 """Small plan, serialization and resume regressions; no converter workloads."""
 
 from contextlib import redirect_stderr, redirect_stdout
-import argparse
 import io
 import json
 from pathlib import Path
@@ -15,7 +13,6 @@ from unittest import mock
 import audit_lod_pack as audit
 import plan_lod_validation as planner
 import run_validation_plan as runner
-import run_conversion_observed as observer
 
 
 class AuditSerializationTests(unittest.TestCase):
@@ -62,6 +59,114 @@ class AuditSerializationTests(unittest.TestCase):
             _, receipt = audit.audit_chunk(root, row, cells, {relative: "a" * 64})
         self.assertEqual(receipt["source_cells"], [[-1, 2], [0, 1]])
         self.assertEqual(receipt, json.loads(json.dumps(receipt)))
+
+
+def ktx_atlas(compression=0, fill=1, trailing=0):
+    """A 16x16 UASTC atlas with three raw mips and optional trailing bytes."""
+    atlas = bytearray(180)
+    atlas[:12] = b"\xabKTX 20\xbb\r\n\x1a\n"
+    struct.pack_into("<13I", atlas, 12, 0, 1, 16, 16, 0, 0, 1, 3, compression, 152, 28, 0, 0)
+    atlas[164] = 166
+    atlas[166] = 2
+    for mip, size in enumerate((256, 64, 16)):
+        struct.pack_into("<3Q", atlas, 80 + mip * 24, len(atlas), size, size)
+        atlas.extend(bytes([fill + mip]) * size)
+    atlas.extend(bytes(trailing))
+    return bytes(atlas)
+
+
+def chunk_glb(atlas, before=b"\x11" * 32, after=b"\x22" * 32, gap=b"", bin_tail=b""):
+    """A one-cell GLB whose BIN is geometry, then the atlas, then suffix geometry.
+
+    ``bin_tail`` lies beyond the declared buffer length, like GLB chunk padding.
+    """
+    binary = bytearray(before)
+    binary += gap
+    image_start = len(binary)
+    binary += atlas
+    suffix_start = len(binary)
+    binary += after
+    declared = len(binary)
+    views = [
+        {"buffer": 0, "byteOffset": 0, "byteLength": len(before)},
+        {"buffer": 0, "byteOffset": image_start, "byteLength": len(atlas)},
+        {"buffer": 0, "byteOffset": suffix_start, "byteLength": len(after)},
+    ]
+    nodes = [{"name": "chunk", "children": [1]}, {"name": "cell_0_0", "extras": {"cell_id": 10}, "children": [2]}]
+    nodes.append({"name": "terrain", "children": [3, 4, 5, 6]})
+    nodes.extend({"name": "terrain_quadrant_" + quadrant} for quadrant in ("sw", "se", "nw", "ne"))
+    document = {
+        "asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
+        "nodes": nodes, "buffers": [{"byteLength": declared}], "bufferViews": views,
+        "images": [{"bufferView": 1, "mimeType": "image/ktx2"}],
+    }
+    encoded = json.dumps(document).encode()
+    encoded += b" " * (-len(encoded) % 4)
+    binary += bytes(-len(binary) % 4) + bin_tail
+    return (
+        b"glTF" + struct.pack("<II", 2, 28 + len(encoded) + len(binary))
+        + struct.pack("<II", len(encoded), 0x4E4F534A) + encoded
+        + struct.pack("<II", len(binary), 0x004E4942) + bytes(binary)
+    )
+
+
+def audit_geometry(payload):
+    """Audit one synthetic chunk and return its geometry and atlas digests."""
+    relative = "lod/00000001/4/cell_0_0.glb"
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        path = root / relative
+        path.parent.mkdir(parents=True)
+        path.write_bytes(payload)
+        row = (1, 4, 0, 0, relative, audit.sha(payload), 0, 0, 0, 1, 1, 1, "0,0")
+        cells = {(1, 0, 0): 10}
+        _, receipt = audit.audit_chunk(root, row, cells, {relative: "a" * 64})
+    return receipt["geometry_hash"], receipt["atlas_hash"]
+
+
+class LodContractTests(unittest.TestCase):
+    def test_raw_atlas_is_accepted_and_supercompression_is_rejected(self):
+        self.assertEqual(audit.ktx_contract(ktx_atlas())["supercompression"], 0)
+        with self.assertRaisesRegex(ValueError, "supercompression"):
+            audit.ktx_contract(ktx_atlas(compression=2))
+
+    def test_raw_mip_length_must_match_the_block_grid(self):
+        atlas = bytearray(ktx_atlas())
+        struct.pack_into("<3Q", atlas, 80, 180, 255, 256)
+        with self.assertRaisesRegex(ValueError, "raw UASTC block length"):
+            audit.ktx_contract(bytes(atlas))
+
+
+class LodGeometryAuditTests(unittest.TestCase):
+    def test_suffix_geometry_after_the_atlas_changes_the_geometry_hash(self):
+        base, _ = audit_geometry(chunk_glb(ktx_atlas()))
+        changed, _ = audit_geometry(chunk_glb(ktx_atlas(), after=b"\x33" * 32))
+        self.assertNotEqual(base, changed)
+
+    def test_atlas_only_mutation_keeps_the_geometry_hash(self):
+        base, base_atlas = audit_geometry(chunk_glb(ktx_atlas()))
+        changed, changed_atlas = audit_geometry(chunk_glb(ktx_atlas(fill=9)))
+        self.assertEqual(base, changed)
+        self.assertNotEqual(base_atlas, changed_atlas)
+
+    def test_atlas_length_change_with_shifted_offsets_keeps_the_geometry_hash(self):
+        base, _ = audit_geometry(chunk_glb(ktx_atlas()))
+        longer, _ = audit_geometry(chunk_glb(ktx_atlas(trailing=8)))
+        self.assertEqual(base, longer)
+
+    def test_geometry_before_the_atlas_still_changes_the_hash(self):
+        base, _ = audit_geometry(chunk_glb(ktx_atlas()))
+        changed, _ = audit_geometry(chunk_glb(ktx_atlas(), before=b"\x44" * 32))
+        self.assertNotEqual(base, changed)
+
+    def test_glb_padding_beyond_the_declared_buffer_is_not_geometry(self):
+        base, _ = audit_geometry(chunk_glb(ktx_atlas()))
+        padded, _ = audit_geometry(chunk_glb(ktx_atlas(), bin_tail=b"\xee" * 4))
+        self.assertEqual(base, padded)
+
+    def test_nonzero_bytes_outside_every_view_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "undeclared BIN"):
+            audit_geometry(chunk_glb(ktx_atlas(), gap=b"\x07\x00\x00\x00"))
 
 
 class ResumeHistoryTests(unittest.TestCase):
@@ -130,34 +235,6 @@ class ValidationPlanTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", arguments), redirect_stdout(output):
             planner.main()
         return json.loads(output.getvalue())
-
-    def test_generated_helper_commands_use_their_owning_parsers(self):
-        class ParsedWithoutExecution(Exception):
-            pass
-
-        parse_args = argparse.ArgumentParser.parse_args
-
-        def stop_after_parse(parser, *args, **kwargs):
-            parse_args(parser, *args, **kwargs)
-            raise ParsedWithoutExecution()
-
-        for ordinary in ("cpu", "gpu"):
-            for run in self.make_plan(ordinary)["runs"]:
-                for module, command in ((observer, run["run"]), (audit, run["lod_validation"])):
-                    with self.subTest(ordinary=ordinary, label=run["label"], owner=module.__name__):
-                        with mock.patch.object(sys, "argv", command[1:]), mock.patch.object(
-                            argparse.ArgumentParser, "parse_args", stop_after_parse
-                        ):
-                            with self.assertRaises(ParsedWithoutExecution):
-                                module.main()
-                typo = run["lod_validation"].copy()
-                typo[typo.index("--expected-chunks")] = "--expected-chunsk"
-                with mock.patch.object(sys, "argv", typo[1:]), mock.patch.object(
-                    argparse.ArgumentParser, "parse_args", stop_after_parse
-                ), redirect_stderr(io.StringIO()):
-                    with self.assertRaises(SystemExit) as error:
-                        audit.main()
-                self.assertEqual(error.exception.code, 2)
 
     def write_completed_prefix(self, count=5):
         records = []

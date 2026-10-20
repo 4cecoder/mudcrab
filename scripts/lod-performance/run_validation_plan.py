@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# mudcrab-cli-owner: lod-performance
 """Run an explicit validation plan sequentially; save evidence and stop on failure."""
 
 import argparse
