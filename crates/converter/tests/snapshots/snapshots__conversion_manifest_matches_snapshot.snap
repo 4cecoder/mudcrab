@@ -1,6 +1,6 @@
 ---
 source: crates/converter/tests/snapshots.rs
-assertion_line: 215
+assertion_line: 218
 expression: manifest
 ---
 {
@@ -13,7 +13,9 @@ expression: manifest
           "size": 721
         }
       ],
+      "recipe": "runtime-english-v1",
       "reader_version": 1,
+      "selection": "runtime_english_v1",
       "source_hash": "[source_hash]"
     },
     "skyrim - misc.bsa": {
@@ -29,7 +31,9 @@ expression: manifest
           "size": 131
         }
       ],
+      "recipe": "runtime-english-v1",
       "reader_version": 1,
+      "selection": "runtime_english_v1",
       "source_hash": "[source_hash]"
     },
     "skyrim - textures.ba2": {
@@ -38,11 +42,6 @@ expression: manifest
           "hash": "[hash]",
           "path": "textures/generated_color.dds",
           "size": 2892
-        },
-        {
-          "hash": "[hash]",
-          "path": "textures/generated_normal.dds",
-          "size": 5636
         },
         {
           "hash": "[hash]",
@@ -56,15 +55,27 @@ expression: manifest
         },
         {
           "hash": "[hash]",
+          "path": "textures/generated_normal.dds",
+          "size": 5636
+        },
+        {
+          "hash": "[hash]",
           "path": "textures/generated_volume.dds",
           "size": 2876
         }
       ],
+      "recipe": "runtime-english-v1",
+      "selection": "runtime_english_v1",
       "source_hash": "[source_hash]"
     }
   },
+  "asset_configuration_hashes": {
+    "dds": "1495cf3ec0f02a297c0bf31210e650b2c41df7f8b5e2bdda71f0a65f84b9db65",
+    "nif": "1efcbe41597406d3477c232fd242b3120148ecfa301361214e1ef0d6d5f4cc65",
+    "pex": "0d16fa82d1877173478e8277d014f2642b4dab09f7b916b370dff6681b7c3275"
+  },
   "complete": true,
-  "configuration_hash": "cca2af2b67310e9bc99f97208cabb4edffbd5d04c007e01fb350fccc011a19a2",
+  "configuration_hash": "32ecc67d2c18c73e6a15f3a6ff1c768c466b840d1bd7aeb53f5bc7ac9325218f",
   "entries": {
     "meshes/generated.nif": {
       "output": "meshes/generated.glb",
@@ -87,31 +98,31 @@ expression: manifest
     "textures/generated_color.dds": {
       "output": "textures/generated_color.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 3169,
+      "output_size": 3099,
       "source_hash": "[source_hash]"
     },
     "textures/generated_color_x8.dds": {
       "output": "textures/generated_color_x8.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 1753,
+      "output_size": 1714,
       "source_hash": "[source_hash]"
     },
     "textures/generated_cube.dds": {
       "output": "textures/generated_cube.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 4537,
+      "output_size": 4498,
       "source_hash": "[source_hash]"
     },
     "textures/generated_normal.dds": {
       "output": "textures/generated_normal.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 5913,
+      "output_size": 5859,
       "source_hash": "[source_hash]"
     },
     "textures/generated_volume.dds": {
       "output": "textures/generated_volume.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 2689,
+      "output_size": 2649,
       "source_hash": "[source_hash]"
     }
   },
@@ -122,5 +133,6 @@ expression: manifest
     "pex": 2
   },
   "pruned_texture_references": {},
-  "schema_version": 24
+  "record_data_complete": true,
+  "schema_version": 28
 }
