@@ -163,6 +163,7 @@ fn sample_streaming_trace(
     mut previous_camera: Local<Option<PreviousCamera>>,
     mut pending_ids: Local<Vec<bevy::asset::AssetId<WorldAsset>>>,
     mut profiler: ResMut<ProfilingState>,
+    runtime: Option<Res<crate::streaming::runtime::StreamingRuntime>>,
 ) {
     // Trace v1 has no interior identity. Do not label interior coordinates as exterior world
     // positions or compare motion across the transition; resume observations after leaving.
@@ -206,6 +207,9 @@ fn sample_streaming_trace(
             &SystemInformationDiagnosticsPlugin::PROCESS_MEM_USAGE,
         ),
         gpu: bridge.as_ref().and_then(|bridge| bridge.latest()),
+        adaptive: runtime
+            .as_ref()
+            .and_then(|runtime| runtime.snapshot.clone()),
     };
     if let Some(trace) = profiler.trace.as_mut() {
         if let Some(server) = server {
@@ -252,6 +256,8 @@ struct BenchmarkReport {
     entity_count: Option<u64>,
     system: Option<SystemSnapshot>,
     streaming: Option<StreamingMetrics>,
+    /// Last control observation, including reservation and physical-pressure gates.
+    adaptive: Option<crate::streaming::runtime::RuntimeSnapshot>,
     renderer: RendererMetrics,
     /// CPU time of the parts of a frame the frame-time and GPU numbers do not split out, in
     /// milliseconds: the main world, the wait for the render thread, extract, and the render
@@ -296,6 +302,7 @@ fn collect_and_finish(
     diagnostics: Res<DiagnosticsStore>,
     system: Option<Res<SystemInfo>>,
     streaming: Option<Res<StreamingMetrics>>,
+    runtime: Option<Res<crate::streaming::runtime::StreamingRuntime>>,
     renderer: Res<RendererMetrics>,
     render_timings: Res<RenderTimings>,
     pacing: Option<Res<PacingTracker>>,
@@ -469,6 +476,9 @@ fn collect_and_finish(
             .map(|value| value as u64),
         system: system_snapshot.clone(),
         streaming: streaming.as_ref().map(|value| (*value).clone()),
+        adaptive: runtime
+            .as_ref()
+            .and_then(|runtime| runtime.snapshot.clone()),
         renderer: renderer.clone(),
         render_world,
         render_pipelines,

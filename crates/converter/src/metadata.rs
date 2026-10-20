@@ -20,6 +20,7 @@ use crate::{
         archive_load_order_priority, compile_lod_chunks, conversion_is_complete, discover,
         installed_archive_owners, non_mo2_archive_is_active, overlay_loose_assets,
         publish_new_directory, sort_archives_by_load_order, staging_path, validate_artifacts,
+        write_streaming_cost_catalog,
     },
     records::addons::RuntimeSchemas,
 };
@@ -187,6 +188,15 @@ impl AssetPipeline {
                 return Err(error);
             }
         };
+        // The rebuilt manifest is final here; the catalog must describe exactly those bytes.
+        // Like the normal route, a catalog failure fails the rebuild before publication.
+        if let Err(error) = write_streaming_cost_catalog(&staging) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        report.artifacts.push(PathBuf::from(
+            shared::streaming_costs::STREAMING_COST_FILE_NAME,
+        ));
         let publication_started = Instant::now();
         if let Err(error) = publish_new_directory(&staging, &config.output_dir, &output_lock) {
             let _ = fs::remove_dir_all(&staging);
@@ -957,6 +967,60 @@ mod metadata_schema_controls {
         assert!(!output.exists());
         assert!(!instance.exists());
         assert!(rx.try_recv().is_err());
+    }
+
+    /// The metadata route must ship a sidecar for its rebuilt manifest. A stale sidecar linked
+    /// from the source pack is unlinked, never written through, and the incomplete-reader note
+    /// still reaches the catalog.
+    #[test]
+    fn metadata_rebuild_catalog_describes_the_final_manifest_and_leaves_the_source_alone() {
+        use shared::streaming_costs::{STREAMING_COST_FILE_NAME, StreamingCostCatalog};
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let staging = temp.path().join("staging");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(source.join(STREAMING_COST_FILE_NAME), b"source catalog").unwrap();
+        fs::hard_link(
+            source.join(STREAMING_COST_FILE_NAME),
+            staging.join(STREAMING_COST_FILE_NAME),
+        )
+        .unwrap();
+        let manifest = ConversionManifest {
+            complete: false,
+            ..Default::default()
+        };
+        manifest
+            .save(&staging.join("conversion-manifest.json"))
+            .unwrap();
+        let manifest_bytes = fs::read(staging.join("conversion-manifest.json")).unwrap();
+
+        write_streaming_cost_catalog(&staging).unwrap();
+
+        let catalog = StreamingCostCatalog::load(
+            &staging.join(STREAMING_COST_FILE_NAME),
+            &hash_bytes(&manifest_bytes),
+        )
+        .unwrap();
+        assert!(
+            catalog
+                .notes
+                .iter()
+                .any(|note| note.contains("manifest is incomplete")),
+            "incomplete rebuild must keep its unknown-resource note"
+        );
+        assert_eq!(
+            fs::read(source.join(STREAMING_COST_FILE_NAME)).unwrap(),
+            b"source catalog",
+            "the source pack's catalog must not change through a shared link"
+        );
+        assert!(
+            StreamingCostCatalog::load(
+                &source.join(STREAMING_COST_FILE_NAME),
+                &hash_bytes(&manifest_bytes),
+            )
+            .is_err()
+        );
     }
 
     const ORIGINAL: &[u8] = br#"{"version":1,"name":"original_source","records":[{"signature":"ZMEX","source":"synthetic metadata fixture","fields":[{"signature":"SCAL","name":"value","kind":"u32"}]}]}"#;

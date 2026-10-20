@@ -395,6 +395,9 @@ impl AssetPipeline {
         report.publication_phase_elapsed_ms =
             publish_runtime_pack(&staging, &config.output_dir, &report, &output_lock)
                 .map_err(|error| failure(error, &staging, &cancellation))?;
+        report.artifacts.push(PathBuf::from(
+            shared::streaming_costs::STREAMING_COST_FILE_NAME,
+        ));
         report.publication_elapsed_ms = publication_started.elapsed().as_millis();
         report
             .phase_elapsed_ms
@@ -3317,6 +3320,9 @@ fn publish_runtime_pack(
     let published = (|| -> Result<()> {
         timings.measure("runtime_pack_linking", || {
             for artifact in &report.artifacts {
+                if artifact == Path::new(shared::streaming_costs::STREAMING_COST_FILE_NAME) {
+                    continue; // Always regenerate; never overwrite a linked prior catalog.
+                }
                 let source = staging.join(artifact);
                 if !source.is_file() {
                     continue;
@@ -3339,6 +3345,13 @@ fn publish_runtime_pack(
             );
             Ok(())
         })?;
+        // Analyze only the assembled runtime pack, after its final manifest is
+        // present. Staging can contain stale resume artifacts and build inputs.
+        // Generate before the directory swap so readers never see a mismatched
+        // catalog/manifest pair and failures preserve the previous published pack.
+        timings.measure("runtime_pack_costs", || {
+            write_streaming_cost_catalog(&pack_staging)
+        })?;
         publish_directory_locked_with_timings(&pack_staging, output, true, lock, &mut timings)
     })();
     if published.is_err() {
@@ -3346,6 +3359,21 @@ fn publish_runtime_pack(
     }
     published?;
     Ok(timings.elapsed_ms)
+}
+
+/// Writes the streaming cost sidecar for an assembled, immutable-until-published pack. Call only
+/// after the final `conversion-manifest.json` bytes are in place: the catalog fingerprint is that
+/// file's hash. A sidecar linked from another pack is unlinked first, never written through.
+pub(crate) fn write_streaming_cost_catalog(pack: &Path) -> Result<()> {
+    let destination = pack.join(shared::streaming_costs::STREAMING_COST_FILE_NAME);
+    match fs::remove_file(&destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let catalog = crate::streaming_costs::analyze_pack(pack)?;
+    fs::write(destination, serde_json::to_vec_pretty(&catalog)?)?;
+    Ok(())
 }
 
 /// Publishes ingestion blobs into the persistent cache, repairing corrupt copies.
@@ -5068,6 +5096,72 @@ mod tests {
     }
 
     #[test]
+    fn runtime_publication_generates_costs_for_only_published_assets() {
+        use shared::streaming_costs::{STREAMING_COST_FILE_NAME, StreamingCostCatalog};
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        let output = directory.path().join("assets");
+        write_test_runtime_pack(&staging, "next");
+        // Malformed assets must retain explicit unknown estimates. A leftover
+        // resume artifact must not become part of the published catalog.
+        fs::write(staging.join("published.glb"), b"invalid GLB").unwrap();
+        fs::write(staging.join("stale.glb"), b"stale GLB").unwrap();
+        fs::write(staging.join(STREAMING_COST_FILE_NAME), b"old sidecar").unwrap();
+        let report = PipelineReport {
+            artifacts: vec![
+                "conversion-manifest.json".into(),
+                "scripts/papyrus_runtime.luau".into(),
+                "published.glb".into(),
+                STREAMING_COST_FILE_NAME.into(),
+            ],
+            ..Default::default()
+        };
+        let lock = AssetLock::acquire_exclusive(&output).unwrap();
+        publish_runtime_pack(&staging, &output, &report, &lock).unwrap();
+        let fingerprint = hash_file(&output.join("conversion-manifest.json")).unwrap();
+        let catalog =
+            StreamingCostCatalog::load(&output.join(STREAMING_COST_FILE_NAME), &fingerprint)
+                .unwrap();
+        assert!(catalog.scenes.contains_key("published.glb"));
+        assert!(!catalog.scenes.contains_key("stale.glb"));
+        assert!(
+            catalog
+                .resolve_scene("published.glb", 64 * 1024 * 1024)
+                .unwrap()
+                .used_unknown_fallback
+        );
+        assert_eq!(
+            fs::read(staging.join(STREAMING_COST_FILE_NAME)).unwrap(),
+            b"old sidecar"
+        );
+        assert!(
+            StreamingCostCatalog::load(&output.join(STREAMING_COST_FILE_NAME), "other-pack")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_publication_cost_failure_preserves_previous_pack() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        let output = directory.path().join("assets");
+        write_test_runtime_pack(&output, "previous");
+        write_test_runtime_pack(&staging, "next");
+        fs::write(staging.join("conversion-manifest.json"), b"invalid JSON").unwrap();
+        let report = PipelineReport {
+            artifacts: vec!["conversion-manifest.json".into()],
+            ..Default::default()
+        };
+        let lock = AssetLock::acquire_exclusive(&output).unwrap();
+        assert!(publish_runtime_pack(&staging, &output, &report, &lock).is_err());
+        assert_eq!(published_manifest(&output).configuration_hash, "previous");
+        assert_eq!(
+            fs::read(output.join("scripts/papyrus_runtime.luau")).unwrap(),
+            b"return {}"
+        );
+    }
+
+    #[test]
     fn recovery_handles_each_owned_publication_boundary() {
         for boundary in 0..=3 {
             let directory = tempfile::tempdir().unwrap();
@@ -6718,6 +6812,11 @@ mod tests {
         let report = run_without_progress(config).await;
         assert!(report.complete);
         assert!(output.join("scripts/one.luau").is_file());
+        let costs = PathBuf::from(shared::streaming_costs::STREAMING_COST_FILE_NAME);
+        assert!(report.artifacts.contains(&costs));
+        let fingerprint = hash_file(&output.join("conversion-manifest.json")).unwrap();
+        shared::streaming_costs::StreamingCostCatalog::load(&output.join(costs), &fingerprint)
+            .unwrap();
     }
 
     #[tokio::test]

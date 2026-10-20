@@ -41,7 +41,7 @@ struct NativeMaterialHandler {
 /// Keep its strong handle in the scene so scene-only loads remain fully loaded.
 #[derive(Component, Clone, Reflect)]
 #[reflect(Component)]
-struct NifSourceMaterial(Handle<StandardMaterial>);
+pub(crate) struct NifSourceMaterial(pub Handle<StandardMaterial>);
 
 /// `SLSF1_External_Emittance` (`vendor/project-wormhole-nif/src/nif_flags.rs`, bit 29).
 const SLSF1_EXTERNAL_EMITTANCE: u64 = 1 << 29;
