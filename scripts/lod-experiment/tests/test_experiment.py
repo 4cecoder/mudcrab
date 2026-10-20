@@ -226,6 +226,83 @@ class ParserTests(unittest.TestCase):
                 self.assertIn("unrecognized arguments: --typo", typo.stderr)
 
 
+class BuilderFailureTests(unittest.TestCase):
+    """Builder failures with a mocked subprocess; no compiler and no real timeout wait."""
+
+    def run_failing(self, root, error):
+        assets = root / "assets"
+        assets.mkdir(parents=True)
+        document, binary = synthetic.grid(12)
+        (assets / "grid.glb").write_bytes(synthetic.glb(document, binary))
+        builder = root / "builder"
+        builder.write_bytes(b"not executed: subprocess.run is mocked\n")
+        receipt = {"meshoptimizer_version": "1.3", "meshoptimizer_commit": experiment.PIN,
+                   "builder_sha256": experiment.digest(builder.read_bytes()),
+                   "builder_source_sha256": "0" * 64}
+        Path(str(builder) + ".build.json").write_text(json.dumps(receipt, sort_keys=True))
+        with mock.patch.object(experiment.subprocess, "run", side_effect=error):
+            manifest = experiment.run_experiment(assets, root / "out", builder)
+        return manifest, (root / "out" / "manifest.json").read_bytes()
+
+    def test_nonzero_exit_reason_is_stable_and_keeps_stderr(self):
+        stderr = b"meshopt: invalid index range\n"
+        results = []
+        for label in ("first", "second"):
+            with tempfile.TemporaryDirectory() as temporary:
+                error = subprocess.CalledProcessError(1, ["builder", "request", "128"], stderr=stderr)
+                manifest, data = self.run_failing(Path(temporary) / label, error)
+                self.assertNotIn(temporary, data.decode())
+                results.append((manifest, data))
+        (first, first_bytes), (second, second_bytes) = results
+        row = first["files"][0]["primitives"][0]
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["reason"], "builder exited with status 1: meshopt: invalid index range")
+        self.assertEqual(first["counts"], {"candidate": 0, "omitted": 0, "failed": 1})
+        self.assertEqual(first_bytes, second_bytes)
+
+    def test_timeout_reason_keeps_partial_stderr_without_waiting(self):
+        error = subprocess.TimeoutExpired(["builder"], 120, stderr=b"partial \xff output")
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, _ = self.run_failing(Path(temporary), error)
+        row = manifest["files"][0]["primitives"][0]
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["reason"], "builder timed out after 120 s: partial � output")
+        self.assertEqual(manifest["counts"]["failed"], 1)
+
+    def test_long_builder_stderr_is_bounded_and_marked(self):
+        error = subprocess.CalledProcessError(3, ["builder"], stderr=b"x" * 100_000)
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest, _ = self.run_failing(Path(temporary), error)
+        reason = manifest["files"][0]["primitives"][0]["reason"]
+        self.assertTrue(reason.startswith("builder exited with status 3: xxx"))
+        self.assertTrue(reason.endswith(" ...[truncated]"))
+        self.assertLess(len(reason), experiment.BUILDER_DIAGNOSTIC_LIMIT + 100)
+
+    def test_staging_paths_in_builder_stderr_are_normalized(self):
+        captured = {}
+
+        def fail(command, **keyword):
+            captured["staging"] = str(Path(command[1]).parent)
+            raise subprocess.CalledProcessError(2, command, stderr=f"cannot read {command[1]}\n".encode())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets = root / "assets"
+            assets.mkdir()
+            document, binary = synthetic.grid(12)
+            (assets / "grid.glb").write_bytes(synthetic.glb(document, binary))
+            builder = root / "builder"
+            builder.write_bytes(b"not executed\n")
+            receipt = {"meshoptimizer_version": "1.3", "meshoptimizer_commit": experiment.PIN,
+                       "builder_sha256": experiment.digest(builder.read_bytes()), "builder_source_sha256": "0" * 64}
+            Path(str(builder) + ".build.json").write_text(json.dumps(receipt, sort_keys=True))
+            with mock.patch.object(experiment.subprocess, "run", side_effect=fail):
+                manifest = experiment.run_experiment(assets, root / "out", builder)
+        reason = manifest["files"][0]["primitives"][0]["reason"]
+        self.assertEqual(reason, "builder exited with status 2: cannot read <staging>/primitive.bin")
+        self.assertNotIn(captured["staging"], reason)
+
+
 @unittest.skipUnless(os.environ.get("LOD_EXPERIMENT_BUILDER"), "set LOD_EXPERIMENT_BUILDER to run compiled-adapter fixtures")
 class AdapterTests(unittest.TestCase):
     def setUp(self):

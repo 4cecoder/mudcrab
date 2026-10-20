@@ -30,6 +30,28 @@ class InputChanged(RuntimeError):
     """An immutable input boundary changed; do not publish mixed candidates."""
 
 
+BUILDER_DIAGNOSTIC_LIMIT = 2048
+
+
+def builder_failure(error, staging):
+    """Failed-row reason for a builder that exited nonzero or timed out.
+
+    Only the staging directory is normalized, so one input and outcome give the
+    same manifest in every run; the builder's own stderr is kept, bounded.
+    """
+    if isinstance(error, subprocess.TimeoutExpired):
+        status = f"timed out after {error.timeout:g} s"
+    else:
+        status = f"exited with status {error.returncode}"
+    stderr = error.stderr or b""
+    if isinstance(stderr, str):
+        stderr = stderr.encode()
+    text = stderr.decode("utf-8", errors="replace").replace(staging, "<staging>").strip()
+    if len(text) > BUILDER_DIAGNOSTIC_LIMIT:
+        text = text[:BUILDER_DIAGNOSTIC_LIMIT] + " ...[truncated]"
+    return f"builder {status}" + (f": {text}" if text else "")
+
+
 def watch(watched, path, checksum):
     if path in watched and watched[path] != checksum:
         raise InputChanged("source input changed during experiment: " + str(path))
@@ -687,6 +709,8 @@ def run_experiment(input_path, output_path, builder_path, asset_root=None, max_t
                             measurements.append(timing)
                         except Omission as error:
                             row.update(status="omitted", reason=str(error))
+                        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                            row.update(status="failed", reason=builder_failure(error, temporary))
                         except (ValueError, KeyError, TypeError, OverflowError, subprocess.SubprocessError) as error:
                             row.update(status="failed", reason=str(error))
                 if export_controls and model_candidates:
