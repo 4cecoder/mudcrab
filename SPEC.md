@@ -232,6 +232,7 @@ V210: CI ! dispatch software Vulkan UASTC encoder, decode synthetic color/alpha/
 V190: Record-aware remap ! exact faction SNAM length 8; rank/padding unchanged; WRLD RNAM coordinates & TNAM strings unchanged; consumed single links remap under relocated full/light slots.
 
 V200: Real-output timing validation ! propagate full selected-set failure; missing configuration, empty selection & semantics collection errors fail; diagnostics never certify passing subset.
+V201: Converter producer 28 ! KTX2 texture containers store mip level data smallest-first at the exact lcm(texel block bytes, 4) alignment (KTX 2.0 sections 3.7, 3.9.7). Producer-27 textures are never reused: a warm rerun regenerates them through normal conversion, and metadata rebuild accepts only current-schema sources, so pre-28 KTX2 is never relabeled. Producer-27 GLBs stay reusable only through the explicit (27, 28) pair and producer-27 scripts through the script gate; producers 24 and 26 never reach 28 meshes. Settings proofs keep their per-kind producer. World database stays 9; regression: fixture_texture_layout_migration.
 
 ## §T TASKS
 
