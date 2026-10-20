@@ -13,8 +13,8 @@ param(
     [string]$Assets,
     [int]$Repeats = 3,
     # Every window runs this long, except `stability`, which uses -StabilitySeconds. A route window
-    # ends when its route does, so for `travel` and `check` this is the longest it may run: it must
-    # cover the wait for the world to load plus the route's minute.
+    # ends when its route does, and runs at least as long as its travel time plus a readiness
+    # allowance (see `Get-WindowDuration`), so a route cannot be cut short by the world loading.
     [int]$DurationSeconds = 120,
     [int]$StabilitySeconds = 1800,
     [string]$Out,
@@ -95,9 +95,27 @@ $resolvedAssets = Resolve-ConvertedAssetSet -Assets $Assets
 # window measures travelling. The engine knows no route; the scenario only names the file. Each has
 # one window (the moving one): the scene standing still is the other scenarios' job.
 $routeScenarios = @{ travel = "travel.json"; check = "check.json" }
+# The route starts only once the world is ready (`"start": "world_ready"`), and the engine counts the
+# window's duration from the process start, so a route window also allows this for the world to load.
+$RouteReadinessSeconds = 60
 
 function Get-RouteFilePath([string]$Name) {
     return Join-Path $PSScriptRoot "routes\$($routeScenarios[$Name])"
+}
+
+# The seconds a route window needs to walk its route at the file's speed: the length of its legs
+# over the speed, rounded up. A looped route has no end, so it has no travel time to allow for.
+function Get-RouteTravelSeconds([string]$Name) {
+    $route = Get-Content -LiteralPath (Get-RouteFilePath $Name) -Raw | ConvertFrom-Json
+    if ($route.loop) { throw "Route $Name loops, so it has no travel time for its window to allow for" }
+    $length = 0.0
+    $points = @($route.waypoints)
+    for ($index = 1; $index -lt $points.Count; $index++) {
+        $dx = [double]$points[$index][0] - [double]$points[$index - 1][0]
+        $dy = [double]$points[$index][1] - [double]$points[$index - 1][1]
+        $length += [Math]::Sqrt($dx * $dx + $dy * $dy)
+    }
+    return [int][Math]::Ceiling($length / [double]$route.speed)
 }
 
 # The engine arguments of one window: the profiling campaign's arguments for the scenario, with the
@@ -126,6 +144,9 @@ function Get-WindowArguments([string]$Name, [hashtable]$Parameters) {
 
 function Get-WindowDuration([string]$Name) {
     if ($Name -eq "stability") { return $StabilitySeconds }
+    if ($routeScenarios.ContainsKey($Name)) {
+        return [Math]::Max($DurationSeconds, (Get-RouteTravelSeconds $Name) + $RouteReadinessSeconds)
+    }
     return $DurationSeconds
 }
 
@@ -1021,7 +1042,7 @@ foreach ($name in $requested) {
                 RunDirectory = $runDirectory; Commit = $identity.commit
                 Hardware = $hardware; RunId = "run-$run"; RunLabel = $label; DirtyWorktree = [bool]$identity.dirty
                 StandingStill = ($kind -eq "standing_still")
-                DurationSeconds = $DurationSeconds; StabilitySeconds = $StabilitySeconds
+                DurationSeconds = (Get-WindowDuration $name); StabilitySeconds = $StabilitySeconds
                 ResolvedAssets = $resolvedAssets; Worldspace = $Worldspace
                 RuralGridX = $RuralGridX; RuralGridY = $RuralGridY; DenseGridX = $DenseGridX; DenseGridY = $DenseGridY
                 DenseLegacyGridX = $DenseLegacyGridX; DenseLegacyGridY = $DenseLegacyGridY
