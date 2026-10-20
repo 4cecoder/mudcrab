@@ -32,6 +32,7 @@ use bevy::{
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     light::{CascadeShadowConfig, CascadeShadowConfigBuilder, DirectionalLightShadowMap},
     log::{Level, LogPlugin},
+    math::DVec3,
     prelude::*,
     render::diagnostic::RenderDiagnosticsPlugin,
     render::occlusion_culling::OcclusionCulling,
@@ -62,6 +63,9 @@ struct AssetDirectoryReadLock {
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
     validate_fixture_selection(&config)?;
+    let preferences = config
+        .interactive_world_physics()
+        .then(|| crate::settings::prepare_settings(&mut config));
     let shots = prepare_shots(&mut config)?;
     let shots_active = shots.is_some();
     configure_io_task_pool(config.io_threads)?;
@@ -73,6 +77,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         None
     };
+    let asset_plugin = asset_plugin(&mut config)?;
     let reads_asset_tree = config.streaming_fixture
         || !(config.benchmark_only
             || config.material_fixture
@@ -94,6 +99,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         None
     };
+    if reads_asset_tree {
+        crate::streaming::requests::validate_pack_identity(&config).wrap_err_with(|| {
+            format!(
+                "cannot read the converted pack manifest under {}",
+                config.assets_dir.display()
+            )
+        })?;
+    }
     let runtime_data = if config.streaming_fixture {
         let database_path = config.assets_dir.join("skyrim_world.db");
         Some((
@@ -127,26 +140,26 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         && !config.streaming_fixture)
         .then(|| MovementTuning::from_world_database(&config.assets_dir.join("skyrim_world.db")))
         .transpose()?;
-    let asset_path = config.assets_dir.to_string_lossy().into_owned();
-    let benchmark_active =
-        config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some();
+    let benchmark_active = config.benchmark_frames.is_some()
+        || config.benchmark_duration_secs.is_some()
+        || config.streaming_benchmark_route_speed.is_some();
     configure_benchmark_priority(benchmark_active)?;
-    let window = (!config.headless || shots_active).then(|| Window {
+    let window = (!config.headless || shots_active || config.hidden_window).then(|| Window {
         title: config.window_title(),
+        visible: !config.hidden_window,
         // A shots file's frame is the size its reference screenshots were taken at, so the window,
         // and every PNG taken of it, is exactly that many pixels.
         resolution: match &shots {
             Some(run) => run.file.window_resolution(),
             None => (1600, 900).into(),
         },
-        // A timing or shots run opens on screen, in the middle, so whoever is at the machine can
-        // see what is running and not disturb it.
+        // Visible timing and shots runs open in the middle of the primary screen.
         position: if benchmark_active || shots_active {
             WindowPosition::Centered(MonitorSelection::Primary)
         } else {
             WindowPosition::Automatic
         },
-        present_mode: if benchmark_active {
+        present_mode: if benchmark_active && !config.benchmark_vsync {
             PresentMode::AutoNoVsync
         } else {
             PresentMode::AutoVsync
@@ -155,13 +168,16 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     });
     let origin = RenderOrigin(IVec2::new(config.start_grid.0, config.start_grid.1));
     let mut app = App::new();
+    if let Some((settings, file)) = preferences {
+        app.insert_resource(settings).insert_resource(file);
+    }
     if let Some(tuning) = movement_tuning {
         app.insert_resource(tuning);
     }
     if let Some(asset_lock) = asset_lock {
         app.insert_resource(AssetDirectoryReadLock { _guard: asset_lock });
     }
-    if benchmark_active || shots_active {
+    if benchmark_active || shots_active || config.hidden_window {
         // Acceptance runs are commonly left unfocused while the campaign driver
         // advances through its scenarios. Bevy's game default throttles an
         // unfocused window to 60 Hz, which makes a 16.67 ms P95 gate measure the
@@ -170,6 +186,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         app.insert_resource(WinitSettings::continuous());
     }
     let render_asset_budget = upload_budget(&config);
+    // The run fingerprint is measurement data: an ordinary play session neither builds one nor
+    // pays for the startup system that reads it.
+    let records_measurements = crate::fingerprint::records_measurements(&config);
     app.insert_resource(config)
         .insert_resource(origin)
         .insert_resource(render_asset_budget)
@@ -179,10 +198,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 .build()
                 .disable::<bevy::render::RenderPlugin>()
                 .add_before::<bevy::render::RenderPlugin>(RendererInitPlugin::default())
-                .set(AssetPlugin {
-                    file_path: asset_path,
-                    ..default()
-                })
+                .set(asset_plugin)
                 .set(world_gltf_plugin())
                 .set(WindowPlugin {
                     primary_window: window,
@@ -205,15 +221,35 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
         .add_plugins((
             VercidiumRendererPlugin,
+            crate::visibility_optimization::VisibilityOptimizationPlugin,
+            crate::terrain_upload::TerrainUploadPlugin,
             crate::mesh_preparation_retry::MeshPreparationRetryPlugin,
+            crate::mesh_residency_audit::MeshResidencyAuditPlugin,
             SkyPlugin,
             ConsolePlugin,
             crate::nif_material::NifMaterialPlugin,
+            crate::emittance::EmittancePlugin,
         ))
         // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
         // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
-        .add_plugins(crate::lights::LightsPlugin);
+        .add_plugins(crate::lights::LightsPlugin)
+        .add_systems(PostUpdate, keep_windows_hidden);
+    if interactive_world_physics {
+        app.add_plugins(crate::settings_ui::SettingsPlugin);
+    }
     add_camera_and_capture_systems(&mut app);
+    if records_measurements {
+        app.add_plugins(crate::fingerprint::RunFingerprintPlugin);
+    }
+    if app
+        .world()
+        .resource::<EngineConfig>()
+        .streaming_benchmark_route_speed
+        .is_some()
+    {
+        app.init_resource::<StreamingBenchmarkRoute>()
+            .add_systems(PreUpdate, drive_streaming_benchmark_route);
+    }
     if let Some((database, catalog, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
             .insert_resource(catalog)
@@ -222,7 +258,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .add_plugins(StreamingPlugin);
         app.add_systems(Startup, setup_world);
         if interactive_world_physics {
-            app.add_plugins(WorldPlayerPlugin);
+            app.add_plugins((WorldPlayerPlugin, crate::door_crossing::DoorCrossingPlugin));
             // `coc`/`coe` move the player, so they come with it, as `tcl` does: a run without a
             // player (a benchmark, `--shots`, headless) lists neither in Help.
             crate::cell_commands::register_cell_commands(&mut app);
@@ -265,7 +301,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             output = %run.output_dir.display(),
             "rendering camera poses"
         );
-        app.add_plugins(ShotsPlugin { run });
+        app.add_plugins((
+            crate::capture_frame::CaptureFramePlugin,
+            ShotsPlugin { run },
+        ));
     }
     let exit = app.run();
     drop(app);
@@ -287,6 +326,18 @@ fn finished(exit: &AppExit) -> Result<()> {
     }
 }
 
+/// Reset accidental visibility changes before Bevy applies Window changes in Last.
+/// The primary window starts hidden, so screenshot rendering needs no visible flash.
+fn keep_windows_hidden(config: Res<EngineConfig>, mut windows: Query<&mut Window>) {
+    if config.hidden_window {
+        for mut window in &mut windows {
+            if window.visible {
+                window.visible = false;
+            }
+        }
+    }
+}
+
 /// Bevy's per-frame render-asset byte budget, seeded from the run's option.
 ///
 /// Textures and meshes over the budget wait for a later frame instead of being
@@ -299,6 +350,20 @@ fn upload_budget(config: &EngineConfig) -> RenderAssetBytesPerFrame {
     RenderAssetBytesPerFrame {
         max_bytes: config.max_upload_bytes_per_frame(),
     }
+}
+
+/// Direct database reads and Bevy's file reader must use the same absolute root.
+fn asset_plugin(config: &mut EngineConfig) -> Result<AssetPlugin> {
+    config.assets_dir = std::path::absolute(&config.assets_dir).wrap_err_with(|| {
+        format!(
+            "cannot resolve asset directory {}",
+            config.assets_dir.display()
+        )
+    })?;
+    Ok(AssetPlugin {
+        file_path: config.assets_dir.to_string_lossy().into_owned(),
+        ..default()
+    })
 }
 
 /// Matches LAND's sampler for shared repeating images before either loader caches them.
@@ -314,8 +379,21 @@ fn world_gltf_plugin() -> bevy::gltf::GltfPlugin {
 /// shot's worldspace and grid square are where streaming starts, so the first view does not wait
 /// for cells around a start the file never looks at.
 fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
-    let Some(path) = config.shots.clone() else {
+    let Some(path) = config
+        .shots
+        .clone()
+        .or_else(|| config.matched_route.clone())
+    else {
         return Ok(None);
+    };
+    color_eyre::eyre::ensure!(
+        !(config.shots.is_some() && config.matched_route.is_some()),
+        "--shots and --matched-route cannot be used together; choose one camera driver"
+    );
+    let mode = if config.matched_route.is_some() {
+        "--matched-route"
+    } else {
+        "--shots"
     };
     let other_mode = config.benchmark_only
         || config.benchmark_frames.is_some()
@@ -330,14 +408,19 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         || config.physics_fixture;
     color_eyre::eyre::ensure!(
         !other_mode,
-        "--shots renders the converted world on its own: it cannot be combined with a benchmark, \
+        "{mode} renders the converted world on its own: it cannot be combined with a benchmark, \
          an acceptance screenshot, --auto-fly-speed or a fixture"
     );
     if config.headless {
         // The logger is not installed yet, so a `warn!` here would never be seen.
-        eprintln!("warning: --shots photographs the window, so --headless is ignored");
+        eprintln!("warning: {mode} photographs the window, so --headless is ignored");
     }
-    let file = ShotsFile::load(&path)?;
+    let (file, checkpoints) = if config.matched_route.is_some() {
+        let (file, checkpoints) = crate::matched_route::MatchedRoute::load(&path)?.expand()?;
+        (file, Some(checkpoints))
+    } else {
+        (ShotsFile::load(&path)?, None)
+    };
     if let Some((worldspace_id, grid)) = file.start() {
         if let Some(worldspace_id) = worldspace_id {
             config.worldspace_id = worldspace_id;
@@ -348,7 +431,9 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         .shots_out
         .clone()
         .unwrap_or_else(|| default_output_dir(&path));
-    Ok(Some(ShotsRun::new(file, output_dir, config.worldspace_id)))
+    let mut run = ShotsRun::new(file, output_dir, config.worldspace_id);
+    run.route_checkpoints = checkpoints;
+    Ok(Some(run))
 }
 
 fn validate_fixture_selection(config: &EngineConfig) -> Result<()> {
@@ -464,9 +549,10 @@ fn check_existing_io_pool(requested: usize, threads: usize, existing: Option<usi
              first, or use 0 to keep the existing pool"
         );
     }
-    warn!(
-        threads,
-        existing, "the asset IO pool already exists with a different thread count; keeping it"
+    // `run` checks the pool before installing LogPlugin, so report directly to stderr.
+    eprintln!(
+        "warning: the asset IO pool already exists with {existing} threads; \
+         automatic sizing selected {threads}; keeping the existing pool"
     );
     Ok(())
 }
@@ -501,10 +587,13 @@ impl StreamingFixtureDirectory {
     fn populate(&self, worldspace_id: u32, start_grid: (i32, i32)) -> Result<()> {
         let database_path = self.path.join("skyrim_world.db");
         let connection = Connection::open(&database_path)?;
+        connection.execute("CREATE TABLE schema_info(version INTEGER NOT NULL)", [])?;
+        connection.execute(
+            "INSERT INTO schema_info VALUES(?1)",
+            [shared::WORLD_DATABASE_SCHEMA_VERSION],
+        )?;
         connection.execute_batch(
-            r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
-            INSERT INTO schema_info VALUES(7);
-            CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
+            r#"CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
             CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,editor_id TEXT,parent_world INTEGER,flags INTEGER,lod_origin_x INTEGER,lod_origin_y INTEGER);
             CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
             CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
@@ -581,8 +670,8 @@ struct StreamingFixtureState {
 /// way a door crossing will load one; the camera then carries on over exteriors far outside the
 /// unload radius and comes back. The contract is that the interior never exists twice and its
 /// references match its root. Today it also stays loaded throughout (an interior has no grid
-/// square, so [`cell_within_unload_radius`](crate::streaming) keeps it, and no runtime path unloads
-/// one); that is current behaviour, not part of the contract.
+/// square, so [`cell_within_unload_radius`](crate::streaming) keeps it, and only a space switch
+/// unloads one); that is current behaviour, not part of the contract.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 struct InteriorCrossing {
     requested_frame: Option<u32>,
@@ -703,12 +792,14 @@ fn cross_streaming_fixture_interior(
         if state.frames < STREAMING_FIXTURE_INTERIOR_FRAME {
             return;
         }
-        streaming.request_cell(
+        if !streaming.request_cell(
             &database,
             CellKey::Interior(STREAMING_FIXTURE_INTERIOR_CELL_ID),
             &mut metrics,
             &mut profiler,
-        );
+        ) {
+            return;
+        }
         state.interior.requested_frame = Some(state.frames);
         state.interior_center = center;
         profiler.event("streaming-fixture", "interior_requested", None);
@@ -1899,7 +1990,7 @@ const SUN_SHADOW_MAX_GRID_CELLS: i32 = 256;
 ///
 /// [sqrt(2)]: std::f32::consts::SQRT_2
 /// [`maximum_distance`]: CascadeShadowConfigBuilder::maximum_distance
-fn sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig {
+pub(crate) fn sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig {
     // Cells draw out to `unload_radius`, one ring past the requested `stream_radius`, and the
     // `+ 1` is the camera's own cell: the grid is `unload_radius` cells around that cell rather
     // than around the camera, which may stand at the far edge of its own. The radius is clamped
@@ -1925,7 +2016,9 @@ fn sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig {
 /// walk-around view from behind and above it. [`sun_shadow_cascades`] measures its range from the
 /// camera, so the offsets live here rather than in two places.
 fn camera_offset(config: &EngineConfig) -> Vec3 {
-    if config.acceptance_screenshot.is_some() {
+    if config.streaming_benchmark_route_speed.is_some() {
+        Vec3::new(0.0, 6000.0, 0.0)
+    } else if config.acceptance_screenshot.is_some() {
         config
             .screenshot_camera_offset
             .map(Vec3::from)
@@ -1954,6 +2047,9 @@ fn setup_world(
     let camera_transform = if config.interactive_world_physics() {
         Transform::from_translation(camera_position)
             .looking_at(camera_position + Vec3::NEG_Z, Vec3::Y)
+    } else if config.streaming_benchmark_route_speed.is_some() {
+        Transform::from_translation(camera_position)
+            .looking_at(target + Vec3::new(0.0, 0.0, -8000.0), Vec3::Y)
     } else {
         Transform::from_translation(camera_position).looking_at(target, Vec3::Y)
     };
@@ -1963,6 +2059,7 @@ fn setup_world(
         Projection::Perspective(PerspectiveProjection { far, ..default() }),
         camera_transform,
         StreamingCamera,
+        IsDefaultUiCamera,
         // This camera draws the streamed world, so the weather's distance fog covers it.
         FogCamera,
         // The sky draws a dome around this camera and clears it to the weather's fog colour.
@@ -1979,9 +2076,14 @@ fn setup_world(
     commands.insert_resource(DirectionalLightShadowMap {
         size: SUN_SHADOW_MAP_SIZE,
     });
+    // The sun and ambient colours are the clear weather's own (`WTHR` 0x81A, day). Their levels are
+    // the configured input ratio in `crate::lights::AMBIENT_ILLUMINANCE` (a simplified heuristic,
+    // not a rendered-parity calibration).
+    let weather_lighting = crate::sky::WeatherLighting::default();
     commands.spawn((
         DirectionalLight {
-            illuminance: 12_000.0,
+            color: weather_lighting.sunlight,
+            illuminance: crate::lights::SUN_ILLUMINANCE,
             shadow_maps_enabled: true,
             ..default()
         },
@@ -1990,7 +2092,7 @@ fn setup_world(
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.48, 0.55, 0.7),
+        color: weather_lighting.mean_ambient(),
         // The one definition of the ambient this world path applies: the converted lights are
         // scaled against it (`crate::lights`).
         brightness: crate::lights::AMBIENT_ILLUMINANCE,
@@ -2084,6 +2186,188 @@ fn jump_camera_position(grid: (i32, i32), origin: IVec2, y: f32) -> Vec3 {
 const CELL_SIZE_HALF: f32 = crate::world::components::CELL_SIZE * 0.5;
 const AUTO_FLIGHT_HALF_SPAN: f32 = crate::world::components::CELL_SIZE * 4.0;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StreamingBenchmarkPhase {
+    #[default]
+    Waiting,
+    Moving,
+    Tail,
+    Finished,
+}
+
+/// An opt-in real-clock camera workload. CPU settlement plus a fixed quiet
+/// interval does not certify GPU preparation or collision safety.
+#[derive(Resource, Debug, Default)]
+pub(crate) struct StreamingBenchmarkRoute {
+    pub phase: StreamingBenchmarkPhase,
+    pub cpu_settled_real_seconds: Option<f64>,
+    pub movement_started_real_seconds: Option<f64>,
+    pub movement_finished_real_seconds: Option<f64>,
+    pub tail_finished_real_seconds: Option<f64>,
+    pub latest_real_seconds: f64,
+    pub route_distance_units: f64,
+    pub start_world_position: Option<[f64; 3]>,
+}
+
+impl StreamingBenchmarkRoute {
+    fn advance(&mut self, now: f64, cpu_ready: bool, config: &EngineConfig) {
+        self.latest_real_seconds = now;
+        let speed = config.streaming_benchmark_route_speed.unwrap_or(0.0);
+        if self.phase == StreamingBenchmarkPhase::Waiting {
+            if !cpu_ready {
+                self.cpu_settled_real_seconds = None;
+                return;
+            }
+            let settled = *self.cpu_settled_real_seconds.get_or_insert(now);
+            if now - settled + f64::EPSILON < config.streaming_benchmark_settle_secs {
+                return;
+            }
+            self.movement_started_real_seconds = Some(now);
+            self.phase = if speed == 0.0 {
+                self.movement_finished_real_seconds = Some(now);
+                StreamingBenchmarkPhase::Tail
+            } else {
+                StreamingBenchmarkPhase::Moving
+            };
+        }
+        let Some(started) = self.movement_started_real_seconds else {
+            return;
+        };
+        let moving_seconds = if speed == 0.0 {
+            0.0
+        } else {
+            (now - started).clamp(0.0, config.streaming_benchmark_route_secs)
+        };
+        self.route_distance_units = speed * moving_seconds;
+        if self.phase == StreamingBenchmarkPhase::Moving
+            && now - started >= config.streaming_benchmark_route_secs
+        {
+            self.movement_finished_real_seconds =
+                Some(started + config.streaming_benchmark_route_secs);
+            self.phase = StreamingBenchmarkPhase::Tail;
+        }
+        if self.phase == StreamingBenchmarkPhase::Tail
+            && let Some(finished) = self.movement_finished_real_seconds
+            && now - finished >= config.streaming_benchmark_tail_secs
+        {
+            self.tail_finished_real_seconds = Some(finished + config.streaming_benchmark_tail_secs);
+            self.phase = StreamingBenchmarkPhase::Finished;
+        }
+    }
+
+    fn local_position(&self, origin: IVec2) -> Option<Vec3> {
+        let mut position = DVec3::from_array(self.start_world_position?);
+        position.z -= self.route_distance_units;
+        position.x -= f64::from(origin.x) * f64::from(crate::world::components::CELL_SIZE);
+        position.z += f64::from(origin.y) * f64::from(crate::world::components::CELL_SIZE);
+        Some(position.as_vec3())
+    }
+}
+
+fn streaming_benchmark_cpu_ready(
+    config: &EngineConfig,
+    metrics: &StreamingMetrics,
+    admission: &crate::streaming::admission::SceneAdmission,
+    renderer: &RendererMetrics,
+    raw_responses: usize,
+    deferred_responses: usize,
+) -> bool {
+    let expected_cells =
+        ((i64::from(config.stream_radius) * 2 + 1).max(0) as usize).saturating_pow(2);
+    metrics.resident_cells == expected_cells
+        && metrics.loading_cells == 0
+        && metrics.active_requests == 0
+        && metrics.requests_submitted == metrics.responses_received
+        && metrics.retiring_cells == 0
+        && metrics.pending_asset_instances == 0
+        && metrics.pending_surface_instances == 0
+        && metrics.arming_queue_depth == 0
+        && metrics.pending_lod_queries == 0
+        && metrics.pending_lod_chunks == 0
+        && admission.active_jobs() == 0
+        && admission.queued_jobs() == 0
+        && raw_responses == 0
+        && deferred_responses == 0
+        && config
+            .streaming_benchmark_expected_models
+            .is_none_or(|expected| metrics.assets_ready == expected)
+        && config
+            .streaming_benchmark_expected_lod_chunks
+            .is_none_or(|expected| metrics.resident_lod_chunks == expected)
+        && config
+            .streaming_benchmark_expected_terrain
+            .is_none_or(|expected| metrics.terrain_patches_validated == expected)
+        && config
+            .streaming_benchmark_expected_water
+            .is_none_or(|expected| metrics.water_surfaces_validated == expected)
+        && metrics.failed_cells == 0
+        && metrics.asset_load_failures == 0
+        && metrics.material_validation_failures == 0
+        && metrics.terrain_validation_failures == 0
+        && metrics.water_validation_failures == 0
+        && metrics.transform_bounds_validation_failures == 0
+        && metrics.diagnostic_fallbacks == 0
+        && metrics.streaming_invariant_failures == 0
+        && metrics.failed_lod_queries == 0
+        && metrics.unrecovered_lod_queries == 0
+        && metrics.failed_lod_chunks == 0
+        && metrics.unrecovered_lod_chunks == 0
+        && renderer.renderer_validation_failures == 0
+        && renderer.final_path_active()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_streaming_benchmark_route(
+    time: Res<Time<Real>>,
+    config: Res<EngineConfig>,
+    origin: Res<RenderOrigin>,
+    metrics: Res<StreamingMetrics>,
+    admission: Res<crate::streaming::admission::SceneAdmission>,
+    renderer: Res<RendererMetrics>,
+    database: Res<WorldDatabase>,
+    runtime: Option<Res<crate::streaming::runtime::StreamingRuntime>>,
+    mut route: ResMut<StreamingBenchmarkRoute>,
+    mut camera: Query<&mut Transform, With<StreamingCamera>>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let Ok(mut transform) = camera.single_mut() else {
+        return;
+    };
+    route.start_world_position.get_or_insert([
+        f64::from(transform.translation.x)
+            + f64::from(origin.0.x) * f64::from(crate::world::components::CELL_SIZE),
+        f64::from(transform.translation.y),
+        f64::from(transform.translation.z)
+            - f64::from(origin.0.y) * f64::from(crate::world::components::CELL_SIZE),
+    ]);
+    let ready = streaming_benchmark_cpu_ready(
+        &config,
+        &metrics,
+        &admission,
+        &renderer,
+        database.pending_cell_responses(),
+        runtime
+            .as_ref()
+            .map_or(0, |runtime| runtime.deferred_responses.len()),
+    );
+    let before = route.phase;
+    route.advance(time.elapsed_secs_f64(), ready, &config);
+    if let Some(position) = route.local_position(origin.0) {
+        transform.translation = position;
+    }
+    if route.phase != before {
+        let stage = match route.phase {
+            StreamingBenchmarkPhase::Waiting => "route_waiting",
+            StreamingBenchmarkPhase::Moving => "route_moving",
+            StreamingBenchmarkPhase::Tail => "route_tail",
+            StreamingBenchmarkPhase::Finished => "route_finished",
+        };
+        info!(phase = ?route.phase, distance = route.route_distance_units, "streaming benchmark route phase");
+        profiler.event("streaming-benchmark-route", stage, None);
+    }
+}
+
 #[derive(Default)]
 struct AutoFlightState {
     initialized: bool,
@@ -2138,7 +2422,12 @@ fn fly_camera(
 ) {
     // Interactive player paths own the camera; automated camera paths keep legacy controls. A
     // shots run poses the camera itself, and a key press must not move a pose.
-    if config.physics_fixture || config.interactive_world_physics() || config.shots.is_some() {
+    if config.physics_fixture
+        || config.interactive_world_physics()
+        || config.shots.is_some()
+        || config.streaming_benchmark_route_speed.is_some()
+        || config.matched_route.is_some()
+    {
         return;
     }
     let started = std::time::Instant::now();
@@ -2205,7 +2494,7 @@ fn capture_acceptance_screenshot(
     streaming: Option<Res<StreamingMetrics>>,
     world_database: Option<Res<WorldDatabase>>,
     renderer: Res<RendererMetrics>,
-    windows: Query<(), With<Window>>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
 ) {
     let Some(path) = &config.acceptance_screenshot else {
         return;
@@ -2286,6 +2575,221 @@ mod tests {
     use bevy::world_serialization::WorldSerializationPlugin;
     use std::time::Duration;
 
+    #[test]
+    fn benchmark_route_requires_an_uninterrupted_cpu_settled_interval() {
+        let config = EngineConfig {
+            streaming_benchmark_route_speed: Some(370.0),
+            ..default()
+        };
+        let mut route = StreamingBenchmarkRoute::default();
+        route.advance(1.0, false, &config);
+        route.advance(2.0, true, &config);
+        route.advance(6.0, true, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Waiting);
+        assert_eq!(route.cpu_settled_real_seconds, Some(2.0));
+        route.advance(6.5, false, &config);
+        assert_eq!(route.cpu_settled_real_seconds, None);
+        route.advance(8.0, true, &config);
+        route.advance(13.0, true, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Moving);
+        assert_eq!(route.cpu_settled_real_seconds, Some(8.0));
+        assert_eq!(route.movement_started_real_seconds, Some(13.0));
+        // New streaming demand during the route must not restart the wait.
+        route.advance(14.0, false, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Moving);
+        assert_eq!(route.route_distance_units, 370.0);
+    }
+
+    #[test]
+    fn benchmark_route_uses_absolute_real_time_across_large_deltas_and_rebases() {
+        let config = EngineConfig {
+            streaming_benchmark_route_speed: Some(3000.0),
+            streaming_benchmark_settle_secs: 0.0,
+            ..default()
+        };
+        let mut route = StreamingBenchmarkRoute {
+            start_world_position: Some([22_528.0, 5976.0, 47_104.0]),
+            ..default()
+        };
+        route.advance(10.0, true, &config);
+        let mut partitioned = StreamingBenchmarkRoute {
+            start_world_position: route.start_world_position,
+            ..default()
+        };
+        partitioned.advance(10.0, true, &config);
+        for now in [10.1, 10.4, 10.7, 11.0] {
+            partitioned.advance(now, false, &config);
+        }
+        // A one-second real interval is not reduced to virtual time's 250 ms cap.
+        route.advance(11.0, false, &config);
+        assert_eq!(route.route_distance_units, 3000.0);
+        assert_eq!(route.route_distance_units, partitioned.route_distance_units);
+        let before = route.local_position(IVec2::new(5, -12)).unwrap();
+        let after = route.local_position(IVec2::new(5, -11)).unwrap();
+        assert_eq!(before.x, after.x);
+        assert_eq!(before.y, after.y);
+        assert_eq!(after.z - before.z, crate::world::components::CELL_SIZE);
+        let stable = |position: Vec3, origin: IVec2| {
+            f64::from(position.z)
+                - f64::from(origin.y) * f64::from(crate::world::components::CELL_SIZE)
+        };
+        assert_eq!(
+            stable(before, IVec2::new(5, -12)),
+            stable(after, IVec2::new(5, -11))
+        );
+        // A long stalled frame clamps at the planned endpoint and crosses both
+        // phase boundaries without extending the route or the tail.
+        route.advance(1000.0, false, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Finished);
+        assert_eq!(route.route_distance_units, 135_000.0);
+        assert_eq!(route.movement_finished_real_seconds, Some(55.0));
+        assert_eq!(route.tail_finished_real_seconds, Some(65.0));
+    }
+
+    #[test]
+    fn stationary_benchmark_route_enters_tail_without_movement() {
+        let config = EngineConfig {
+            streaming_benchmark_route_speed: Some(0.0),
+            streaming_benchmark_settle_secs: 0.0,
+            streaming_benchmark_tail_secs: 3.0,
+            ..default()
+        };
+        let mut route = StreamingBenchmarkRoute::default();
+        route.advance(4.0, true, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Tail);
+        assert_eq!(route.movement_started_real_seconds, Some(4.0));
+        assert_eq!(route.movement_finished_real_seconds, Some(4.0));
+        assert_eq!(route.route_distance_units, 0.0);
+        route.advance(6.0, false, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Tail);
+        route.advance(7.0, false, &config);
+        assert_eq!(route.phase, StreamingBenchmarkPhase::Finished);
+        assert_eq!(route.tail_finished_real_seconds, Some(7.0));
+        assert_eq!(route.route_distance_units, 0.0);
+    }
+
+    #[test]
+    fn benchmark_cpu_gate_checks_expected_counts_and_pending_database_payloads() {
+        let config = EngineConfig {
+            streaming_benchmark_expected_models: Some(7),
+            streaming_benchmark_expected_lod_chunks: Some(3),
+            streaming_benchmark_expected_terrain: Some(4),
+            streaming_benchmark_expected_water: Some(1),
+            ..default()
+        };
+        let metrics = StreamingMetrics {
+            resident_cells: 25,
+            requests_submitted: 25,
+            responses_received: 25,
+            assets_ready: 7,
+            resident_lod_chunks: 3,
+            terrain_patches_validated: 4,
+            water_surfaces_validated: 1,
+            ..default()
+        };
+        let admission = crate::streaming::admission::SceneAdmission::default();
+        let renderer = RendererMetrics {
+            gpu_preprocessing_active: true,
+            gpu_culling_active: true,
+            indirect_drawing_active: true,
+            occlusion_culling_views: 1,
+            hzb_views: 1,
+            indirect_phase_buffers: 1,
+            indirect_batch_sets: 1,
+            proof_frames: 1,
+            ..default()
+        };
+        let ready = |metrics: &StreamingMetrics, raw, deferred| {
+            streaming_benchmark_cpu_ready(&config, metrics, &admission, &renderer, raw, deferred)
+        };
+        assert!(ready(&metrics, 0, 0));
+        assert!(!ready(&metrics, 1, 0));
+        assert!(!ready(&metrics, 0, 1));
+        assert!(!ready(
+            &StreamingMetrics {
+                assets_ready: 6,
+                ..metrics.clone()
+            },
+            0,
+            0
+        ));
+        assert!(!ready(
+            &StreamingMetrics {
+                pending_lod_queries: 1,
+                ..metrics.clone()
+            },
+            0,
+            0
+        ));
+        assert!(!ready(
+            &StreamingMetrics {
+                pending_surface_instances: 1,
+                ..metrics.clone()
+            },
+            0,
+            0
+        ));
+        assert!(!ready(
+            &StreamingMetrics {
+                asset_load_failures: 1,
+                ..metrics
+            },
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    fn automated_camera_conflicts_name_the_selected_drivers() {
+        let mut both = EngineConfig {
+            shots: Some("shots.json".into()),
+            matched_route: Some("route.json".into()),
+            ..default()
+        };
+        let Err(error) = prepare_shots(&mut both) else {
+            panic!("drivers must conflict");
+        };
+        let message = error.to_string();
+        assert!(message.contains("--shots"));
+        assert!(message.contains("--matched-route"));
+
+        let mut route_benchmark = EngineConfig {
+            matched_route: Some("route.json".into()),
+            benchmark_frames: Some(60),
+            ..default()
+        };
+        let Err(error) = prepare_shots(&mut route_benchmark) else {
+            panic!("benchmark must conflict with route");
+        };
+        let message = error.to_string();
+        assert!(message.contains("--matched-route"));
+        assert!(message.contains("benchmark"));
+    }
+
+    /// A capture window remains hidden if an update system tries to show it.
+    #[test]
+    fn hidden_capture_suppresses_visibility_changes_before_window_sync() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            hidden_window: true,
+            ..default()
+        })
+        .add_systems(PostUpdate, keep_windows_hidden);
+        let entity = app
+            .world_mut()
+            .spawn(Window {
+                visible: true,
+                ..default()
+            })
+            .id();
+        app.update();
+        assert!(!app.world().get::<Window>(entity).unwrap().visible);
+        app.world_mut().resource_mut::<EngineConfig>().hidden_window = false;
+        app.world_mut().get_mut::<Window>(entity).unwrap().visible = true;
+        app.update();
+        assert!(app.world().get::<Window>(entity).unwrap().visible);
+    }
+
     /// The origin cell's centre is (2048, y, -2048), the start position's convention, and +grid_y
     /// runs towards -z, so the sign and the half-cell offset are pinned per axis.
     #[test]
@@ -2307,6 +2811,75 @@ mod tests {
                 "grid {grid:?} origin {origin:?}"
             );
         }
+    }
+
+    #[test]
+    fn relative_asset_root_is_shared_by_database_and_streamed_files() {
+        use bevy::asset::io::{AssetReader, Reader, file::FileAssetReader};
+
+        // Keep the process CWD and environment intact so this can run alongside other tests.
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(&cwd).unwrap();
+        let mut config = EngineConfig {
+            assets_dir: directory.path().strip_prefix(&cwd).unwrap().to_owned(),
+            ..default()
+        };
+        let plugin = asset_plugin(&mut config).unwrap();
+        assert!(config.assets_dir.is_absolute());
+        assert_eq!(config.assets_dir, directory.path());
+
+        let database_path = config.assets_dir.join("skyrim_world.db");
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE fixture (value TEXT); INSERT INTO fixture VALUES ('same root');",
+            )
+            .unwrap();
+        fs::create_dir(config.assets_dir.join("meshes")).unwrap();
+        fs::write(config.assets_dir.join("meshes/model.glb"), b"model").unwrap();
+        fs::create_dir(config.assets_dir.join("textures")).unwrap();
+        fs::write(config.assets_dir.join("textures/image.png"), b"image").unwrap();
+
+        let reader = FileAssetReader::new(plugin.file_path);
+        assert_eq!(reader.root_path(), &config.assets_dir);
+        bevy::tasks::block_on(async {
+            for (path, expected) in [
+                ("meshes/model.glb", b"model".as_slice()),
+                ("textures/image.png", b"image".as_slice()),
+            ] {
+                let mut file = reader.read(Path::new(path)).await.unwrap();
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes, expected);
+            }
+        });
+        let database =
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let value: String = database
+            .query_row("SELECT value FROM fixture", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "same root");
+    }
+
+    #[test]
+    fn asset_root_resolution_allows_missing_directories_and_preserves_absolute_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let absolute = directory.path().join("not-created");
+        let mut config = EngineConfig {
+            assets_dir: absolute.clone(),
+            ..default()
+        };
+        let plugin = asset_plugin(&mut config).unwrap();
+        assert_eq!(config.assets_dir, absolute);
+        assert_eq!(PathBuf::from(plugin.file_path), absolute);
+        assert!(!absolute.exists());
+
+        config.assets_dir = EngineConfig::default().assets_dir;
+        asset_plugin(&mut config).unwrap();
+        assert_eq!(
+            config.assets_dir,
+            std::env::current_dir().unwrap().join("modern_assets")
+        );
     }
 
     #[test]

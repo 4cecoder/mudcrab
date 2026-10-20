@@ -13,6 +13,7 @@ use color_eyre::{
     eyre::{WrapErr, ensure},
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use shared::collision::CollisionBody;
 use std::path::Path;
 
 use crate::{
@@ -33,6 +34,18 @@ pub const GROUP_WORLD: Group = Group::GROUP_1;
 pub const GROUP_PLAYER: Group = Group::GROUP_2;
 /// Collision groups: dynamic debug tankards (V17).
 pub const GROUP_TANKARD: Group = Group::GROUP_3;
+/// Collision groups: placed dynamic clutter from authored physics data (#104 phase a).
+pub const GROUP_CLUTTER: Group = Group::GROUP_4;
+/// Rapier's default linear speed cap is 400 units/s, which clips free fall under 900 units/s^2
+/// gravity after 0.44 s. Authored clutter limits (about 7000 units/s) are enforced per body by
+/// [`clamp_dynamic_clutter_velocities`], so the global cap only has to stay out of the way. The cap
+/// is global, so debug tankards fall faster too; they and clutter both use continuous collision.
+pub const MAX_LINEAR_SPEED: f32 = 20_000.0;
+/// Live-cap on simultaneous dynamic clutter bodies, like [`MAX_LIVE_TANKARDS`]. The cap bounds
+/// the contact-pair cost a cell arrival can create; bodies over it keep no collider at all
+/// for as long as their cell stays resident (a refusal is not retried); they are considered again
+/// when their cell loads next, if earlier bodies have unloaded by then.
+pub const MAX_LIVE_DYNAMIC_CLUTTER: usize = 256;
 
 /// Provisional movement tuning, centralized (V10, V11, V12).
 #[derive(Debug, Clone, Resource)]
@@ -227,15 +240,211 @@ pub struct FixtureArena;
 
 /// Groups every collider belongs to / collides with (V17).
 pub fn world_collision_groups() -> CollisionGroups {
-    CollisionGroups::new(GROUP_WORLD, GROUP_PLAYER | GROUP_TANKARD)
+    CollisionGroups::new(GROUP_WORLD, GROUP_PLAYER | GROUP_TANKARD | GROUP_CLUTTER)
 }
 
 pub fn player_collision_groups() -> CollisionGroups {
-    CollisionGroups::new(GROUP_PLAYER, GROUP_WORLD | GROUP_TANKARD)
+    CollisionGroups::new(GROUP_PLAYER, GROUP_WORLD | GROUP_TANKARD | GROUP_CLUTTER)
 }
 
 pub fn tankard_collision_groups() -> CollisionGroups {
-    CollisionGroups::new(GROUP_TANKARD, GROUP_WORLD | GROUP_PLAYER | GROUP_TANKARD)
+    CollisionGroups::new(
+        GROUP_TANKARD,
+        GROUP_WORLD | GROUP_PLAYER | GROUP_TANKARD | GROUP_CLUTTER,
+    )
+}
+
+/// Placed dynamic clutter collides with the world, the player, tankards and other clutter.
+pub fn clutter_collision_groups() -> CollisionGroups {
+    CollisionGroups::new(
+        GROUP_CLUTTER,
+        GROUP_WORLD | GROUP_PLAYER | GROUP_TANKARD | GROUP_CLUTTER,
+    )
+}
+
+/// A placed reference simulated as a dynamic Rapier body from its authored physics data (#104
+/// phase a).
+///
+/// The object's stable ID is the [`crate::world::components::FormId`] already on the reference
+/// entity. The resting pose is not persisted (#90), and the body despawns with its cell.
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub struct DynamicClutter {
+    /// Authored cap on linear speed, Creation units/s.
+    pub max_linear_velocity: f32,
+    /// Authored cap on angular speed, rad/s.
+    pub max_angular_velocity: f32,
+}
+
+/// Mass properties for an authored body, or `None` when the mass or tensor is unusable (the
+/// caller then falls back to collider density).
+///
+/// The tensor must be finite, symmetric and positive definite, the centre of mass finite and the
+/// mass finite and above zero. Havok values come in the shape frame already (the converter bakes
+/// the node and rigid-body transforms), in Creation units and kg x Creation units squared.
+pub fn mass_properties_from_body(body: &CollisionBody) -> Option<MassProperties> {
+    if !body.mass.is_finite() || body.mass <= 0.0 {
+        return None;
+    }
+    if !body
+        .inertia
+        .iter()
+        .chain(&body.center_of_mass)
+        .all(|value| value.is_finite())
+    {
+        return None;
+    }
+    let i = body.inertia.map(f64::from);
+    // Row-major 3x3. Sylvester's criterion on the leading minors plus a symmetry check.
+    let symmetric = |a: f64, b: f64| (a - b).abs() <= 1e-4 * (a.abs() + b.abs()).max(1e-12);
+    if !(symmetric(i[1], i[3]) && symmetric(i[2], i[6]) && symmetric(i[5], i[7])) {
+        return None;
+    }
+    let minor2 = i[0] * i[4] - i[1] * i[3];
+    let det = i[0] * (i[4] * i[8] - i[5] * i[7]) - i[1] * (i[3] * i[8] - i[5] * i[6])
+        + i[2] * (i[3] * i[7] - i[4] * i[6]);
+    if !(i[0] > 0.0 && minor2 > 0.0 && det > 0.0) {
+        return None;
+    }
+    // Bevy's Mat3 is column-major; the tensor is symmetric, so rows and columns agree.
+    let matrix = Mat3::from_cols_array(&body.inertia);
+    Some(MassProperties::from_rapier(
+        bevy_rapier3d::rapier::dynamics::MassProperties::with_inertia_matrix(
+            Vec3::from_array(body.center_of_mass),
+            body.mass,
+            matrix,
+        ),
+    ))
+}
+
+/// Make `entity` a dynamic Rapier body from authored physics data (#104 phase a).
+///
+/// `parts` are the body's collider shapes and their translations in the entity's frame, already
+/// built by the caller (a hull for a non-convex body). `mass` is the authored tensor; when it is
+/// `None` (unusable values) collider density supplies the mass instead. `scale` is the
+/// reference's uniform scale: Rapier scales the colliders from the `GlobalTransform` but not
+/// [`AdditionalMassProperties`], so the authored centre of mass is scaled by it and the inertia by
+/// its square, keeping them in step with the scaled shapes (the authored mass stays as it is). An
+/// unusable scale falls back to collider density. Every collider carries
+/// zero mass when the authored tensor is used, because collider mass is *added* to
+/// [`AdditionalMassProperties`] rather than replacing it.
+///
+/// The body sits on the reference entity itself, which is a descendant of the cell root: it moves
+/// with the root and despawns with the cell.
+/// The character controller does not push dynamic bodies yet (`apply_impulse_to_dynamic_bodies`
+/// is false), so the player collides with clutter but cannot shove it in phase (a).
+pub fn spawn_dynamic_clutter<'a>(
+    commands: &mut Commands,
+    entity: Entity,
+    body: &CollisionBody,
+    parts: impl IntoIterator<Item = (Vec3, &'a Collider)>,
+    mass: Option<MassProperties>,
+    scale: f32,
+) {
+    let finite_or = |value: f32, default: f32| {
+        if value.is_finite() && value >= 0.0 {
+            value
+        } else {
+            default
+        }
+    };
+    let mut entity_commands = commands.entity(entity);
+    entity_commands.insert((
+        RigidBody::Dynamic,
+        DynamicClutter {
+            max_linear_velocity: body.max_linear_velocity,
+            max_angular_velocity: body.max_angular_velocity,
+        },
+        Damping {
+            linear_damping: finite_or(body.linear_damping, 0.0),
+            angular_damping: finite_or(body.angular_damping, 0.0),
+        },
+        Velocity::zero(),
+        // Asleep until something touches it: each model becomes ready on its own, so the shelf or
+        // terrain under a body may still be loading (or its collider disabled) on the first step,
+        // and an awake body would fall through it. A contact, a grab or a set velocity wakes it.
+        Sleeping {
+            sleeping: true,
+            ..default()
+        },
+        // The raised global speed cap lets a fast body cover more than a floor's thickness in
+        // one 60 Hz step, so clutter gets continuous collision detection against the world.
+        Ccd::enabled(),
+    ));
+    let collider_mass = match mass {
+        Some(mut properties) if scale.is_finite() && scale > 0.0 => {
+            properties.local_center_of_mass *= scale;
+            properties.principal_inertia *= scale * scale;
+            entity_commands.insert(AdditionalMassProperties::MassProperties(properties));
+            ColliderMassProperties::Mass(0.0)
+        }
+        _ => ColliderMassProperties::Density(0.001),
+    };
+    // The Havok deactivator type is not mapped in phase (a): past the asleep start, Rapier's
+    // default sleeping applies.
+    let friction = Friction::coefficient(finite_or(body.friction, 0.5));
+    let restitution = Restitution::coefficient(finite_or(body.restitution, 0.0));
+    let parts: Vec<(Vec3, &Collider)> = parts.into_iter().collect();
+    if let [(translation, collider)] = parts.as_slice()
+        && *translation == Vec3::ZERO
+    {
+        commands.entity(entity).insert((
+            (*collider).clone(),
+            collider_mass,
+            friction,
+            restitution,
+            clutter_collision_groups(),
+        ));
+        return;
+    }
+    for (translation, collider) in parts {
+        commands.spawn((
+            (*collider).clone(),
+            collider_mass,
+            friction,
+            restitution,
+            clutter_collision_groups(),
+            Transform::from_translation(translation),
+            ChildOf(entity),
+        ));
+    }
+}
+
+/// Clamp each dynamic clutter body to its authored max linear and angular speed.
+///
+/// Rapier has one global linear cap and no per-body or angular cap. Running after the Rapier
+/// writeback means the corrected [`Velocity`] reaches the body at the next step. Clamps are
+/// counted in `StreamingMetrics::dynamic_clutter_clamped`.
+pub fn clamp_dynamic_clutter_velocities(
+    mut bodies: Query<(&DynamicClutter, &mut Velocity)>,
+    metrics: Option<ResMut<StreamingMetrics>>,
+) {
+    let mut clamped = 0u64;
+    for (limits, mut velocity) in &mut bodies {
+        let mut capped = *velocity;
+        let linear = capped.linear.length();
+        if limits.max_linear_velocity.is_finite()
+            && limits.max_linear_velocity > 0.0
+            && linear > limits.max_linear_velocity
+        {
+            capped.linear *= limits.max_linear_velocity / linear;
+        }
+        let angular = capped.angular.length();
+        if limits.max_angular_velocity.is_finite()
+            && limits.max_angular_velocity > 0.0
+            && angular > limits.max_angular_velocity
+        {
+            capped.angular *= limits.max_angular_velocity / angular;
+        }
+        if capped != *velocity {
+            *velocity = capped;
+            clamped += 1;
+        }
+    }
+    if clamped > 0
+        && let Some(mut metrics) = metrics
+    {
+        metrics.dynamic_clutter_clamped = metrics.dynamic_clutter_clamped.saturating_add(clamped);
+    }
 }
 
 /// Compound cup + handle collider for the debug tankard (R8, V15).
@@ -266,7 +475,11 @@ impl Plugin for PhysicsCorePlugin {
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<MovementTuning>()
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::default().in_fixed_schedule())
-        .add_systems(Startup, (configure_physics_gravity, report_movement_tuning));
+        .add_systems(Startup, (configure_physics_gravity, report_movement_tuning))
+        .add_systems(
+            FixedUpdate,
+            clamp_dynamic_clutter_velocities.after(PhysicsSet::Writeback),
+        );
     }
 }
 
@@ -289,9 +502,17 @@ fn report_movement_tuning(tuning: Res<MovementTuning>) {
 fn configure_physics_gravity(
     tuning: Res<MovementTuning>,
     mut configs: Query<&mut RapierConfiguration>,
+    mut simulations: Query<&mut RapierContextSimulation>,
 ) {
     for mut config in &mut configs {
         config.gravity = Vect::new(0.0, -tuning.gravity, 0.0);
+    }
+    // Raise Rapier's global linear cap (default 400 units/s) so falling clutter is not clipped;
+    // the authored per-body limits are enforced by `clamp_dynamic_clutter_velocities`.
+    for mut simulation in &mut simulations {
+        simulation
+            .integration_parameters
+            .normalized_max_linear_velocity = MAX_LINEAR_SPEED;
     }
 }
 
@@ -335,17 +556,27 @@ impl Plugin for PlayerControlsPlugin {
                     cursor_lifecycle_system,
                     apply_teleport_player,
                     look_input_system,
-                    noclip_flight_system,
-                    walk_intent_system,
+                    noclip_flight_system.run_if(crate::door_crossing::no_door_crossing),
+                    // Nothing walks during a door crossing: the landing has no collision yet.
+                    walk_intent_system.run_if(crate::door_crossing::no_door_crossing),
                     toggle_mode_system.run_if(console_closed),
                     walk_camera_follow_system,
                     sprint_fov_system,
                     overlay_system,
                 )
                     .chain()
+                    .after(crate::settings_ui::SettingsUiSet)
                     .in_set(PlayerControlsSystems),
             )
-            .add_systems(FixedUpdate, walk_movement_system);
+            .add_systems(
+                FixedUpdate,
+                // Rapier consumes this tick's displacement during SyncBackend. Feeding it after
+                // that phase leaves grounded output one tick behind a newly launched jump.
+                walk_movement_system
+                    .run_if(crate::door_crossing::no_door_crossing)
+                    .run_if(console_closed)
+                    .before(PhysicsSet::SyncBackend),
+            );
     }
 }
 
@@ -367,11 +598,8 @@ impl Plugin for WorldPlayerPlugin {
             .add_systems(PostStartup, setup_world_player)
             .add_systems(
                 Update,
-                (
-                    toggle_collision_debug_system.run_if(console_closed),
-                    update_collision_debug_visibility,
-                )
-                    .chain()
+                update_collision_debug_visibility
+                    .after(crate::settings_ui::SettingsUiSet)
                     .before(overlay_system),
             )
             .add_systems(
@@ -380,7 +608,8 @@ impl Plugin for WorldPlayerPlugin {
                     world_tankard_input.run_if(console_closed),
                     move_held_tankard,
                 )
-                    .chain(),
+                    .chain()
+                    .after(crate::settings_ui::SettingsUiSet),
             );
     }
 }
@@ -424,6 +653,9 @@ fn spawn_debug_tankard(commands: &mut Commands, visuals: &TankardVisuals, positi
             tankard_collision_groups(),
             ColliderMassProperties::Density(0.001),
             Velocity::zero(),
+            // The raised global speed cap (`MAX_LINEAR_SPEED`) no longer clips a falling tankard
+            // at 400 units/s, so it gets continuous collision detection like clutter does.
+            Ccd::enabled(),
             Transform::from_translation(position),
             Visibility::default(),
         ))
@@ -590,6 +822,7 @@ fn validate_physics_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::ecs::system::RunSystemOnce;
 
     #[test]
     fn movement_tuning_preserves_spec_speed_ordering() {
@@ -713,6 +946,140 @@ mod tests {
     }
 
     #[test]
+    fn clutter_group_collides_with_world_player_tankards_and_clutter() {
+        let clutter = clutter_collision_groups();
+        for group in [GROUP_WORLD, GROUP_PLAYER, GROUP_TANKARD, GROUP_CLUTTER] {
+            assert!(clutter.filters.contains(group));
+        }
+        assert!(world_collision_groups().filters.contains(GROUP_CLUTTER));
+        assert!(player_collision_groups().filters.contains(GROUP_CLUTTER));
+        assert!(tankard_collision_groups().filters.contains(GROUP_CLUTTER));
+        assert_eq!(clutter.memberships, GROUP_CLUTTER);
+    }
+
+    fn test_body(mass: f32, inertia: [f32; 9]) -> CollisionBody {
+        CollisionBody {
+            node: 0,
+            target: String::new(),
+            shapes: vec![0],
+            kind: shared::collision::BodyKind::Dynamic,
+            havok: shared::collision::HavokBodyInfo {
+                motion_system: 3,
+                quality_type: 4,
+                deactivator_type: 1,
+                collision_layer: 4,
+            },
+            mass,
+            inertia,
+            center_of_mass: [0.0, 2.0, 0.0],
+            linear_damping: 0.0,
+            angular_damping: 0.0,
+            friction: 0.5,
+            restitution: 0.0,
+            max_linear_velocity: 100.0,
+            max_angular_velocity: 5.0,
+            convex: true,
+        }
+    }
+
+    #[test]
+    fn mass_properties_follow_the_authored_tensor_and_reject_unusable_ones() {
+        let good = mass_properties_from_body(&test_body(
+            2.0,
+            [3.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 5.0],
+        ))
+        .expect("positive definite tensor");
+        assert!((good.mass - 2.0).abs() < 1.0e-6);
+        assert!((good.local_center_of_mass.y - 2.0).abs() < 1.0e-6);
+        let mut principal = [
+            good.principal_inertia.x,
+            good.principal_inertia.y,
+            good.principal_inertia.z,
+        ];
+        principal.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for (got, want) in principal.iter().zip([3.0, 4.0, 5.0]) {
+            assert!((got - want).abs() < 1.0e-4, "{principal:?}");
+        }
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        assert!(mass_properties_from_body(&test_body(0.0, identity)).is_none());
+        assert!(mass_properties_from_body(&test_body(f32::NAN, identity)).is_none());
+        assert!(mass_properties_from_body(&test_body(1.0, [0.0; 9])).is_none());
+        // Not positive definite: a negative principal moment.
+        assert!(
+            mass_properties_from_body(&test_body(
+                1.0,
+                [1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0]
+            ))
+            .is_none()
+        );
+        // Not symmetric.
+        assert!(
+            mass_properties_from_body(&test_body(
+                1.0,
+                [1.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn clamp_caps_authored_max_velocity_and_counts_it() {
+        let mut world = World::new();
+        world.init_resource::<StreamingMetrics>();
+        let limits = DynamicClutter {
+            max_linear_velocity: 100.0,
+            max_angular_velocity: 5.0,
+        };
+        let fast = world
+            .spawn((
+                limits,
+                Velocity {
+                    linear: Vec3::new(300.0, 400.0, 0.0),
+                    angular: Vec3::new(0.0, 20.0, 0.0),
+                },
+            ))
+            .id();
+        let slow = world
+            .spawn((
+                limits,
+                Velocity {
+                    linear: Vec3::new(10.0, 0.0, 0.0),
+                    angular: Vec3::new(0.0, 1.0, 0.0),
+                },
+            ))
+            .id();
+        world
+            .run_system_once(clamp_dynamic_clutter_velocities)
+            .unwrap();
+        let fast = *world.get::<Velocity>(fast).unwrap();
+        assert!((fast.linear.length() - 100.0).abs() < 1.0e-3);
+        assert!((fast.angular.length() - 5.0).abs() < 1.0e-3);
+        // Direction is kept.
+        assert!((fast.linear.normalize() - Vec3::new(0.6, 0.8, 0.0)).length() < 1.0e-4);
+        let slow = *world.get::<Velocity>(slow).unwrap();
+        assert_eq!(slow.linear, Vec3::new(10.0, 0.0, 0.0));
+        assert_eq!(
+            world.resource::<StreamingMetrics>().dynamic_clutter_clamped,
+            1
+        );
+    }
+
+    #[test]
+    fn physics_core_raises_the_global_linear_speed_cap() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, PhysicsCorePlugin));
+        app.update();
+        let mut query = app.world_mut().query::<&RapierContextSimulation>();
+        let simulation = query.single(app.world()).expect("rapier context");
+        assert_eq!(
+            simulation
+                .integration_parameters
+                .normalized_max_linear_velocity,
+            MAX_LINEAR_SPEED
+        );
+    }
+
+    #[test]
     fn physics_core_uses_fixed_sixty_hertz_step() {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, PhysicsCorePlugin));
@@ -729,6 +1096,368 @@ mod tests {
         assert_eq!(
             app.world().resource::<Time<Fixed>>().timestep(),
             std::time::Duration::from_secs_f64(1.0 / 60.0)
+        );
+    }
+}
+
+/// Placed dynamic clutter from authored physics data (#104 phase a), on the fixture arena.
+#[cfg(test)]
+mod clutter_tests {
+    use super::headless;
+    use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+    use shared::collision::{BodyKind, HavokBodyInfo};
+
+    fn authored_body(mass: f32, inertia: [f32; 9], center_of_mass: [f32; 3]) -> CollisionBody {
+        CollisionBody {
+            node: 1,
+            target: "Clutter01".to_owned(),
+            shapes: vec![0],
+            kind: BodyKind::Dynamic,
+            havok: HavokBodyInfo {
+                motion_system: 3,
+                quality_type: 4,
+                deactivator_type: 1,
+                collision_layer: 4,
+            },
+            mass,
+            inertia,
+            center_of_mass,
+            linear_damping: 0.1,
+            angular_damping: 0.05,
+            friction: 0.6,
+            restitution: 0.3,
+            max_linear_velocity: 7_000.0,
+            max_angular_velocity: 31.0,
+            convex: true,
+        }
+    }
+
+    /// A 20-unit box whose collider sits 10 units above its reference origin, as the converter
+    /// writes a NIF box shape.
+    fn box_body() -> CollisionBody {
+        authored_body(
+            2.0,
+            [30.0, 0.0, 0.0, 0.0, 40.0, 0.0, 0.0, 0.0, 50.0],
+            [0.0, 10.0, 0.0],
+        )
+    }
+
+    /// A 100-unit square platform, heavy enough that a tankard does not move it.
+    fn platform_body() -> CollisionBody {
+        authored_body(
+            200.0,
+            [20_000.0, 0.0, 0.0, 0.0, 20_000.0, 0.0, 0.0, 0.0, 20_000.0],
+            [0.0, 10.0, 0.0],
+        )
+    }
+
+    /// Spawn a placed clutter reference (optionally under a cell root) with one authored collider.
+    fn spawn_clutter(
+        app: &mut App,
+        body: CollisionBody,
+        collider: Collider,
+        center: Vec3,
+        position: Vec3,
+        velocity: Vec3,
+        parent: Option<Entity>,
+    ) -> Entity {
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands| {
+                let mut entity = commands.spawn(Transform::from_translation(position));
+                if let Some(parent) = parent {
+                    entity.insert(ChildOf(parent));
+                }
+                let entity = entity.id();
+                let mass = mass_properties_from_body(&body);
+                spawn_dynamic_clutter(
+                    &mut commands,
+                    entity,
+                    &body,
+                    [(center, &collider)],
+                    mass,
+                    1.0,
+                );
+                commands.entity(entity).insert(Velocity {
+                    linear: velocity,
+                    angular: Vec3::ZERO,
+                });
+                entity
+            })
+            .unwrap()
+    }
+
+    /// Clutter starts asleep, so it stays where it was placed (its support may still be loading);
+    /// once woken it falls and settles on the floor.
+    #[test]
+    fn dynamic_clutter_body_falls_and_settles_on_the_fixture_arena() {
+        let mut app = headless::fixture_app();
+        let entity = spawn_clutter(
+            &mut app,
+            box_body(),
+            Collider::cuboid(10.0, 10.0, 10.0),
+            Vec3::new(0.0, 10.0, 0.0),
+            Vec3::new(-300.0, 400.0, 400.0),
+            Vec3::ZERO,
+            None,
+        );
+        for _ in 0..60 {
+            app.update();
+        }
+        let y = app.world().get::<Transform>(entity).unwrap().translation.y;
+        assert!((y - 400.0).abs() < 1.0e-3, "asleep clutter moved to {y}");
+        app.world_mut()
+            .get_mut::<Sleeping>(entity)
+            .expect("clutter carries Sleeping")
+            .sleeping = false;
+        for _ in 0..600 {
+            app.update();
+        }
+        let y = app.world().get::<Transform>(entity).unwrap().translation.y;
+        // The collider's centre is 10 above the reference origin and the floor top is y = 0.
+        assert!(y.abs() < 3.0, "clutter rests at {y}");
+        let velocity = app.world().get::<Velocity>(entity).unwrap();
+        assert!(
+            velocity.linear.length() < 5.0,
+            "clutter still moving: {velocity:?}"
+        );
+    }
+
+    #[test]
+    fn dynamic_clutter_body_takes_the_authored_mass_tensor_and_surface_values() {
+        let mut app = headless::fixture_app();
+        let entity = spawn_clutter(
+            &mut app,
+            box_body(),
+            Collider::cuboid(10.0, 10.0, 10.0),
+            Vec3::new(0.0, 10.0, 0.0),
+            Vec3::new(-300.0, 500.0, 400.0),
+            Vec3::ZERO,
+            None,
+        );
+        for _ in 0..3 {
+            app.update();
+        }
+        app.world_mut()
+            .run_system_once(move |context: ReadRapierContext| {
+                let context = context.single().expect("rapier context");
+                let handle = context.entity2body()[&entity];
+                let body = context.rigidbody_set.bodies.get(handle).expect("body");
+                let props = body.mass_properties().local_mprops;
+                assert!((props.mass() - 2.0).abs() < 1.0e-3, "mass {}", props.mass());
+                let inertia = props.principal_inertia();
+                let mut sorted = [inertia.x, inertia.y, inertia.z];
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                for (got, want) in sorted.iter().zip([30.0, 40.0, 50.0]) {
+                    assert!((got - want).abs() < 0.01, "inertia {sorted:?}");
+                }
+                assert!((props.local_com.y - 10.0).abs() < 1.0e-3);
+                assert!((body.linear_damping() - 0.1).abs() < 1.0e-6);
+                assert!((body.angular_damping() - 0.05).abs() < 1.0e-6);
+            })
+            .unwrap();
+        // The surface values sit on the colliders: the body entity itself for a single centred
+        // shape, otherwise its collider children.
+        let world = app.world_mut();
+        let mut colliders = world.query::<(Entity, Option<&ChildOf>, &Friction, &Restitution)>();
+        let surfaces: Vec<(f32, f32)> = colliders
+            .iter(world)
+            .filter(|(collider, parent, _, _)| {
+                *collider == entity || parent.is_some_and(|parent| parent.parent() == entity)
+            })
+            .map(|(_, _, friction, restitution)| (friction.coefficient, restitution.coefficient))
+            .collect();
+        assert!(!surfaces.is_empty(), "the body has colliders");
+        for (friction, restitution) in surfaces {
+            assert_eq!(friction, 0.6);
+            assert_eq!(restitution, 0.3);
+        }
+    }
+
+    /// A reference placed at scale 2 keeps its authored mass; the centre of mass moves with the
+    /// scaled shape and the inertia grows with the square of the scale.
+    #[test]
+    fn a_scaled_reference_scales_the_authored_centre_of_mass_and_inertia() {
+        let mut app = headless::fixture_app();
+        let entity = app
+            .world_mut()
+            .run_system_once(move |mut commands: Commands| {
+                let entity = commands
+                    .spawn(
+                        Transform::from_translation(Vec3::new(-300.0, 500.0, 400.0))
+                            .with_scale(Vec3::splat(2.0)),
+                    )
+                    .id();
+                let body = box_body();
+                let mass = mass_properties_from_body(&body);
+                let collider = Collider::cuboid(10.0, 10.0, 10.0);
+                spawn_dynamic_clutter(
+                    &mut commands,
+                    entity,
+                    &body,
+                    [(Vec3::new(0.0, 10.0, 0.0), &collider)],
+                    mass,
+                    2.0,
+                );
+                entity
+            })
+            .unwrap();
+        for _ in 0..3 {
+            app.update();
+        }
+        app.world_mut()
+            .run_system_once(move |context: ReadRapierContext| {
+                let context = context.single().expect("rapier context");
+                let handle = context.entity2body()[&entity];
+                let body = context.rigidbody_set.bodies.get(handle).expect("body");
+                let props = body.mass_properties().local_mprops;
+                assert!((props.mass() - 2.0).abs() < 1.0e-3, "mass {}", props.mass());
+                let inertia = props.principal_inertia();
+                let mut sorted = [inertia.x, inertia.y, inertia.z];
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                for (got, want) in sorted.iter().zip([120.0, 160.0, 200.0]) {
+                    assert!((got - want).abs() < 0.05, "inertia {sorted:?}");
+                }
+                assert!((props.local_com.y - 20.0).abs() < 1.0e-3);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn dynamic_clutter_body_collides_with_a_tankard() {
+        let mut app = headless::fixture_app();
+        let base = Vec3::new(-300.0, 0.0, 400.0);
+        let platform = spawn_clutter(
+            &mut app,
+            platform_body(),
+            Collider::cuboid(50.0, 10.0, 50.0),
+            Vec3::new(0.0, 10.0, 0.0),
+            base,
+            Vec3::ZERO,
+            None,
+        );
+        let tankard = app
+            .world_mut()
+            .spawn((
+                DebugTankard,
+                RigidBody::Dynamic,
+                debug_tankard_collider(),
+                tankard_collision_groups(),
+                ColliderMassProperties::Density(0.001),
+                Velocity::zero(),
+                Transform::from_translation(base + Vec3::Y * 300.0),
+            ))
+            .id();
+        for _ in 0..400 {
+            app.update();
+        }
+        let platform_top = app
+            .world()
+            .get::<Transform>(platform)
+            .unwrap()
+            .translation
+            .y
+            + 20.0;
+        let tankard_y = app.world().get::<Transform>(tankard).unwrap().translation.y;
+        // A tankard that fell through the clutter would rest on the floor, about 14-18 above it.
+        assert!(
+            tankard_y > platform_top + 10.0,
+            "tankard {tankard_y} passed through the clutter top {platform_top}"
+        );
+    }
+
+    #[test]
+    fn a_falling_tankard_knocks_over_a_light_clutter_body() {
+        let mut app = headless::fixture_app();
+        let base = Vec3::new(-300.0, 0.0, 400.0);
+        // A tall light body (1 kg) balanced on one end; the tankard drops onto its top corner.
+        let mut light = authored_body(
+            1.0,
+            [400.0, 0.0, 0.0, 0.0, 400.0, 0.0, 0.0, 0.0, 400.0],
+            [0.0, 40.0, 0.0],
+        );
+        light.restitution = 0.0;
+        let clutter = spawn_clutter(
+            &mut app,
+            light,
+            Collider::cuboid(5.0, 40.0, 5.0),
+            Vec3::new(0.0, 40.0, 0.0),
+            base,
+            Vec3::ZERO,
+            None,
+        );
+        for _ in 0..30 {
+            app.update();
+        }
+        // Control: left alone for as long as the tankard gets below, the body stays standing, so
+        // the rotation the assertion sees comes from the tankard, not from solver jitter.
+        let settled = app.world().get::<Transform>(clutter).unwrap().rotation;
+        for _ in 0..240 {
+            app.update();
+        }
+        let before = app.world().get::<Transform>(clutter).unwrap().rotation;
+        assert!(
+            settled.angle_between(before) < 0.05,
+            "the body tipped over on its own (rotation changed {})",
+            settled.angle_between(before)
+        );
+        app.world_mut().spawn((
+            DebugTankard,
+            RigidBody::Dynamic,
+            debug_tankard_collider(),
+            tankard_collision_groups(),
+            ColliderMassProperties::Density(0.01),
+            Velocity {
+                linear: Vec3::new(120.0, -50.0, 0.0),
+                angular: Vec3::ZERO,
+            },
+            Transform::from_translation(base + Vec3::new(-40.0, 70.0, 0.0)),
+        ));
+        for _ in 0..240 {
+            app.update();
+        }
+        let after = app.world().get::<Transform>(clutter).unwrap().rotation;
+        assert!(
+            before.angle_between(after) > 0.2,
+            "the tankard did not move the clutter body (rotation changed {})",
+            before.angle_between(after)
+        );
+    }
+
+    #[test]
+    fn dynamic_clutter_body_collides_with_the_player_capsule() {
+        let mut app = headless::fixture_app();
+        let base = Vec3::new(-300.0, 0.0, 400.0);
+        let platform = spawn_clutter(
+            &mut app,
+            platform_body(),
+            Collider::cuboid(50.0, 10.0, 50.0),
+            Vec3::new(0.0, 10.0, 0.0),
+            base,
+            Vec3::ZERO,
+            None,
+        );
+        for _ in 0..120 {
+            app.update();
+        }
+        let top = app
+            .world()
+            .get::<Transform>(platform)
+            .unwrap()
+            .translation
+            .y
+            + 20.0;
+        headless::place_player(&mut app, base + Vec3::Y * (top + 150.0));
+        for _ in 0..240 {
+            app.update();
+        }
+        let (pose, grounded) = headless::player_pose(&mut app);
+        let tuning = MovementTuning::default();
+        let rest = top + tuning.capsule_half_height() + tuning.capsule_radius;
+        assert!(grounded, "player not grounded at {pose:?}");
+        assert!(
+            pose.y > rest - 4.0,
+            "player {pose:?} sank through the clutter (rest {rest})"
         );
     }
 }
@@ -770,7 +1499,7 @@ pub struct WalkIntent {
 
 /// WALK sprint toggle; cleared whenever movement or controls stop.
 #[derive(Debug, Clone, Copy, Default, Resource)]
-struct SprintLatch(bool);
+pub(crate) struct SprintLatch(pub(crate) bool);
 
 /// Live walk state: horizontal velocity + vertical velocity (V10, V11).
 #[derive(Debug, Clone, Copy, Default, Component)]
@@ -916,7 +1645,10 @@ pub fn try_enter_walk(
             candidate,
             Quat::IDENTITY,
             shape,
-            QueryFilter::default().groups(CollisionGroups::new(GROUP_PLAYER, GROUP_WORLD)),
+            QueryFilter::default().groups(CollisionGroups::new(
+                GROUP_PLAYER,
+                GROUP_WORLD | GROUP_CLUTTER,
+            )),
             |_| {
                 overlapping = true;
                 false
@@ -930,21 +1662,26 @@ pub fn try_enter_walk(
     Err("no free capsule placement nearby".to_owned())
 }
 
-/// Everything `clear_motion_state` touches, optional so the console works in partial apps.
+/// The pending-input state a pause drops, optional so the console works in partial apps.
 #[derive(SystemParam)]
 pub(crate) struct MotionReset<'w, 's> {
     intent: Option<ResMut<'w, WalkIntent>>,
     sprint: Option<ResMut<'w, SprintLatch>>,
-    states: Query<'w, 's, &'static mut WalkState>,
     controllers: Query<'w, 's, &'static mut KinematicCharacterController>,
 }
 
 impl MotionReset<'_, '_> {
-    pub(crate) fn clear(&mut self) {
-        if let (Some(intent), Some(sprint)) =
-            (self.intent.as_deref_mut(), self.sprint.as_deref_mut())
-        {
-            clear_motion_state(intent, sprint, &mut self.states, &mut self.controllers);
+    /// Drops pending input only: walk intent, the sprint latch and the queued controller
+    /// translation. Velocity and jump state stay, so a pause resumes the motion where it stopped.
+    pub(crate) fn clear_input(&mut self) {
+        if let Some(intent) = self.intent.as_deref_mut() {
+            *intent = WalkIntent::default();
+        }
+        if let Some(sprint) = self.sprint.as_deref_mut() {
+            sprint.0 = false;
+        }
+        for mut controller in &mut self.controllers {
+            controller.translation = None;
         }
     }
 }
@@ -1475,6 +2212,13 @@ mod simulation_tests {
         };
         assert_eq!(start.len(), 3);
         assert!(start.iter().all(|y| *y > 200.0));
+        let continuous = app
+            .world_mut()
+            .query_filtered::<&Ccd, With<DebugTankard>>()
+            .iter(app.world())
+            .filter(|ccd| ccd.enabled)
+            .count();
+        assert_eq!(continuous, 3, "every tankard has continuous collision");
         for _ in 0..600 {
             app.update();
         }
@@ -1657,25 +2401,16 @@ pub fn noclip_displacement(
 
 fn noclip_overlay_text(mode: MoveMode, status: &WalkEntryStatus) -> String {
     let base = match mode {
-        MoveMode::Noclip => "NOCLIP: ON  [V]",
-        MoveMode::Walk => "NOCLIP: OFF  [V]",
+        MoveMode::Noclip => "NOCLIP: ON",
+        MoveMode::Walk => "NOCLIP: OFF",
     };
     match &status.blocked_reason {
-        Some(reason) => format!("{base}  [T] tankard  [E] grab/drop  WALK blocked: {reason}"),
-        None => format!("{base}  [T] tankard  [E] grab/drop"),
+        Some(reason) => format!("{base}  WALK blocked: {reason}"),
+        None => base.to_owned(),
     }
 }
 
-fn toggle_collision_debug_system(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    mut debug: ResMut<DebugRenderContext>,
-) {
-    if keyboard.just_pressed(KeyCode::F3) {
-        flip_collision_debug(&mut debug);
-    }
-}
-
-/// Flip the rapier collider outlines; shared by the F3 key and the `tcg` command.
+/// Flip the Rapier collider outlines for the `tcg` command.
 fn flip_collision_debug(debug: &mut DebugRenderContext) {
     debug.enabled = !debug.enabled;
 }
@@ -1769,7 +2504,7 @@ fn setup_controlled_player(
     commands.spawn((
         Name::new("Noclip overlay"),
         NoclipOverlay,
-        Text::new("NOCLIP: ON  [V]    [T] tankard  [E] grab/drop"),
+        Text::new("NOCLIP: ON"),
         TextFont::from_font_size(18.0),
         TextColor(Color::WHITE),
         Node {
@@ -1781,8 +2516,25 @@ fn setup_controlled_player(
     ));
 }
 
-/// T spawns a test tankard and E grabs or drops one, only while the cursor is captured.
-/// Riverwood test objects stay in world coordinates and are never children of a streamed cell.
+type PickupFilter = Or<(With<DebugTankard>, With<DynamicClutter>)>;
+
+/// Resolve a compound collider child to the authored dynamic-body root.
+fn pickup_root(
+    mut entity: Entity,
+    parents: &Query<&ChildOf>,
+    objects: &Query<(), PickupFilter>,
+) -> Option<Entity> {
+    loop {
+        if objects.get(entity).is_ok() {
+            return Some(entity);
+        }
+        entity = parents.get(entity).ok()?.parent();
+    }
+}
+
+/// T spawns a test tankard; E grabs or drops a tankard or authored dynamic clutter,
+/// only while the cursor is captured. Debug tankards stay in world coordinates and are never
+/// children of a streamed cell; authored bodies keep their streamed-cell parent.
 #[allow(clippy::too_many_arguments)]
 fn world_tankard_input(
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -1790,6 +2542,8 @@ fn world_tankard_input(
     camera: Query<&Transform, (With<StreamingCamera>, With<ControlledCamera>)>,
     terrain: Query<(), With<TerrainCollider>>,
     tankards: Query<(), With<DebugTankard>>,
+    interactables: Query<(), PickupFilter>,
+    parents: Query<&ChildOf>,
     player: Query<Entity, With<PlayerBody>>,
     visuals: Option<Res<TankardVisuals>>,
     mut held: ResMut<HeldTankard>,
@@ -1827,11 +2581,17 @@ fn world_tankard_input(
         return;
     }
     if let Some(entity) = held.0.take() {
-        if tankards.get(entity).is_ok() {
+        if interactables.get(entity).is_ok() {
             commands
                 .entity(entity)
                 .remove::<(RigidBodyDisabled, ColliderDisabled)>();
-            commands.entity(entity).insert(Velocity::zero());
+            commands.entity(entity).insert((
+                Velocity::zero(),
+                Sleeping {
+                    sleeping: false,
+                    ..default()
+                },
+            ));
         }
         return;
     }
@@ -1840,14 +2600,16 @@ fn world_tankard_input(
     } else {
         QueryFilter::default()
     };
-    if let Some((entity, _)) = context.cast_ray(
-        camera.translation,
-        camera.forward().as_vec3(),
-        240.0,
-        true,
-        filter,
-    ) && tankards.get(entity).is_ok()
-    {
+    let selected = context
+        .cast_ray(
+            camera.translation,
+            camera.forward().as_vec3(),
+            240.0,
+            true,
+            filter,
+        )
+        .and_then(|(entity, _)| pickup_root(entity, &parents, &interactables));
+    if let Some(entity) = selected {
         commands
             .entity(entity)
             .insert((RigidBodyDisabled, ColliderDisabled, Velocity::zero()));
@@ -1864,16 +2626,34 @@ fn move_held_tankard(
             With<StreamingCamera>,
             With<ControlledCamera>,
             Without<DebugTankard>,
+            Without<DynamicClutter>,
         ),
     >,
-    mut tankards: Query<&mut Transform, (With<DebugTankard>, Without<StreamingCamera>)>,
+    mut tankards: Query<
+        (&mut Transform, Option<&ChildOf>),
+        (
+            Or<(With<DebugTankard>, With<DynamicClutter>)>,
+            Without<StreamingCamera>,
+        ),
+    >,
+    parents: Query<&GlobalTransform>,
 ) {
     let Some(entity) = held.0 else { return };
-    let (Ok(camera), Ok(mut tankard)) = (camera.single(), tankards.get_mut(entity)) else {
+    let (Ok(camera), Ok((mut tankard, parent))) = (camera.single(), tankards.get_mut(entity))
+    else {
         held.0 = None;
         return;
     };
-    tankard.translation = camera.translation + camera.forward().as_vec3() * 110.0;
+    let position = camera.translation + camera.forward().as_vec3() * 110.0;
+    tankard.translation = match parent {
+        Some(parent) => {
+            let Ok(transform) = parents.get(parent.parent()) else {
+                return;
+            };
+            transform.affine().inverse().transform_point3(position)
+        }
+        None => position,
+    };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1888,14 +2668,15 @@ fn cursor_lifecycle_system(
     mut states: Query<&mut WalkState>,
     mut controllers: Query<&mut KinematicCharacterController>,
     console: Option<Res<ConsoleState>>,
+    menu: Option<Res<crate::settings_ui::SettingsMenuState>>,
 ) {
-    // Focus loss or Escape releases; click recaptures (V6). While the console is open, and on the
-    // frame it closes, it owns the capture state, so none of that applies; the cursor options
-    // below still follow it.
+    // Focus loss or F3 releases; click recaptures (V6). The console and settings menu own capture
+    // while open and on their closing frame; the cursor options below still follow that state.
     let focused = windows.iter().all(|window| window.focused);
-    let console_owns_capture = console.is_some_and(|console| console.open || console.closing);
+    let console_owns_capture = console.is_some_and(|console| console.open || console.closing)
+        || menu.is_some_and(|menu| menu.blocks_gameplay());
     if !console_owns_capture {
-        if !focused || keyboard.just_pressed(KeyCode::Escape) {
+        if !focused || keyboard.just_pressed(KeyCode::F3) {
             if *capture == CursorCapture::Captured {
                 *capture = CursorCapture::Released;
                 clear_motion_state(&mut intent, &mut sprint, &mut states, &mut controllers);
@@ -2029,6 +2810,7 @@ fn toggle_mode_system(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn toggle_move_mode_effect(
     tuning: Res<MovementTuning>,
+    mut crossing: Option<ResMut<crate::door_crossing::DoorCrossing>>,
     context: ReadRapierContext,
     mut mode: ResMut<MoveMode>,
     mut status: ResMut<WalkEntryStatus>,
@@ -2047,6 +2829,20 @@ fn toggle_move_mode_effect(
     // A reason from an earlier attempt must not outlive it: if this attempt stops early
     // (no camera, player or physics context), the caller reports "no player" instead.
     status.blocked_reason = None;
+    if let Some(crossing) = crossing.as_mut().filter(|crossing| crossing.is_active()) {
+        if crossing.needs_recovery() {
+            let Ok((entity, _, _)) = player.single() else {
+                return;
+            };
+            commands.entity(entity).insert(RigidBodyDisabled);
+            *mode = MoveMode::Noclip;
+            clear_motion_state(&mut intent, &mut sprint, &mut states, &mut controllers);
+            crossing.finish_recovery();
+            return;
+        }
+        status.blocked_reason = Some("door crossing in progress".to_owned());
+        return;
+    }
     match *mode {
         MoveMode::Noclip => {
             let (Ok(camera), Ok((entity, mut body, collider)), Ok(context)) =
@@ -2108,12 +2904,19 @@ fn toggle_collision_command() -> ConsoleCommand {
                 return Err("noclip is not available in this run".to_owned());
             }
             let before = *world.resource::<MoveMode>();
+            let recovering = world
+                .get_resource::<crate::door_crossing::DoorCrossing>()
+                .is_some_and(|crossing| crossing.needs_recovery());
             let Some(effect) = world.get_resource::<MoveModeEffect>().map(|e| e.0) else {
                 return Err("noclip is not available in this run".to_owned());
             };
             world.run_system(effect).map_err(|e| e.to_string())?;
             let after = *world.resource::<MoveMode>();
-            if after == before {
+            let recovered = recovering
+                && world
+                    .get_resource::<crate::door_crossing::DoorCrossing>()
+                    .is_some_and(|crossing| !crossing.is_active());
+            if after == before && !recovered {
                 let reason = world
                     .get_resource::<WalkEntryStatus>()
                     .and_then(|status| status.blocked_reason.clone());
@@ -2130,13 +2933,13 @@ fn toggle_collision_command() -> ConsoleCommand {
     }
 }
 
-/// Skyrim's `ToggleCollisionGeometry` / `tcg`; the `F3` key runs the same effect.
+/// Skyrim's `ToggleCollisionGeometry` / `tcg`; also available in the Graphics settings tab.
 fn toggle_collision_geometry_command() -> ConsoleCommand {
     ConsoleCommand {
         name: "ToggleCollisionGeometry",
         short: Some("tcg"),
         usage: "ToggleCollisionGeometry",
-        help: "toggle the collision outlines (key F3)",
+        help: "toggle the collision outlines (also in Graphics settings)",
         handler: Box::new(|world, args| {
             no_args(args, "ToggleCollisionGeometry")?;
             let Some(mut debug) = world.get_resource_mut::<DebugRenderContext>() else {
@@ -2155,6 +2958,7 @@ fn overlay_system(
     mode: Res<MoveMode>,
     status: Res<WalkEntryStatus>,
     sprint: Res<SprintLatch>,
+    crossing: Option<Res<crate::door_crossing::DoorCrossing>>,
     collision_debug: Option<Res<DebugRenderContext>>,
     player: Query<Option<&KinematicCharacterControllerOutput>, With<PlayerBody>>,
     mut overlay: Query<&mut Text, With<NoclipOverlay>>,
@@ -2166,16 +2970,19 @@ fn overlay_system(
     if *mode == MoveMode::Walk {
         let speed = actual_walk_speed(player.single().ok().flatten());
         let sprint_status = if sprint.0 { "ON" } else { "OFF" };
-        label.push_str(&format!(
-            "  SPRINT: {sprint_status}  [ALT]  SPEED: {speed:.0} u/s"
-        ));
+        label.push_str(&format!("  SPRINT: {sprint_status}  SPEED: {speed:.0} u/s"));
     }
     if let Some(debug) = collision_debug {
         label.push_str(if debug.enabled {
-            "  COLLISION: ON  [F3]"
+            "  COLLISION: ON"
         } else {
-            "  COLLISION: OFF  [F3]"
+            "  COLLISION: OFF"
         });
+    }
+    if crossing.is_some_and(|crossing| crossing.needs_recovery()) {
+        label.push_str(
+            "\nDoor crossing failed. Movement paused. Press V or use tcl to recover in noclip.",
+        );
     }
     **text = label;
 }
@@ -2203,6 +3010,7 @@ fn sprint_fov_system(
     time: Res<Time>,
     player: Query<Option<&KinematicCharacterControllerOutput>, With<PlayerBody>>,
     mut camera: Query<&mut Projection, (With<StreamingCamera>, With<ControlledCamera>)>,
+    settings: Option<Res<crate::settings::RenderingSettings>>,
 ) {
     let Ok(mut projection) = camera.single_mut() else {
         return;
@@ -2210,7 +3018,11 @@ fn sprint_fov_system(
     let Projection::Perspective(perspective) = &mut *projection else {
         return;
     };
-    let base_fov = PerspectiveProjection::default().fov;
+    let base_fov = settings
+        .as_deref()
+        .map_or(PerspectiveProjection::default().fov, |settings| {
+            settings.fov_degrees.to_radians()
+        });
     let moving = actual_walk_speed(player.single().ok().flatten()) > 1.0;
     let target_fov = if *mode == MoveMode::Walk && sprint.0 && moving {
         base_fov + SPRINT_FOV_BONUS_DEGREES.to_radians()
@@ -2224,6 +3036,109 @@ fn sprint_fov_system(
 mod noclip_tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
+
+    #[test]
+    fn authored_compound_clutter_grab_uses_parent_space_and_wakes_on_drop() {
+        let mut app = headless::fixture_app();
+        app.init_resource::<HeldTankard>();
+        app.insert_resource(CursorCapture::Captured);
+        let parent = app
+            .world_mut()
+            .spawn((
+                Transform::from_xyz(500.0, 0.0, 0.0),
+                GlobalTransform::default(),
+            ))
+            .id();
+        let body = app
+            .world_mut()
+            .spawn((
+                DynamicClutter {
+                    max_linear_velocity: 2000.0,
+                    max_angular_velocity: 20.0,
+                },
+                RigidBody::Dynamic,
+                Velocity::zero(),
+                Sleeping {
+                    sleeping: true,
+                    ..default()
+                },
+                Transform::from_xyz(0.0, 200.0, -160.0),
+                GlobalTransform::default(),
+                ChildOf(parent),
+            ))
+            .id();
+        app.world_mut().spawn((
+            Collider::cuboid(10.0, 10.0, 10.0),
+            clutter_collision_groups(),
+            Transform::default(),
+            GlobalTransform::default(),
+            ChildOf(body),
+        ));
+        let camera = app
+            .world_mut()
+            .query_filtered::<Entity, With<ControlledCamera>>()
+            .single(app.world())
+            .unwrap();
+        *app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap() = Transform::from_xyz(500.0, 200.0, 0.0);
+        app.update();
+        app.insert_resource(CursorCapture::Captured);
+        *app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap() = Transform::from_xyz(500.0, 200.0, 0.0);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyE);
+        app.world_mut()
+            .run_system_once(world_tankard_input)
+            .unwrap();
+        assert_eq!(app.world().resource::<HeldTankard>().0, Some(body));
+        assert!(app.world().entity(body).contains::<RigidBodyDisabled>());
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation
+            .x += 40.0;
+        app.world_mut().run_system_once(move_held_tankard).unwrap();
+        let position = app
+            .world()
+            .entity(body)
+            .get::<Transform>()
+            .unwrap()
+            .translation;
+        assert!(
+            position.abs_diff_eq(Vec3::new(40.0, 200.0, -110.0), 0.01),
+            "{position:?}"
+        );
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.release(KeyCode::KeyE);
+            keys.clear();
+            keys.press(KeyCode::KeyE);
+        }
+        app.world_mut()
+            .run_system_once(world_tankard_input)
+            .unwrap();
+        assert_eq!(app.world().resource::<HeldTankard>().0, None);
+        assert!(!app.world().entity(body).contains::<RigidBodyDisabled>());
+        assert!(!app.world().entity(body).get::<Sleeping>().unwrap().sleeping);
+        for _ in 0..10 {
+            app.update();
+        }
+        assert!(
+            app.world()
+                .entity(body)
+                .get::<Transform>()
+                .unwrap()
+                .translation
+                .y
+                < position.y
+        );
+    }
 
     #[test]
     fn sprint_fov_interpolation_is_exponential_and_returns_to_base() {
@@ -2393,16 +3308,10 @@ mod noclip_tests {
     }
 
     #[test]
-    fn overlay_reports_mode_with_key_hint_and_block_reason() {
+    fn overlay_reports_mode_and_block_reason_without_control_hints() {
         let status = WalkEntryStatus::default();
-        assert_eq!(
-            noclip_overlay_text(MoveMode::Noclip, &status),
-            "NOCLIP: ON  [V]  [T] tankard  [E] grab/drop"
-        );
-        assert_eq!(
-            noclip_overlay_text(MoveMode::Walk, &status),
-            "NOCLIP: OFF  [V]  [T] tankard  [E] grab/drop"
-        );
+        assert_eq!(noclip_overlay_text(MoveMode::Noclip, &status), "NOCLIP: ON");
+        assert_eq!(noclip_overlay_text(MoveMode::Walk, &status), "NOCLIP: OFF");
         let blocked = WalkEntryStatus {
             blocked_reason: Some("no free capsule placement nearby".to_owned()),
         };
@@ -2513,6 +3422,13 @@ mod gate_tests {
             );
         app.update();
         app.insert_resource(CursorCapture::Captured);
+        // The Riverwood test tankards already exist; the one T spawns is the one not listed here.
+        let existing: Vec<Entity> = {
+            let mut query = app
+                .world_mut()
+                .query_filtered::<Entity, With<DebugTankard>>();
+            query.iter(app.world()).collect()
+        };
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::KeyT);
@@ -2556,7 +3472,7 @@ mod gate_tests {
                 .query_filtered::<(Entity, &Transform), With<DebugTankard>>();
             query
                 .iter(app.world())
-                .find(|(_, pose)| pose.translation.z < -100.0 && pose.translation.x.abs() < 1.0)
+                .find(|(entity, _)| !existing.contains(entity))
                 .map(|(entity, pose)| (entity, pose.translation))
                 .expect("spawned tankard above terrain")
         };
@@ -2780,10 +3696,7 @@ mod gate_tests {
             .world_mut()
             .query_filtered::<&Text, With<NoclipOverlay>>();
         let text = query.single(app.world()).expect("overlay").clone();
-        assert_eq!(
-            text.as_str(),
-            "NOCLIP: OFF  [V]  [T] tankard  [E] grab/drop  SPRINT: OFF  [ALT]  SPEED: 0 u/s"
-        );
+        assert_eq!(text.as_str(), "NOCLIP: OFF  SPRINT: OFF  SPEED: 0 u/s");
         app.insert_resource(MoveMode::Noclip);
         for _ in 0..5 {
             app.update();
@@ -2792,7 +3705,26 @@ mod gate_tests {
             .world_mut()
             .query_filtered::<&Text, With<NoclipOverlay>>();
         let text = query.single(app.world()).expect("overlay").clone();
-        assert_eq!(text.as_str(), "NOCLIP: ON  [V]  [T] tankard  [E] grab/drop");
+        assert_eq!(text.as_str(), "NOCLIP: ON");
+    }
+
+    #[test]
+    fn a_failed_crossing_holds_the_walking_body_and_shows_how_to_recover() {
+        let mut app = headless::fixture_app();
+        let start = Vec3::new(0.0, 5_000.0, 0.0);
+        headless::place_player(&mut app, start);
+        app.insert_resource(crate::door_crossing::DoorCrossing::recovery_for_test());
+        for _ in 0..60 {
+            app.update();
+        }
+        let (held, _) = headless::player_pose(&mut app);
+        assert!((held - start).length() < 1.0, "unguarded fall: {held}");
+        let mut query = app
+            .world_mut()
+            .query_filtered::<&Text, With<NoclipOverlay>>();
+        let text = query.single(app.world()).unwrap();
+        assert!(text.contains("Movement paused"));
+        assert!(text.contains("Press V or use tcl to recover in noclip"));
     }
 
     #[test]
@@ -2895,8 +3827,7 @@ mod console_tests {
             // `ToggleCollision`/`tcl` comes in with `PlayerControlsPlugin` through the fixture.
             app.add_plugins(ConsolePlugin)
                 .add_console_command(toggle_collision_geometry_command())
-                .insert_resource(DebugRenderContext::default())
-                .add_systems(Update, toggle_collision_debug_system.run_if(console_closed));
+                .insert_resource(DebugRenderContext::default());
         });
         app.update();
         app
@@ -2938,7 +3869,7 @@ mod console_tests {
             "Help [text] - ",
             "ClearConsole - ",
             "ToggleCollision [tcl] - toggle noclip flight and walking (key V)",
-            "ToggleCollisionGeometry [tcg] - toggle the collision outlines (key F3)",
+            "ToggleCollisionGeometry [tcg] - toggle the collision outlines (also in Graphics settings)",
         ] {
             assert!(text.contains(line), "Help is missing {line}: {text}");
         }
@@ -2965,6 +3896,63 @@ mod console_tests {
         assert_eq!(mode(&app), MoveMode::Noclip);
         execute_line(app.world_mut(), "togglecollision");
         assert_eq!(mode(&app), MoveMode::Walk);
+    }
+
+    #[test]
+    fn crossing_blocks_both_mode_switch_entry_points_in_both_modes() {
+        for initial in [MoveMode::Noclip, MoveMode::Walk] {
+            let mut app = console_fixture();
+            app.insert_resource(initial);
+            app.insert_resource(CursorCapture::Captured);
+            app.insert_resource(crate::door_crossing::DoorCrossing::holding_for_test());
+            press(&mut app, KeyCode::KeyV);
+            app.world_mut().run_system_once(toggle_mode_system).unwrap();
+            assert_eq!(mode(&app), initial, "V must preserve mode during crossing");
+            execute_line(app.world_mut(), "tcl");
+            assert_eq!(
+                mode(&app),
+                initial,
+                "tcl must preserve mode during crossing"
+            );
+            assert!(scrollback(&app).contains("door crossing in progress"));
+            app.insert_resource(crate::door_crossing::DoorCrossing::default());
+            execute_line(app.world_mut(), "tcl");
+            assert_ne!(mode(&app), initial, "switching resumes after crossing");
+        }
+    }
+
+    #[test]
+    fn failed_crossing_recovery_uses_noclip_from_both_modes_and_entry_points() {
+        for initial in [MoveMode::Noclip, MoveMode::Walk] {
+            for keyed in [false, true] {
+                let mut app = console_fixture();
+                app.insert_resource(initial);
+                app.insert_resource(CursorCapture::Captured);
+                app.insert_resource(crate::door_crossing::DoorCrossing::recovery_for_test());
+                if keyed {
+                    press(&mut app, KeyCode::KeyV);
+                    app.world_mut().run_system_once(toggle_mode_system).unwrap();
+                } else {
+                    execute_line(app.world_mut(), "tcl");
+                    assert!(scrollback(&app).contains("noclip ON"));
+                }
+                assert_eq!(mode(&app), MoveMode::Noclip);
+                assert!(
+                    !app.world()
+                        .resource::<crate::door_crossing::DoorCrossing>()
+                        .is_active()
+                );
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<&RigidBodyDisabled, With<PlayerBody>>();
+                assert_eq!(players.iter(app.world()).count(), 1);
+                assert!(
+                    app.world_mut()
+                        .run_system_once(crate::door_crossing::no_door_crossing)
+                        .unwrap()
+                );
+            }
+        }
     }
 
     #[test]
@@ -3011,16 +3999,10 @@ mod console_tests {
     }
 
     #[test]
-    fn key_and_command_agree_on_collision_outlines() {
-        let mut keyed = console_fixture();
-        let before = keyed.world().resource::<DebugRenderContext>().enabled;
-        press(&mut keyed, KeyCode::F3);
-        keyed
-            .world_mut()
-            .run_system_once(toggle_collision_debug_system)
-            .unwrap();
+    fn command_toggles_collision_outlines() {
         let mut commanded = console_fixture();
-        // The removed `f3` alias is unknown; Skyrim's `tcg` runs the key's effect.
+        let before = commanded.world().resource::<DebugRenderContext>().enabled;
+        // F3 releases the mouse; Skyrim's `tcg` controls collision outlines.
         execute_line(commanded.world_mut(), "f3");
         assert!(scrollback(&commanded).contains("unknown command \"f3\""));
         assert_eq!(
@@ -3028,11 +4010,9 @@ mod console_tests {
             before
         );
         execute_line(commanded.world_mut(), "tcg");
-        let key_state = keyed.world().resource::<DebugRenderContext>().enabled;
-        assert_ne!(key_state, before);
-        assert_eq!(
-            key_state,
-            commanded.world().resource::<DebugRenderContext>().enabled
+        assert_ne!(
+            commanded.world().resource::<DebugRenderContext>().enabled,
+            before
         );
         execute_line(commanded.world_mut(), "ToggleCollisionGeometry");
         assert_eq!(
@@ -3165,10 +4145,15 @@ mod console_tests {
         app.insert_resource(CursorCapture::Captured);
         let before = app.world().resource::<DebugRenderContext>().enabled;
         send_key(&mut app, KeyCode::KeyV);
-        send_key(&mut app, KeyCode::F3);
         app.update();
         assert_eq!(mode(&app), MoveMode::Walk, "{}", scrollback(&app));
-        assert_ne!(app.world().resource::<DebugRenderContext>().enabled, before);
+        send_key(&mut app, KeyCode::F3);
+        app.update();
+        assert_eq!(
+            *app.world().resource::<CursorCapture>(),
+            CursorCapture::Released
+        );
+        assert_eq!(app.world().resource::<DebugRenderContext>().enabled, before);
     }
 
     fn send_state(app: &mut App, key_code: KeyCode, state: bevy::input::ButtonState) {
@@ -3234,6 +4219,72 @@ mod console_tests {
 #[cfg(test)]
 mod teleport_tests {
     use super::*;
+
+    #[test]
+    fn noclip_flight_pauses_during_a_door_crossing_and_resumes_afterward() {
+        let mut app = headless::fixture_app();
+        app.insert_resource(MoveMode::Noclip);
+        app.insert_resource(CursorCapture::Captured);
+        app.insert_resource(crate::door_crossing::DoorCrossing::holding_for_test());
+        let camera_position = |app: &mut App| {
+            app.world_mut()
+                .query_filtered::<&Transform, With<StreamingCamera>>()
+                .single(app.world())
+                .unwrap()
+                .translation
+        };
+        let start = camera_position(&mut app);
+        app.world_mut()
+            .write_message(bevy::input::keyboard::KeyboardInput {
+                key_code: KeyCode::KeyW,
+                logical_key: bevy::input::keyboard::Key::Character("w".into()),
+                state: bevy::input::ButtonState::Pressed,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+        for _ in 0..360 {
+            app.update();
+        }
+        assert_eq!(camera_position(&mut app), start);
+        app.insert_resource(crate::door_crossing::DoorCrossing::default());
+        for _ in 0..360 {
+            app.update();
+        }
+        assert!((camera_position(&mut app) - start).length() > 4096.0);
+    }
+
+    /// A WALK body over nothing does not fall, or walk, while a door crossing holds the screen
+    /// black, and falls again once the crossing is over.
+    #[test]
+    fn walking_pauses_during_a_door_crossing() {
+        let mut app = headless::fixture_app();
+        let start = Vec3::new(0.0, 5_000.0, 0.0);
+        headless::place_player(&mut app, start);
+        app.insert_resource(crate::door_crossing::DoorCrossing::holding_for_test());
+        {
+            let mut intent = app.world_mut().resource_mut::<WalkIntent>();
+            intent.wish_dir = Vec3::NEG_Z;
+            intent.target_speed = 300.0;
+        }
+        for _ in 0..30 {
+            app.update();
+        }
+        let (held, _) = headless::player_pose(&mut app);
+        assert!(
+            (held - start).length() < 1.0,
+            "moved during the crossing: {held}"
+        );
+        app.insert_resource(crate::door_crossing::DoorCrossing::default());
+        for _ in 0..30 {
+            app.update();
+        }
+        let (after, _) = headless::player_pose(&mut app);
+        assert!(
+            after.y < start.y - 10.0,
+            "did not fall after the crossing: {after}"
+        );
+    }
 
     #[test]
     fn teleport_player_moves_the_body_and_zeroes_its_velocity() {

@@ -8,7 +8,7 @@
 //! [`crate::terrain_chunks`] groups and writes the meshes. Every winning LTEX of the merged
 //! records becomes an array source; each exterior cell with a grid square builds one mesh from
 //! the one LAND it keeps — the LAND whose version comes from the plugin latest in the load
-//! order ([`crate::esm::cell_cache::land_per_cell`], the choice the cell cache uses too) — keyed
+//! order ([`crate::esm::cell_cache::merged_terrain_lands`], the choice the cell cache uses too) — keyed
 //! by [`crate::terrain_chunks::cell_mesh_key`] over the LAND, its plugin's master list and the
 //! LTEX and TXST records the LAND names. The LANDs a cell drops are reported in
 //! [`TerrainReport::warnings`].
@@ -49,9 +49,9 @@
 
 use crate::{
     asset_path::{AssetKind, canonical_asset_path},
-    config::{PipelineConfig, TerrainDefaultTexture},
+    config::{PipelineConfig, RecordReader, TerrainDefaultTexture},
     esm::{
-        cell_cache::{extract_texture_layers, land_per_cell},
+        cell_cache::{extract_texture_layers, merged_terrain_lands},
         extractors::{SubrecordView, extract_cell_info},
         load_order::LoadOrder,
         records::RawRecord,
@@ -107,6 +107,19 @@ pub fn terrain_records(merged: HashMap<u32, RawRecord>) -> HashMap<u32, RawRecor
         .into_iter()
         .filter(|(_, record)| TERRAIN_RECORD_TYPES.contains(&&record.record_type))
         .collect()
+}
+
+/// The native record positions the cell cache orders LANDs by, for the reader a conversion used.
+/// The in-house reader writes them into the database it exports, so they are read back from it;
+/// the legacy reader has none, so every LAND is ordered by load order and FormID alone.
+pub fn cell_cache_source_offsets(
+    reader: RecordReader,
+    db_path: &Path,
+) -> Result<HashMap<u32, u64>> {
+    match reader {
+        RecordReader::Inhouse => crate::esm::inhouse::terrain_source_offsets(db_path),
+        RecordReader::Legacy => Ok(HashMap::new()),
+    }
 }
 
 /// The conversion settings a merged-terrain build reads.
@@ -271,6 +284,7 @@ pub fn build_merged_terrain(
     staging: &Path,
     merged: &HashMap<u32, RawRecord>,
     masters: &PluginMasters,
+    source_offsets: &HashMap<u32, u64>,
     options: &TerrainOptions,
 ) -> Result<TerrainReport> {
     let started = Instant::now();
@@ -324,12 +338,13 @@ pub fn build_merged_terrain(
     let mut placed: Vec<PlacedCellMesh> = Vec::new();
     let mut skipped_cells: Vec<SkippedCell> = Vec::new();
     let mut stats = CellStats::default();
-    // One LAND per cell, chosen by load order the way the cell cache chooses: the dropped
-    // LANDs are reported with the stage's other warnings, and two LANDs for one cell from the
-    // same load-order slot are an error. The database stage has already checked this when the
-    // option is on, so an error here is a wiring bug, not the run's first sight of one.
-    let (lands, land_warnings) = land_per_cell(merged, true)?;
-    for land in lands.values() {
+    // One LAND per cell, chosen the way the cell cache chooses (the same native positions order
+    // it): the dropped LANDs are reported with the stage's other warnings, and two LANDs for one
+    // cell from the same load-order slot without positions are an error. The conversion has
+    // already checked this before the texture and LOD stages, so an error here is a wiring bug.
+    let (lands, land_warnings) = merged_terrain_lands(merged, source_offsets)?;
+    for form_id in lands.values() {
+        let land = &merged[form_id];
         match cell_mesh(merged, masters, land, &known) {
             Ok((cell, report)) => {
                 stats.observe(&report);
@@ -361,12 +376,13 @@ pub fn build_merged_terrain(
     let default_texture_source = reconcile_default_source(default_texture_source, &array_report);
     let mut warnings = land_warnings;
     warnings.extend(array_report.warnings());
+    let default_fell_back = matches!(
+        default_texture_source,
+        DefaultTextureSource::SkyrimIniFallback { .. }
+    );
     for skipped in &pre_skipped {
         if skipped.ltex_form_id == DEFAULT_LAND_TEXTURE_FORM_ID {
-            warnings.push(format!(
-                "the default land texture falls back to the generated white one: {}",
-                skipped.reason
-            ));
+            warnings.push(default_skip_warning(&skipped.reason, default_fell_back));
             continue;
         }
         warnings.push(format!(
@@ -434,6 +450,7 @@ pub fn build_merged_terrain(
 pub async fn run_merged_terrain_stage(
     staging: &Path,
     records: Option<HashMap<u32, RawRecord>>,
+    source_offsets: HashMap<u32, u64>,
     plugins: &[PathBuf],
     options: &TerrainOptions,
     progress_tx: &Sender<ProgressEvent>,
@@ -460,10 +477,11 @@ pub async fn run_merged_terrain_stage(
     let masters = load_order_masters(&order);
     let staging = staging.to_path_buf();
     let options = options.clone();
-    let terrain =
-        spawn_blocking(move || build_merged_terrain(&staging, &records, &masters, &options))
-            .await
-            .wrap_err("the merged terrain worker panicked")??;
+    let terrain = spawn_blocking(move || {
+        build_merged_terrain(&staging, &records, &masters, &source_offsets, &options)
+    })
+    .await
+    .wrap_err("the merged terrain worker panicked")??;
     // Everything the stage wrote is published by name, as the LOD stage does with its payloads.
     report
         .artifacts
@@ -801,6 +819,17 @@ fn reconcile_default_source(
         ini,
         diffuse,
         normal,
+    }
+}
+
+/// The warning for an entry-0 source that could not be used. Entry 0 is the generated white texture
+/// only when the default diffuse fell back, which the default source already reports; a skipped
+/// default normal map leaves the diffuse in place, so the warning must not claim the white one.
+fn default_skip_warning(reason: &str, default_fell_back: bool) -> String {
+    if default_fell_back {
+        format!("the default land texture falls back to the generated white one: {reason}")
+    } else {
+        format!("the default land normal map is left out, the default diffuse stays: {reason}")
     }
 }
 
@@ -1162,6 +1191,7 @@ mod tests {
                 staging.path(),
                 &records,
                 &masters,
+                &HashMap::new(),
                 &TerrainOptions::default(),
             )
             .unwrap();
@@ -1199,6 +1229,20 @@ mod tests {
         }
     }
 
+    /// A skipped default normal map does not turn the default albedo into the white texture in the
+    /// warning; only a fallen-back diffuse does.
+    #[test]
+    fn a_skipped_default_normal_map_does_not_claim_the_white_albedo() {
+        let normal = default_skip_warning("the default normal texture cannot be resolved", false);
+        assert!(!normal.contains("white"), "{normal}");
+        assert!(normal.contains("the default diffuse stays"), "{normal}");
+        let diffuse = default_skip_warning("the default land texture cannot be resolved", true);
+        assert!(
+            diffuse.contains("falls back to the generated white one"),
+            "{diffuse}"
+        );
+    }
+
     /// Two distinct LANDs for one cell from the same load-order slot stop the terrain build:
     /// the game's order for that case is not established, so nothing is picked.
     #[test]
@@ -1212,6 +1256,7 @@ mod tests {
             staging.path(),
             &records,
             &masters(0, &["Skyrim.esm"]),
+            &HashMap::new(),
             &TerrainOptions::default(),
         )
         .unwrap_err()
