@@ -33,7 +33,9 @@ pub(crate) fn surface_resource_paths(
             continue;
         };
         for layer in layers {
-            if layer.is_base && layer.texture_form_id == 0 {
+            // Zero is an unresolved slot for base and overlays alike: `TerrainExtension::from_quadrant`
+            // binds no image there, so the catalog's row zero must not be reserved.
+            if layer.texture_form_id == 0 {
                 continue;
             }
             paths.extend(catalog.landscape_diffuse(layer.texture_form_id));
@@ -203,6 +205,49 @@ mod tests {
             2
         );
         assert!(surface_resource_paths(None, true, &catalog).is_empty());
+    }
+
+    #[test]
+    fn zero_overlay_reserves_nothing_while_a_valid_overlay_keeps_its_textures() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);\
+             CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT,normal_path TEXT);\
+             CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);\
+             INSERT INTO texture_sets VALUES(1,'Textures\\Zero_must_not_load.dds',NULL);\
+             INSERT INTO texture_sets VALUES(2,'Textures\\Shared.dds','Textures\\Shared_n.dds');\
+             INSERT INTO landscape_textures VALUES(0,1);\
+             INSERT INTO landscape_textures VALUES(10,2);",
+            )
+            .unwrap();
+        drop(connection);
+        let catalog = AssetCatalog::open(&path).unwrap();
+        // Row zero is a real catalog entry, so skipping it is the only thing that keeps it out.
+        assert!(catalog.landscape_diffuse(0).is_some());
+        let mut terrain = terrain();
+        for quadrant in 0..4 {
+            terrain.layers.push(TerrainLayerSnapshot {
+                texture_form_id: 0,
+                quadrant,
+                layer: 1,
+                is_base: false,
+                weights: vec![(0, 0.5)],
+            });
+            terrain.layers.push(TerrainLayerSnapshot {
+                texture_form_id: 10,
+                quadrant,
+                layer: 2,
+                is_base: false,
+                weights: vec![(18, 0.75)],
+            });
+        }
+        assert_eq!(
+            surface_resource_paths(Some(&terrain), false, &catalog),
+            vec!["textures/shared.ktx2", "textures/shared_n.ktx2"]
+        );
     }
 
     #[test]
