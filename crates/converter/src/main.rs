@@ -751,12 +751,21 @@ fn parse_command(args: Vec<OsString>) -> Result<Command> {
     }
     if args.first().and_then(|argument| argument.to_str()) == Some("repair-failed") {
         let apply = args.iter().any(|argument| argument == "--apply");
+        let gpu_tuning = args
+            .iter()
+            .any(|argument| argument == "--gpu-quality" || argument == "--gpu-batch-mb");
         let cli = parse_cli(
             args.into_iter()
                 .skip(1)
                 .filter(|argument| argument != "--apply")
                 .collect(),
         )?;
+        // Repair encodes textures only; terrain LOD defaults to GPU but never runs here.
+        if gpu_tuning && !matches!(cli.texture_encoder, TextureEncoder::Gpu { .. }) {
+            bail!(
+                "repair-failed applies --gpu-quality and --gpu-batch-mb only with --texture-encoder gpu"
+            );
+        }
         if cli.resume_staging.is_some()
             || cli.plugins_file.is_some()
             || cli.skyrim_ccc_file.is_some()
@@ -1299,7 +1308,8 @@ mod tests {
         .unwrap();
         let resume = resume_command("converter", &cli, Path::new("out.staging-1-2"));
         assert!(resume.contains("--mo2-instance"));
-        assert!(resume.ends_with("--mo2-profile \"Zed\" --record-reader inhouse"));
+        assert!(resume.contains("--mo2-profile \"Zed\""));
+        assert!(resume.ends_with(" --record-reader inhouse"));
         assert!(parse_cli(args(&["Data", "--mo2-profile", "Zed"])).is_err());
         assert!(
             parse_cli(args(&[
@@ -2065,7 +2075,8 @@ mod tests {
         .unwrap();
         assert_eq!(cpu.lod_texture_encoder, TextureEncoder::Cpu);
         assert!(
-            resume_command("converter", &cpu, Path::new("staging")).ends_with(" --lod-encoder cpu")
+            resume_command("converter", &cpu, Path::new("staging"))
+                .ends_with(" --lod-encoder cpu --record-reader inhouse")
         );
         let resumed = parse_cli(
             [
@@ -2153,8 +2164,9 @@ mod tests {
             }
         );
         assert!(
-            resume_command("converter", &lod, Path::new("staging"))
-                .ends_with(" --lod-encoder gpu --gpu-quality 3 --gpu-batch-mb 256")
+            resume_command("converter", &lod, Path::new("staging")).ends_with(
+                " --lod-encoder gpu --gpu-quality 3 --gpu-batch-mb 256 --record-reader inhouse"
+            )
         );
     }
 
