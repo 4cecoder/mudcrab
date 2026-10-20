@@ -727,6 +727,7 @@ fn spawn_merged_cell(
         IVec2::ZERO,
         false,
         true,
+        false,
         CellPayload {
             generation: 1,
             key: key(0),
