@@ -1002,11 +1002,11 @@ dependencies = [
  "image 0.25.10",
  "ktx2",
  "rectangle-pack",
- "ruzstd",
  "serde",
  "thiserror 2.0.18",
  "tracing",
  "wgpu-types",
+ "zstd",
 ]
 
 [[package]]
@@ -2352,6 +2352,7 @@ dependencies = [
  "memmap2",
  "mesh-tools",
  "mlua",
+ "mo2",
  "nom 8.0.0",
  "nom-derive",
  "project-wormhole-esm",
@@ -2362,6 +2363,7 @@ dependencies = [
  "rkyv",
  "rusqlite",
  "ruzstd",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",
@@ -2837,6 +2839,8 @@ dependencies = [
  "converter",
  "crossbeam-channel",
  "ddsfile",
+ "dummy-content",
+ "gltf",
  "ktx2",
  "memmap2",
  "mlua",
@@ -4119,9 +4123,11 @@ dependencies = [
  "bevy",
  "converter",
  "crossbeam-channel",
+ "mo2",
  "rusqlite",
  "serde_json",
  "shared",
+ "tempfile",
  "tokio",
  "winreg",
 ]
@@ -4426,6 +4432,17 @@ dependencies = [
  "luajit-src",
  "luau0-src",
  "pkg-config",
+]
+
+[[package]]
+name = "mo2"
+version = "0.1.0"
+dependencies = [
+ "color-eyre",
+ "serde",
+ "shared",
+ "tempfile",
+ "walkdir",
 ]
 
 [[package]]
@@ -6142,9 +6159,9 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "ruzstd"
-version = "0.8.3"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
 dependencies = [
  "twox-hash",
 ]
@@ -6262,6 +6279,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

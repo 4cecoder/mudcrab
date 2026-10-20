@@ -120,7 +120,7 @@ fn cell_pipeline_fixture(
 ) {
     use crate::{
         render::WaterReflectionTexture,
-        streaming::{StreamingCommitBudget, TerrainContinuity},
+        streaming::{ActiveSpace, StreamingCommitBudget, TerrainContinuity},
         world::{cache::CellCache, database::AssetCatalog},
     };
     let (mut app, directory) = fixture(true);
@@ -157,6 +157,7 @@ fn cell_pipeline_fixture(
         .insert_resource(CellCache::open(&cache_path).unwrap())
         .insert_resource(RenderOrigin(IVec2::ZERO))
         .insert_resource(WaterReflectionTexture(Handle::default()))
+        .init_resource::<ActiveSpace>()
         .init_resource::<StreamingCommitBudget>()
         .init_resource::<TerrainContinuity>();
     app.world_mut()
@@ -536,6 +537,8 @@ fn unavailable_and_stale_process_memory_are_unknown_while_fresh_pressure_blocks_
     assert_eq!(snapshot.process_rss_bytes, Some(31 * 1024 * MIB));
     assert!(snapshot.pressure_sample_fresh);
     assert!(snapshot.control.reasons.memory_pressure);
+    assert!(snapshot.memory_blocked);
+    assert!(snapshot.physical_memory_blocked);
     assert!(!snapshot.control.allow_scene_intake);
     let mut stale_process = Diagnostic::new(SystemInformationDiagnosticsPlugin::PROCESS_MEM_USAGE);
     stale_process.add_measurement(DiagnosticMeasurement {
@@ -628,6 +631,41 @@ fn disabled_controls_leave_catalog_and_loader_state_unused() {
             .get_path_ids("meshes/nonexistent.glb#Scene0")
             .is_empty()
     );
+}
+
+#[test]
+fn reservation_denials_are_reported_separately_from_physical_pressure() {
+    let (mut app, _directory) = fixture(true);
+    assert!(
+        !app.world_mut()
+            .resource_mut::<StreamingRuntime>()
+            .reserve_scene(&scene_key("meshes/unknown.glb"))
+    );
+    update_streaming_control(app.world_mut());
+    let snapshot = app
+        .world()
+        .resource::<StreamingRuntime>()
+        .snapshot
+        .as_ref()
+        .unwrap();
+    let json = serde_json::to_value(snapshot).unwrap();
+    assert_eq!(json["memory_denied_total"], 1);
+    assert_eq!(json["memory_denied_since_last_update"], 1);
+    assert_eq!(json["memory_blocked"], true);
+    assert_eq!(json["physical_memory_blocked"], false);
+    assert_eq!(json["catalog_loaded"], false);
+    // A past denial is not current physical pressure and does not tune pacing.
+    assert!(!snapshot.control.reasons.memory_pressure);
+    update_streaming_control(app.world_mut());
+    let snapshot = app
+        .world()
+        .resource::<StreamingRuntime>()
+        .snapshot
+        .as_ref()
+        .unwrap();
+    assert_eq!(snapshot.memory_denied_total, 1);
+    assert_eq!(snapshot.memory_denied_since_last_update, 0);
+    assert!(!snapshot.memory_blocked);
 }
 
 #[test]
@@ -1255,6 +1293,33 @@ fn missing_physical_memory_uses_fallback_and_explicit_memory_limit_takes_precede
 }
 
 #[test]
+fn physical_memory_parses_bevy_one_decimal_output_and_falls_back_when_unknown() {
+    // Bevy formats `SystemInfo::memory` as `{:.1} GiB`, and reports `Unknown` on unsupported
+    // platforms. Both must reach the same explicit adaptive fallback rules.
+    let mut world = World::new();
+    let config = EngineConfig {
+        adaptive_streaming: true,
+        ..default()
+    };
+    world.insert_resource(SystemInfo {
+        memory: "15.9 GiB".into(),
+        ..system_info(1)
+    });
+    let physical = physical_memory_bytes(&world).unwrap();
+    assert!(physical > 15 * 1024 * MIB && physical < 16 * 1024 * MIB);
+    assert_eq!(automatic_memory_limit(&config, &world), Some(physical / 2));
+    world.insert_resource(SystemInfo {
+        memory: "Unknown".into(),
+        ..system_info(1)
+    });
+    assert_eq!(physical_memory_bytes(&world), None);
+    assert_eq!(
+        automatic_memory_limit(&config, &world),
+        Some(8 * 1024 * MIB)
+    );
+}
+
+#[test]
 fn physical_ram_at_or_below_headroom_never_becomes_unlimited_and_blocks_intake() {
     let (mut app, _directory) = fixture(true);
     app.world_mut().insert_resource(system_info(8));
@@ -1616,6 +1681,115 @@ fn watched_demands(app: &App) -> Vec<PreparationDemand> {
 }
 
 #[test]
+fn uninspected_material_binding_retains_preparation_and_disposal_reservations() {
+    let (mut app, _directory) = catalog_dependency_fixture();
+    let (key, scene) = register_catalog_scene(&mut app, "meshes/a.glb");
+    let scene_id = scene.id();
+    // Model the source-world boundary where another material plugin replaces
+    // the StandardMaterial binding. Its concrete type is outside this PR.
+    app.world_mut()
+        .resource_mut::<Assets<WorldAsset>>()
+        .get_mut(scene_id)
+        .unwrap()
+        .world
+        .spawn((
+            Mesh3d(Handle::default()),
+            MeshMaterial3d::<TerrainMaterial>(Handle::default()),
+        ));
+    let bridge = app.world().resource::<StreamingPreparationBridge>().clone();
+    bridge.publish_fixture(1, watched_demands(&app), true);
+    observe_at(&mut app, 1);
+    let runtime = app.world().resource::<StreamingRuntime>();
+    let geometry = runtime.resource_key("meshes/a.glb", None);
+    let texture = runtime.resource_key("textures/shared.ktx2", None);
+    assert!(!runtime.scenes[&key].dependencies_cached);
+    assert!(!runtime.scenes[&key].prepared);
+    assert!(runtime.scenes[&key].resources.contains(&texture));
+    assert!(
+        runtime.watches[&geometry]
+            .unobserved_scenes
+            .contains(&scene_id)
+    );
+    let retained = runtime.ledger.totals().peak_bytes().unwrap();
+    update_streaming_control(app.world_mut());
+    assert_eq!(
+        app.world()
+            .resource::<StreamingRuntime>()
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .unobserved_scene_dependencies,
+        1
+    );
+    app.world_mut()
+        .resource_mut::<SceneAdmission>()
+        .reconcile_demands([]);
+    app.world_mut()
+        .resource_mut::<Assets<WorldAsset>>()
+        .remove(scene_id);
+    drop(scene);
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    while app
+        .world()
+        .resource::<AssetServer>()
+        .get_load_state(scene_id)
+        .is_some_and(|state| !matches!(state, LoadState::NotLoaded))
+    {
+        assert!(Instant::now() < deadline, "source scene did not unload");
+        app.update();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    observe_at(&mut app, 2);
+    bridge.publish_absent_fixture(4, watched_demands(&app));
+    observe_at(&mut app, 4);
+    let runtime = app.world().resource::<StreamingRuntime>();
+    // Empty GPU IDs cannot certify absence of a material we never inspected.
+    assert!(runtime.watches.contains_key(&geometry));
+    assert_eq!(runtime.ledger.totals().peak_bytes(), Some(retained));
+    assert!(
+        runtime.watches[&texture]
+            .unobserved_scenes
+            .contains(&scene_id)
+    );
+}
+
+#[test]
+fn inspecting_one_scene_does_not_clear_shared_texture_unknown_ownership() {
+    let (mut app, _directory) = catalog_dependency_fixture();
+    let (first_key, first) = register_catalog_scene(&mut app, "meshes/a.glb");
+    let (_, _second) = register_catalog_scene(&mut app, "meshes/b.glb");
+    let material = app
+        .world()
+        .resource::<Assets<StandardMaterial>>()
+        .reserve_handle();
+    app.world_mut()
+        .resource_mut::<Assets<WorldAsset>>()
+        .get_mut(first.id())
+        .unwrap()
+        .world
+        .spawn(MeshMaterial3d(material.clone()));
+    observe_at(&mut app, 1);
+    let runtime = app.world().resource::<StreamingRuntime>();
+    let texture = runtime.resource_key("textures/shared.ktx2", None);
+    assert!(
+        runtime.watches[&texture]
+            .unobserved_scenes
+            .contains(&first.id())
+    );
+    assert!(runtime.scenes[&first_key].resources.contains(&texture));
+    app.world_mut()
+        .resource_mut::<Assets<StandardMaterial>>()
+        .insert(material.id(), StandardMaterial::default())
+        .unwrap();
+    observe_at(&mut app, 2);
+    assert!(
+        app.world().resource::<StreamingRuntime>().watches[&texture]
+            .unobserved_scenes
+            .is_empty()
+    );
+}
+
+#[test]
 fn unused_catalog_texture_waits_for_cpu_materials_then_releases_after_absence() {
     let (mut app, _directory) = catalog_dependency_fixture();
     let (key, scene) = register_catalog_scene(&mut app, "meshes/a.glb");
@@ -1635,6 +1809,12 @@ fn unused_catalog_texture_waits_for_cpu_materials_then_releases_after_absence() 
     let runtime = app.world().resource::<StreamingRuntime>();
     let texture = runtime.resource_key("textures/shared.ktx2", None);
     assert!(!runtime.scenes[&key].dependencies_cached);
+    let geometry = runtime.resource_key("meshes/a.glb", None);
+    assert!(
+        runtime.watches[&geometry]
+            .unobserved_scenes
+            .contains(&scene.id())
+    );
     assert!(runtime.scenes[&key].resources.contains(&texture));
     assert!(runtime.watches[&texture].orphaned_frame.is_none());
 
@@ -1645,6 +1825,11 @@ fn unused_catalog_texture_waits_for_cpu_materials_then_releases_after_absence() 
     observe_at(&mut app, 2);
     let runtime = app.world().resource::<StreamingRuntime>();
     assert!(runtime.scenes[&key].dependencies_cached);
+    assert!(
+        !runtime.watches[&geometry]
+            .unobserved_scenes
+            .contains(&scene.id())
+    );
     assert!(!runtime.scenes[&key].resources.contains(&texture));
     assert_eq!(runtime.watches[&texture].orphaned_frame, Some(2));
     assert_eq!(runtime.ledger.totals().orphan_bytes(), Some(512 + 32));

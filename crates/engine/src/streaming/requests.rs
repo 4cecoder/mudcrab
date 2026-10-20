@@ -19,7 +19,10 @@ use bevy::{
     world_serialization::WorldAsset,
 };
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{Duration, Instant},
+};
 
 pub(super) fn enabled(config: &EngineConfig) -> bool {
     config.prioritize_streaming
@@ -48,10 +51,50 @@ pub(super) struct SceneRequest {
 #[derive(Component)]
 pub(super) struct SceneRequestKey(pub SceneKey);
 
+/// A loader that has not reached a terminal state for this long is reported, so a finite
+/// `--max-scene-loads` stall is visible. Reporting never releases the job's slot or handle.
+const STALLED_LOAD_AFTER: Duration = Duration::from_secs(10);
+/// Minimum spacing between reports for one job, so a stuck load logs a trickle, not a line per frame.
+const STALLED_LOAD_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct StalledLoads {
+    since: BTreeMap<SceneKey, Instant>,
+    reported: BTreeMap<SceneKey, Instant>,
+}
+
+impl StalledLoads {
+    /// Track this pass's non-terminal jobs and return those due for a report, with their wait.
+    /// Jobs absent from `loading` leave the tracker, so a later reload starts a fresh clock.
+    fn observe(&mut self, now: Instant, loading: &[SceneKey]) -> Vec<(SceneKey, Duration)> {
+        let live: BTreeSet<&SceneKey> = loading.iter().collect();
+        self.since.retain(|key, _| live.contains(key));
+        self.reported.retain(|key, _| live.contains(key));
+        let mut due = Vec::new();
+        for key in loading {
+            let since = *self.since.entry(key.clone()).or_insert(now);
+            let waited = now.duration_since(since);
+            if waited < STALLED_LOAD_AFTER {
+                continue;
+            }
+            let report = self
+                .reported
+                .get(key)
+                .is_none_or(|last| now.duration_since(*last) >= STALLED_LOAD_REPORT_INTERVAL);
+            if report {
+                self.reported.insert(key.clone(), now);
+                due.push((key.clone(), waited));
+            }
+        }
+        due
+    }
+}
+
 #[derive(Resource)]
 pub(super) struct SceneSchedulingState {
     pack_identity: String,
     reconciled_subscribers: std::collections::HashSet<Entity>,
+    stalled: StalledLoads,
     pub dispatch_choices: u64,
     pub activation_choices: u64,
     reservation_retries: BTreeMap<SceneKey, u64>,
@@ -61,19 +104,19 @@ pub(super) struct SceneSchedulingState {
 impl FromWorld for SceneSchedulingState {
     fn from_world(world: &mut World) -> Self {
         let config = world.resource::<EngineConfig>();
-        let root =
-            std::path::absolute(&config.assets_dir).unwrap_or_else(|_| config.assets_dir.clone());
+        let root = pack_root(config);
         // Hash metadata, never decode the pack to discover costs. Synthetic fixtures can
         // have no manifest; their identity is then scoped to this immutable asset root.
+        // `run` already rejected any other read error, so this read cannot fail here.
         let fingerprint = if enabled(config) {
-            std::fs::read(root.join("conversion-manifest.json"))
-                .ok()
-                .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+            read_manifest_fingerprint(&root)
+                .expect("the conversion manifest was checked before the world was built")
         } else {
             None
         };
         Self {
             reconciled_subscribers: default(),
+            stalled: default(),
             pack_identity: format!(
                 "{}#{}",
                 root.display(),
@@ -85,6 +128,29 @@ impl FromWorld for SceneSchedulingState {
             reservation_attempts: 0,
         }
     }
+}
+
+fn pack_root(config: &EngineConfig) -> std::path::PathBuf {
+    std::path::absolute(&config.assets_dir).unwrap_or_else(|_| config.assets_dir.clone())
+}
+
+/// Hash the converted pack's manifest. Only an absent file selects the unmanifested identity;
+/// any other error (permissions, I/O) is returned so records are never matched under a guessed pack.
+fn read_manifest_fingerprint(root: &std::path::Path) -> std::io::Result<Option<String>> {
+    match std::fs::read(root.join("conversion-manifest.json")) {
+        Ok(bytes) => Ok(Some(format!("{:x}", Sha256::digest(bytes)))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Startup check for the scene pack identity, run before the world is built so a bad manifest
+/// stops the run with a diagnostic instead of selecting a fallback identity.
+pub(crate) fn validate_pack_identity(config: &EngineConfig) -> std::io::Result<()> {
+    if enabled(config) {
+        read_manifest_fingerprint(&pack_root(config))?;
+    }
+    Ok(())
 }
 
 pub(super) fn reference_geometry(
@@ -199,6 +265,10 @@ pub(super) fn dispatch_scene_requests(world: &mut World) {
         // Immutable-pack terminal records need no polling. Compare exact owners so an
         // unload/replacement still reconciles; unassigned, orphan or retry work never skips.
         world
+            .resource_mut::<SceneSchedulingState>()
+            .stalled
+            .observe(started, &[]);
+        world
             .resource_mut::<ProfilingState>()
             .record_elapsed("streaming/admit_scenes", started);
         return;
@@ -288,11 +358,27 @@ pub(super) fn dispatch_scene_requests(world: &mut World) {
         }
     }
     let jobs = world.resource::<SceneAdmission>().jobs();
+    let mut loading = Vec::new();
     for (key, handle) in jobs {
         let status = job_status(&server, &handle);
+        if status == SceneJobStatus::Loading {
+            loading.push(key.clone());
+        }
         world
             .resource_mut::<SceneAdmission>()
             .set_status(&key, status);
+    }
+    let due = world
+        .resource_mut::<SceneSchedulingState>()
+        .stalled
+        .observe(started, &loading);
+    for (key, waited) in due {
+        warn!(
+            path = %key.canonical_path,
+            waited_secs = waited.as_secs(),
+            scene_load_limit = cap,
+            "scene load has no terminal loader state; its admission slot stays held until it completes or is cancelled"
+        );
     }
     let cleanup_waiting: std::collections::HashSet<_> = requests
         .iter(world)
@@ -540,6 +626,37 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    #[test]
+    fn every_admission_or_pressure_switch_selects_the_request_path() {
+        // Generated terrain batches allocate outside the scene ledger, so each switch that
+        // selects this path must also keep those batches disabled.
+        assert!(!enabled(&EngineConfig::default()));
+        for config in [
+            EngineConfig {
+                prioritize_streaming: true,
+                ..default()
+            },
+            EngineConfig {
+                max_scene_loads: 1,
+                ..default()
+            },
+            EngineConfig {
+                adaptive_streaming: true,
+                ..default()
+            },
+            EngineConfig {
+                max_streaming_backlog: 1,
+                ..default()
+            },
+            EngineConfig {
+                streaming_memory_mib: 1,
+                ..default()
+            },
+        ] {
+            assert!(enabled(&config));
+        }
+    }
 
     #[derive(TypePath)]
     struct TestSceneLoader {
@@ -1243,6 +1360,54 @@ mod tests {
                 .unwrap()
                 .handle
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn stalled_loads_report_once_per_interval_and_restart_after_leaving() {
+        let key = |path: &str| SceneKey {
+            canonical_path: path.to_owned(),
+            build_identity: None,
+            content_identity: None,
+        };
+        let slow = key("slow.glb");
+        let origin = Instant::now();
+        let at = |secs: u64| origin + Duration::from_secs(secs);
+        let mut stalled = StalledLoads::default();
+        assert!(
+            stalled
+                .observe(at(0), std::slice::from_ref(&slow))
+                .is_empty()
+        );
+        assert!(
+            stalled
+                .observe(at(9), std::slice::from_ref(&slow))
+                .is_empty()
+        );
+        let due = stalled.observe(at(10), std::slice::from_ref(&slow));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, slow);
+        assert!(
+            stalled
+                .observe(at(11), std::slice::from_ref(&slow))
+                .is_empty(),
+            "a report is throttled to one per interval"
+        );
+        assert_eq!(
+            stalled.observe(at(70), std::slice::from_ref(&slow)).len(),
+            1,
+            "a still-stalled load reports again after the interval"
+        );
+        assert!(stalled.observe(at(71), &[]).is_empty());
+        assert!(
+            stalled
+                .observe(at(72), std::slice::from_ref(&slow))
+                .is_empty(),
+            "a load that left the pass and returned starts a fresh clock"
+        );
+        assert_eq!(
+            stalled.observe(at(82), std::slice::from_ref(&slow)).len(),
+            1
         );
     }
 

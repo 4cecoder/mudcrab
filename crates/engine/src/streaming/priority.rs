@@ -3,12 +3,13 @@
 //! This estimates view-facing footprint from bounds, not frustum visibility or file cost.
 //! Callers retain ownership of readiness, cancellation, quotas and scheduling progress.
 
+use crate::world::components::CELL_SIZE;
 use bevy::math::DVec3;
 use std::cmp::Ordering;
 
 pub(super) const AGED_SERVICE_INTERVAL: u64 = 8;
 /// Initial protection distance in runtime units: one exterior cell from the bounds surface.
-pub(super) const COLLISION_PROTECTION_DISTANCE: f64 = 4096.0;
+pub(super) const COLLISION_PROTECTION_DISTANCE: f64 = CELL_SIZE as f64;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PriorityView {

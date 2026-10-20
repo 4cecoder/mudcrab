@@ -106,6 +106,8 @@ pub struct EngineConfig {
     /// prepare per frame. `0` prepares every asset the frame extracted.
     pub max_upload_mib_per_frame: usize,
     pub headless: bool,
+    /// Keep a renderable window hidden for automated screenshot capture.
+    pub hidden_window: bool,
     pub benchmark_only: bool,
     pub benchmark_frames: Option<u32>,
     pub benchmark_duration_secs: Option<f64>,
@@ -121,6 +123,12 @@ pub struct EngineConfig {
     pub streaming_benchmark_expected_lod_chunks: Option<usize>,
     pub streaming_benchmark_expected_terrain: Option<u64>,
     pub streaming_benchmark_expected_water: Option<u64>,
+    /// `--benchmark-jump <grid-x>,<grid-y>`: once the world around the camera is first fully
+    /// loaded, move the camera to the centre of that cell of the same worldspace and measure how
+    /// long the world takes to become fully loaded again (`time_to_world_ready_after_jump_ms`).
+    /// Coordinates must be within [`JUMP_GRID_LIMIT`]; anything further out is ignored with a
+    /// warning, since the position maths would not survive it.
+    pub benchmark_jump: Option<(i32, i32)>,
     pub benchmark_output: PathBuf,
     /// Where to write every measured frame time, in order, as CSV (`--benchmark-frame-times`).
     /// Off by default: the report's summary is what acceptance reads; the series is for choosing
@@ -147,6 +155,8 @@ pub struct EngineConfig {
     /// `--shots <file>`: render the camera poses in a shots file, one PNG each, and exit instead of
     /// running interactively. See [`crate::shots`].
     pub shots: Option<PathBuf>,
+    /// Exact, fixed-step profiling traversal. Mutually exclusive with other camera drivers.
+    pub matched_route: Option<PathBuf>,
     /// `--shots-out <dir>`: where the PNGs and `shots.log` go. `None` is
     /// [`crate::shots::default_output_dir`], a `<file stem>-shots/` folder beside the shots file.
     pub shots_out: Option<PathBuf>,
@@ -163,6 +173,7 @@ pub struct EngineConfig {
 }
 
 impl Default for EngineConfig {
+    /// Start with the standard engine settings and optional profiling diagnostics disabled.
     fn default() -> Self {
         Self {
             assets_dir: PathBuf::from("modern_assets"),
@@ -199,6 +210,7 @@ impl Default for EngineConfig {
             // far more new assets than the streaming radius can produce.
             max_upload_mib_per_frame: 16,
             headless: false,
+            hidden_window: false,
             benchmark_only: false,
             benchmark_frames: None,
             benchmark_duration_secs: None,
@@ -212,6 +224,7 @@ impl Default for EngineConfig {
             streaming_benchmark_expected_lod_chunks: None,
             streaming_benchmark_expected_terrain: None,
             streaming_benchmark_expected_water: None,
+            benchmark_jump: None,
             benchmark_output: PathBuf::from("benchmark-report.json"),
             benchmark_frame_times: None,
             run_label: None,
@@ -231,6 +244,7 @@ impl Default for EngineConfig {
             acceptance_screenshot: None,
             screenshot_camera_offset: None,
             shots: None,
+            matched_route: None,
             shots_out: None,
             diagnostic_asset_fallbacks: false,
             material_fixture: false,
@@ -264,6 +278,7 @@ Assets and start position:
   --grid-y <cell>                       starting cell y (default: 0)
   --allow-incomplete-assets             run despite a failed manifest or integration-report gate
   --headless                            run without opening a window
+  --hidden-window                       render screenshots without showing a window
   --lights                              place a point light for each streamed LIGH reference
 
 Streaming:
@@ -299,6 +314,7 @@ Benchmark and profiling:
   --streaming-benchmark-expected-lod-chunks <count>   optional initial resident LOD chunk count
   --streaming-benchmark-expected-terrain <count>      optional initial validated terrain patch count
   --streaming-benchmark-expected-water <count>        optional initial validated water surface count
+  --benchmark-jump <x,y>                after the world first loads, jump to this grid cell and time the reload
   --benchmark-output <file>             benchmark report path (default: benchmark-report.json)
   --benchmark-frame-times [<file>]      write every measured frame time to this CSV file
   --run-label [<text>]                  name the run in the window title
@@ -308,6 +324,7 @@ Benchmark and profiling:
   --accept-max-memory-growth-gib <gib>  fail the run above this memory growth (default: 0.5)
   --acceptance-screenshot <file>        write a screenshot when the run ends
   --screenshot-camera-offset <x,y,z>    camera offset for the acceptance screenshot
+  --matched-route <file>                execute exact route steps with transition and settled checkpoints
   --shots <file>                        render the camera poses in a shots file, one PNG each, then exit
   --shots-out <dir>                     where the shots' PNGs and shots.log go (default: beside the shots file)
   --profile-output <dir>                profile bundle directory (default: no bundle)
@@ -363,6 +380,11 @@ pub enum ConfigError {
         /// What the option needs, phrased for the message.
         expected: &'static str,
     },
+    /// An option that only works together with another option that was not given.
+    MissingRequirement {
+        option: &'static str,
+        requires: &'static str,
+    },
 }
 
 impl ConfigError {
@@ -391,6 +413,7 @@ impl ConfigError {
 }
 
 impl fmt::Display for ConfigError {
+    /// Format a configuration error with the relevant option and usage guidance.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownOption {
@@ -411,6 +434,10 @@ impl fmt::Display for ConfigError {
             Self::UnexpectedArgument { argument } => write!(
                 formatter,
                 "unexpected argument '{argument}'. Run with --help to list every option."
+            ),
+            Self::MissingRequirement { option, requires } => write!(
+                formatter,
+                "option '{option}' requires '{requires}'. Run with --help to list every option."
             ),
             Self::InvalidValue {
                 option,
@@ -492,14 +519,19 @@ impl EngineConfig {
     }
 
     /// Interactive exterior play owns the mouse/controller; automated camera paths keep their
-    /// existing movement and framing.
+    /// existing movement and framing. A `--benchmark-jump` run is one of those even without a frame
+    /// limit: the jump moves only the camera, and in WALK the camera follow would put it straight
+    /// back at the player's body.
     pub fn interactive_world_physics(&self) -> bool {
         !self.headless
+            && !self.hidden_window
+            && self.benchmark_jump.is_none()
             && !self.benchmark_only
             && self.benchmark_frames.is_none()
             && self.benchmark_duration_secs.is_none()
             && self.acceptance_screenshot.is_none()
             && self.shots.is_none()
+            && self.matched_route.is_none()
             && self.auto_fly_speed <= 0.0
             && self.streaming_benchmark_route_speed.is_none()
             && !self.material_fixture
@@ -514,13 +546,38 @@ impl EngineConfig {
         Self::from_args(std::env::args().skip(1))
     }
 
+    /// Whether this is a benchmark run: `--benchmark-frames` or `--benchmark-duration` was given.
+    /// The same test the report uses to decide whether to write itself (`metrics::collect_and_finish`),
+    /// so anything that only makes sense for a benchmark can key off it.
+    pub fn is_benchmark_run(&self) -> bool {
+        self.benchmark_frames.is_some()
+            || self.benchmark_duration_secs.is_some()
+            || self.streaming_benchmark_route_speed.is_some()
+    }
+
+    /// Whether the pacing instrumentation should run at all. It is measurement only, and only a
+    /// benchmark report or the profiling campaign (itself a benchmark run) reads it, so an ordinary
+    /// play session installs none of it. A jump without a frame limit or duration still installs it:
+    /// the jump is documented to run without a report and warn that it has none.
+    pub fn measures_pacing(&self) -> bool {
+        self.is_benchmark_run() || self.benchmark_jump.is_some()
+    }
+
+    /// Whether the readiness scan records how far behind the flying camera each model finishes
+    /// loading. Only the pacing report reads it, so a plain `--auto-fly-speed` run records nothing.
+    pub fn records_fly_lag(&self) -> bool {
+        self.auto_fly_speed > 0.0 && self.measures_pacing()
+    }
+
     /// The window's title: what kind of automated run this is and its `--run-label`, so a run on
     /// the taskbar says what it is. An interactive run is plain "Mudcrab".
     pub fn window_title(&self) -> String {
-        let kind = if self.benchmark_frames.is_some() || self.benchmark_duration_secs.is_some() {
+        let kind = if self.is_benchmark_run() {
             Some("benchmark")
         } else if self.streaming_fixture {
             Some("streaming fixture")
+        } else if self.matched_route.is_some() {
+            Some("matched-route")
         } else if self.shots.is_some() {
             Some("shots")
         } else {
@@ -619,6 +676,7 @@ impl EngineConfig {
                     config.unload_radius = value + 1;
                 }
                 "--headless" => config.headless = true,
+                "--hidden-window" => config.hidden_window = true,
                 "--max-unloads-per-frame" => {
                     config.max_cell_unloads_per_frame = take_value(
                         "--max-unloads-per-frame",
@@ -795,6 +853,25 @@ impl EngineConfig {
                         args.next(),
                     )?);
                 }
+                // Unlike its neighbours, a bad jump only warns: the jump is an add-on to a
+                // benchmark run, which still measures and writes its report without it.
+                "--benchmark-jump" => match args.next_if(|value| !value.starts_with("--")) {
+                    Some(raw) => match parse_grid(&raw) {
+                        Some(value) if in_jump_grid_range(value) => {
+                            config.benchmark_jump = Some(value)
+                        }
+                        Some((x, y)) => eprintln!(
+                            "warning: ignoring --benchmark-jump {x},{y}: grid coordinates must be within {}..={JUMP_GRID_LIMIT}",
+                            -JUMP_GRID_LIMIT
+                        ),
+                        None => eprintln!(
+                            "warning: ignoring malformed --benchmark-jump {raw:?}; expected \"<grid-x>,<grid-y>\" integers"
+                        ),
+                    },
+                    None => eprintln!(
+                        "warning: missing value for --benchmark-jump; expected \"<grid-x>,<grid-y>\" integers"
+                    ),
+                },
                 "--benchmark-output" => {
                     config.benchmark_output = take_value(
                         "--benchmark-output",
@@ -899,6 +976,13 @@ impl EngineConfig {
                 // A path left out is an error, and must not swallow the next option: a `--shots`
                 // with no path is no mode at all, and continuing would silently launch an ordinary
                 // interactive run.
+                "--matched-route" => {
+                    config.matched_route = Some(take_value(
+                        "--matched-route",
+                        "a route fixture",
+                        args.next(),
+                    )?);
+                }
                 "--shots" => {
                     config.shots = Some(take_value("--shots", "a shots file path", args.next())?);
                 }
@@ -924,6 +1008,8 @@ impl EngineConfig {
             && (config.benchmark_only
                 || config.acceptance_screenshot.is_some()
                 || config.shots.is_some()
+                || config.matched_route.is_some()
+                || config.auto_fly_speed > 0.0
                 || config.material_fixture
                 || config.terrain_water_fixture
                 || config.transform_bounds_fixture
@@ -950,7 +1036,74 @@ impl EngineConfig {
                 "a duration whose route distance and total duration remain finite",
             ));
         }
+        // The inventory is written into the profile bundle; without one it would do nothing.
+        if config.profile_gpu_inventory && config.profile_output_dir.is_none() {
+            return Err(ConfigError::MissingRequirement {
+                option: "--profile-gpu-inventory",
+                requires: "--profile-output",
+            });
+        }
+        config.drop_jump_the_run_would_overwrite();
         Ok(ConfigAction::Run(Box::new(config)))
+    }
+
+    /// The reason text for a fixture run that builds no streaming runtime (see `app.rs`), or
+    /// `None` when none of those fixtures is selected.
+    fn non_streaming_fixture(&self) -> Option<&'static str> {
+        if self.material_fixture {
+            Some("--material-fixture creates no streaming runtime to jump in")
+        } else if self.terrain_water_fixture {
+            Some("--terrain-water-fixture creates no streaming runtime to jump in")
+        } else if self.transform_bounds_fixture {
+            Some("--transform-bounds-fixture creates no streaming runtime to jump in")
+        } else if self.renderer_fixture {
+            Some("--renderer-fixture creates no streaming runtime to jump in")
+        } else if self.physics_fixture {
+            Some("--physics-fixture creates no streaming runtime to jump in")
+        } else {
+            None
+        }
+    }
+
+    /// `--benchmark-jump` moves the camera once, so a run that keeps driving it would undo the
+    /// jump: auto-fly keeps moving it, the streaming fixture moves it every frame, a shots run poses
+    /// it for each shot, and a screenshot run anchors streaming on the start cell. A synthetic
+    /// `--benchmark-only` run loads no world, so nothing would carry the jump out.
+    fn drop_jump_the_run_would_overwrite(&mut self) {
+        let reason = if self.benchmark_only {
+            Some("--benchmark-only loads no world to jump in")
+        } else if let Some(fixture) = self.non_streaming_fixture() {
+            Some(fixture)
+        } else if self.auto_fly_speed > 0.0 {
+            Some("--auto-fly-speed keeps driving the camera")
+        } else if self.acceptance_screenshot.is_some() {
+            Some("--acceptance-screenshot anchors streaming on the start cell")
+        } else if self.streaming_fixture {
+            Some("--streaming-fixture moves the camera every frame")
+        } else if self.shots.is_some() {
+            Some("--shots sets the camera pose for each shot")
+        } else if self.streaming_benchmark_route_speed.is_some() {
+            Some("--streaming-benchmark-route-speed owns the camera")
+        } else if self.matched_route.is_some() {
+            Some("--matched-route sets the camera pose for each route step")
+        } else {
+            None
+        };
+        let Some(reason) = reason else {
+            // The jump still runs, but with no frame limit or duration no benchmark report (which
+            // carries the pacing fields) is written, so there is nothing to read the jump out of.
+            if let Some((x, y)) = self.benchmark_jump
+                && !self.is_benchmark_run()
+            {
+                eprintln!(
+                    "warning: --benchmark-jump {x},{y} has no report to appear in without --benchmark-frames or --benchmark-duration"
+                );
+            }
+            return;
+        };
+        if let Some((x, y)) = self.benchmark_jump.take() {
+            eprintln!("warning: ignoring --benchmark-jump {x},{y}: {reason}");
+        }
     }
 }
 
@@ -983,6 +1136,23 @@ fn parse_offset(value: &str) -> Option<(f32, f32, f32)> {
         return None;
     }
     Some((x, y, z))
+}
+
+/// The furthest grid coordinate `--benchmark-jump` accepts. The jump position maths subtracts the
+/// render origin and scales by the cell size, so an extreme `i32` would overflow; half the distance
+/// to `i32::MAX` in cells is far past any converted world.
+const JUMP_GRID_LIMIT: i32 = 512;
+
+fn in_jump_grid_range((x, y): (i32, i32)) -> bool {
+    (-JUMP_GRID_LIMIT..=JUMP_GRID_LIMIT).contains(&x)
+        && (-JUMP_GRID_LIMIT..=JUMP_GRID_LIMIT).contains(&y)
+}
+
+fn parse_grid(value: &str) -> Option<(i32, i32)> {
+    let mut parts = value.split(',');
+    let x: i32 = parts.next()?.trim().parse().ok()?;
+    let y: i32 = parts.next()?.trim().parse().ok()?;
+    parts.next().is_none().then_some((x, y))
 }
 
 fn parse_u32(value: &str) -> Option<u32> {
@@ -1170,46 +1340,57 @@ mod tests {
         "--ignore-submodules",   // git diff
         "--quiet",               // git diff
         "--short",               // git rev-parse
-        "--output",              // world-inspect, repeat-terrain-startup.py
-        "--radius",              // world-inspect
-        "--library-path",        // ld-linux
-        "--meshes",              // audit-collision.py
-        "--min-x",               // audit-collision.py
-        "--max-x",               // audit-collision.py
-        "--min-y",               // audit-collision.py
-        "--max-y",               // audit-collision.py
-        "--out",                 // audit-collision.py
-        "--expect-solid",        // audit-collision.py
-        "--expect-passable",     // audit-collision.py
-        "--original",            // audit_asset_sizes.py
-        "--json",                // audit_asset_sizes.py
+        "--output", // world-inspect, profiling, startup runner, repeat-terrain-startup.py
+        "--pairs-output", // correlate_drawables.py
+        "--radius", // world-inspect
+        "--library-path", // ld-linux
+        "--meshes", // audit-collision.py
+        "--min-x",  // audit-collision.py
+        "--max-x",  // audit-collision.py
+        "--min-y",  // audit-collision.py
+        "--max-y",  // audit-collision.py
+        "--out",    // audit-collision.py
+        "--expect-solid", // audit-collision.py
+        "--expect-passable", // audit-collision.py
+        "--original", // audit_asset_sizes.py
+        "--json",   // audit_asset_sizes.py
         "--candidate-inventory", // audit-riverwood-reuse.py
         "--reference-inventory", // audit-riverwood-reuse.py
-        "--manifest",            // audit-riverwood-reuse.py
-        "--locked",              // cargo run
-        "--manifest-path",       // cargo run
-        "--cpu-jobs",            // converter
-        "--io-jobs",             // converter
-        "--binary",              // git diff
-        "--porcelain",           // git status
-        "--engine",              // repeat-terrain-startup.py
-        "--repeats",             // repeat-terrain-startup.py
-        "--upload-budgets",      // repeat-terrain-startup.py
-        "--warmup",              // repeat-terrain-startup.py
-        "--duration",            // repeat-terrain-startup.py
-        "--timeout",             // repeat-terrain-startup.py
-        "--launch-prefix",       // repeat-terrain-startup.py
-        "--commit",              // repeat-terrain-startup.py
-        "--costs",               // compare-streaming-modes.py
-        "--thermal-probe",       // compare-streaming-modes.py
-        "--ablation-repeats",    // compare-streaming-modes.py
-        "--resume",              // compare-streaming-modes.py
-        "--seed",                // streaming comparison scripts
-        "--smoke",               // compare-streaming-modes.py
-        "--experiment",          // analyze-streaming-comparison.py
-        "--output-dir",          // analyze-streaming-comparison.py
-        "--bootstrap-samples",   // analyze-streaming-comparison.py
-        "--comparison",          // analyze-streaming-comparison.py
+        "--manifest", // audit-riverwood-reuse.py
+        "--include", // audit-z-fighting.py
+        "--materials-only", // audit-z-fighting.py
+        "--no-placements", // audit-z-fighting.py
+        "--plane-tolerance", // audit-z-fighting.py
+        "--min-overlap-area", // audit-z-fighting.py
+        "--max-triangles", // audit-z-fighting.py
+        "--max-comparisons", // audit-z-fighting.py
+        "--max-examples", // audit-z-fighting.py
+        "--progress", // audit-z-fighting.py
+        "--jobs",   // audit-z-fighting.py
+        "--locked", // cargo run
+        "--manifest-path", // cargo run
+        "--cpu-jobs", // converter
+        "--io-jobs", // converter
+        "--binary", // git diff
+        "--porcelain", // git status
+        "--engine", // repeat-terrain-startup.py
+        "--repeats", // repeat-terrain-startup.py
+        "--upload-budgets", // repeat-terrain-startup.py
+        "--warmup", // repeat-terrain-startup.py
+        "--duration", // repeat-terrain-startup.py
+        "--timeout", // repeat-terrain-startup.py
+        "--launch-prefix", // repeat-terrain-startup.py
+        "--commit", // repeat-terrain-startup.py
+        "--costs",  // compare-streaming-modes.py
+        "--thermal-probe", // compare-streaming-modes.py
+        "--ablation-repeats", // compare-streaming-modes.py
+        "--resume", // compare-streaming-modes.py
+        "--seed",   // streaming comparison scripts
+        "--smoke",  // compare-streaming-modes.py
+        "--experiment", // analyze-streaming-comparison.py
+        "--output-dir", // analyze-streaming-comparison.py
+        "--bootstrap-samples", // analyze-streaming-comparison.py
+        "--comparison", // analyze-streaming-comparison.py
     ];
 
     fn run_config(arguments: &[&str]) -> EngineConfig {
@@ -1251,6 +1432,7 @@ mod tests {
         assert_eq!(config.io_threads, 0);
     }
 
+    /// Verify GPU inventory is opt-in and requires a profile output directory.
     #[test]
     fn gpu_inventory_is_separate_from_normal_profile_output() {
         assert!(!EngineConfig::default().profile_gpu_inventory);
@@ -1265,10 +1447,20 @@ mod tests {
             diagnostic.profile_output_dir,
             Some(PathBuf::from("profiles/test"))
         );
-        // Parsing the switch alone must not implicitly enable profile collection.
-        let without_output = run_config(&["--profile-gpu-inventory"]);
-        assert!(without_output.profile_gpu_inventory);
-        assert!(without_output.profile_output_dir.is_none());
+        // The switch alone must not silently do nothing or implicitly enable profile collection.
+        let error = parse_error(&["--profile-gpu-inventory"]);
+        assert!(matches!(
+            error,
+            ConfigError::MissingRequirement {
+                option: "--profile-gpu-inventory",
+                requires: "--profile-output",
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "option '--profile-gpu-inventory' requires '--profile-output'. \
+             Run with --help to list every option."
+        );
     }
 
     #[test]
@@ -1549,6 +1741,20 @@ mod tests {
         assert!(line.ends_with(&format!("(default: {default})")), "{line}");
     }
 
+    /// Hidden capture selects rendering without enabling interactive mouse ownership.
+    #[test]
+    fn parses_hidden_window_capture_mode() {
+        assert!(!EngineConfig::default().hidden_window);
+        let config = run_config(&["--hidden-window", "--acceptance-screenshot", "capture.png"]);
+        assert!(config.hidden_window);
+        assert!(!config.headless);
+        assert!(!config.interactive_world_physics());
+        assert_eq!(
+            config.acceptance_screenshot,
+            Some(PathBuf::from("capture.png"))
+        );
+    }
+
     #[test]
     fn parses_the_model_spawn_budget_and_lets_zero_mean_unlimited() {
         let config = run_config(&["--max-model-spawns-per-frame", "12"]);
@@ -1618,6 +1824,57 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_benchmark_jump_target() {
+        let config = EngineConfig::run_from_args(["--benchmark-jump", "12,-7"].map(str::to_owned));
+        assert_eq!(config.benchmark_jump, Some((12, -7)));
+        assert_eq!(EngineConfig::default().benchmark_jump, None);
+        for bad in ["12", "12,", "a,b", "1,2,3", "1.5,2", ""] {
+            let config = EngineConfig::run_from_args(["--benchmark-jump", bad].map(str::to_owned));
+            assert_eq!(config.benchmark_jump, None, "{bad:?}");
+        }
+        // A missing value sets no target and does not swallow the next option.
+        let config = EngineConfig::run_from_args(["--benchmark-jump"].map(str::to_owned));
+        assert_eq!(config.benchmark_jump, None);
+        let config =
+            EngineConfig::run_from_args(["--benchmark-jump", "--headless"].map(str::to_owned));
+        assert_eq!(config.benchmark_jump, None);
+        assert!(config.headless);
+    }
+
+    #[test]
+    fn a_jump_grid_coordinate_is_dropped_when_out_of_range() {
+        let args =
+            |list: &[&str]| EngineConfig::run_from_args(list.iter().map(|v| (*v).to_owned()));
+        // The ends of the accepted range are kept.
+        assert_eq!(
+            args(&["--benchmark-jump", "512,-512"]).benchmark_jump,
+            Some((512, -512))
+        );
+        assert_eq!(
+            args(&["--benchmark-jump", "-512,512"]).benchmark_jump,
+            Some((-512, 512))
+        );
+        // One past either end is dropped, including the extremes that would overflow the position
+        // maths, and a flag after it is still read.
+        for bad in [
+            "513,0",
+            "0,513",
+            "-513,0",
+            "0,-513",
+            "2147483647,0",
+            "0,-2147483648",
+        ] {
+            let config = args(&["--benchmark-jump", bad, "--benchmark-frames", "60"]);
+            assert_eq!(config.benchmark_jump, None, "{bad:?}");
+            assert_eq!(
+                config.benchmark_frames,
+                Some(60),
+                "{bad:?} ate the next flag"
+            );
+        }
+    }
+
+    #[test]
     fn a_negative_budget_is_refused() {
         for option in [
             "--max-unloads-per-frame",
@@ -1632,6 +1889,143 @@ mod tests {
                 "{option} accepted -1"
             );
         }
+    }
+
+    #[test]
+    fn pacing_is_measured_only_for_a_benchmark_or_a_jump() {
+        assert!(!EngineConfig::default().measures_pacing());
+        assert!(
+            EngineConfig {
+                benchmark_frames: Some(60),
+                ..EngineConfig::default()
+            }
+            .measures_pacing()
+        );
+        assert!(
+            EngineConfig {
+                benchmark_duration_secs: Some(30.0),
+                ..EngineConfig::default()
+            }
+            .measures_pacing()
+        );
+        // A jump without a frame limit or duration still runs, and warns that it has no report.
+        assert!(
+            EngineConfig {
+                benchmark_jump: Some((3, 4)),
+                ..EngineConfig::default()
+            }
+            .measures_pacing()
+        );
+    }
+
+    #[test]
+    fn fly_lag_is_recorded_only_while_flying_in_a_measured_run() {
+        let flying = EngineConfig {
+            auto_fly_speed: 900.0,
+            ..EngineConfig::default()
+        };
+        assert!(!flying.records_fly_lag(), "flying alone measures nothing");
+        assert!(
+            EngineConfig {
+                benchmark_frames: Some(60),
+                ..flying.clone()
+            }
+            .records_fly_lag()
+        );
+        assert!(
+            !EngineConfig {
+                benchmark_frames: Some(60),
+                ..EngineConfig::default()
+            }
+            .records_fly_lag(),
+            "a benchmark that does not fly has no fly lag"
+        );
+    }
+
+    #[test]
+    fn a_jump_is_ignored_when_the_run_drives_the_camera() {
+        let args =
+            |list: &[&str]| EngineConfig::run_from_args(list.iter().map(|v| (*v).to_owned()));
+        // In either order of the flags.
+        for list in [
+            ["--benchmark-jump", "3,4", "--auto-fly-speed", "900"],
+            ["--auto-fly-speed", "900", "--benchmark-jump", "3,4"],
+        ] {
+            let config = args(&list);
+            assert_eq!(config.benchmark_jump, None, "{list:?}");
+            assert_eq!(config.auto_fly_speed, 900.0);
+        }
+        let config = args(&[
+            "--benchmark-jump",
+            "3,4",
+            "--acceptance-screenshot",
+            "a.png",
+        ]);
+        assert_eq!(config.benchmark_jump, None);
+        // The streaming fixture drives the camera every frame too.
+        let config = args(&["--benchmark-jump", "3,4", "--streaming-fixture"]);
+        assert_eq!(config.benchmark_jump, None);
+        assert!(config.streaming_fixture);
+        // A shots run poses the camera for each shot, and a jump would move it off a pose.
+        let config = args(&[
+            "--benchmark-jump",
+            "3,4",
+            "--benchmark-frames",
+            "600",
+            "--shots",
+            "shots.json",
+        ]);
+        assert_eq!(config.benchmark_jump, None);
+        assert!(config.shots.is_some());
+        for list in [
+            ["--benchmark-jump", "3,4", "--matched-route", "route.json"],
+            ["--matched-route", "route.json", "--benchmark-jump", "3,4"],
+        ] {
+            let config = args(&list);
+            assert_eq!(config.benchmark_jump, None, "{list:?}");
+            assert_eq!(config.matched_route, Some(PathBuf::from("route.json")));
+        }
+        // A synthetic benchmark loads no world, so no streaming system would issue the jump.
+        let config = args(&[
+            "--benchmark-only",
+            "--benchmark-frames",
+            "120",
+            "--benchmark-jump",
+            "1,2",
+        ]);
+        assert_eq!(config.benchmark_jump, None);
+        assert!(config.benchmark_only);
+        // The single-scene fixtures create no streaming runtime either.
+        for flag in [
+            "--material-fixture",
+            "--terrain-water-fixture",
+            "--transform-bounds-fixture",
+            "--renderer-fixture",
+            "--physics-fixture",
+        ] {
+            let config = args(&["--benchmark-jump", "3,4", "--benchmark-frames", "600", flag]);
+            assert_eq!(config.benchmark_jump, None, "{flag}");
+        }
+        assert_eq!(
+            args(&["--benchmark-jump", "3,4"]).benchmark_jump,
+            Some((3, 4))
+        );
+    }
+
+    /// Without a frame limit or duration no report is written, so the jump has nowhere to appear:
+    /// the run warns but keeps the target (an interactive run may still be worth watching).
+    #[test]
+    fn a_jump_without_a_report_keeps_the_target() {
+        let config = EngineConfig::run_from_args(["--benchmark-jump", "3,4"].map(str::to_owned));
+        assert_eq!(config.benchmark_jump, Some((3, 4)));
+        assert!(!config.is_benchmark_run());
+        // The jump is an automated camera path: no player whose WALK camera follow would undo it.
+        assert!(!config.interactive_world_physics());
+        let config = EngineConfig::run_from_args(
+            ["--benchmark-jump", "3,4", "--benchmark-frames", "600"].map(str::to_owned),
+        );
+        assert_eq!(config.benchmark_jump, Some((3, 4)));
+        assert!(config.is_benchmark_run());
     }
 
     #[test]
@@ -1719,6 +2113,18 @@ mod tests {
             "Mudcrab - shots: riverwood"
         );
         assert_eq!(args(&[]).window_title(), "Mudcrab");
+    }
+
+    #[test]
+    fn matched_route_is_a_separate_automated_camera_mode() {
+        let config = run_config(&["--matched-route", "route.json"]);
+        assert_eq!(config.matched_route, Some(PathBuf::from("route.json")));
+        assert!(!config.interactive_world_physics());
+        assert!(
+            run_config(&["--matched-route", "route.json", "--run-label", "test"])
+                .window_title()
+                .contains("matched-route")
+        );
     }
 
     /// A shots path left out does not swallow the next option, and it is an error rather than a
@@ -1900,6 +2306,10 @@ mod tests {
             },
             EngineConfig {
                 shots: Some("poses.json".into()),
+                ..EngineConfig::default()
+            },
+            EngineConfig {
+                benchmark_jump: Some((3, 4)),
                 ..EngineConfig::default()
             },
             EngineConfig {
@@ -2262,6 +2672,8 @@ mod tests {
 
     /// Utility `.ps1`, `.sh` and `.py` files under `root`, subdirectories included,
     /// in a stable order. Hidden directories and script tests are excluded.
+    /// Converter-only profiling tools stay in the scan; their flags are checked
+    /// only on lines that invoke the engine (see `checked_script_engine_flags`).
     fn script_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut paths = Vec::new();
         let mut pending = vec![root.to_owned()];
@@ -2275,8 +2687,7 @@ mod tests {
                 // loop the walk; hidden folders (`.venv`) hold no project scripts.
                 if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                     let name = entry.file_name();
-                    // Tests inspect script text, including deliberately unsupported engine
-                    // options; they are not utility command lines.
+                    // Tests inspect deliberately unsupported engine options.
                     if !name.to_string_lossy().starts_with('.') && name != "tests" {
                         pending.push(path);
                     }
@@ -2292,13 +2703,84 @@ mod tests {
         paths
     }
 
+    fn checked_script_engine_flags(script: &str, path: &std::path::Path) -> usize {
+        let options = parser_options();
+        let mut checked = 0;
+        // lod-performance tools parse converter options. Only their lines that
+        // name the engine are engine invocations; the rest is not checked.
+        let converter_tool = path
+            .components()
+            .any(|part| part.as_os_str() == "lod-performance");
+        let engine_lines: String;
+        let scanned = if converter_tool {
+            engine_lines = script
+                .lines()
+                .filter(|line| {
+                    line.split(|c: char| !c.is_alphanumeric())
+                        .any(|word| word == "engine")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            engine_lines.as_str()
+        } else {
+            script
+        };
+        for flag in option_tokens(scanned) {
+            // This database-only tool owns --verify. Keep it scoped to the tool:
+            // an engine launcher passing --verify must still fail the audit.
+            let observation_option = path.file_name().is_some_and(|name| {
+                name == "reference-enable-observations.py" && flag == "--verify"
+            });
+            if NON_ENGINE_FLAGS.contains(&flag) || observation_option {
+                continue;
+            }
+            assert!(
+                options.contains(&flag),
+                "{} passes {flag}, which the parser refuses",
+                path.display()
+            );
+            checked += 1;
+        }
+        checked
+    }
+
+    #[test]
+    fn the_script_audit_scopes_observation_options_and_rejects_unknown_engine_flags() {
+        let observation = std::path::Path::new("reference-enable-observations.py");
+        assert_eq!(
+            checked_script_engine_flags(
+                "--output manifest.json --verify manifest.json",
+                observation
+            ),
+            0
+        );
+        assert_eq!(
+            checked_script_engine_flags("engine --headless", observation),
+            1
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                checked_script_engine_flags("engine --unknown-engine-option", observation)
+            })
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                checked_script_engine_flags(
+                    "engine --verify manifest.json",
+                    std::path::Path::new("launch.sh"),
+                )
+            })
+            .is_err()
+        );
+    }
+
     /// Every utility `.ps1`, `.sh` and `.py` file in `scripts/`, subdirectories
     /// included, is read from disk, so a script added later cannot pass an
     /// option the parser refuses without failing this test. The scan is skipped
     /// when the repository's `scripts/` is not next to this crate.
     #[test]
     fn the_scripts_only_pass_options_the_parser_accepts() {
-        let options = parser_options();
         let Some(scripts) = scripts_directory() else {
             return;
         };
@@ -2306,17 +2788,7 @@ mod tests {
         for path in script_paths(&scripts) {
             let script = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
-            for flag in option_tokens(&script) {
-                if NON_ENGINE_FLAGS.contains(&flag) {
-                    continue;
-                }
-                assert!(
-                    options.contains(&flag),
-                    "{} passes {flag}, which the parser refuses",
-                    path.display()
-                );
-                checked += 1;
-            }
+            checked += checked_script_engine_flags(&script, &path);
         }
         assert!(
             checked >= 20,
@@ -2407,14 +2879,42 @@ mod tests {
     }
 
     #[test]
-    fn script_v89_scan_excludes_tests_and_keeps_nested_utilities() {
+    fn script_v89_scan_excludes_other_tool_scopes_and_keeps_nested_utilities() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("tests")).unwrap();
+        std::fs::create_dir(directory.path().join("lod-performance")).unwrap();
         std::fs::create_dir(directory.path().join("utils")).unwrap();
         std::fs::write(directory.path().join("tests/check.py"), "--log-file").unwrap();
+        std::fs::write(
+            directory.path().join("lod-performance/audit.py"),
+            "--data-root --expected-chunks --lod-encoder",
+        )
+        .unwrap();
         let utility = directory.path().join("utils/capture.sh");
         std::fs::write(&utility, "--headless").unwrap();
-        assert_eq!(script_paths(directory.path()), vec![utility]);
+        assert_eq!(
+            script_paths(directory.path()),
+            vec![directory.path().join("lod-performance/audit.py"), utility]
+        );
+    }
+
+    #[test]
+    fn lod_performance_flags_are_checked_only_on_engine_lines() {
+        let tool = std::path::Path::new("scripts/lod-performance/run_conversion_observed.py");
+        assert_eq!(
+            checked_script_engine_flags("converter --data-root x --lod-encoder cpu", tool),
+            0
+        );
+        assert_eq!(
+            checked_script_engine_flags("engine --headless\nconverter --data-root x", tool),
+            1
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                checked_script_engine_flags("engine --unknown-engine-option", tool)
+            })
+            .is_err()
+        );
     }
 
     /// True when a script spells out a finite number.

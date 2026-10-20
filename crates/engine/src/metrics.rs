@@ -1,9 +1,10 @@
 use crate::{
     config::EngineConfig,
+    pacing::{PacingReport, PacingTracker},
     profiling::{MetricSummary, ProfilingState, SystemMetadata, reconcile_scene, summarize},
     render::RendererMetrics,
-    render_timing::{RenderTimingPlugin, RenderTimings},
-    streaming::{RenderOrigin, StreamingMetrics},
+    render_timing::{PipelineActivity, RenderTimingPlugin, RenderTimings},
+    streaming::{ActiveSpace, RenderOrigin, StreamingMetrics},
     streaming_gpu_metrics::StreamingGpuMetricsBridge,
     streaming_trace::{
         BenchmarkWindow, CameraMotion, CameraObservation, StreamingBenchmarkRouteSnapshot,
@@ -29,6 +30,7 @@ use std::{
 pub struct AcceptanceMetricsPlugin;
 
 impl Plugin for AcceptanceMetricsPlugin {
+    /// Install benchmark collection and enable frame tracing when profile output is configured.
     fn build(&self, app: &mut App) {
         app.init_resource::<BenchmarkSamples>()
             .add_plugins((
@@ -47,6 +49,20 @@ impl Plugin for AcceptanceMetricsPlugin {
         {
             app.add_systems(Last, sample_streaming_trace.before(collect_and_finish));
         }
+        let measures_pacing = app
+            .world()
+            .get_resource::<EngineConfig>()
+            .map(EngineConfig::measures_pacing);
+        install_schedule_timing(app, measures_pacing);
+    }
+}
+
+/// Adds the schedule-timing plugin (which also counts asset arrivals) only when the run measures
+/// pacing. An ordinary play session installs neither the eight marker schedules per frame nor the
+/// four asset-arrival counts.
+fn install_schedule_timing(app: &mut App, measures_pacing: Option<bool>) {
+    if measures_pacing == Some(true) {
+        app.add_plugins(crate::schedule_timing::ScheduleTimingPlugin);
     }
 }
 
@@ -63,6 +79,7 @@ struct BenchmarkSamples {
     finished: bool,
 }
 
+/// Classify the current frame before benchmark collection advances its counters.
 fn benchmark_window(config: &EngineConfig, samples: &BenchmarkSamples) -> BenchmarkWindow {
     if config.benchmark_frames.is_none() && config.benchmark_duration_secs.is_none() {
         BenchmarkWindow::OutsideBenchmark
@@ -123,6 +140,8 @@ struct PreviousCamera {
     rotation: Quat,
 }
 
+/// Record stable world coordinates and motion relative to the previous comparable camera.
+/// Origin rebases and equivalent quaternion signs do not count as movement.
 fn observe_camera(
     entity: Entity,
     transform: &GlobalTransform,
@@ -167,6 +186,10 @@ fn observe_camera(
     }
 }
 
+/// Runs in `Last` before `collect_and_finish`, and `profiling::begin_trace_frame` clears the
+/// per-frame span maps in `First`. Spans recorded after this system in `Last`, or by render-world
+/// callbacks that land after it, therefore never reach the per-frame trace. They still reach the
+/// aggregate profile, so the trace's span totals can be slightly lower than the aggregate.
 #[allow(clippy::too_many_arguments)]
 fn sample_streaming_trace(
     config: Res<EngineConfig>,
@@ -179,21 +202,25 @@ fn sample_streaming_trace(
     mut events: MessageReader<AssetEvent<WorldAsset>>,
     cameras: Query<(Entity, &GlobalTransform), With<StreamingCamera>>,
     origin: Option<Res<RenderOrigin>>,
+    space: Option<Res<ActiveSpace>>,
     mut previous_camera: Local<Option<PreviousCamera>>,
     mut pending_ids: Local<Vec<bevy::asset::AssetId<WorldAsset>>>,
     mut profiler: ResMut<ProfilingState>,
     runtime: Option<Res<crate::streaming::runtime::StreamingRuntime>>,
     route: Option<Res<crate::app::StreamingBenchmarkRoute>>,
 ) {
-    let camera = match cameras.single() {
-        Ok((entity, transform)) => Some(observe_camera(
+    // Trace v1 has no interior identity. Do not label interior coordinates as exterior world
+    // positions or compare motion across the transition; resume observations after leaving.
+    let active = space.as_deref().copied().unwrap_or_default();
+    let camera = match cameras.single().ok().filter(|_| active.interior.is_none()) {
+        Some((entity, transform)) => Some(observe_camera(
             entity,
             transform,
-            config.worldspace_id,
+            active.exterior_worldspace(config.worldspace_id),
             origin.as_ref().map_or(IVec2::ZERO, |origin| origin.0),
             &mut previous_camera,
         )),
-        Err(_) => {
+        None => {
             *previous_camera = None;
             None
         }
@@ -243,7 +270,9 @@ fn sample_streaming_trace(
                     | AssetEvent::LoadedWithDependencies { id } => {
                         reconcile_scene(trace, &server, *id);
                     }
-                    AssetEvent::Removed { .. } => {}
+                    AssetEvent::Removed { id } => {
+                        trace.remove_scene(*id);
+                    }
                 }
             }
             pending_ids.clear();
@@ -280,11 +309,20 @@ struct BenchmarkReport {
     entity_count: Option<u64>,
     system: Option<SystemSnapshot>,
     streaming: Option<StreamingMetrics>,
+    /// Last control observation, including reservation and physical-pressure gates.
+    adaptive: Option<crate::streaming::runtime::RuntimeSnapshot>,
     renderer: RendererMetrics,
     /// CPU time of the parts of a frame the frame-time and GPU numbers do not split out, in
     /// milliseconds: the main world, the wait for the render thread, extract, and the render
     /// thread with its phases (see `render_timing`). Empty when the renderer did not run.
     render_world: BTreeMap<String, MetricSummary>,
+    /// Render pipelines queued and finished per render frame, set against render-thread time (see
+    /// `render_timing::PipelineActivity`). Serialised as `null` when the renderer did not run.
+    render_pipelines: Option<PipelineActivity>,
+    /// Time to a fully loaded world, the jump, and loading lag at speed (see `pacing`). The fields
+    /// sit at the top level of the report and are absent for a run with no streaming.
+    #[serde(flatten)]
+    pacing: Option<PacingReport>,
     thresholds: Thresholds,
     passed: bool,
 }
@@ -318,28 +356,17 @@ fn collect_and_finish(
     diagnostics: Res<DiagnosticsStore>,
     system: Option<Res<SystemInfo>>,
     streaming: Option<Res<StreamingMetrics>>,
+    runtime: Option<Res<crate::streaming::runtime::StreamingRuntime>>,
     renderer: Res<RendererMetrics>,
     render_timings: Res<RenderTimings>,
+    pacing: Option<Res<PacingTracker>>,
     mut samples: ResMut<BenchmarkSamples>,
     mut profiler: ResMut<ProfilingState>,
     mut exit: MessageWriter<AppExit>,
     route: Option<Res<crate::app::StreamingBenchmarkRoute>>,
-    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
 ) {
-    if samples.finished
-        || (route.is_none()
-            && config.benchmark_frames.is_none()
-            && config.benchmark_duration_secs.is_none())
-    {
+    if samples.finished || !config.is_benchmark_run() {
         return;
-    }
-    if route.is_some()
-        && let Ok(window) = windows.single()
-    {
-        profiler.capture_window_resolution = Some([
-            window.resolution.physical_width(),
-            window.resolution.physical_height(),
-        ]);
     }
     if !samples.measurement_complete {
         samples.frames_seen = samples.frames_seen.saturating_add(1);
@@ -415,6 +442,15 @@ fn collect_and_finish(
             (name.to_owned(), summarize(&values))
         })
         .collect();
+    let render_pipelines = render_timings.take_pipeline_activity();
+    let pacing_report = pacing.as_deref().map(|tracker| {
+        tracker.report(
+            &config,
+            streaming
+                .as_deref()
+                .map_or(0, |value| value.peak_arming_queue_depth),
+        )
+    });
     let mut ordered = samples.frame_ms.clone();
     ordered.sort_by(f64::total_cmp);
     let total_ms = ordered.iter().sum::<f64>();
@@ -467,7 +503,7 @@ fn collect_and_finish(
         memory: value.memory.clone(),
     });
     let report = BenchmarkReport {
-        format_version: if route.is_some() { 8 } else { 7 },
+        format_version: 8,
         generated_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
@@ -521,8 +557,13 @@ fn collect_and_finish(
             .map(|value| value as u64),
         system: system_snapshot.clone(),
         streaming: streaming.as_ref().map(|value| (*value).clone()),
+        adaptive: runtime
+            .as_ref()
+            .and_then(|runtime| runtime.snapshot.clone()),
         renderer: renderer.clone(),
         render_world,
+        render_pipelines,
+        pacing: pacing_report,
         thresholds: Thresholds {
             minimum_average_fps: config.accept_min_fps,
             maximum_p95_frame_ms: config.accept_p95_ms,
@@ -691,6 +732,77 @@ fn frame_times_csv(frame_ms: &[f64]) -> String {
 mod tests {
     use super::*;
 
+    /// The signal-timing app used by the gate test: minimal plugins, an asset store to add to,
+    /// and a `ProfilingState` for the plugin (or the test) to record into.
+    fn timing_app(measures_pacing: bool) -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Mesh>()
+            .init_resource::<ProfilingState>();
+        install_schedule_timing(&mut app, Some(measures_pacing));
+        app.finish();
+        app.cleanup();
+        app.update();
+        app.world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Mesh::from(Cuboid::default()));
+        app.update();
+        app.update();
+        app
+    }
+
+    /// A normal play session is not a benchmark, so it installs neither the marker schedules nor
+    /// the asset-arrival counting; a benchmark run installs both.
+    #[test]
+    fn schedule_and_asset_instrumentation_is_benchmark_only() {
+        let profiler = timing_app(false);
+        let profiler = profiler.world().resource::<ProfilingState>();
+        assert!(
+            profiler.span_samples("main_schedule/Update").is_empty(),
+            "a play session must not add the schedule markers"
+        );
+        assert!(
+            profiler.span_samples("assets_added/mesh").is_empty(),
+            "a play session must not count asset arrivals"
+        );
+
+        let profiler = timing_app(true);
+        let profiler = profiler.world().resource::<ProfilingState>();
+        assert!(
+            !profiler.span_samples("main_schedule/Update").is_empty(),
+            "a benchmark run times the schedules"
+        );
+        assert!(
+            profiler
+                .span_samples("assets_added/mesh")
+                .iter()
+                .sum::<f64>()
+                >= 1.0,
+            "a benchmark run counts asset arrivals"
+        );
+    }
+
+    /// The plugin reads the run's `EngineConfig` while it builds, so the config must already be
+    /// in the world; this drives that real path rather than the helper.
+    #[test]
+    fn the_plugin_installs_schedule_timing_from_the_inserted_config() {
+        let installed = |config: Option<EngineConfig>| {
+            let mut app = App::new();
+            app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+            if let Some(config) = config {
+                app.insert_resource(config);
+            }
+            app.add_plugins(AcceptanceMetricsPlugin);
+            app.is_plugin_added::<crate::schedule_timing::ScheduleTimingPlugin>()
+        };
+        assert!(installed(Some(EngineConfig {
+            benchmark_frames: Some(60),
+            ..EngineConfig::default()
+        })));
+        assert!(!installed(Some(EngineConfig::default())));
+        assert!(!installed(None), "no config means no measured run");
+    }
+
     #[test]
     fn route_report_clock_keeps_uncapped_real_frame_intervals() {
         use crate::{app::StreamingBenchmarkPhase, profiling::ProfilingPlugin};
@@ -746,6 +858,7 @@ mod tests {
         assert_eq!(snapshot.movement_started_elapsed_ms, Some(7000.0));
     }
 
+    /// Verify trace frame ordering across all benchmark windows with GPU inventory on and off.
     #[test]
     fn trace_keeps_warmup_and_capture_settlement_on_one_frame_clock() {
         for gpu_inventory_enabled in [false, true] {
@@ -753,6 +866,7 @@ mod tests {
         }
     }
 
+    /// Run a short benchmark and verify frame windows, span attribution and exported frame IDs.
     fn check_trace_windows(gpu_inventory_enabled: bool) {
         use crate::profiling::ProfilingPlugin;
         use bevy::time::TimeUpdateStrategy;
@@ -841,6 +955,7 @@ mod tests {
         }
     }
 
+    /// Verify camera motion uses stable coordinates and resets across worldspace changes.
     #[test]
     fn camera_motion_ignores_rebases_and_quaternion_sign() {
         let entity = Entity::from_raw_u32(1).unwrap();
@@ -876,6 +991,51 @@ mod tests {
             &mut previous,
         );
         assert_eq!(changed_space.motion, CameraMotion::Unavailable);
+    }
+
+    #[test]
+    fn trace_uses_the_active_worldspace_and_resets_camera_history_across_interiors() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(EngineConfig {
+                profile_output_dir: Some(directory.path().join("profile")),
+                ..default()
+            })
+            .insert_resource(RenderOrigin(IVec2::new(4, -3)))
+            .insert_resource(ActiveSpace {
+                worldspace_id: Some(42),
+                interior: None,
+            })
+            .init_resource::<DiagnosticsStore>()
+            .init_resource::<RendererMetrics>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<Image>>()
+            .add_plugins((AcceptanceMetricsPlugin, crate::profiling::ProfilingPlugin));
+        app.world_mut()
+            .spawn((StreamingCamera, GlobalTransform::from_xyz(10.0, 20.0, 30.0)));
+        app.update();
+        app.update();
+        app.world_mut().resource_mut::<ActiveSpace>().interior = Some(77);
+        app.update();
+        app.world_mut().resource_mut::<ActiveSpace>().interior = None;
+        app.update();
+        let profiler = app.world().resource::<ProfilingState>();
+        let report = profiler.trace.as_ref().unwrap().report();
+        let samples = &report.samples;
+        assert_eq!(samples[0].camera.as_ref().unwrap().worldspace_id, 42);
+        assert_eq!(
+            samples[1].camera.as_ref().unwrap().motion,
+            CameraMotion::Stationary
+        );
+        assert!(
+            samples[2].camera.is_none(),
+            "interior coordinates have no exterior identity"
+        );
+        assert_eq!(
+            samples[3].camera.as_ref().unwrap().motion,
+            CameraMotion::Unavailable
+        );
     }
 
     #[test]
@@ -921,11 +1081,39 @@ mod tests {
     }
 
     #[test]
-    fn calculates_nearest_rank_percentiles() {
+    fn calculates_percentiles_at_the_shared_rank() {
         let samples: Vec<_> = (1..=100).map(f64::from).collect();
         assert_eq!(percentile(&samples, 0.50), 51.0);
         assert_eq!(percentile(&samples, 0.95), 96.0);
         assert_eq!(percentile(&samples, 0.99), 100.0);
+    }
+
+    /// A report without streaming carries no pacing fields at all: `#[serde(flatten)]` on the
+    /// `None` must not fail or leave a `null` behind.
+    #[test]
+    fn a_report_without_pacing_serialises_no_pacing_fields() {
+        #[derive(Serialize)]
+        struct Flattened {
+            frames: usize,
+            #[serde(flatten)]
+            pacing: Option<PacingReport>,
+        }
+        let value = serde_json::to_value(Flattened {
+            frames: 3,
+            pacing: None,
+        })
+        .expect("a report with no pacing block must serialise");
+        assert_eq!(value, serde_json::json!({ "frames": 3 }));
+        let value = serde_json::to_value(Flattened {
+            frames: 3,
+            pacing: Some(PacingReport {
+                world_ready_reached: true,
+                ..Default::default()
+            }),
+        })
+        .unwrap();
+        assert_eq!(value["world_ready_reached"], serde_json::json!(true));
+        assert_eq!(value["frames"], serde_json::json!(3));
     }
 
     #[test]
@@ -1081,5 +1269,99 @@ mod tests {
             false,
             false
         ));
+    }
+
+    /// The `collect_and_finish` app: a measurement that has already completed, a renderer on its
+    /// final path, and the screenshot at `screenshot`, with the screenshot wait seeded `waited` ago
+    /// rather than slept through. Every threshold but the screenshot's passes, so `passed` says
+    /// what the screenshot gate alone decided. The report goes to `directory`.
+    fn acceptance_report_app(
+        directory: &std::path::Path,
+        screenshot: Option<&std::path::Path>,
+        waited: std::time::Duration,
+    ) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(EngineConfig {
+                benchmark_frames: Some(1),
+                benchmark_output: directory.join("benchmark-report.json"),
+                acceptance_screenshot: screenshot.map(std::path::Path::to_path_buf),
+                accept_min_fps: 0.0,
+                ..default()
+            })
+            .insert_resource(BenchmarkSamples {
+                measurement_complete: true,
+                screenshot_wait_started: Some(std::time::Instant::now() - waited),
+                ..default()
+            })
+            .insert_resource(RendererMetrics {
+                gpu_preprocessing_active: true,
+                gpu_culling_active: true,
+                indirect_drawing_active: true,
+                occlusion_culling_views: 1,
+                hzb_views: 1,
+                indirect_phase_buffers: 1,
+                indirect_batch_sets: 1,
+                proof_frames: 1,
+                ..default()
+            })
+            .init_resource::<RenderTimings>()
+            .init_resource::<DiagnosticsStore>()
+            .insert_resource(ProfilingState::default())
+            .add_systems(Update, collect_and_finish);
+        app
+    }
+
+    fn written_report(directory: &std::path::Path) -> serde_json::Value {
+        let report = fs::read_to_string(directory.join("benchmark-report.json")).unwrap();
+        serde_json::from_str(&report).unwrap()
+    }
+
+    /// A missing acceptance screenshot fails the run once the 10-second wait is past, instead of
+    /// passing on it or hanging; the same run with the PNG written passes. The wait is seeded past
+    /// rather than slept through.
+    #[test]
+    fn the_screenshot_wait_fails_a_missing_capture_instead_of_passing_it() {
+        use bevy::app::AppExit;
+        use bevy::ecs::message::Messages;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("acceptance.png");
+
+        // The wait has only just started: the run waits for the screenshot instead of finishing.
+        let mut waiting = acceptance_report_app(directory.path(), Some(&missing), Duration::ZERO);
+        waiting.update();
+        assert!(!waiting.world().resource::<BenchmarkSamples>().finished);
+        assert!(!directory.path().join("benchmark-report.json").exists());
+
+        // Past the wait: the run finishes with the screenshot gate failed, and says so.
+        let mut expired =
+            acceptance_report_app(directory.path(), Some(&missing), Duration::from_secs(11));
+        expired.update();
+        assert!(expired.world().resource::<BenchmarkSamples>().finished);
+        let exits: Vec<AppExit> = expired
+            .world()
+            .resource::<Messages<AppExit>>()
+            .iter_current_update_messages()
+            .cloned()
+            .collect();
+        assert_eq!(
+            exits,
+            vec![AppExit::error()],
+            "a missing screenshot fails the run"
+        );
+        let report = written_report(directory.path());
+        assert_eq!(report["thresholds"]["screenshot_captured"], false);
+        assert_eq!(report["passed"], false);
+
+        // The screenshot the capture system queues is what that gate reads: write it and the same
+        // run passes without waiting at all.
+        fs::write(&missing, b"png").unwrap();
+        let mut captured = acceptance_report_app(directory.path(), Some(&missing), Duration::ZERO);
+        captured.update();
+        let report = written_report(directory.path());
+        assert_eq!(report["thresholds"]["screenshot_captured"], true);
+        assert_eq!(report["passed"], true);
     }
 }
