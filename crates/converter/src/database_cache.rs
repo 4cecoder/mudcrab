@@ -159,6 +159,24 @@ pub(super) fn identity(
     sources: inhouse::StringSources<'_>,
     cancellation: &Cancellation,
 ) -> Result<Option<Identity>> {
+    identity_with_program(config, plugins, sources, cancellation, program_digest)
+}
+
+/// The running converter's own bytes. An unreadable or replaced executable is an optional proof
+/// failure, not a conversion failure: see [`identity_with_program`].
+fn program_digest() -> Result<String> {
+    hash_file(&std::env::current_exe()?)
+}
+
+/// The identity with the converter's digest supplied by `program`. A digest that cannot be
+/// produced makes the database uncacheable for this run; conversion itself continues.
+fn identity_with_program(
+    config: &PipelineConfig,
+    plugins: &[PathBuf],
+    sources: inhouse::StringSources<'_>,
+    cancellation: &Cancellation,
+    program: impl FnOnce() -> Result<String>,
+) -> Result<Option<Identity>> {
     let mut plugin_inputs = Vec::new();
     let mut localization = Vec::new();
     for (index, plugin) in plugins.iter().enumerate() {
@@ -191,6 +209,9 @@ pub(super) fn identity(
             localization.push(input);
         }
     }
+    let Ok(program_sha256) = program() else {
+        return Ok(None);
+    };
     let inputs = serde_json::json!({
         "cache_format": FORMAT,
         "converter_schema": CONVERTER_SCHEMA_VERSION,
@@ -198,7 +219,7 @@ pub(super) fn identity(
         "reader": inhouse::configured_reader_identity(config)?,
         "language": config.language,
         "native_sources_sha256": source_fingerprint(),
-        "compiled_program_sha256": hash_file(&std::env::current_exe()?)?,
+        "compiled_program_sha256": program_sha256,
         "target": {"arch": std::env::consts::ARCH, "os": std::env::consts::OS,
             "endian": if cfg!(target_endian = "little") {"little"} else {"big"},
             "pointer_width": usize::BITS},
@@ -917,6 +938,43 @@ mod tests {
             );
             assert!(!target.join("skyrim_world.db").exists());
         }
+    }
+
+    /// An unreadable converter executable makes the database uncacheable, while a readable one
+    /// keeps the same proof and key. The digest is injected, so the running binary is untouched.
+    #[test]
+    fn unreadable_program_digest_makes_the_database_uncacheable_not_fatal() {
+        let fixture = fixture();
+        let cancellation = Cancellation::new();
+        let vfs = fixture.staging.join("vfs");
+        let sources = test_sources(&fixture.config, &vfs);
+        let proven = identity(&fixture.config, &fixture.plugins, sources, &cancellation)
+            .unwrap()
+            .unwrap();
+        let digest = proven.inputs["compiled_program_sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let unavailable = identity_with_program(
+            &fixture.config,
+            &fixture.plugins,
+            sources,
+            &cancellation,
+            || Err(color_eyre::eyre::eyre!("executable was replaced")),
+        )
+        .unwrap();
+        assert!(unavailable.is_none());
+        let available = identity_with_program(
+            &fixture.config,
+            &fixture.plugins,
+            sources,
+            &cancellation,
+            || Ok(digest.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(available.key, proven.key);
+        assert_eq!(available.inputs["compiled_program_sha256"], digest.as_str());
     }
 
     /// Loose-first Data sources for the run's configured language, as an ordinary run builds them.

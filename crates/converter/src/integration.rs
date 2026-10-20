@@ -288,7 +288,7 @@ fn read_glb_bounds_from_reader(
         .wrap_err("invalid GLB container")?;
     ensure!(&header[..4] == b"glTF", "invalid GLB container");
     ensure!(&header[16..20] == b"JSON", "GLB JSON chunk is missing");
-    let json_length = u32::from_le_bytes(header[12..16].try_into().unwrap());
+    let json_length = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
     ensure!(
         u64::from(json_length) <= file_length.saturating_sub(header.len() as u64),
         "truncated GLB JSON chunk"

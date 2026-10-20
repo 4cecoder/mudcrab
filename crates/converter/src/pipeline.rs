@@ -1076,8 +1076,10 @@ impl AssetPipeline {
                             "database_cache_persistence".into(),
                             store_started.elapsed().as_millis(),
                         );
-                    } else {
+                    } else if current.is_some() {
                         report.notices.push("base database cache was not stored because its inputs changed during conversion".into());
+                    } else {
+                        report.notices.push("base database cache was not stored because its identity could not be verified".into());
                     }
                 }
             }
