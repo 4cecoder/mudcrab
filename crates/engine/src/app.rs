@@ -2650,7 +2650,8 @@ mod tests {
                 Ok(_) => panic!("a route with a shots or matched route must be refused"),
             };
             assert!(
-                error.contains("renders the converted world on its own") && error.contains("--route"),
+                error.contains("renders the converted world on its own")
+                    && error.contains("--route"),
                 "{error}"
             );
         }

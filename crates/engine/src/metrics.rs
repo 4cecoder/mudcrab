@@ -1209,7 +1209,10 @@ mod tests {
         app.insert_resource(finished).update();
         let report = written_report(directory.path());
         assert_eq!(report["route"]["completed"], true);
-        assert_eq!(report["passed"], true, "a finished route passes with the other gates");
+        assert_eq!(
+            report["passed"], true,
+            "a finished route passes with the other gates"
+        );
     }
 
     /// Whether the world counts as ready on each frame of the file-route fixtures below.
