@@ -2746,11 +2746,15 @@ mod tests {
     fn checked_script_engine_flags(script: &str, path: &std::path::Path) -> usize {
         let options = parser_options();
         let mut checked = 0;
-        // lod-performance tools parse converter options. Only their lines that
-        // name the engine are engine invocations; the rest is not checked.
-        let converter_tool = path
-            .components()
-            .any(|part| part.as_os_str() == "lod-performance");
+        // lod-performance tools parse converter options and lod-experiment
+        // tools parse their own offline options. Only their lines that name the
+        // engine are engine invocations; the rest is not checked.
+        let converter_tool = path.components().any(|part| {
+            matches!(
+                part.as_os_str().to_str(),
+                Some("lod-performance" | "lod-experiment")
+            )
+        });
         let engine_lines: String;
         let scanned = if converter_tool {
             engine_lines = script
@@ -2954,6 +2958,47 @@ mod tests {
                 checked_script_engine_flags("engine --unknown-engine-option", tool)
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn lod_experiment_flags_are_checked_only_on_engine_lines() {
+        let tool = std::path::Path::new("scripts/lod-experiment/build.py");
+        assert_eq!(
+            checked_script_engine_flags(
+                "builder --meshoptimizer x --max-cluster-triangles 124 --output out",
+                tool
+            ),
+            0
+        );
+        assert_eq!(
+            checked_script_engine_flags("engine --headless\nbuilder --meshoptimizer x", tool),
+            1
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                checked_script_engine_flags("engine --unknown-engine-option", tool)
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unregistered_lod_experiment_utilities_stay_in_the_scan() {
+        let directory = tempfile::tempdir().unwrap();
+        let experiment = directory.path().join("lod-experiment");
+        std::fs::create_dir(&experiment).unwrap();
+        let registered = experiment.join("build.py");
+        let utility = experiment.join("unregistered.py");
+        std::fs::write(&registered, "--meshoptimizer x").unwrap();
+        std::fs::write(&utility, "--meshoptimizer x").unwrap();
+        assert_eq!(
+            script_paths(directory.path()),
+            vec![registered.clone(), utility.clone()]
+        );
+        assert_eq!(
+            checked_script_engine_flags(&std::fs::read_to_string(&utility).unwrap(), &utility),
+            0
         );
     }
 
