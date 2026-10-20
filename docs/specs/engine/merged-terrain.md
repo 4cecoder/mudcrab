@@ -39,15 +39,18 @@ around one cell at a time.
 5. `NoData` and `Invalid` cells use the quadrant path, which is unchanged. Every cell with terrain
    is counted once: `terrain_cells_merged`, or `terrain_cells_fallback` (with
    `terrain_cells_fallback_expected_merged` and `terrain_cells_merged_invalid` for the cells whose
-   merged data was expected or broken). The scene gauges split `scene/terrain_patches` into
-   `scene/terrain_merged_cells` and `scene/terrain_quadrant_patches`.
+   merged data was expected or broken). The scene inventory counts split `scene/terrain_patches`
+   into `scene/terrain_merged_cells` and `scene/terrain_quadrant_patches`.
 
 While the arrays load, the responses of exterior cells that have terrain are held (in arrival
 order, replayed first once setup ends) so a cell is never drawn by the quadrant path only because
 the arrays were late. Interiors, cells with no LAND and failed loads are not held, and the first
 hold is logged once. Setup is bounded: if no device verdict arrives (a run with no render world
 posts its refusal at once; anything else waits out `SETUP_TIMEOUT`) or the arrays do not finish
-loading, the merged path is refused and the held cells are drawn by quadrant.
+loading, the merged path is refused and the held cells are drawn by quadrant. A held response
+whose load has left the active space or the unload radius is stale: it is discarded at once,
+counted as a stale response, and its outstanding slot is released. A held response still wanted
+keeps its slot, so the held backlog stays within the streaming backlog limit.
 
 Chunk files are memory-mapped whole and validated once with `rkyv::access`; the map starts on a
 page boundary, which is the alignment rkyv needs, and no sub-slice of a chunk is read. A test reads

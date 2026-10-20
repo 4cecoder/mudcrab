@@ -335,6 +335,15 @@ impl StreamingWorld {
             self.outstanding_cells.remove(&key);
         }
     }
+
+    /// Whether a response is for the load still wanted under its generation. A cell that left the
+    /// active space or the unload radius while its response was in flight is not.
+    fn awaits(&self, key: CellKey, generation: u64) -> bool {
+        matches!(
+            self.cells.get(&key),
+            Some(CellStatus::Loading { generation: current }) if *current == generation
+        )
+    }
 }
 
 #[derive(Resource)]
@@ -1119,6 +1128,7 @@ fn collect_cells(
         .is_some_and(TerrainMerge::holds_cells);
     let frame_commit_started = Instant::now();
     commit_budget.frame_started = frame_commit_started;
+    release_stale_held_responses(&mut streaming, &mut metrics, &mut profiler);
     let response_scan_limit = config.max_cell_commits_per_frame.saturating_mul(8).max(8);
     // Retry each previously deferred response once. Responses refused during
     // this scan wait until the next frame, leaving room for other arrivals.
@@ -1195,6 +1205,13 @@ fn collect_cells(
                 "streaming/db_request_total",
                 response.total_request_micros,
             );
+            // A response for a load no longer wanted is stale; it must not wait for setup.
+            if !streaming.awaits(response.key, response.generation) {
+                streaming.consume_cell_response(response.key, response.generation);
+                metrics.stale_responses += 1;
+                profiler.event(format!("{:?}", response.key), "stale_discarded", None);
+                continue;
+            }
             if holding
                 && let Some(merge) = assets.merge.as_deref_mut()
                 && should_hold_response(merge, &response.result, |id| cache.has_terrain(id))
@@ -3184,6 +3201,26 @@ fn merged_geometry_check(cell: &TerrainCellMesh) -> Result<(), String> {
         return Err("terrain contains a zero-length packed normal".to_owned());
     }
     Ok(())
+}
+
+/// Drops the held responses whose load is no longer wanted, releasing each one's outstanding slot.
+/// Setup can hold cells for up to [`terrain_merge::SETUP_TIMEOUT`]; a held response that went stale
+/// meanwhile must not keep its slot until then. Current held responses keep their place in order.
+fn release_stale_held_responses(
+    streaming: &mut StreamingWorld,
+    metrics: &mut StreamingMetrics,
+    profiler: &mut ProfilingState,
+) {
+    let held = std::mem::take(&mut streaming.held_responses);
+    for response in held {
+        if streaming.awaits(response.key, response.generation) {
+            streaming.held_responses.push_back(response);
+        } else {
+            streaming.consume_cell_response(response.key, response.generation);
+            metrics.stale_responses += 1;
+            profiler.event(format!("{:?}", response.key), "stale_discarded", None);
+        }
+    }
 }
 
 /// Whether a database response waits for the merged terrain setup: only a loaded exterior cell
