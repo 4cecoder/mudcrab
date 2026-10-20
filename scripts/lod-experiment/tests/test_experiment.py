@@ -308,6 +308,29 @@ class AdapterTests(unittest.TestCase):
     def setUp(self):
         self.builder = Path(os.environ["LOD_EXPERIMENT_BUILDER"])
 
+    def test_malformed_builder_timing_leaves_no_candidate_artifacts(self):
+        real_run = subprocess.run
+
+        def malformed_timing(command, **keyword):
+            result = real_run(command, **keyword)
+            return subprocess.CompletedProcess(result.args, result.returncode, result.stdout, b"{not json")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            assets = root / "assets"
+            assets.mkdir()
+            document, binary = synthetic.grid(24)
+            (assets / "grid.glb").write_bytes(synthetic.glb(document, binary))
+            with mock.patch.object(experiment.subprocess, "run", side_effect=malformed_timing):
+                manifest = experiment.run_experiment(assets, root / "out", self.builder, export_controls=True)
+            row = manifest["files"][0]["primitives"][0]
+            self.assertEqual(row["status"], "failed")
+            self.assertEqual(set(row), {"mesh", "primitive", "status", "reason"})
+            self.assertEqual(manifest["counts"], {"candidate": 0, "omitted": 0, "failed": 1})
+            self.assertNotIn("controls", manifest["files"][0])
+            self.assertEqual(os.listdir(root / "out" / "candidates"), [])
+            self.assertEqual(json.loads((root / "out" / "measurements.json").read_text())["primitives"], [])
+
     def test_end_to_end_reproducibility_omissions_and_source_preservation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
