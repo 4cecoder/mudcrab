@@ -2628,6 +2628,34 @@ struct ScreenshotCaptureState {
 
 #[cfg(test)]
 mod tests {
+    /// A `--route` file shares the camera with neither `--shots` nor `--matched-route`. The refusal
+    /// comes before the shots file is read, so the file names here need not exist.
+    #[test]
+    fn a_route_refuses_shots_and_matched_route_before_reading_either() {
+        for config in [
+            EngineConfig {
+                route: Some("travel.json".into()),
+                shots: Some("poses.json".into()),
+                ..EngineConfig::default()
+            },
+            EngineConfig {
+                route: Some("travel.json".into()),
+                matched_route: Some("route.json".into()),
+                ..EngineConfig::default()
+            },
+        ] {
+            let mut config = config;
+            let error = match super::prepare_shots(&mut config) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("a route with a shots or matched route must be refused"),
+            };
+            assert!(
+                error.contains("renders the converted world on its own") && error.contains("--route"),
+                "{error}"
+            );
+        }
+    }
+
     use super::*;
     use crate::console::ConsoleState;
     use bevy::asset::{AssetApp, AssetPlugin};

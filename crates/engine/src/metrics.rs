@@ -509,11 +509,15 @@ fn collect_and_finish(
         // keeps the GPU diagnostics of the measured frames, and the GPU-memory counters only once
         // the render world has measured them (see `ProfilingState::sample_frame`). A route run's
         // measured window is the route's own, not the warm-up count.
-        let measuring = route.as_deref().map_or(
-            samples.frames_seen > config.benchmark_warmup_frames,
-            |route| route_window(route) == BenchmarkWindow::Measured,
-        );
-        if route.is_some() && !measuring {
+        // A file route's frames are measured from its first full moving frame on (the frame the route
+        // scores), so the waiting for the world and the activation frame are not in the summary, the
+        // budget, or the duration limit. A streaming route and a run without one keep their gates.
+        let measuring = match (route.as_deref(), measurements.file_route.as_deref()) {
+            (Some(route), _) => route_window(route) == BenchmarkWindow::Measured,
+            (None, Some(file_route)) => file_route.scoring(),
+            (None, None) => samples.frames_seen > config.benchmark_warmup_frames,
+        };
+        if (route.is_some() || measurements.file_route.is_some()) && !measuring {
             render_timings.set_recording(false);
         }
         profiler.sample_frame(
@@ -558,13 +562,19 @@ fn collect_and_finish(
             .benchmark_duration_secs
             .is_some_and(|limit| real_time.elapsed_secs_f64() >= limit);
         // A streaming route ends the window at its last waypoint, so the report covers the route
-        // and not the standing around after it. A `--route` file ends it the same way.
+        // and not the standing around after it. A `--route` file ends it the same way, and its real
+        // deadline ends a route that never became ready or never reached its end.
         let complete = match route.as_deref() {
             Some(route) => {
                 route.phase == crate::app::StreamingBenchmarkPhase::Finished
                     || route_deadline_reached
             }
-            None => frame_limit_reached || duration_reached || samples.route_finished,
+            None => {
+                frame_limit_reached
+                    || duration_reached
+                    || samples.route_finished
+                    || (measurements.file_route.is_some() && route_deadline_reached)
+            }
         };
         if !complete {
             return;
@@ -649,7 +659,10 @@ fn collect_and_finish(
         && screenshot_captured
         && route
             .as_ref()
-            .is_none_or(|route| route.phase == crate::app::StreamingBenchmarkPhase::Finished);
+            .is_none_or(|route| route.phase == crate::app::StreamingBenchmarkPhase::Finished)
+        // A `--route` run passes only once its route has finished: a window closed by its frame
+        // or duration limit reports the partial route, and that is not a pass.
+        && measurements.file_route.as_deref().is_none_or(RouteRunner::finished);
     // Whether the device can time GPU work is the device's own answer, recorded in the fingerprint
     // at startup. The GPU sections take the fingerprint whole, so a run with no renderer says so
     // rather than blaming a backend it never had.
@@ -1165,6 +1178,176 @@ mod tests {
         assert_eq!(samples.frame_ms, vec![600.0]);
         assert_eq!(samples.measured_seconds, 0.6);
         assert!(app.world().resource::<Time>().delta_secs_f64() < 0.6);
+    }
+
+    /// A `--route` run passes acceptance only when its route has finished. A window closed by its
+    /// limit with the route still walking is reported as partial and fails; a finished route passes.
+    #[test]
+    fn a_file_route_passes_only_once_it_has_finished() {
+        let waypoints = r#"{"worldspace": 60, "speed": 100, "waypoints": [[0, 0], [100, 0]]}"#;
+        let route_at = |json: &str| {
+            crate::route::RouteRunner::new(
+                crate::route::RoutePlan::parse(json).unwrap(),
+                crate::route::RouteGround::default(),
+            )
+        };
+        let directory = tempfile::tempdir().unwrap();
+        // The world is ready on the first frame, which stands still; the window closes at once.
+        let mut partial = route_at(waypoints);
+        partial.step(1.0, true, 0.0);
+        let mut app = acceptance_report_app(directory.path(), None, Duration::ZERO);
+        app.insert_resource(partial).update();
+        let report = written_report(directory.path());
+        assert_eq!(report["route"]["completed"], false);
+        assert_eq!(report["passed"], false, "a partial route cannot pass");
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut finished = route_at(waypoints);
+        finished.step(0.0, true, 0.0);
+        finished.step(2.0, true, 2000.0);
+        let mut app = acceptance_report_app(directory.path(), None, Duration::ZERO);
+        app.insert_resource(finished).update();
+        let report = written_report(directory.path());
+        assert_eq!(report["route"]["completed"], true);
+        assert_eq!(report["passed"], true, "a finished route passes with the other gates");
+    }
+
+    /// Whether the world counts as ready on each frame of the file-route fixtures below.
+    #[derive(Resource, Default)]
+    struct FixtureWorldReady(bool);
+
+    /// Steps the file route the way `route::drive_route` does, from the same real clock. The camera
+    /// is not needed for the route's own timing, so the fixture steps the runner directly.
+    fn step_fixture_route(
+        mut runner: ResMut<crate::route::RouteRunner>,
+        real_time: Res<Time<Real>>,
+        ready: Res<FixtureWorldReady>,
+    ) {
+        runner.step(
+            real_time.delta_secs(),
+            ready.0,
+            real_time.elapsed_secs_f64() * 1000.0,
+        );
+    }
+
+    /// A file-route app with the real measurement systems: the route steps in `PreUpdate`, and the
+    /// report is taken in `Last` as in the engine. `directory` receives the report.
+    fn file_route_app(directory: &std::path::Path, route: &str, duration_secs: Option<f64>) -> App {
+        let plan = crate::route::RoutePlan::parse(route).unwrap();
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(EngineConfig {
+                benchmark_frames: Some(1000),
+                benchmark_duration_secs: duration_secs,
+                benchmark_output: directory.join("benchmark-report.json"),
+                ..default()
+            })
+            .insert_resource(crate::route::RouteRunner::new(
+                plan,
+                crate::route::RouteGround::default(),
+            ))
+            .insert_resource(FixtureWorldReady(false))
+            .init_resource::<DiagnosticsStore>()
+            .init_resource::<RendererMetrics>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<ProfilingState>()
+            .add_plugins(AcceptanceMetricsPlugin)
+            .add_systems(PreUpdate, step_fixture_route);
+        app
+    }
+
+    /// The route's frames are measured from its first full moving frame. A ten-second wait for the
+    /// world and the activation frame that follows it are not frames of the route: the summary, the
+    /// frame budget and the report's `frames` count the same four moving frames, each 100 ms.
+    #[test]
+    fn a_file_route_measures_its_moving_frames_not_the_wait_or_the_activation() {
+        use bevy::time::TimeUpdateStrategy;
+
+        let directory = tempfile::tempdir().unwrap();
+        // 500 units at 1000 units per second: five moving frames of 100 ms reach the end.
+        let mut app = file_route_app(
+            directory.path(),
+            r#"{"worldspace": 60, "speed": 1000, "waypoints": [[0, 0], [500, 0]]}"#,
+            None,
+        );
+        let frames = [(10.0, false), (10.0, true)]
+            .into_iter()
+            .chain(std::iter::repeat((0.1, true)).take(8));
+        for (seconds, ready) in frames {
+            app.insert_resource(FixtureWorldReady(ready))
+                .insert_resource(TimeUpdateStrategy::ManualDuration(
+                    std::time::Duration::from_secs_f64(seconds),
+                ));
+            app.update();
+            if app.world().resource::<BenchmarkSamples>().finished {
+                break;
+            }
+        }
+        let samples = app.world().resource::<BenchmarkSamples>();
+        assert_eq!(samples.frame_ms.len(), 4, "{:?}", samples.frame_ms);
+        for milliseconds in &samples.frame_ms {
+            assert!((milliseconds - 100.0).abs() < 1e-6, "{milliseconds}");
+        }
+        let report = written_report(directory.path());
+        assert_eq!(report["route"]["completed"], true);
+        assert_eq!(report["frames"], 4);
+        assert_eq!(report["frame_budget"]["frames"], 4);
+    }
+
+    /// A `--route` run with a duration limit ends at that real-time deadline even if the route never
+    /// became ready, and reports the route as not started and not completed. Acceptance fails.
+    #[test]
+    fn a_file_route_that_never_becomes_ready_ends_at_its_deadline_and_fails() {
+        use bevy::time::TimeUpdateStrategy;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = file_route_app(
+            directory.path(),
+            r#"{"worldspace": 60, "speed": 400, "waypoints": [[0, 0], [1000, 0]]}"#,
+            Some(1.0),
+        );
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_millis(600),
+        ));
+        for _ in 0..4 {
+            app.update();
+            if app.world().resource::<BenchmarkSamples>().finished {
+                break;
+            }
+        }
+        let report = written_report(directory.path());
+        assert_eq!(report["route"]["started"], false);
+        assert_eq!(report["route"]["completed"], false);
+        assert_eq!(report["passed"], false, "an unready route cannot pass");
+    }
+
+    /// A route that started but is still walking when its real-time deadline arrives is reported as
+    /// partial and fails, however fast its frames were.
+    #[test]
+    fn a_file_route_still_walking_at_its_deadline_is_reported_as_partial() {
+        use bevy::time::TimeUpdateStrategy;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = file_route_app(
+            directory.path(),
+            r#"{"worldspace": 60, "speed": 10, "waypoints": [[0, 0], [1000, 0]]}"#,
+            Some(1.0),
+        );
+        app.insert_resource(FixtureWorldReady(true))
+            .insert_resource(TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_millis(600),
+            ));
+        for _ in 0..4 {
+            app.update();
+            if app.world().resource::<BenchmarkSamples>().finished {
+                break;
+            }
+        }
+        let report = written_report(directory.path());
+        assert_eq!(report["route"]["started"], true);
+        assert_eq!(report["route"]["completed"], false);
+        assert_eq!(report["passed"], false);
     }
 
     /// A route whose CPU never settles still finalises at its real-time deadline: the profile

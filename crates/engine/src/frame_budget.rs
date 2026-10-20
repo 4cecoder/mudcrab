@@ -9,10 +9,10 @@
 //!
 //! # Frame times
 //!
-//! Every frame time in the report is a real-clock delta (`Time<Real>`): this branch moved the older
-//! `frame_ms_*` fields from Bevy's virtual clock, which clamps a frame at 250 ms, to the real one,
-//! and the two differ only for frames longer than 250 ms. The real clock is what this section needs:
-//! a clamp would cut off exactly the frames it exists to count.
+//! The frame times this section scores are real-clock deltas (`Time<Real>`). Bevy's virtual clock
+//! clamps a frame at 250 ms, and a clamp would cut off exactly the frames this section exists to
+//! count. The older `frame_ms_*` fields keep the clock they had: the virtual one on a run without a
+//! route, unchanged, and the real one on a route run, where the route's own timing needs it.
 //!
 //! # The owner of a frame
 //!

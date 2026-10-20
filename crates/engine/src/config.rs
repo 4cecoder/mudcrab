@@ -2253,6 +2253,30 @@ mod tests {
         assert_eq!(args(&[]).window_title(), "Mudcrab");
     }
 
+    /// A file route cannot share the camera with the streaming benchmark route. Refused while the
+    /// arguments are parsed, before any asset or device work starts.
+    #[test]
+    fn a_file_route_refuses_the_streaming_benchmark_route() {
+        let error = parse_error(&[
+            "--route",
+            "travel.json",
+            "--streaming-benchmark-route-speed",
+            "370",
+            "--benchmark-duration",
+            "30",
+        ]);
+        assert!(
+            matches!(
+                error,
+                ConfigError::InvalidValue {
+                    option: "--streaming-benchmark-route-speed",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
     #[test]
     fn matched_route_is_a_separate_automated_camera_mode() {
         let config = run_config(&["--matched-route", "route.json"]);

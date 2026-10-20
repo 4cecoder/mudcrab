@@ -234,8 +234,7 @@ window scans.
   blocking on its upscaling pipeline, 150 ms and more) with the hitches that matter, those while cells
   load during play. Two windows separate them, each as `{ frames, p99_ms, worst_ms, over_33ms,
   over_50ms }` (warm-up frames included; `null` for a window
-  with no frames). These two windows take their frame deltas from the real (wall) clock, as the
-  report's own `frame_ms_*` now do (they read Bevy's virtual `Time` before the route work): Bevy
+  with no frames). These two windows take their frame deltas from the real (wall) clock. Bevy
   clamps the virtual delta to 250 ms by default, so a one-second hitch would read as 250 ms, while
   the real delta is unclamped. A frame's
   delta is the interval that ended at that frame, so a window's first
@@ -510,15 +509,17 @@ file.
 
 **The report.** Every benchmark report (report format 11; the new fields are additive) carries
 `frame_budget` for the measured window (a route run: the route's frames) and `route` (`null` without
-a route). Every frame time in the report is a real-clock delta: this branch changed the older
-`frame_ms_*` fields (with `average_fps` and the duration limit) from Bevy's virtual clock, which
-clamps a frame at 250 ms, to the real clock, and the two differ only for frames longer than 250 ms.
-A route run uses two windows: the older `frame_ms_*` fields cover every frame after the benchmark
-warm-up, which includes the wait for the world to become ready before the route starts, while
-`frame_budget` covers the route's own frames from the first full frame on it (the report names that
-window in `frame_budget.scope`). The two therefore differ by the warm-up and by that wait. A route
-that ends before the warm-up has passed leaves the `frame_ms_*` fields at zero (no frames measured)
-while `frame_budget` is filled. `frame_budget` has: `budget_ms`,
+a route). The frame times `frame_budget` scores are real-clock deltas. The older `frame_ms_*` fields
+(with `average_fps` and the duration limit) keep their clock: Bevy's virtual clock, which clamps a
+frame at 250 ms, on a run without a route, and the real clock on a route run, which differs from the
+virtual one only for frames longer than 250 ms.
+A `--route` file run measures the route's own frames: the older `frame_ms_*` fields and
+`frame_budget` both cover the frames from the first full moving frame on the route (the report names
+that window in `frame_budget.scope`), so the wait for the world to become ready and the frame the
+route starts on are in neither. A run whose route has not finished when its window closes (its frame
+limit, its time limit, or the real-time deadline, which counts from the start of the process) reports
+`route.completed` as false and fails acceptance. A route run's `frame_ms_*` fields read the real clock
+(`Time<Real>`); a run without a route keeps the virtual clock it always had. `frame_budget` has: `budget_ms`,
 `frames`, `window_seconds`, `p50_ms`,
 `p99_ms`, `p99_9_ms` (nearest rank: the smallest frame time with at least that share of frames at or
 below it; the older `frame_ms_p99` takes the higher of the two ranks around `(n - 1) * 0.99`, so the
