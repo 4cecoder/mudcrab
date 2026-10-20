@@ -1,6 +1,7 @@
 use crate::{
     config::EngineConfig,
     fingerprint::{RunFingerprint, records_measurements},
+    frame_budget::{FrameBudgetReport, FrameSides, ScoredFrame, attribute},
     pacing::{PacingReport, PacingTracker},
     profiling::{
         CpuReport, GpuPassReport, MemoryReport, MetricSummary, ProfilingState,
@@ -9,6 +10,7 @@ use crate::{
     },
     render::RendererMetrics,
     render_timing::{PipelineActivity, RenderTimingPlugin, RenderTimings},
+    route::{RouteReport, RouteRunner},
     streaming::{ActiveSpace, RenderOrigin, StreamingMetrics},
     streaming_gpu_metrics::StreamingGpuMetricsBridge,
     streaming_trace::{
@@ -55,7 +57,9 @@ impl Plugin for AcceptanceMetricsPlugin {
             ))
             .add_systems(
                 Last,
-                collect_and_finish.after(crate::render_timing::end_main_world),
+                (record_frame_ledger, collect_and_finish)
+                    .chain()
+                    .after(crate::render_timing::end_main_world),
             );
         if app
             .world()
@@ -135,6 +139,43 @@ struct BenchmarkSamples {
     measurement_complete: bool,
     screenshot_wait_started: Option<std::time::Instant>,
     finished: bool,
+    /// The frame-time distribution against the budget, scored frame by frame.
+    ledger: FrameLedger,
+    /// The route reached its last waypoint: the measured window ends with this frame.
+    route_finished: bool,
+}
+
+/// What the frame-budget section of the report is built from: every scored frame with its owner.
+///
+/// It keeps its own frame count, which advances in step with `BenchmarkSamples::frames_seen`
+/// (both count the frames of a benchmark run from the first, and stop together), so the same frames
+/// are warm-up for both.
+#[derive(Default)]
+struct FrameLedger {
+    frames_seen: u32,
+    /// The streaming commit counters as of the previous frame, to find what this frame added.
+    last_commit: Option<(u64, u64)>,
+    /// The commit time of the previous frame's cycle, which is the cycle the current frame time
+    /// measures.
+    previous_upload_ms: Option<f64>,
+    scored: Vec<ScoredFrame>,
+}
+
+impl FrameLedger {
+    /// The streaming commit time of the frame that just ran, in milliseconds: zero on a frame that
+    /// committed nothing. The counters only grow, so the first frame, which has nothing to compare
+    /// with, counts as zero.
+    fn commit_ms(&mut self, metrics: &StreamingMetrics) -> f64 {
+        let now = (metrics.commit_frames, metrics.total_frame_commit_micros);
+        let added = match self.last_commit {
+            Some((frames, micros)) if now.0 > frames => {
+                now.1.saturating_sub(micros) as f64 / 1000.0
+            }
+            _ => 0.0,
+        };
+        self.last_commit = Some(now);
+        added
+    }
 }
 
 /// Classify the current frame before benchmark collection advances its counters.
@@ -381,6 +422,12 @@ struct BenchmarkReport {
     /// sit at the top level of the report and are absent for a run with no streaming.
     #[serde(flatten)]
     pacing: Option<PacingReport>,
+    /// The frame-time distribution against `--frame-budget-ms` (6.25 ms unless given), the frames
+    /// over it, and who owned them (see `frame_budget`). Present in every benchmark report. The
+    /// frames scored are the measured window's, or, for a route run, the route's.
+    frame_budget: FrameBudgetReport,
+    /// What the `--route` run was and how far it got (see `route`); `null` without a route.
+    route: Option<RouteReport>,
     /// What the run ran on: machine, renderer, world data, and the settings it rendered with (see
     /// `fingerprint`). `null` only for a run that recorded measurements without installing the
     /// fingerprint.
@@ -420,14 +467,15 @@ struct Thresholds {
     screenshot_captured: bool,
 }
 
-/// The run's fingerprint, the render-world probe and the loaded assets, grouped so that
-/// `collect_and_finish` stays within Bevy's system-parameter limit.
+/// The run's fingerprint, the render-world probe, the loaded assets and the `--route` file's runner,
+/// grouped so that `collect_and_finish` stays within Bevy's system-parameter limit.
 #[derive(SystemParam)]
 struct MeasurementInputs<'w> {
     fingerprint: Option<Res<'w, RunFingerprint>>,
     render_measurement_probe: Option<Res<'w, RenderMeasurementProbe>>,
     meshes: Res<'w, Assets<Mesh>>,
     images: Res<'w, Assets<Image>>,
+    file_route: Option<Res<'w, RouteRunner>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -461,11 +509,15 @@ fn collect_and_finish(
         // keeps the GPU diagnostics of the measured frames, and the GPU-memory counters only once
         // the render world has measured them (see `ProfilingState::sample_frame`). A route run's
         // measured window is the route's own, not the warm-up count.
-        let measuring = route.as_deref().map_or(
-            samples.frames_seen > config.benchmark_warmup_frames,
-            |route| route_window(route) == BenchmarkWindow::Measured,
-        );
-        if route.is_some() && !measuring {
+        // A file route's frames are measured from its first full moving frame on (the frame the route
+        // scores), so the waiting for the world and the activation frame are not in the summary, the
+        // budget, or the duration limit. A streaming route and a run without one keep their gates.
+        let measuring = match (route.as_deref(), measurements.file_route.as_deref()) {
+            (Some(route), _) => route_window(route) == BenchmarkWindow::Measured,
+            (None, Some(file_route)) => file_route.scoring(),
+            (None, None) => samples.frames_seen > config.benchmark_warmup_frames,
+        };
+        if (route.is_some() || measurements.file_route.is_some()) && !measuring {
             render_timings.set_recording(false);
         }
         profiler.sample_frame(
@@ -479,7 +531,7 @@ fn collect_and_finish(
         );
         if measuring {
             render_timings.set_recording(true);
-            let milliseconds = if route.is_some() {
+            let milliseconds = if route.is_some() || measurements.file_route.is_some() {
                 real_time.delta_secs_f64() * 1000.0
             } else {
                 time.delta_secs_f64() * 1000.0
@@ -509,12 +561,21 @@ fn collect_and_finish(
         let route_deadline_reached = config
             .benchmark_duration_secs
             .is_some_and(|limit| real_time.elapsed_secs_f64() >= limit);
-        let complete = route
-            .as_ref()
-            .map_or(frame_limit_reached || duration_reached, |route| {
+        // A streaming route ends the window at its last waypoint, so the report covers the route
+        // and not the standing around after it. A `--route` file ends it the same way, and its real
+        // deadline ends a route that never became ready or never reached its end.
+        let complete = match route.as_deref() {
+            Some(route) => {
                 route.phase == crate::app::StreamingBenchmarkPhase::Finished
                     || route_deadline_reached
-            });
+            }
+            None => {
+                frame_limit_reached
+                    || duration_reached
+                    || samples.route_finished
+                    || (measurements.file_route.is_some() && route_deadline_reached)
+            }
+        };
         if !complete {
             return;
         }
@@ -598,7 +659,10 @@ fn collect_and_finish(
         && screenshot_captured
         && route
             .as_ref()
-            .is_none_or(|route| route.phase == crate::app::StreamingBenchmarkPhase::Finished);
+            .is_none_or(|route| route.phase == crate::app::StreamingBenchmarkPhase::Finished)
+        // A `--route` run passes only once its route has finished: a window closed by its frame
+        // or duration limit reports the partial route, and that is not a pass.
+        && measurements.file_route.as_deref().is_none_or(RouteRunner::finished);
     // Whether the device can time GPU work is the device's own answer, recorded in the fingerprint
     // at startup. The GPU sections take the fingerprint whole, so a run with no renderer says so
     // rather than blaming a backend it never had.
@@ -624,8 +688,17 @@ fn collect_and_finish(
         core_count: value.core_count.clone(),
         memory: value.memory.clone(),
     });
+    let frame_budget = FrameBudgetReport::from_frames(
+        config.frame_budget_ms,
+        if route.is_some() || measurements.file_route.is_some() {
+            "route window: the frames from the first full frame on the route to the end of the measured window"
+        } else {
+            "measured window: every frame after the warm-up"
+        },
+        &samples.ledger.scored,
+    );
     let report = BenchmarkReport {
-        format_version: 10,
+        format_version: 11,
         generated_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
@@ -685,6 +758,8 @@ fn collect_and_finish(
         render_world,
         render_pipelines,
         pacing: pacing_report,
+        frame_budget,
+        route: measurements.file_route.as_deref().map(RouteRunner::report),
         fingerprint: measurements.fingerprint.as_deref().cloned(),
         gpu_passes,
         scene,
@@ -769,6 +844,69 @@ fn collect_and_finish(
     } else {
         AppExit::error()
     });
+}
+
+/// Scores the frame that just ended: its real-clock duration and the side that owned it (see
+/// `frame_budget`). Runs just before [`collect_and_finish`] and follows it frame for frame, so the
+/// frames scored are the frames the report measures; for a route run only the frames on the route
+/// count, and the route's arrival is passed on as the end of the window.
+///
+/// The duration is the time from the start of the previous main frame to the start of this one, so
+/// the sides that explain it are the previous cycle's: its main schedule and commit time, and the
+/// render and extract time that ran in it (`RenderTimings::take_previous_cycle`).
+fn record_frame_ledger(
+    config: Res<EngineConfig>,
+    real_time: Res<Time<Real>>,
+    render_timings: Res<RenderTimings>,
+    streaming: Option<Res<StreamingMetrics>>,
+    route: Option<Res<RouteRunner>>,
+    mut samples: ResMut<BenchmarkSamples>,
+) {
+    if samples.finished || samples.measurement_complete || !config.is_benchmark_run() {
+        return;
+    }
+    let samples = &mut *samples;
+    if route.as_deref().is_some_and(RouteRunner::finished) {
+        samples.route_finished = true;
+    }
+    let ledger = &mut samples.ledger;
+    ledger.frames_seen = ledger.frames_seen.saturating_add(1);
+    let commit_ms = streaming
+        .as_deref()
+        .map(|metrics| ledger.commit_ms(metrics));
+    // Taken on every frame, warm-up included, so the records of frames nobody scores do not pile up.
+    let cycle = render_timings.take_previous_cycle();
+    let scored = frame_is_scored(
+        ledger.frames_seen,
+        config.benchmark_warmup_frames,
+        route.as_deref().map(RouteRunner::scoring),
+    );
+    let milliseconds = real_time.delta_secs_f64() * 1000.0;
+    if scored && milliseconds.is_finite() && milliseconds > 0.0 {
+        let cycle = cycle.unwrap_or_default();
+        let sides = FrameSides::from_samples(
+            cycle.main_ms,
+            cycle.extract_ms,
+            cycle.render_ms,
+            cycle.acquire_ms,
+            ledger.previous_upload_ms,
+        );
+        ledger.scored.push(ScoredFrame {
+            ms: milliseconds,
+            owner: attribute(milliseconds, &sides),
+            wait_ms: cycle.wait_ms,
+        });
+    }
+    ledger.previous_upload_ms = commit_ms;
+}
+
+/// Whether a frame belongs to the frame budget's window. A run with no route scores the frames
+/// after the warm-up, as the rest of the report does. A route run scores the route's own frames
+/// and nothing else: the route's start (waiting for the world, or none at all) is what opens the
+/// window, so the warm-up frames are not trimmed on top of it, which would drop the first frames
+/// of a route that starts at once.
+fn frame_is_scored(frames_seen: u32, warmup_frames: u32, on_route: Option<bool>) -> bool {
+    on_route.unwrap_or(frames_seen > warmup_frames)
 }
 
 fn memory_settle_seconds(config: &EngineConfig) -> f64 {
@@ -1040,6 +1178,179 @@ mod tests {
         assert_eq!(samples.frame_ms, vec![600.0]);
         assert_eq!(samples.measured_seconds, 0.6);
         assert!(app.world().resource::<Time>().delta_secs_f64() < 0.6);
+    }
+
+    /// A `--route` run passes acceptance only when its route has finished. A window closed by its
+    /// limit with the route still walking is reported as partial and fails; a finished route passes.
+    #[test]
+    fn a_file_route_passes_only_once_it_has_finished() {
+        let waypoints = r#"{"worldspace": 60, "speed": 100, "waypoints": [[0, 0], [100, 0]]}"#;
+        let route_at = |json: &str| {
+            crate::route::RouteRunner::new(
+                crate::route::RoutePlan::parse(json).unwrap(),
+                crate::route::RouteGround::default(),
+            )
+        };
+        let directory = tempfile::tempdir().unwrap();
+        // The world is ready on the first frame, which stands still; the window closes at once.
+        let mut partial = route_at(waypoints);
+        partial.step(1.0, true, 0.0);
+        let mut app = acceptance_report_app(directory.path(), None, std::time::Duration::ZERO);
+        app.insert_resource(partial).update();
+        let report = written_report(directory.path());
+        assert_eq!(report["route"]["completed"], false);
+        assert_eq!(report["passed"], false, "a partial route cannot pass");
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut finished = route_at(waypoints);
+        finished.step(0.0, true, 0.0);
+        finished.step(2.0, true, 2000.0);
+        let mut app = acceptance_report_app(directory.path(), None, std::time::Duration::ZERO);
+        app.insert_resource(finished).update();
+        let report = written_report(directory.path());
+        assert_eq!(report["route"]["completed"], true);
+        assert_eq!(
+            report["passed"], true,
+            "a finished route passes with the other gates"
+        );
+    }
+
+    /// Whether the world counts as ready on each frame of the file-route fixtures below.
+    #[derive(Resource, Default)]
+    struct FixtureWorldReady(bool);
+
+    /// Steps the file route the way `route::drive_route` does, from the same real clock. The camera
+    /// is not needed for the route's own timing, so the fixture steps the runner directly.
+    fn step_fixture_route(
+        mut runner: ResMut<crate::route::RouteRunner>,
+        real_time: Res<Time<Real>>,
+        ready: Res<FixtureWorldReady>,
+    ) {
+        runner.step(
+            real_time.delta_secs(),
+            ready.0,
+            real_time.elapsed_secs_f64() * 1000.0,
+        );
+    }
+
+    /// A file-route app with the real measurement systems: the route steps in `PreUpdate`, and the
+    /// report is taken in `Last` as in the engine. `directory` receives the report.
+    fn file_route_app(directory: &std::path::Path, route: &str, duration_secs: Option<f64>) -> App {
+        let plan = crate::route::RoutePlan::parse(route).unwrap();
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(EngineConfig {
+                benchmark_frames: Some(1000),
+                benchmark_duration_secs: duration_secs,
+                benchmark_output: directory.join("benchmark-report.json"),
+                ..default()
+            })
+            .insert_resource(crate::route::RouteRunner::new(
+                plan,
+                crate::route::RouteGround::default(),
+            ))
+            .insert_resource(FixtureWorldReady(false))
+            .init_resource::<DiagnosticsStore>()
+            .init_resource::<RendererMetrics>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<ProfilingState>()
+            .add_plugins(AcceptanceMetricsPlugin)
+            .add_systems(PreUpdate, step_fixture_route);
+        app
+    }
+
+    /// The route's frames are measured from its first full moving frame. A ten-second wait for the
+    /// world and the activation frame that follows it are not frames of the route: the summary, the
+    /// frame budget and the report's `frames` count the same four moving frames, each 100 ms.
+    #[test]
+    fn a_file_route_measures_its_moving_frames_not_the_wait_or_the_activation() {
+        use bevy::time::TimeUpdateStrategy;
+
+        let directory = tempfile::tempdir().unwrap();
+        // 500 units at 1000 units per second: five moving frames of 100 ms reach the end.
+        let mut app = file_route_app(
+            directory.path(),
+            r#"{"worldspace": 60, "speed": 1000, "waypoints": [[0, 0], [500, 0]]}"#,
+            None,
+        );
+        let frames = [(10.0, false), (10.0, true)]
+            .into_iter()
+            .chain(std::iter::repeat_n((0.1, true), 8));
+        for (seconds, ready) in frames {
+            app.insert_resource(FixtureWorldReady(ready))
+                .insert_resource(TimeUpdateStrategy::ManualDuration(
+                    std::time::Duration::from_secs_f64(seconds),
+                ));
+            app.update();
+            if app.world().resource::<BenchmarkSamples>().finished {
+                break;
+            }
+        }
+        let samples = app.world().resource::<BenchmarkSamples>();
+        assert_eq!(samples.frame_ms.len(), 4, "{:?}", samples.frame_ms);
+        for milliseconds in &samples.frame_ms {
+            assert!((milliseconds - 100.0).abs() < 1e-6, "{milliseconds}");
+        }
+        let report = written_report(directory.path());
+        assert_eq!(report["route"]["completed"], true);
+        assert_eq!(report["frames"], 4);
+        assert_eq!(report["frame_budget"]["frames"], 4);
+    }
+
+    /// A `--route` run with a duration limit ends at that real-time deadline even if the route never
+    /// became ready, and reports the route as not started and not completed. Acceptance fails.
+    #[test]
+    fn a_file_route_that_never_becomes_ready_ends_at_its_deadline_and_fails() {
+        use bevy::time::TimeUpdateStrategy;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = file_route_app(
+            directory.path(),
+            r#"{"worldspace": 60, "speed": 400, "waypoints": [[0, 0], [1000, 0]]}"#,
+            Some(1.0),
+        );
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_millis(600),
+        ));
+        for _ in 0..4 {
+            app.update();
+            if app.world().resource::<BenchmarkSamples>().finished {
+                break;
+            }
+        }
+        let report = written_report(directory.path());
+        assert_eq!(report["route"]["started"], false);
+        assert_eq!(report["route"]["completed"], false);
+        assert_eq!(report["passed"], false, "an unready route cannot pass");
+    }
+
+    /// A route that started but is still walking when its real-time deadline arrives is reported as
+    /// partial and fails, however fast its frames were.
+    #[test]
+    fn a_file_route_still_walking_at_its_deadline_is_reported_as_partial() {
+        use bevy::time::TimeUpdateStrategy;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = file_route_app(
+            directory.path(),
+            r#"{"worldspace": 60, "speed": 10, "waypoints": [[0, 0], [1000, 0]]}"#,
+            Some(1.0),
+        );
+        app.insert_resource(FixtureWorldReady(true))
+            .insert_resource(TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_millis(600),
+            ));
+        for _ in 0..4 {
+            app.update();
+            if app.world().resource::<BenchmarkSamples>().finished {
+                break;
+            }
+        }
+        let report = written_report(directory.path());
+        assert_eq!(report["route"]["started"], true);
+        assert_eq!(report["route"]["completed"], false);
+        assert_eq!(report["passed"], false);
     }
 
     /// A route whose CPU never settles still finalises at its real-time deadline: the profile
@@ -1366,6 +1677,21 @@ mod tests {
         .unwrap();
         assert_eq!(value["world_ready_reached"], serde_json::json!(true));
         assert_eq!(value["frames"], serde_json::json!(3));
+    }
+
+    /// A route run scores from the route's start, with no warm-up trimmed: a route that starts on
+    /// the first frame loses none of its frames. Without a route the warm-up is dropped.
+    #[test]
+    fn route_runs_score_from_the_route_start_without_a_warmup_trim() {
+        // No route: frames 1..=60 are warm-up, 61 is the first scored.
+        assert!(!frame_is_scored(60, 60, None));
+        assert!(frame_is_scored(61, 60, None));
+        // A route that has not started, or is on its first frame, scores nothing, whatever the
+        // frame number.
+        assert!(!frame_is_scored(500, 60, Some(false)));
+        // A route scoring on frame 3 (it started on frame 2) is scored inside the warm-up.
+        assert!(frame_is_scored(3, 60, Some(true)));
+        assert!(frame_is_scored(500, 60, Some(true)));
     }
 
     #[test]
