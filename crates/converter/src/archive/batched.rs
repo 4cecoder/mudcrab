@@ -2241,6 +2241,10 @@ mod tests {
             .position(|window| window == b"xx\0")
             .unwrap();
         bytes[folder..folder + 2].copy_from_slice(b"..");
+        // The folder hash is verified before the path is validated; store the hash of the
+        // mutated name so the walk reaches the unsafe-path check this test is about.
+        let hash = crate::archive::bsa_name::folder_hash(b"..");
+        bytes[36..44].copy_from_slice(&hash.to_le_bytes());
         fs::write(&archive, bytes).unwrap();
         let error = ArchiveExtractor::extract_batched(
             &archive,

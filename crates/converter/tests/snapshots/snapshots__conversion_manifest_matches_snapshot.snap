@@ -13,8 +13,8 @@ expression: manifest
           "size": 721
         }
       ],
-      "recipe": "runtime-english-v1",
       "reader_version": 1,
+      "recipe": "runtime-english-v1",
       "selection": "runtime_english_v1",
       "source_hash": "[source_hash]"
     },
@@ -31,8 +31,8 @@ expression: manifest
           "size": 131
         }
       ],
-      "recipe": "runtime-english-v1",
       "reader_version": 1,
+      "recipe": "runtime-english-v1",
       "selection": "runtime_english_v1",
       "source_hash": "[source_hash]"
     },
