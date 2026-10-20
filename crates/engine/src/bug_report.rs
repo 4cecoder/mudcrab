@@ -505,6 +505,12 @@ fn saved(
 }
 
 fn drive_reports(world: &mut World) {
+    let work_pending = world
+        .get_resource::<BugReportService>()
+        .is_some_and(|service| service.queued.is_some() || service.active.is_some());
+    if !work_pending {
+        return;
+    }
     let Some(mut service) = world.remove_resource::<BugReportService>() else {
         return;
     };
@@ -621,6 +627,15 @@ fn drive_reports(world: &mut World) {
 // Last runs before render extraction, after the scene's Update/PostUpdate systems. Re-check size
 // here so a resize between command dispatch and rendering cannot bypass the allocation bound.
 fn capture_frame_metadata(world: &mut World) {
+    let capture_sample_pending = world
+        .get_resource::<BugReportService>()
+        .and_then(|service| service.active.as_ref())
+        .is_some_and(|active| {
+            active.phase == Phase::Capturing && active.capture_sample_pending
+        });
+    if !capture_sample_pending {
+        return;
+    }
     let Some(mut service) = world.remove_resource::<BugReportService>() else {
         return;
     };
@@ -779,6 +794,26 @@ mod tests {
                 .unwrap_err()
                 .contains("already")
         );
+    }
+
+    #[test]
+    fn idle_report_systems_do_not_mark_service_changed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = test_app(directory.path());
+
+        app.world_mut().clear_trackers();
+        drive_reports(app.world_mut());
+        assert!(!app
+            .world()
+            .resource_ref::<BugReportService>()
+            .is_changed());
+
+        app.world_mut().clear_trackers();
+        capture_frame_metadata(app.world_mut());
+        assert!(!app
+            .world()
+            .resource_ref::<BugReportService>()
+            .is_changed());
     }
 
     #[test]
