@@ -279,9 +279,16 @@ pub enum LandTextureDefault {
 
 /// The settings a table was built from, as the converter's terrain stage resolved them. Entry 0's
 /// source, the downscale allowance and the Skyrim.ini bytes it was read from change the arrays
-/// and entries, so a stored table records them. `terrain_ini_sha256` is the SHA-256 of the
-/// configured ini file (`None` for the built-in Dirt02 paths and for `white`). The DDS paths are
-/// the ones resolved, not the machine's file locations.
+/// and entries, so a stored table records them.
+///
+/// `default_diffuse` and `default_normal` are converted `.ktx2` paths, the textures entry 0 holds,
+/// and only when entry 0 holds the ini's own textures (`skyrim_ini`). They are absent for
+/// `generated_white` and `skyrim_ini_fallback_white`, where entry 0 is the white texture; the DDS
+/// paths a run asked for are reported elsewhere, not here. `default_normal` is absent when the ini
+/// named no normal map or its normal did not convert.
+///
+/// `terrain_ini_sha256` is the SHA-256 of the Skyrim.ini bytes the defaults were parsed from, taken
+/// from that same read (`None` for the built-in Dirt02 paths and for `white`).
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct LandTextureSettings {
     pub request: LandTextureRequest,

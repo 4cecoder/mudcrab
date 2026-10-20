@@ -108,6 +108,11 @@ pub(crate) fn merged_terrain_lands(
         let cell_id = record.cell_form_id.unwrap_or(record.form_id);
         lands_by_cell.entry(cell_id).or_default().push(record);
     }
+    // The map's iteration order is not the record order: sort each cell's LANDs by FormID so the
+    // dropped-LAND warnings come out the same however the records were collected.
+    for lands in lands_by_cell.values_mut() {
+        lands.sort_unstable_by_key(|land| land.form_id);
+    }
     let mut warnings = Vec::new();
     for (&cell_id, lands) in &lands_by_cell {
         if lands.len() < 2 {
@@ -1601,6 +1606,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cell_cache.rkyv");
         assert!(write_cell_cache(&records, &path).is_ok());
+    }
+
+    /// Three LANDs in one cell name every dropped LAND in FormID order, whatever order the records
+    /// were collected in, and the winner is the same. The warnings are compared as a whole, not
+    /// by containment, so a reordering would fail the test.
+    #[test]
+    fn dropped_lands_are_reported_in_formid_order_whatever_the_insertion_order() {
+        let first = land(0x1000, 0x2300, 0, 0.0);
+        let second = land(0x1000, 0x2100, 1, 1.0);
+        let third = land(0x1000, 0x2200, 2, 2.0);
+        let forward = HashMap::from([
+            (first.form_id, first.clone()),
+            (second.form_id, second.clone()),
+            (third.form_id, third.clone()),
+        ]);
+        let reverse = HashMap::from([
+            (third.form_id, third),
+            (second.form_id, second),
+            (first.form_id, first),
+        ]);
+        let (winners, warnings) = merged_terrain_lands(&forward, &HashMap::new()).unwrap();
+        let (reversed_winners, reversed_warnings) =
+            merged_terrain_lands(&reverse, &HashMap::new()).unwrap();
+        assert_eq!(winners, reversed_winners);
+        assert_eq!(winners[&0x1000], 0x2200, "the highest load-order slot wins");
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings, reversed_warnings);
+        assert!(
+            warnings[0].contains("dropped LAND 00002100")
+                && warnings[1].contains("dropped LAND 00002300"),
+            "{warnings:?}"
+        );
     }
 
     /// A cell with one LAND keeps it and says nothing: the rule changes only multi-LAND cells.
