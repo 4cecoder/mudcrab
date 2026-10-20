@@ -1,7 +1,11 @@
 pub mod app;
+pub mod cell_commands;
 pub mod color_pipeline;
 pub mod config;
 pub mod console;
+pub mod door_crossing;
+pub mod doors;
+pub mod emittance;
 pub mod lights;
 pub mod mesh_preparation_retry;
 pub mod metrics;
@@ -20,6 +24,8 @@ pub mod shots;
 pub mod sky;
 pub mod skyrim_ini;
 pub mod streaming;
+mod streaming_gpu_metrics;
+mod streaming_trace;
 pub mod world;
 
 pub use app::run;
