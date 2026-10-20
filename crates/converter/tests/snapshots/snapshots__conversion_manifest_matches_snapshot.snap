@@ -1,6 +1,6 @@
 ---
 source: crates/converter/tests/snapshots.rs
-assertion_line: 215
+assertion_line: 218
 expression: manifest
 ---
 {
@@ -13,6 +13,8 @@ expression: manifest
           "size": 721
         }
       ],
+      "recipe": "runtime-english-v1",
+      "selection": "runtime_english_v1",
       "source_hash": "[source_hash]"
     },
     "skyrim - misc.bsa": {
@@ -28,6 +30,8 @@ expression: manifest
           "size": 131
         }
       ],
+      "recipe": "runtime-english-v1",
+      "selection": "runtime_english_v1",
       "source_hash": "[source_hash]"
     },
     "skyrim - textures.ba2": {
@@ -36,11 +40,6 @@ expression: manifest
           "hash": "[hash]",
           "path": "textures/generated_color.dds",
           "size": 2892
-        },
-        {
-          "hash": "[hash]",
-          "path": "textures/generated_normal.dds",
-          "size": 5636
         },
         {
           "hash": "[hash]",
@@ -54,15 +53,27 @@ expression: manifest
         },
         {
           "hash": "[hash]",
+          "path": "textures/generated_normal.dds",
+          "size": 5636
+        },
+        {
+          "hash": "[hash]",
           "path": "textures/generated_volume.dds",
           "size": 2876
         }
       ],
+      "recipe": "runtime-english-v1",
+      "selection": "runtime_english_v1",
       "source_hash": "[source_hash]"
     }
   },
+  "asset_configuration_hashes": {
+    "dds": "a219a7c650f50a442d6a12b19c965feed2eb480b534474f516a0ee4187feec40",
+    "nif": "2378d459ee153ec2dba792300e620bbd599ca389e9e62e1df5597ffff8962f16",
+    "pex": "0d16fa82d1877173478e8277d014f2642b4dab09f7b916b370dff6681b7c3275"
+  },
   "complete": true,
-  "configuration_hash": "cca2af2b67310e9bc99f97208cabb4edffbd5d04c007e01fb350fccc011a19a2",
+  "configuration_hash": "9a2926b704ad4c96d1987300d983a4d0bc23070e31dea991bd711ac08c3dc5ee",
   "entries": {
     "meshes/generated.nif": {
       "output": "meshes/generated.glb",
@@ -120,5 +131,6 @@ expression: manifest
     "pex": 2
   },
   "pruned_texture_references": {},
-  "schema_version": 24
+  "record_data_complete": true,
+  "schema_version": 27
 }
