@@ -68,12 +68,12 @@ expression: manifest
     }
   },
   "asset_configuration_hashes": {
-    "dds": "a219a7c650f50a442d6a12b19c965feed2eb480b534474f516a0ee4187feec40",
-    "nif": "2378d459ee153ec2dba792300e620bbd599ca389e9e62e1df5597ffff8962f16",
+    "dds": "1495cf3ec0f02a297c0bf31210e650b2c41df7f8b5e2bdda71f0a65f84b9db65",
+    "nif": "1efcbe41597406d3477c232fd242b3120148ecfa301361214e1ef0d6d5f4cc65",
     "pex": "0d16fa82d1877173478e8277d014f2642b4dab09f7b916b370dff6681b7c3275"
   },
   "complete": true,
-  "configuration_hash": "9a2926b704ad4c96d1987300d983a4d0bc23070e31dea991bd711ac08c3dc5ee",
+  "configuration_hash": "32ecc67d2c18c73e6a15f3a6ff1c768c466b840d1bd7aeb53f5bc7ac9325218f",
   "entries": {
     "meshes/generated.nif": {
       "output": "meshes/generated.glb",
@@ -96,31 +96,31 @@ expression: manifest
     "textures/generated_color.dds": {
       "output": "textures/generated_color.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 3169,
+      "output_size": 3099,
       "source_hash": "[source_hash]"
     },
     "textures/generated_color_x8.dds": {
       "output": "textures/generated_color_x8.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 1753,
+      "output_size": 1714,
       "source_hash": "[source_hash]"
     },
     "textures/generated_cube.dds": {
       "output": "textures/generated_cube.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 4537,
+      "output_size": 4498,
       "source_hash": "[source_hash]"
     },
     "textures/generated_normal.dds": {
       "output": "textures/generated_normal.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 5913,
+      "output_size": 5859,
       "source_hash": "[source_hash]"
     },
     "textures/generated_volume.dds": {
       "output": "textures/generated_volume.ktx2",
       "output_hash": "[output_hash]",
-      "output_size": 2689,
+      "output_size": 2649,
       "source_hash": "[source_hash]"
     }
   },
@@ -132,5 +132,5 @@ expression: manifest
   },
   "pruned_texture_references": {},
   "record_data_complete": true,
-  "schema_version": 27
+  "schema_version": 28
 }

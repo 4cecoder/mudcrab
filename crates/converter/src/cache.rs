@@ -320,21 +320,26 @@ pub struct ConversionManifest {
 /// Script ABI/settings, source and output proofs still have to match. Archive
 /// extraction uses its own source/blob integrity proof, independent of this gate.
 /// Schema 25 is excluded: two unmerged candidates both used it for different contracts.
+/// The producer-27 to producer-28 transition changes only texture container bytes,
+/// so producer-27 scripts remain valid.
 pub(crate) fn can_reuse_scripts_and_archives(schema: u32) -> bool {
-    matches!(schema, 12..=24 | 26)
+    matches!(schema, 12..=24 | 26 | 27)
 }
 
-/// Published producer-24 meshes retain the producer-26 byte contract. Producer 27
-/// changes the GLB collision data, so no earlier producer's meshes pass this gate
-/// at 27. This never authorizes texture reuse or bypasses source/configuration/
+/// Published producer-24 meshes retain the producer-26 byte contract, and producer-27
+/// meshes retain the producer-28 byte contract (only texture containers changed).
+/// Producer 27 changed the GLB collision data, so no producer before 27 passes this
+/// gate at 28 or later. This never authorizes texture reuse or bypasses source/configuration/
 /// output proof.
 pub(crate) fn can_reuse_meshes(schema: u32) -> bool {
     can_reuse_meshes_for_producer(schema, CONVERTER_SCHEMA_VERSION)
 }
 
 /// Check the explicit producer pair so later contracts cannot inherit old mesh reuse.
+/// Each pair names a byte-identical GLB contract; `(24, 26)` must never be read as
+/// transitive, so `(24, 28)` and `(26, 28)` are deliberately absent.
 pub(crate) fn can_reuse_meshes_for_producer(schema: u32, current: u32) -> bool {
-    schema == current || matches!((schema, current), (24, 26))
+    schema == current || matches!((schema, current), (24, 26) | (27, 28))
 }
 
 impl ConversionManifest {
@@ -369,7 +374,7 @@ impl ConversionManifest {
                 && mesh_schema <= manifest.schema_version
                 && (manifest.retained_mesh_schema_version.is_some() || !metadata_rebuild);
             // All old textures regenerate. GLBs of a producer `can_reuse_meshes`
-            // accepts (none for an earlier producer at 27) and scripts remain
+            // accepts (at 28: producers 27 only, never 24 or 26) and scripts remain
             // candidates for the usual per-asset verification.
             manifest.complete = false;
             manifest.entries.retain(|_, entry| {
