@@ -124,8 +124,13 @@ impl MaterialExtension for NifDepthExtension {
     }
 }
 
-pub fn depth_material(base: StandardMaterial, state: NifDepthState) -> NifDepthMaterial {
-    NifDepthMaterial {
+/// Wraps `base` in the authored depth state. The extension has no shaders of its own, so the
+/// base keeps drawing with its own; effect palettes use this too (`crate::nif_material`).
+pub fn depth_material<B: Material>(
+    base: B,
+    state: NifDepthState,
+) -> ExtendedMaterial<B, NifDepthExtension> {
+    ExtendedMaterial {
         base,
         extension: NifDepthExtension { state },
     }

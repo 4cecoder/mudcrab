@@ -25,7 +25,7 @@
 
 use crate::{
     doors::LoadDoor,
-    nif_material::EffectPaletteMaterial,
+    nif_material::{EffectPaletteDepthSource, EffectPaletteMaterial},
     physics::{
         CursorCapture, MovementTuning, PlayerBody, TeleportPlayer, body_and_camera_for_feet,
     },
@@ -438,6 +438,7 @@ struct LandingAssets<'w, 's> {
             Option<&'static MeshMaterial3d<TerrainMaterial>>,
             Option<&'static MeshMaterial3d<WaterMaterial>>,
             Option<&'static MeshMaterial3d<EffectPaletteMaterial>>,
+            Option<&'static EffectPaletteDepthSource>,
         ),
     >,
     meshes: Option<Res<'w, Assets<Mesh>>>,
@@ -532,14 +533,16 @@ impl LandingAssets<'_, '_> {
     }
 
     /// Inspects every mesh, material and texture under `root`. Covered: `Mesh3d`,
-    /// `MeshMaterial3d<StandardMaterial>` and the effect palette material with all their texture
-    /// dependencies, and the terrain and water materials with their base-material textures. The
+    /// `MeshMaterial3d<StandardMaterial>` and the effect palette material (directly or as the
+    /// source of its depth wrapper) with all their texture dependencies, and the terrain and water materials with their base-material textures. The
     /// terrain and water extensions' own layer and reflection images are private to `render.rs`
     /// and are not checked.
     fn inspect_under(&self, root: Entity) -> LandingReport {
         let mut report = LandingReport::default();
         for entity in std::iter::once(root).chain(self.children.iter_descendants(root)) {
-            let Ok((mesh, standard, terrain, water, palette)) = self.parts.get(entity) else {
+            let Ok((mesh, standard, terrain, water, palette, palette_depth)) =
+                self.parts.get(entity)
+            else {
                 continue;
             };
             if let Some(Mesh3d(handle)) = mesh {
@@ -577,7 +580,12 @@ impl LandingAssets<'_, '_> {
                     &mut report,
                 );
             }
-            if let Some(MeshMaterial3d(handle)) = palette {
+            // A palette surface under a depth override draws through a wrapper; its palette
+            // material is the source the wrapper was cloned from.
+            let palette = palette
+                .map(|material| &material.0)
+                .or_else(|| palette_depth.map(|source| &source.0));
+            if let Some(handle) = palette {
                 self.check_material(
                     handle,
                     &self.palette,
@@ -1338,6 +1346,17 @@ mod tests {
 
     #[test]
     fn the_fade_in_waits_for_an_effect_palette_materials_source_texture_and_palette() {
+        fade_in_waits_for_effect_palette_images(false);
+    }
+
+    #[test]
+    fn the_fade_in_waits_for_a_depth_wrapped_effect_palette_through_its_source() {
+        fade_in_waits_for_effect_palette_images(true);
+    }
+
+    /// `depth_wrapped`: the surface carries only the wrapper's source, as a palette surface
+    /// under an authored depth override does; the wrapper itself is not inspected.
+    fn fade_in_waits_for_effect_palette_images(depth_wrapped: bool) {
         let (mut app, _) = app_with(interior_door());
         press_e(&mut app);
         run_until_black(&mut app);
@@ -1366,8 +1385,16 @@ mod tests {
                 bevy::asset::RenderAssetUsages::default(),
             ));
         let root = app.world_mut().spawn_empty().id();
-        app.world_mut()
-            .spawn((Mesh3d(mesh), MeshMaterial3d(material), ChildOf(root)));
+        let part = app.world_mut().spawn((Mesh3d(mesh), ChildOf(root))).id();
+        if depth_wrapped {
+            app.world_mut()
+                .entity_mut(part)
+                .insert(EffectPaletteDepthSource(material));
+        } else {
+            app.world_mut()
+                .entity_mut(part)
+                .insert(MeshMaterial3d(material));
+        }
         app.world_mut()
             .resource_mut::<StreamingWorld>()
             .set_resident_for_test(CellKey::Interior(77), root);

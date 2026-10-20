@@ -1,5 +1,7 @@
 //! Native construction of converted NIF materials using Bevy's glTF extension hooks.
-use crate::nif_depth::{NifDepthMaterial, NifDepthMaterialSource, NifDepthState, depth_material};
+use crate::nif_depth::{
+    NifDepthExtension, NifDepthMaterial, NifDepthMaterialSource, NifDepthState, depth_material,
+};
 use ::gltf::material::AlphaMode as GltfAlphaMode;
 use bevy::{
     asset::{LoadContext, embedded_asset},
@@ -24,6 +26,7 @@ impl Plugin for NifMaterialPlugin {
         app.add_plugins(MaterialPlugin::<NifDepthMaterial>::default())
             .register_type::<NifSourceMaterial>()
             .register_type::<NifDepthMaterialSource>()
+            .register_type::<EffectPaletteDepthSource>()
             .register_type::<ExternalEmittance>();
         app.world_mut()
             .resource_mut::<GltfExtensionHandlers>()
@@ -42,13 +45,26 @@ impl Plugin for EffectPaletteMaterialPlugin {
         load_shader_library!(app, "shaders/effect_palette_functions.wgsl");
         embedded_asset!(app, "shaders/effect_palette.wgsl");
         embedded_asset!(app, "shaders/effect_palette_prepass.wgsl");
-        app.init_asset::<EffectPaletteImage>()
-            .add_plugins(MaterialPlugin::<EffectPaletteMaterial>::default());
+        app.init_asset::<EffectPaletteImage>().add_plugins((
+            MaterialPlugin::<EffectPaletteMaterial>::default(),
+            MaterialPlugin::<EffectPaletteDepthMaterial>::default(),
+        ));
     }
 }
 
 /// A converted effect surface coloured through its greyscale palette.
 pub type EffectPaletteMaterial = ExtendedMaterial<StandardMaterial, EffectPalette>;
+
+/// An effect palette surface that also has an authored depth override: the depth extension
+/// wraps the palette material and keeps its shaders, as [`NifDepthMaterial`] does for standard
+/// surfaces.
+pub type EffectPaletteDepthMaterial = ExtendedMaterial<EffectPaletteMaterial, NifDepthExtension>;
+
+/// The palette material an [`EffectPaletteDepthMaterial`] wraps, kept for scene validation and
+/// readiness checks, which only know the palette material.
+#[derive(Component, Clone, Reflect)]
+#[reflect(Component)]
+pub(crate) struct EffectPaletteDepthSource(pub Handle<EffectPaletteMaterial>);
 
 /// The palette half of an [`EffectPaletteMaterial`]; the standard half carries the source
 /// texture, base colour, UV transform and blending as for every other converted material.
@@ -339,8 +355,6 @@ impl GltfExtensionHandler for NativeMaterialHandler {
             .expect("NifMaterialPlugin requires the stock PBR glTF handler before it");
         let material = native_material(source, standard).unwrap_or_else(|| standard.clone());
         match palette {
-            // Effect palettes keep their own material; an authored depth override on the same
-            // surface is not combined with it.
             Some((lookup, image)) => {
                 let holder = format!("{label}/nif_palette_image");
                 context.add_labeled_asset(
@@ -349,7 +363,19 @@ impl GltfExtensionHandler for NativeMaterialHandler {
                         image: image.clone(),
                     },
                 );
+                let depth = native_depth_state(source, material.alpha_mode);
                 let material = effect_palette_material(lookup, material, image);
+                if let Some(state) = depth {
+                    self.depth_states.insert(label.to_owned(), state);
+                    let depth_material = depth_material(material.clone(), state);
+                    let Ok(_) = context.labeled_asset_scope(
+                        format!("{label}/nif_palette_depth"),
+                        |scope| {
+                            scope.get_label_handle::<EffectPaletteImage>(holder.clone());
+                            Ok::<_, Infallible>(depth_material)
+                        },
+                    );
+                }
                 let Ok(_) = context.labeled_asset_scope(format!("{label}/nif_palette"), |scope| {
                     scope.get_label_handle::<EffectPaletteImage>(holder);
                     Ok::<_, Infallible>(material)
@@ -390,13 +416,22 @@ impl GltfExtensionHandler for NativeMaterialHandler {
             entity.insert(NifSourceMaterial(source));
             if palette {
                 // A mesh draws once per material component, so the standard one has to go.
-                entity
-                    .remove::<MeshMaterial3d<StandardMaterial>>()
-                    .insert(MeshMaterial3d(
-                        context.get_label_handle::<EffectPaletteMaterial>(format!(
-                            "{label}/nif_palette"
+                entity.remove::<MeshMaterial3d<StandardMaterial>>();
+                let palette = context
+                    .get_label_handle::<EffectPaletteMaterial>(format!("{label}/nif_palette"));
+                if let Some(state) = self.depth_states.get(label).copied() {
+                    entity.insert((
+                        EffectPaletteDepthSource(palette),
+                        MeshMaterial3d(context.get_label_handle::<EffectPaletteDepthMaterial>(
+                            format!("{label}/nif_palette_depth"),
                         )),
                     ));
+                    if state.excludes_shadow() {
+                        entity.insert(NotShadowCaster);
+                    }
+                } else {
+                    entity.insert(MeshMaterial3d(palette));
+                }
             } else if let Some(state) = self.depth_states.get(label).copied() {
                 let base = context.get_label_handle::<StandardMaterial>(format!("{label}/nif"));
                 entity.remove::<MeshMaterial3d<StandardMaterial>>();
@@ -627,6 +662,88 @@ mod tests {
         let (retained, rendered) = query.single(&cloned.world).unwrap();
         assert_eq!(retained.0, source);
         assert_eq!(rendered.0, native);
+    }
+
+    /// An effect palette decal, like `dlc01/effects/icechunk01.nif`: the palette lookup and the
+    /// authored depth override both apply, and the wrapper keeps the palette and its blending.
+    #[test]
+    fn palette_decal_keeps_its_palette_under_the_depth_override() {
+        let document = first_material(serde_json::json!({
+            "alphaMode": "MASK",
+            "extensions": {"OPEN_SKYRIM_material": {
+                "shaderFamily": "effect", "shaderFlags1": DEPTH_TEST | DECAL | 0x30,
+                "textureSlots": [{"semantic": "greyscale", "slot": 1, "texture": 0}]
+            }},
+            "extras": {"openSkyrim": {"shaderFlags1": DEPTH_TEST | DECAL | 0x30, "shaderFlags2": 0}}
+        }));
+        let source = document.materials().next().unwrap();
+        let lookup = palette_lookup(&source).unwrap();
+        let state = native_depth_state(&source, AlphaMode::Mask(0.5)).unwrap();
+        assert!(state.decal && state.alpha_mask && !state.depth_write);
+        let mut images = Assets::<Image>::default();
+        let palette = images.add(Image::default());
+        let base = StandardMaterial {
+            alpha_mode: AlphaMode::Mask(0.5),
+            ..default()
+        };
+        let wrapped = depth_material(
+            effect_palette_material(lookup, base, palette.clone()),
+            state,
+        );
+        assert_eq!(wrapped.extension.state, state);
+        assert_eq!(wrapped.base.extension.palette(), &palette);
+        assert_eq!(wrapped.base.base.alpha_mode, AlphaMode::Mask(0.5));
+        assert_eq!(bevy::pbr::Material::alpha_mode(&wrapped), AlphaMode::Blend);
+    }
+
+    #[test]
+    fn depth_wrapped_palette_scene_clone_retains_the_palette_source() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_resource::<GltfExtensionHandlers>()
+            .init_asset::<StandardMaterial>()
+            .init_asset::<EffectPaletteMaterial>()
+            .init_asset::<EffectPaletteDepthMaterial>()
+            .add_plugins(NifMaterialPlugin)
+            .register_type::<MeshMaterial3d<EffectPaletteDepthMaterial>>()
+            .register_type::<NotShadowCaster>();
+        let palette = EffectPaletteMaterial {
+            base: StandardMaterial::default(),
+            extension: EffectPalette::new(Handle::default(), true, true, 1.0),
+        };
+        let state = NifDepthState::from_flags(DEPTH_TEST | DECAL, 0, AlphaMode::Opaque).unwrap();
+        let wrapped = app
+            .world_mut()
+            .resource_mut::<Assets<EffectPaletteDepthMaterial>>()
+            .add(depth_material(palette.clone(), state));
+        let palette = app
+            .world_mut()
+            .resource_mut::<Assets<EffectPaletteMaterial>>()
+            .add(palette);
+        let mut world = World::new();
+        world.spawn((
+            EffectPaletteDepthSource(palette.clone()),
+            MeshMaterial3d(wrapped.clone()),
+            NotShadowCaster,
+        ));
+        let mut cloned = WorldAsset::new(world)
+            .clone_with(
+                app.world()
+                    .resource::<bevy::ecs::reflect::AppTypeRegistry>(),
+            )
+            .unwrap();
+        let mut query = cloned.world.query::<(
+            &EffectPaletteDepthSource,
+            &MeshMaterial3d<EffectPaletteDepthMaterial>,
+            Option<&MeshMaterial3d<EffectPaletteMaterial>>,
+            Option<&NotShadowCaster>,
+        )>();
+        let (source, rendered, unwrapped, no_shadow) = query.single(&cloned.world).unwrap();
+        assert_eq!(source.0, palette);
+        assert_eq!(rendered.0, wrapped);
+        // One material component per mesh: the palette itself must not also draw.
+        assert!(unwrapped.is_none());
+        assert!(no_shadow.is_some());
     }
 
     fn first_material(material: serde_json::Value) -> gltf::Gltf {

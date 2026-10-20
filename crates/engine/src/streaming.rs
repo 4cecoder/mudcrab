@@ -1,4 +1,4 @@
-use crate::nif_material::EffectPaletteMaterial;
+use crate::nif_material::{EffectPaletteDepthSource, EffectPaletteMaterial};
 use crate::physics::{DebugTankard, PlayerBody, PlayerControlsSystems};
 use crate::{
     config::EngineConfig,
@@ -2167,11 +2167,28 @@ type ReadinessExtras<'world, 'state> = (
 );
 
 /// Converted effect surfaces drawn through their palette (`crate::nif_material`): these carry an
-/// [`EffectPaletteMaterial`] in place of a `StandardMaterial`.
+/// [`EffectPaletteMaterial`] in place of a `StandardMaterial`, either directly or, under an
+/// authored depth override, as the source of the material that wraps it.
 type EffectPalettePrimitives<'world, 'state> = (
-    Query<'world, 'state, &'static MeshMaterial3d<EffectPaletteMaterial>>,
+    Query<'world, 'state, EffectPaletteSurface>,
     Option<Res<'world, Assets<EffectPaletteMaterial>>>,
 );
+
+type EffectPaletteSurface = AnyOf<(
+    &'static MeshMaterial3d<EffectPaletteMaterial>,
+    &'static EffectPaletteDepthSource,
+)>;
+
+fn effect_palette_handle<'a>(
+    (material, depth_source): (
+        Option<&'a MeshMaterial3d<EffectPaletteMaterial>>,
+        Option<&'a EffectPaletteDepthSource>,
+    ),
+) -> Option<&'a Handle<EffectPaletteMaterial>> {
+    material
+        .map(|material| &material.0)
+        .or_else(|| depth_source.map(|source| &source.0))
+}
 
 type PendingAssetQuery<'world, 'state> = Query<
     'world,
@@ -3101,7 +3118,7 @@ fn validate_spawned_asset(
     meshes: &Assets<Mesh>,
     materials: &Assets<StandardMaterial>,
     (palettes, palette_materials): (
-        &Query<&MeshMaterial3d<EffectPaletteMaterial>>,
+        &Query<EffectPaletteSurface>,
         Option<&Assets<EffectPaletteMaterial>>,
     ),
     images: &Assets<Image>,
@@ -3119,7 +3136,11 @@ fn validate_spawned_asset(
             ));
         }
         summary.meshes += 1;
-        if let Ok(MeshMaterial3d(palette_handle)) = palettes.get(descendant) {
+        if let Some(palette_handle) = palettes
+            .get(descendant)
+            .ok()
+            .and_then(effect_palette_handle)
+        {
             let material = palette_materials
                 .and_then(|materials| materials.get(palette_handle))
                 .ok_or_else(|| {

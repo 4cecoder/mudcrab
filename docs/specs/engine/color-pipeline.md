@@ -161,16 +161,25 @@ image is a `#[dependency]`), and the palette material depends on that label. A s
 as loaded only once its palettes have loaded; without this, spawn validation could run before a
 palette arrived and reject the model for good.
 
+A palette surface that also has an authored depth override (`crate::nif_depth`: decals, surfaces
+that test but do not write depth, and surfaces with depth testing off) draws through
+`EffectPaletteDepthMaterial`, the depth extension wrapped around the palette material
+(`…/nif_palette_depth`). The wrapper keeps the palette shaders and adds the authored depth state,
+the sorted colour pass, no prepass and the authored `Cast_Shadows` flag, exactly as
+`NifDepthMaterial` does for standard surfaces. The surface keeps its palette material as
+`EffectPaletteDepthSource`, which spawn validation and the door crossing's readiness check read.
+
 Not covered: effect lighting influence, falloff, soft depth, membrane shaders, `IgnoreTexAlpha`,
 nonstandard blend factors and every animation controller.
 
 `material_palette_probe --output <dir> [--interior] [--standard-material]`: converter-published
 synthetic effect contracts → glTF/KTX2 → production palette material → GPU swatches beside unlit
 references computed on the CPU (bilinear filtering of the decoded 4×4 palette), with a depth
-prepass as the engine's cameras have. Seven cases: mid grey, HDR scale with the row from base red
-only, clamped corner, colour and alpha blended, alpha only, and two alpha-tested cases over an
-unlit plane: opaque source alpha with transparent palette alpha (must leave the plane visible,
-not a prepass hole) and the reverse. A second glTF names a palette file that does not exist; its
+prepass as the engine's cameras have. Nine cases: mid grey, HDR scale with the row from base red
+only, clamped corner, colour and alpha blended, alpha only, two depth-tested decals drawn through
+the depth wrapper (colour and alpha; an alpha-tested palette alpha that must discard), and two
+alpha-tested cases over an unlit plane: opaque source alpha with transparent palette alpha (must
+leave the plane visible, not a prepass hole) and the reverse. A second glTF names a palette file that does not exist; its
 palette material's recursive load must fail rather than finish. The palette view must be
 `Rgba8UnormSrgb`; tolerance 2/255; references must be visible. `--standard-material` draws the
 stock material the engine used before and must fail with exit 1.

@@ -2,7 +2,8 @@
 //! --output <directory> [--interior] [--standard-material] (negative control).
 //!
 //! Also checks that a palette material counts its palette image as a dependency: with the palette
-//! file missing, the material's recursive load must fail rather than finish.
+//! file missing, the material's recursive load must fail rather than finish. The decal cases draw
+//! through the depth override's wrapper (`/nif_palette_depth`) and must match the same references.
 use bevy::{
     camera::{RenderTarget, ScalingMode},
     core_pipeline::tonemapping::DebandDither,
@@ -24,7 +25,11 @@ use converter::{
 use ddsfile::{AlphaMode, D3D10ResourceDimension, Dds, DxgiFormat, NewDxgiParams};
 use engine::{
     color_pipeline::SceneColorPipeline,
-    nif_material::{EffectPaletteMaterial, EffectPaletteMaterialPlugin, NifMaterialPlugin},
+    nif_depth::{DECAL, DEPTH_TEST},
+    nif_material::{
+        EffectPaletteDepthMaterial, EffectPaletteMaterial, EffectPaletteMaterialPlugin,
+        NifMaterialPlugin,
+    },
 };
 use std::{
     path::PathBuf,
@@ -33,6 +38,8 @@ use std::{
 
 const PALETTE_COLOR: u32 = 1 << 4;
 const PALETTE_ALPHA: u32 = 1 << 5;
+/// A depth-tested decal: an authored depth override, so the palette draws through its wrapper.
+const DEPTH_DECAL: u32 = DEPTH_TEST | DECAL;
 /// 4×4 palette. Red rises and alpha falls along U, green rises along V, so a wrong coordinate
 /// shows in a channel of its own; blue marks the palette apart from the source texture. Alpha
 /// falls where grey rises, so an opaque source texel can look up a transparent palette entry.
@@ -68,7 +75,7 @@ struct Case {
     scale: f32,
 }
 
-const CASES: [Case; 7] = [
+const CASES: [Case; 9] = [
     Case {
         name: "colour_mid",
         flags: PALETTE_COLOR,
@@ -109,6 +116,24 @@ const CASES: [Case; 7] = [
         mode: Mode::Blend,
         texel: [150, 100],
         base: [0.6, 0.3, 0.9, 0.7],
+        scale: 1.0,
+    },
+    Case {
+        // The ice chunk decals: a palette under the authored depth override.
+        name: "decal_colour_and_alpha",
+        flags: DEPTH_DECAL | PALETTE_COLOR | PALETTE_ALPHA,
+        mode: Mode::Opaque,
+        texel: [90, 200],
+        base: [0.7, 0.7, 0.7, 1.0],
+        scale: 1.3,
+    },
+    Case {
+        // The wrapper draws in the sorted pass, but a cutout palette alpha must still discard.
+        name: "decal_mask_palette_discards",
+        flags: DEPTH_DECAL | PALETTE_ALPHA,
+        mode: Mode::Mask,
+        texel: [128, 255],
+        base: [0.9, 0.6, 0.3, 1.0],
         scale: 1.0,
     },
     Case {
@@ -209,6 +234,8 @@ struct Probe {
     standard: bool,
     started: Instant,
     palettes: Vec<Handle<EffectPaletteMaterial>>,
+    /// The depth wrapper each decal case draws with in place of its palette material.
+    wrapped: Vec<Option<Handle<EffectPaletteDepthMaterial>>>,
     missing_palette: Handle<EffectPaletteMaterial>,
     standards: Vec<Handle<StandardMaterial>>,
     target: Handle<Image>,
@@ -413,6 +440,14 @@ fn main() {
     let palettes = (0..CASES.len())
         .map(|index| server.load(format!("materials.gltf#Material{index}/nif_palette")))
         .collect();
+    let wrapped = CASES
+        .iter()
+        .enumerate()
+        .map(|(index, case)| {
+            (case.flags & DECAL != 0)
+                .then(|| server.load(format!("materials.gltf#Material{index}/nif_palette_depth")))
+        })
+        .collect();
     let missing_palette = server.load("missing_palette.gltf#Material0/nif_palette");
     let standards = (0..CASES.len())
         .map(|index| server.load(format!("materials.gltf#Material{index}/std")))
@@ -433,6 +468,7 @@ fn main() {
             standard,
             started: Instant::now(),
             palettes,
+            wrapped,
             missing_palette,
             standards,
             target,
@@ -454,6 +490,7 @@ fn render_and_capture(
     mut commands: Commands,
     mut probe: ResMut<Probe>,
     palettes: Res<Assets<EffectPaletteMaterial>>,
+    wrapped: Res<Assets<EffectPaletteDepthMaterial>>,
     mut standards: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
     images: Res<Assets<Image>>,
@@ -474,7 +511,13 @@ fn render_and_capture(
         else {
             return;
         };
-        if probe.standards.iter().any(|h| standards.get(h).is_none()) {
+        if probe.standards.iter().any(|h| standards.get(h).is_none())
+            || probe
+                .wrapped
+                .iter()
+                .flatten()
+                .any(|h| wrapped.get(h).is_none())
+        {
             return;
         }
         let dependencies = loaded.iter().flat_map(|material| {
@@ -553,6 +596,12 @@ fn render_and_capture(
                     MeshMaterial3d(probe.standards[index].clone()),
                     Transform::from_xyz(-2.0, y, 0.0),
                 ));
+            } else if let Some(wrapped) = &probe.wrapped[index] {
+                commands.spawn((
+                    Mesh3d(quad.clone()),
+                    MeshMaterial3d(wrapped.clone()),
+                    Transform::from_xyz(-2.0, y, 0.0),
+                ));
             } else {
                 commands.spawn((
                     Mesh3d(quad.clone()),
@@ -628,7 +677,7 @@ fn evaluate(
         passed &= error <= 2;
         // Guard against a blank render satisfying a pairwise comparison.
         passed &= reference.iter().any(|v| *v > 5 && *v < 250);
-        samples.push(serde_json::json!({"case":case.name,"flags1":case.flags,"mode":format!("{:?}", case.mode),"source_grey_alpha_u8":case.texel,"base_color":case.base,"base_color_scale":case.scale,"expected_linear":expected(case),"pixel_y":y,"converted_rgb":actual,"reference_rgb":reference,"max_error_u8":error}));
+        samples.push(serde_json::json!({"case":case.name,"flags1":case.flags,"mode":format!("{:?}", case.mode),"source_grey_alpha_u8":case.texel,"base_color":case.base,"base_color_scale":case.scale,"depth_wrapped":probe.wrapped[index].is_some(),"expected_linear":expected(case),"pixel_y":y,"converted_rgb":actual,"reference_rgb":reference,"max_error_u8":error}));
     }
     let palette: Vec<_> = (0..PALETTE_SIZE)
         .map(|y| {
