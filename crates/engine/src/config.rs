@@ -838,6 +838,8 @@ impl EngineConfig {
             Some("--streaming-fixture moves the camera every frame")
         } else if self.shots.is_some() {
             Some("--shots sets the camera pose for each shot")
+        } else if self.matched_route.is_some() {
+            Some("--matched-route sets the camera pose for each route step")
         } else {
             None
         };
@@ -1442,6 +1444,14 @@ mod tests {
         ]);
         assert_eq!(config.benchmark_jump, None);
         assert!(config.shots.is_some());
+        for list in [
+            ["--benchmark-jump", "3,4", "--matched-route", "route.json"],
+            ["--matched-route", "route.json", "--benchmark-jump", "3,4"],
+        ] {
+            let config = args(&list);
+            assert_eq!(config.benchmark_jump, None, "{list:?}");
+            assert_eq!(config.matched_route, Some(PathBuf::from("route.json")));
+        }
         // A synthetic benchmark loads no world, so no streaming system would issue the jump.
         let config = args(&[
             "--benchmark-only",

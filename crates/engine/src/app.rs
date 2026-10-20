@@ -352,8 +352,16 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
     else {
         return Ok(None);
     };
-    let other_mode = (config.shots.is_some() && config.matched_route.is_some())
-        || config.benchmark_only
+    color_eyre::eyre::ensure!(
+        !(config.shots.is_some() && config.matched_route.is_some()),
+        "--shots and --matched-route cannot be used together; choose one camera driver"
+    );
+    let mode = if config.matched_route.is_some() {
+        "--matched-route"
+    } else {
+        "--shots"
+    };
+    let other_mode = config.benchmark_only
         || config.benchmark_frames.is_some()
         || config.benchmark_duration_secs.is_some()
         || config.acceptance_screenshot.is_some()
@@ -366,12 +374,12 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
         || config.physics_fixture;
     color_eyre::eyre::ensure!(
         !other_mode,
-        "--shots renders the converted world on its own: it cannot be combined with a benchmark, \
+        "{mode} renders the converted world on its own: it cannot be combined with a benchmark, \
          an acceptance screenshot, --auto-fly-speed or a fixture"
     );
     if config.headless {
         // The logger is not installed yet, so a `warn!` here would never be seen.
-        eprintln!("warning: --shots photographs the window, so --headless is ignored");
+        eprintln!("warning: {mode} photographs the window, so --headless is ignored");
     }
     let (file, checkpoints) = if config.matched_route.is_some() {
         let (file, checkpoints) = crate::matched_route::MatchedRoute::load(&path)?.expand()?;
@@ -2336,6 +2344,33 @@ mod tests {
     use bevy::window::{PrimaryWindow, Window};
     use bevy::world_serialization::WorldSerializationPlugin;
     use std::time::Duration;
+
+    #[test]
+    fn automated_camera_conflicts_name_the_selected_drivers() {
+        let mut both = EngineConfig {
+            shots: Some("shots.json".into()),
+            matched_route: Some("route.json".into()),
+            ..default()
+        };
+        let Err(error) = prepare_shots(&mut both) else {
+            panic!("drivers must conflict");
+        };
+        let message = error.to_string();
+        assert!(message.contains("--shots"));
+        assert!(message.contains("--matched-route"));
+
+        let mut route_benchmark = EngineConfig {
+            matched_route: Some("route.json".into()),
+            benchmark_frames: Some(60),
+            ..default()
+        };
+        let Err(error) = prepare_shots(&mut route_benchmark) else {
+            panic!("benchmark must conflict with route");
+        };
+        let message = error.to_string();
+        assert!(message.contains("--matched-route"));
+        assert!(message.contains("benchmark"));
+    }
 
     /// A capture window remains hidden if an update system tries to show it.
     #[test]

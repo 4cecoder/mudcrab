@@ -22,7 +22,13 @@ use serde::Serialize;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Component, Default)]
-pub(crate) struct CaptureTicket(pub Arc<Mutex<Option<CaptureFrame>>>);
+pub(crate) struct CaptureTicket {
+    receipt: Arc<Mutex<Option<CaptureFrame>>>,
+    /// The run's failure counters when this shot started settling, frozen into the request so the receipt
+    /// reports only the failures of this shot: an earlier shot's failures are history, and one
+    /// that happens after the request still shows up in the receipt.
+    baseline: crate::shots::Failures,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct CaptureFrame {
@@ -39,8 +45,21 @@ pub(crate) struct CaptureFrame {
 }
 
 impl CaptureTicket {
+    /// A ticket carrying the failure baseline of the shot that requested it.
+    pub(crate) fn new(baseline: crate::shots::Failures) -> Self {
+        Self {
+            receipt: Arc::new(Mutex::new(None)),
+            baseline,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn baseline(&self) -> crate::shots::Failures {
+        self.baseline
+    }
+
     pub(crate) fn receipt(&self) -> Option<CaptureFrame> {
-        self.0.lock().unwrap().clone()
+        self.receipt.lock().unwrap().clone()
     }
 }
 
@@ -111,13 +130,57 @@ fn extract_capture_frames(
     let offset = shot_camera_translation([0.0; 3], origin.0);
     let absolute = transform.translation - offset;
     let pose = shared::coordinates::runtime_to_creation_vector(absolute.to_array());
-    let mut work = crate::shots::SettleCounts::read(
-        &streaming,
-        &renderer,
-        default(),
-        renderer.final_path_active(),
-        0,
-    );
+    for ticket in &tickets {
+        if ticket.receipt().is_some() {
+            continue;
+        }
+        let work = captured_work(
+            ticket,
+            &streaming,
+            &renderer,
+            &profiler,
+            &uploads,
+            renderer.final_path_active(),
+        );
+        let record = CaptureFrame {
+            main_frame: frame.0,
+            render_frame: extracted.render_frame,
+            camera_creation: pose,
+            rotation_runtime_xyzw: transform.rotation.to_array(),
+            vertical_fov_radians: match projection {
+                Projection::Perspective(p) => Some(p.fov),
+                _ => None,
+            },
+            render_origin: origin.0.to_array(),
+            pending_specializations: None,
+            work,
+            terrain_gauges: profiler.terrain_gauges(),
+            terrain_coverage: surfaces
+                .iter()
+                .filter(|(_, visible)| visible.get())
+                .map(|(coverage, _)| serde_json::json!({"source": coverage.receipt()}))
+                .chain(batches.iter().flat_map(|batch| batch.coverage_receipt()))
+                .collect(),
+        };
+        extracted.captures.push((ticket.clone(), record));
+    }
+}
+
+/// The work one captured receipt carries, read against the baseline frozen when its capture was
+/// requested: a failure from an earlier shot is history and cannot reject this receipt, while a
+/// failure after the request - including one between the request and this extraction - still can.
+/// Everything pending is read as it stands, so work that is unavailable rather than absent leaves
+/// the receipt without a claim of readiness.
+fn captured_work(
+    ticket: &CaptureTicket,
+    streaming: &crate::streaming::StreamingMetrics,
+    renderer: &crate::render::RendererMetrics,
+    profiler: &crate::profiling::ProfilingState,
+    uploads: &crate::terrain_upload::TerrainMeshUploadReadiness,
+    renderer_ready: bool,
+) -> crate::shots::SettleCounts {
+    let mut work =
+        crate::shots::SettleCounts::read(streaming, renderer, ticket.baseline, renderer_ready, 0);
     work.outstanding_terrain_uploads = uploads.outstanding();
     work.pending_batch_cpu = profiler
         .gauge("lod/pending_terrain_batch_chunks")
@@ -128,31 +191,7 @@ fn extract_capture_frames(
     work.pending_batch_selection = profiler
         .gauge("lod/pending_terrain_selection_uploads")
         .unwrap_or(0.0) as usize;
-    let record = CaptureFrame {
-        main_frame: frame.0,
-        render_frame: extracted.render_frame,
-        camera_creation: pose,
-        rotation_runtime_xyzw: transform.rotation.to_array(),
-        vertical_fov_radians: match projection {
-            Projection::Perspective(p) => Some(p.fov),
-            _ => None,
-        },
-        render_origin: origin.0.to_array(),
-        pending_specializations: None,
-        work,
-        terrain_gauges: profiler.terrain_gauges(),
-        terrain_coverage: surfaces
-            .iter()
-            .filter(|(_, visible)| visible.get())
-            .map(|(coverage, _)| serde_json::json!({"source": coverage.receipt()}))
-            .chain(batches.iter().flat_map(|batch| batch.coverage_receipt()))
-            .collect(),
-    };
-    for ticket in &tickets {
-        if ticket.receipt().is_none() {
-            extracted.captures.push((ticket.clone(), record.clone()));
-        }
-    }
+    work
 }
 
 fn finalize_capture_frames(
@@ -165,7 +204,7 @@ fn finalize_capture_frames(
         record.pending_specializations = pending;
         record.work.pending_specializations = pending;
         record.work.pending_render_transfers = *transfers.0.lock().unwrap();
-        let mut receipt = ticket.0.lock().unwrap();
+        let mut receipt = ticket.receipt.lock().unwrap();
         // Never overwrite the render frame when asynchronous readback takes more frames.
         if receipt.is_none() {
             *receipt = Some(record);
@@ -225,6 +264,89 @@ mod tests {
         world.run_system_once(finalize_capture_frames).unwrap();
         assert_eq!(validate_receipt(&ticket, [1.0; 3]).unwrap().render_frame, 2);
         assert!(validate_receipt(&ticket, [0.0; 3]).is_err());
+    }
+
+    /// A receipt is checked against the failures of the shot it belongs to: the run's history is
+    /// not this capture's rejection, and a failure after the request still is.
+    #[test]
+    fn a_receipt_reports_the_failures_of_its_own_shot_only() {
+        let earlier_failures = crate::streaming::StreamingMetrics {
+            failed_cells: 1,
+            asset_load_failures: 2,
+            material_validation_failures: 1,
+            failed_lod_queries: 3,
+            failed_lod_chunks: 4,
+            ..crate::streaming::StreamingMetrics::default()
+        };
+        let renderer = crate::render::RendererMetrics::default();
+        let baseline = crate::shots::Failures::read(&earlier_failures, &renderer);
+        let profiler = crate::profiling::ProfilingState::default();
+        let uploads = crate::terrain_upload::TerrainMeshUploadReadiness::default();
+        let observed = |work: &mut crate::shots::SettleCounts| {
+            work.pending_specializations = Some(0);
+            work.pending_render_transfers = Some(0);
+        };
+
+        // This shot added nothing, so its receipt is quiet despite the run's failures behind it.
+        let ticket = CaptureTicket::new(baseline);
+        let mut quiet = captured_work(
+            &ticket,
+            &earlier_failures,
+            &renderer,
+            &profiler,
+            &uploads,
+            true,
+        );
+        observed(&mut quiet);
+        assert!(
+            quiet.is_quiet(),
+            "earlier failures poison this receipt: {}",
+            quiet.describe()
+        );
+
+        // A failure between the request and this extraction is this shot's failure.
+        let mut during = earlier_failures.clone();
+        during.failed_lod_chunks += 1;
+        during.failed_cells += 1;
+        let mut fresh = captured_work(&ticket, &during, &renderer, &profiler, &uploads, true);
+        observed(&mut fresh);
+        assert_eq!(
+            (fresh.failed_cells, fresh.failed_lod_work),
+            (1, 1),
+            "a failure after the request is counted"
+        );
+        assert!(!fresh.is_quiet(), "{}", fresh.describe());
+
+        // Render-side work that has not been observed yet stays unavailable, not quiet.
+        let unavailable = captured_work(
+            &ticket,
+            &earlier_failures,
+            &renderer,
+            &profiler,
+            &uploads,
+            true,
+        );
+        assert!(!unavailable.is_quiet(), "unobserved work is not quiet");
+
+        // The renderer's final path has to be running for the frame to be a settled one.
+        let mut not_ready = captured_work(
+            &ticket,
+            &earlier_failures,
+            &renderer,
+            &profiler,
+            &uploads,
+            false,
+        );
+        observed(&mut not_ready);
+        assert!(!not_ready.is_quiet(), "an unready renderer is not settled");
+
+        // Pending LOD work holds the receipt back whatever the failure baseline says.
+        let mut pending_lod = earlier_failures.clone();
+        pending_lod.pending_lod_queries = 1;
+        let mut pending =
+            captured_work(&ticket, &pending_lod, &renderer, &profiler, &uploads, true);
+        observed(&mut pending);
+        assert!(!pending.is_quiet(), "{}", pending.describe());
     }
 }
 
