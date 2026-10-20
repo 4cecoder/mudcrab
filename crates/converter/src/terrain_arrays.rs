@@ -48,7 +48,7 @@
 //! # Publication
 //!
 //! Nothing is written under `output_root/terrain` until every array and the table are complete:
-//! the build works in `output_root/terrain.staging-<pid>/`, then renames the array files over
+//! the build works in `output_root/terrain.staging/`, then renames the array files over
 //! their targets one by one and the table last, so a table is never missing (a rename over an
 //! existing file is atomic on one volume). Between the first and last rename the old table can
 //! meet a new array, so the conversion's own staging folder is the outer transaction: it is
@@ -1608,19 +1608,29 @@ fn pad_to(out: &mut impl Write, position: &mut u64, target: u64) -> Result<()> {
     Ok(())
 }
 
-/// The staging folder of one build: `terrain.staging-<pid>` under the output root, mirroring
-/// its layout, removed when dropped.
+/// The staging folder of one build: `terrain.staging` under the output root, mirroring its
+/// layout, removed when dropped. The name is fixed, not per process: the conversion holds the
+/// output's exclusive lock for the whole build, so no other build can be using it, and a build
+/// that was interrupted (and so skipped its `Drop`) leaves nothing that a later build must
+/// tolerate beside its own files. Whatever is at this name when a build starts is cleared.
 struct Staging {
     path: PathBuf,
 }
 
 impl Staging {
     fn create(output_root: &Path) -> Result<Self> {
-        let path = output_root.join(format!("terrain.staging-{}", std::process::id()));
-        if path.exists() {
-            // A folder of this name is a leftover of an earlier process with the same id.
-            fs::remove_dir_all(&path)
-                .wrap_err_with(|| format!("failed to clear {}", path.display()))?;
+        let path = output_root.join(STAGING_DIR);
+        // Only this fixed name is cleared; nothing else under the output root is touched.
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&path)
+                .wrap_err_with(|| format!("failed to clear {}", path.display()))?,
+            Ok(_) => fs::remove_file(&path)
+                .wrap_err_with(|| format!("failed to clear {}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .wrap_err_with(|| format!("failed to inspect {}", path.display()));
+            }
         }
         let staging = Self { path };
         for dir in [staging.path.join(TERRAIN_DIR), staging.spool_dir()] {
@@ -1639,6 +1649,9 @@ impl Staging {
         self.path.join("spool")
     }
 }
+
+/// The staging folder's name under the output root.
+const STAGING_DIR: &str = "terrain.staging";
 
 impl Drop for Staging {
     fn drop(&mut self) {
@@ -2106,6 +2119,58 @@ mod tests {
         let written: LandTextureTable = serde_json::from_slice(&json).unwrap();
         assert_eq!(written, table);
         assert_no_staging(dir.path());
+    }
+
+    /// A build that was interrupted left its fixed staging folder behind, spool files included. The
+    /// next build clears that folder and builds from scratch, and the unrelated legacy
+    /// `terrain.staging-<pid>` folder beside it is not touched.
+    #[test]
+    fn a_stale_staging_folder_from_an_interrupted_build_is_cleared_by_the_next_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let red = solid_bc1_fixture(dir.path(), "red.ktx2", 8, 4, RED);
+        let stale_spool = dir.path().join("terrain.staging/spool");
+        fs::create_dir_all(&stale_spool).unwrap();
+        fs::write(
+            stale_spool.join("land-diffuse-bc1-8.spool"),
+            b"partial spool",
+        )
+        .unwrap();
+        let stale_output = dir.path().join("terrain.staging/terrain");
+        fs::create_dir_all(&stale_output).unwrap();
+        fs::write(
+            stale_output.join("land-diffuse-bc1-1024.ktx2.partial"),
+            b"partial",
+        )
+        .unwrap();
+        let legacy = dir.path().join("terrain.staging-4242/spool");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("kept.spool"), b"another process's").unwrap();
+
+        let sources = [LandTextureSource {
+            ltex_form_id: 0x10,
+            diffuse: red,
+            normal: None,
+        }];
+        let (table, _) = build_land_texture_arrays(&sources, None, dir.path(), &tiny()).unwrap();
+
+        assert!(!stale_spool.join("land-diffuse-bc1-8.spool").exists());
+        assert!(
+            !dir.path().join("terrain.staging").exists(),
+            "the build removed its own folder"
+        );
+        assert!(
+            !dir.path()
+                .join("terrain/land-diffuse-bc1-1024.ktx2.partial")
+                .exists()
+        );
+        assert!(
+            legacy.join("kept.spool").is_file(),
+            "legacy folders are not touched"
+        );
+        let written: LandTextureTable =
+            serde_json::from_slice(&fs::read(dir.path().join(LAND_TEXTURE_TABLE_PATH)).unwrap())
+                .unwrap();
+        assert_eq!(written, table);
     }
 
     /// No staging folder or partial file is left beside the output.
