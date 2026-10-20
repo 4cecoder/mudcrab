@@ -73,6 +73,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         None
     };
+    let asset_plugin = asset_plugin(&mut config)?;
     let reads_asset_tree = config.streaming_fixture
         || !(config.benchmark_only
             || config.material_fixture
@@ -127,7 +128,6 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         && !config.streaming_fixture)
         .then(|| MovementTuning::from_world_database(&config.assets_dir.join("skyrim_world.db")))
         .transpose()?;
-    let asset_path = config.assets_dir.to_string_lossy().into_owned();
     let benchmark_active =
         config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some();
     configure_benchmark_priority(benchmark_active)?;
@@ -179,10 +179,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 .build()
                 .disable::<bevy::render::RenderPlugin>()
                 .add_before::<bevy::render::RenderPlugin>(RendererInitPlugin::default())
-                .set(AssetPlugin {
-                    file_path: asset_path,
-                    ..default()
-                })
+                .set(asset_plugin)
                 .set(world_gltf_plugin())
                 .set(WindowPlugin {
                     primary_window: window,
@@ -209,6 +206,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             SkyPlugin,
             ConsolePlugin,
             crate::nif_material::NifMaterialPlugin,
+            crate::emittance::EmittancePlugin,
         ))
         // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
         // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
@@ -223,7 +221,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .add_plugins(StreamingPlugin);
         app.add_systems(Startup, setup_world);
         if interactive_world_physics {
-            app.add_plugins(WorldPlayerPlugin);
+            app.add_plugins((WorldPlayerPlugin, crate::door_crossing::DoorCrossingPlugin));
             // `coc`/`coe` move the player, so they come with it, as `tcl` does: a run without a
             // player (a benchmark, `--shots`, headless) lists neither in Help.
             crate::cell_commands::register_cell_commands(&mut app);
@@ -312,6 +310,20 @@ fn upload_budget(config: &EngineConfig) -> RenderAssetBytesPerFrame {
     RenderAssetBytesPerFrame {
         max_bytes: config.max_upload_bytes_per_frame(),
     }
+}
+
+/// Direct database reads and Bevy's file reader must use the same absolute root.
+fn asset_plugin(config: &mut EngineConfig) -> Result<AssetPlugin> {
+    config.assets_dir = std::path::absolute(&config.assets_dir).wrap_err_with(|| {
+        format!(
+            "cannot resolve asset directory {}",
+            config.assets_dir.display()
+        )
+    })?;
+    Ok(AssetPlugin {
+        file_path: config.assets_dir.to_string_lossy().into_owned(),
+        ..default()
+    })
 }
 
 /// Matches LAND's sampler for shared repeating images before either loader caches them.
@@ -514,10 +526,13 @@ impl StreamingFixtureDirectory {
     fn populate(&self, worldspace_id: u32, start_grid: (i32, i32)) -> Result<()> {
         let database_path = self.path.join("skyrim_world.db");
         let connection = Connection::open(&database_path)?;
+        connection.execute("CREATE TABLE schema_info(version INTEGER NOT NULL)", [])?;
+        connection.execute(
+            "INSERT INTO schema_info VALUES(?1)",
+            [shared::WORLD_DATABASE_SCHEMA_VERSION],
+        )?;
         connection.execute_batch(
-            r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
-            INSERT INTO schema_info VALUES(7);
-            CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
+            r#"CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
             CREATE TABLE worldspaces(id INTEGER PRIMARY KEY,editor_id TEXT,parent_world INTEGER,flags INTEGER,lod_origin_x INTEGER,lod_origin_y INTEGER);
             CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
             CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
@@ -594,8 +609,8 @@ struct StreamingFixtureState {
 /// way a door crossing will load one; the camera then carries on over exteriors far outside the
 /// unload radius and comes back. The contract is that the interior never exists twice and its
 /// references match its root. Today it also stays loaded throughout (an interior has no grid
-/// square, so [`cell_within_unload_radius`](crate::streaming) keeps it, and no runtime path unloads
-/// one); that is current behaviour, not part of the contract.
+/// square, so [`cell_within_unload_radius`](crate::streaming) keeps it, and only a space switch
+/// unloads one); that is current behaviour, not part of the contract.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 struct InteriorCrossing {
     requested_frame: Option<u32>,
@@ -2344,6 +2359,75 @@ mod tests {
                 "grid {grid:?} origin {origin:?}"
             );
         }
+    }
+
+    #[test]
+    fn relative_asset_root_is_shared_by_database_and_streamed_files() {
+        use bevy::asset::io::{AssetReader, Reader, file::FileAssetReader};
+
+        // Keep the process CWD and environment intact so this can run alongside other tests.
+        let cwd = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(&cwd).unwrap();
+        let mut config = EngineConfig {
+            assets_dir: directory.path().strip_prefix(&cwd).unwrap().to_owned(),
+            ..default()
+        };
+        let plugin = asset_plugin(&mut config).unwrap();
+        assert!(config.assets_dir.is_absolute());
+        assert_eq!(config.assets_dir, directory.path());
+
+        let database_path = config.assets_dir.join("skyrim_world.db");
+        Connection::open(&database_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE fixture (value TEXT); INSERT INTO fixture VALUES ('same root');",
+            )
+            .unwrap();
+        fs::create_dir(config.assets_dir.join("meshes")).unwrap();
+        fs::write(config.assets_dir.join("meshes/model.glb"), b"model").unwrap();
+        fs::create_dir(config.assets_dir.join("textures")).unwrap();
+        fs::write(config.assets_dir.join("textures/image.png"), b"image").unwrap();
+
+        let reader = FileAssetReader::new(plugin.file_path);
+        assert_eq!(reader.root_path(), &config.assets_dir);
+        bevy::tasks::block_on(async {
+            for (path, expected) in [
+                ("meshes/model.glb", b"model".as_slice()),
+                ("textures/image.png", b"image".as_slice()),
+            ] {
+                let mut file = reader.read(Path::new(path)).await.unwrap();
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes, expected);
+            }
+        });
+        let database =
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let value: String = database
+            .query_row("SELECT value FROM fixture", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "same root");
+    }
+
+    #[test]
+    fn asset_root_resolution_allows_missing_directories_and_preserves_absolute_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let absolute = directory.path().join("not-created");
+        let mut config = EngineConfig {
+            assets_dir: absolute.clone(),
+            ..default()
+        };
+        let plugin = asset_plugin(&mut config).unwrap();
+        assert_eq!(config.assets_dir, absolute);
+        assert_eq!(PathBuf::from(plugin.file_path), absolute);
+        assert!(!absolute.exists());
+
+        config.assets_dir = EngineConfig::default().assets_dir;
+        asset_plugin(&mut config).unwrap();
+        assert_eq!(
+            config.assets_dir,
+            std::env::current_dir().unwrap().join("modern_assets")
+        );
     }
 
     #[test]
