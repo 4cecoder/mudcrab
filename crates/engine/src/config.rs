@@ -2139,6 +2139,8 @@ mod tests {
 
     /// Utility `.ps1`, `.sh` and `.py` files under `root`, subdirectories included,
     /// in a stable order. Hidden directories and script tests are excluded.
+    /// Converter-only profiling tools stay in the scan; their flags are checked
+    /// only on lines that invoke the engine (see `checked_script_engine_flags`).
     fn script_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut paths = Vec::new();
         let mut pending = vec![root.to_owned()];
@@ -2152,8 +2154,7 @@ mod tests {
                 // loop the walk; hidden folders (`.venv`) hold no project scripts.
                 if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                     let name = entry.file_name();
-                    // Tests inspect script text, including deliberately unsupported engine
-                    // options; they are not utility command lines.
+                    // Tests inspect deliberately unsupported engine options.
                     if !name.to_string_lossy().starts_with('.') && name != "tests" {
                         pending.push(path);
                     }
@@ -2172,7 +2173,26 @@ mod tests {
     fn checked_script_engine_flags(script: &str, path: &std::path::Path) -> usize {
         let options = parser_options();
         let mut checked = 0;
-        for flag in option_tokens(script) {
+        // lod-performance tools parse converter options. Only their lines that
+        // name the engine are engine invocations; the rest is not checked.
+        let converter_tool = path
+            .components()
+            .any(|part| part.as_os_str() == "lod-performance");
+        let engine_lines: String;
+        let scanned = if converter_tool {
+            engine_lines = script
+                .lines()
+                .filter(|line| {
+                    line.split(|c: char| !c.is_alphanumeric())
+                        .any(|word| word == "engine")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            engine_lines.as_str()
+        } else {
+            script
+        };
+        for flag in option_tokens(scanned) {
             // This database-only tool owns --verify. Keep it scoped to the tool:
             // an engine launcher passing --verify must still fail the audit.
             let observation_option = path.file_name().is_some_and(|name| {
@@ -2326,14 +2346,42 @@ mod tests {
     }
 
     #[test]
-    fn script_v89_scan_excludes_tests_and_keeps_nested_utilities() {
+    fn script_v89_scan_excludes_other_tool_scopes_and_keeps_nested_utilities() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("tests")).unwrap();
+        std::fs::create_dir(directory.path().join("lod-performance")).unwrap();
         std::fs::create_dir(directory.path().join("utils")).unwrap();
         std::fs::write(directory.path().join("tests/check.py"), "--log-file").unwrap();
+        std::fs::write(
+            directory.path().join("lod-performance/audit.py"),
+            "--data-root --expected-chunks --lod-encoder",
+        )
+        .unwrap();
         let utility = directory.path().join("utils/capture.sh");
         std::fs::write(&utility, "--headless").unwrap();
-        assert_eq!(script_paths(directory.path()), vec![utility]);
+        assert_eq!(
+            script_paths(directory.path()),
+            vec![directory.path().join("lod-performance/audit.py"), utility]
+        );
+    }
+
+    #[test]
+    fn lod_performance_flags_are_checked_only_on_engine_lines() {
+        let tool = std::path::Path::new("scripts/lod-performance/run_conversion_observed.py");
+        assert_eq!(
+            checked_script_engine_flags("converter --data-root x --lod-encoder cpu", tool),
+            0
+        );
+        assert_eq!(
+            checked_script_engine_flags("engine --headless\nconverter --data-root x", tool),
+            1
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                checked_script_engine_flags("engine --unknown-engine-option", tool)
+            })
+            .is_err()
+        );
     }
 
     /// True when a script spells out a finite number.
