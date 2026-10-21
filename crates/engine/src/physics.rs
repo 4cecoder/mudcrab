@@ -1587,10 +1587,10 @@ fn walk_spawn_probe_distance(
         return fallback;
     };
     let distance_to_ground = body_y - ground_y;
-    if !distance_to_ground.is_finite() || distance_to_ground < 0.0 {
+    if !distance_to_ground.is_finite() {
         return 0.0;
     }
-    (distance_to_ground + WALK_SPAWN_SURFACE_TOLERANCE).min(WALK_SPAWN_MAX_PROBE_DISTANCE)
+    (distance_to_ground + WALK_SPAWN_SURFACE_TOLERANCE).clamp(0.0, WALK_SPAWN_MAX_PROBE_DISTANCE)
 }
 
 /// Marker for the player body entity (V9).
@@ -2387,6 +2387,50 @@ mod world_startup_tests {
         tick(&mut app, 2);
         assert!(!app.world().resource::<WalkSpawnHold>().active);
         assert_mode(&mut app, MoveMode::Walk);
+    }
+
+    #[test]
+    fn sampled_probe_keeps_tolerance_below_sample_and_stays_bounded() {
+        let tuning = MovementTuning::default();
+        assert_eq!(walk_spawn_probe_distance(-8.0, Some(0.0), &tuning), 56.0);
+        assert_eq!(walk_spawn_probe_distance(-64.0, Some(0.0), &tuning), 0.0);
+        assert_eq!(walk_spawn_probe_distance(-80.0, Some(0.0), &tuning), 0.0);
+        assert_eq!(
+            walk_spawn_probe_distance(100_000.0, Some(0.0), &tuning),
+            65_536.0
+        );
+        assert_eq!(
+            walk_spawn_probe_distance(100.0, Some(f32::NAN), &tuning),
+            tuning.capsule_standing_height * 2.0
+        );
+        assert_eq!(walk_spawn_probe_distance(f32::NAN, Some(0.0), &tuning), 0.0);
+    }
+
+    #[test]
+    fn sampled_start_below_sample_releases_on_loaded_lower_surface() {
+        let mut app = world_app();
+        let entity = body(&mut app);
+        app.world_mut()
+            .get_mut::<Transform>(entity)
+            .unwrap()
+            .translation
+            .y = -10.0;
+        app.world_mut()
+            .resource_mut::<WalkSpawnHold>()
+            .sampled_ground_y = Some(0.0);
+        let ground = floor(&mut app, false);
+        app.world_mut()
+            .get_mut::<Transform>(ground)
+            .unwrap()
+            .translation
+            .y = -50.0;
+        tick(&mut app, 10);
+        assert!(!app.world().resource::<WalkSpawnHold>().active);
+        assert_mode(&mut app, MoveMode::Walk);
+        assert!(
+            app.world().get::<Transform>(entity).unwrap().translation.y
+                >= -40.0 + body_height_above_feet(&MovementTuning::default()) - 2.0
+        );
     }
 
     #[test]
