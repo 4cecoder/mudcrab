@@ -177,8 +177,8 @@ fn main() {
             .disable::<bevy::audio::AudioPlugin>(),
     )
     .add_plugins((
-        NifMaterialPlugin,
         EffectPaletteMaterialPlugin,
+        NifMaterialPlugin,
         PrepassVertexAlphaPlugin,
         MaterialPlugin::<IdMaterial>::default(),
     ))

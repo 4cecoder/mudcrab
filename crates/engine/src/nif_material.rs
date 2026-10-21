@@ -23,32 +23,59 @@ pub struct NifMaterialPlugin;
 
 impl Plugin for NifMaterialPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(MaterialPlugin::<NifDepthMaterial>::default())
+        // `EffectPaletteMaterialPlugin` must run first when both plugins are present:
+        // Bevy 0.19's MaterialPlugin::build calls init_asset unconditionally.
+        // Keep this plugin's registrations conditional so it can also support headless
+        // NIF loading without replacing stores initialized by the rendering plugin.
+        if !app.is_plugin_added::<Self>() {
+            init_asset_if_missing::<EffectPaletteImage>(app);
+            init_asset_if_missing::<EffectPaletteMaterial>(app);
+            init_asset_if_missing::<EffectPaletteDepthMaterial>(app);
+        }
+        if !app.is_plugin_added::<MaterialPlugin<NifDepthMaterial>>() {
+            app.add_plugins(MaterialPlugin::<NifDepthMaterial>::default());
+        }
+        app
             .register_type::<NifSourceMaterial>()
             .register_type::<NifDepthMaterialSource>()
             .register_type::<EffectPaletteDepthSource>()
             .register_type::<ExternalEmittance>();
-        app.world_mut()
-            .resource_mut::<GltfExtensionHandlers>()
-            .0
-            .write_blocking()
-            .push(Box::new(NativeMaterialHandler::default()));
+        if !app.is_plugin_added::<Self>() {
+            app.world_mut()
+                .resource_mut::<GltfExtensionHandlers>()
+                .0
+                .write_blocking()
+                .push(Box::new(NativeMaterialHandler::default()));
+        }
     }
 }
 
-/// Registers the effect palette material and its shader. Separate from [`NifMaterialPlugin`]
-/// because it needs the asset and render plugins, which the material handler's tests leave out.
+fn init_asset_if_missing<A: Asset>(app: &mut App) {
+    if !app.world().contains_resource::<Assets<A>>() {
+        app.init_asset::<A>();
+    }
+}
+
+/// Registers the effect palette material and its shader. Add before [`NifMaterialPlugin`]
+/// when both are used: Bevy 0.19's `MaterialPlugin` replaces an existing asset store.
+/// Separate from [`NifMaterialPlugin`] so headless material-handler tests need no renderer.
 pub struct EffectPaletteMaterialPlugin;
 
 impl Plugin for EffectPaletteMaterialPlugin {
     fn build(&self, app: &mut App) {
+        if app.is_plugin_added::<Self>() {
+            return;
+        }
         load_shader_library!(app, "shaders/effect_palette_functions.wgsl");
         embedded_asset!(app, "shaders/effect_palette.wgsl");
         embedded_asset!(app, "shaders/effect_palette_prepass.wgsl");
-        app.init_asset::<EffectPaletteImage>().add_plugins((
-            MaterialPlugin::<EffectPaletteMaterial>::default(),
-            MaterialPlugin::<EffectPaletteDepthMaterial>::default(),
-        ));
+        init_asset_if_missing::<EffectPaletteImage>(app);
+        if !app.is_plugin_added::<MaterialPlugin<EffectPaletteMaterial>>() {
+            app.add_plugins(MaterialPlugin::<EffectPaletteMaterial>::default());
+        }
+        if !app.is_plugin_added::<MaterialPlugin<EffectPaletteDepthMaterial>>() {
+            app.add_plugins(MaterialPlugin::<EffectPaletteDepthMaterial>::default());
+        }
     }
 }
 
@@ -462,6 +489,199 @@ mod tests {
     use super::*;
     use crate::nif_depth::{CAST_SHADOWS, DECAL, DEPTH_TEST, DEPTH_WRITE, DYNAMIC_DECAL};
     use bevy::{pbr::Material, shader::ShaderRef};
+
+    fn assert_asset_server_accepts_typed_asset<A: Asset>(app: &App, path: &'static str) {
+        let asset_server = app.world().resource::<AssetServer>();
+        let handle = asset_server.load::<A>(path);
+        assert_eq!(asset_server.get_path(handle.id()), Some(path.into()));
+    }
+
+    #[test]
+    fn nif_plugin_registers_palette_asset_types_without_a_renderer() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_resource::<GltfExtensionHandlers>()
+            .add_plugins(NifMaterialPlugin);
+
+        assert!(app.world().contains_resource::<Assets<EffectPaletteImage>>());
+        assert!(app
+            .world()
+            .contains_resource::<Assets<EffectPaletteMaterial>>());
+        assert!(app
+            .world()
+            .contains_resource::<Assets<EffectPaletteDepthMaterial>>());
+        assert_asset_server_accepts_typed_asset::<EffectPaletteImage>(
+            &app,
+            "palette-registration-image-probe.no-loader",
+        );
+        assert_asset_server_accepts_typed_asset::<EffectPaletteMaterial>(
+            &app,
+            "palette-registration-material-probe.no-loader",
+        );
+        assert_asset_server_accepts_typed_asset::<EffectPaletteDepthMaterial>(
+            &app,
+            "palette-registration-depth-probe.no-loader",
+        );
+
+        let image = app
+            .world_mut()
+            .resource_mut::<Assets<EffectPaletteImage>>()
+            .add(EffectPaletteImage {
+                image: Handle::default(),
+            });
+        let palette = app
+            .world_mut()
+            .resource_mut::<Assets<EffectPaletteMaterial>>()
+            .add(effect_palette_material(
+                PaletteLookup {
+                    texture: 0,
+                    color: true,
+                    alpha: true,
+                },
+                StandardMaterial::default(),
+                Handle::default(),
+            ));
+        let palette_asset = app
+            .world()
+            .resource::<Assets<EffectPaletteMaterial>>()
+            .get(&palette)
+            .unwrap()
+            .clone();
+        let wrapped = app
+            .world_mut()
+            .resource_mut::<Assets<EffectPaletteDepthMaterial>>()
+            .add(depth_material(
+                palette_asset,
+                NifDepthState::from_flags(DEPTH_TEST | DECAL, 0, AlphaMode::Opaque).unwrap(),
+            ));
+
+        assert!(app
+            .world()
+            .resource::<Assets<EffectPaletteImage>>()
+            .get(&image)
+            .is_some());
+        assert!(app
+            .world()
+            .resource::<Assets<EffectPaletteMaterial>>()
+            .get(&palette)
+            .is_some());
+        assert!(app
+            .world()
+            .resource::<Assets<EffectPaletteDepthMaterial>>()
+            .get(&wrapped)
+            .is_some());
+    }
+
+    #[test]
+    fn nif_plugin_keeps_preinitialized_palette_assets_and_handles() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_resource::<GltfExtensionHandlers>()
+            .init_asset::<EffectPaletteImage>()
+            .init_asset::<EffectPaletteMaterial>()
+            .init_asset::<EffectPaletteDepthMaterial>();
+
+        let image = app
+            .world_mut()
+            .resource_mut::<Assets<EffectPaletteImage>>()
+            .add(EffectPaletteImage {
+                image: Handle::default(),
+            });
+        let palette = effect_palette_material(
+            PaletteLookup {
+                texture: 0,
+                color: true,
+                alpha: false,
+            },
+            StandardMaterial::default(),
+            Handle::default(),
+        );
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<EffectPaletteMaterial>>()
+            .add(palette.clone());
+        let wrapped = app
+            .world_mut()
+            .resource_mut::<Assets<EffectPaletteDepthMaterial>>()
+            .add(depth_material(
+                palette,
+                NifDepthState::from_flags(DEPTH_TEST | DECAL, 0, AlphaMode::Opaque).unwrap(),
+            ));
+
+        app.add_plugins((NifMaterialPlugin, NifMaterialPlugin));
+
+        assert!(app
+            .world()
+            .resource::<Assets<EffectPaletteImage>>()
+            .get(&image)
+            .is_some());
+        assert!(app
+            .world()
+            .resource::<Assets<EffectPaletteMaterial>>()
+            .get(&material)
+            .is_some());
+        assert!(app
+            .world()
+            .resource::<Assets<EffectPaletteDepthMaterial>>()
+            .get(&wrapped)
+            .is_some());
+    }
+
+    #[test]
+    fn rendering_plugin_order_keeps_palette_asset_stores_and_handles() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Shader>()
+            .init_resource::<GltfExtensionHandlers>()
+            .add_plugins((EffectPaletteMaterialPlugin, EffectPaletteMaterialPlugin));
+
+        let palette = effect_palette_material(
+            PaletteLookup {
+                texture: 0,
+                color: true,
+                alpha: true,
+            },
+            StandardMaterial::default(),
+            Handle::default(),
+        );
+        let image = app
+            .world_mut()
+            .resource_mut::<Assets<EffectPaletteImage>>()
+            .add(EffectPaletteImage {
+                image: Handle::default(),
+            });
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<EffectPaletteMaterial>>()
+            .add(palette.clone());
+        let wrapped = app
+            .world_mut()
+            .resource_mut::<Assets<EffectPaletteDepthMaterial>>()
+            .add(depth_material(
+                palette,
+                NifDepthState::from_flags(DEPTH_TEST | DECAL, 0, AlphaMode::Opaque).unwrap(),
+            ));
+
+        app.add_plugins(NifMaterialPlugin);
+
+        assert!(app
+            .world()
+            .resource::<Assets<EffectPaletteImage>>()
+            .get(&image)
+            .is_some());
+        assert!(app
+            .world()
+            .resource::<Assets<EffectPaletteMaterial>>()
+            .get(&material)
+            .is_some());
+        assert!(app
+            .world()
+            .resource::<Assets<EffectPaletteDepthMaterial>>()
+            .get(&wrapped)
+            .is_some());
+        assert!(app.is_plugin_added::<MaterialPlugin<EffectPaletteMaterial>>());
+        assert!(app.is_plugin_added::<MaterialPlugin<EffectPaletteDepthMaterial>>());
+    }
 
     #[test]
     fn native_depth_reads_authored_shadow_flag_for_decals_and_depth_overrides() {

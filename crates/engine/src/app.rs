@@ -355,8 +355,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             SkyrimCinematicPostPlugin,
             ConsolePlugin,
             crate::bug_report::BugReportPlugin,
-            crate::nif_material::NifMaterialPlugin,
             crate::nif_material::EffectPaletteMaterialPlugin,
+            crate::nif_material::NifMaterialPlugin,
             crate::emittance::EmittancePlugin,
         ))
         // The render→main "prepared and drawable" bridge. Registered for every

@@ -529,7 +529,7 @@ fn main() {
             .disable::<bevy::winit::WinitPlugin>()
             .disable::<bevy::audio::AudioPlugin>(),
     )
-    .add_plugins((NifMaterialPlugin, EffectPaletteMaterialPlugin))
+    .add_plugins((EffectPaletteMaterialPlugin, NifMaterialPlugin))
     .add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(
         Duration::from_millis(16),
     ));
