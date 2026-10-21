@@ -480,6 +480,7 @@ fn both_record_readers_publish_the_same_reference_links() {
         .filter(|(id, _)| subset_ids.contains(id))
         .collect();
     let subset_db = Connection::open_in_memory().unwrap();
+    super::exporter::create_tables(&subset_db).unwrap();
     super::exporter::export_to_db(&subset_db, &subset).unwrap();
     let subset_lock: Option<i64> = get(
         &subset_db,
