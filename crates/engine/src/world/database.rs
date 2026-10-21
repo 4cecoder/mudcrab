@@ -372,6 +372,26 @@ fn is_safe_relative_asset_path(path: &str) -> bool {
 }
 
 impl WorldDatabase {
+    #[cfg(test)]
+    pub(crate) fn channel_fixture(
+        capacity: usize,
+    ) -> (Self, Receiver<DatabaseRequest>, Sender<DatabaseResponse>) {
+        let (requests, request_rx) = bounded(capacity);
+        let (response_tx, responses) = unbounded();
+        let (_lod_tx, lod_responses) = unbounded();
+        (
+            Self {
+                requests,
+                responses,
+                lod_responses,
+                worker: None,
+                worker_stopped: Arc::new(AtomicBool::new(true)),
+            },
+            request_rx,
+            response_tx,
+        )
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         validate(path)?;
         let path = path.to_owned();
@@ -403,8 +423,18 @@ impl WorldDatabase {
             .wrap_err("world database worker stopped")
     }
 
+    /// Ordinary streaming intake must never wait for the worker on the main thread.
+    pub(crate) fn try_request(&self, request: DatabaseRequest) -> Result<()> {
+        enqueue_request(&self.requests, request)
+    }
+
     pub fn try_response(&self) -> Option<DatabaseResponse> {
         self.responses.try_recv().ok()
+    }
+
+    /// Includes returned payloads that the main world has not polled yet.
+    pub(crate) fn pending_cell_responses(&self) -> usize {
+        self.responses.len()
     }
 
     /// Queue a world-space LOD chunk range query on the existing database worker.
@@ -428,6 +458,10 @@ fn enqueue_lod_query(
         query,
         queued_at: Instant::now(),
     };
+    enqueue_request(requests, request)
+}
+
+fn enqueue_request(requests: &Sender<DatabaseRequest>, request: DatabaseRequest) -> Result<()> {
     match requests.try_send(request) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(_)) => Err(color_eyre::eyre::eyre!(
@@ -441,8 +475,8 @@ fn enqueue_lod_query(
 
 impl Drop for WorldDatabase {
     fn drop(&mut self) {
-        let _ = self.requests.send(DatabaseRequest::Shutdown);
         if let Some(worker) = self.worker.take() {
+            let _ = self.requests.send(DatabaseRequest::Shutdown);
             let _ = worker.join();
         }
         debug_assert!(self.worker_stopped.load(Ordering::Acquire));
@@ -1681,6 +1715,20 @@ mod tests {
     }
 
     #[test]
+    fn full_database_queue_rejects_cell_intake_without_blocking() {
+        let (database, requests, _responses) = WorldDatabase::channel_fixture(1);
+        let request = || DatabaseRequest::Load {
+            generation: 1,
+            key: CellKey::Interior(1),
+            queued_at: Instant::now(),
+        };
+        database.try_request(request()).unwrap();
+        let error = database.try_request(request()).unwrap_err().to_string();
+        assert!(error.contains("queue is full"), "{error}");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
     fn runtime_lod_contract_rejects_missing_mixed_and_incomplete_manifests() {
         let directory = tempfile::tempdir().unwrap();
         let identity = "a".repeat(64);
@@ -1969,8 +2017,8 @@ mod tests {
             grid_x: 2,
             grid_y: -3,
         };
-        // The map marker (STAT 0x10) carries the flag; the Civil War map flag (ACTI 0xF083A) has
-        // "marker" in its filename but no flag, and the game draws it.
+        // The map marker carries the flag; the Civil War map flag has "marker" in its filename
+        // but no flag. A marker flag on a model without "marker" in its path is still authoritative.
         connection
             .execute_batch(
                 "INSERT INTO statics VALUES(23,'marker_map.nif',-1,-1,-1,1,1,1,1,8388608);
@@ -1978,7 +2026,12 @@ mod tests {
                  INSERT INTO \"references\" VALUES(41,10,23,8250,-12150,55,0,0,0,1);
                  INSERT INTO exterior_spatial VALUES(41,8250,8250,-12150,-12150,55,55,10,60);
                  INSERT INTO \"references\" VALUES(42,10,24,8250,-12150,55,0,0,0,1);
-                 INSERT INTO exterior_spatial VALUES(42,8250,8250,-12150,-12150,55,55,10,60);",
+                 INSERT INTO exterior_spatial VALUES(42,8250,8250,-12150,-12150,55,55,10,60);
+                 INSERT INTO statics VALUES(25,'architecture/wall.nif',-1,-1,-1,1,1,1,1,8388608);
+                 INSERT INTO \"references\" VALUES(43,10,25,8250,-12150,55,0,0,0,1);
+                 INSERT INTO exterior_spatial VALUES(43,8250,8250,-12150,-12150,55,55,10,60);
+                 INSERT INTO \"references\" VALUES(44,10,999,8250,-12150,55,0,0,0,1);
+                 INSERT INTO exterior_spatial VALUES(44,8250,8250,-12150,-12150,55,55,10,60);",
             )
             .unwrap();
         let payload = load_cell(&connection, 1, exterior).unwrap();
@@ -1993,6 +2046,8 @@ mod tests {
         assert!(marker(41));
         assert!(!marker(42));
         assert!(!marker(30));
+        assert!(marker(43));
+        assert!(!marker(44));
     }
 
     #[test]
