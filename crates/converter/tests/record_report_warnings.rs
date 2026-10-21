@@ -121,6 +121,39 @@ fn malformed_fixture(data: &Path) {
     plugin(data, "Broken.esm", 0x81, &[], &body);
 }
 
+/// Localized names with one missing key and one valid null sentinel retain a clean neighbor.
+fn localized_loss_fixture(data: &Path) {
+    let localized = |id| {
+        record(
+            b"NPC_",
+            id,
+            0,
+            &[
+                field(b"EDID", b"LocalizedName\0"),
+                field(b"FULL", &17u32.to_le_bytes()),
+            ]
+            .concat(),
+        )
+    };
+    let null_key = record(
+        b"NPC_",
+        0x807,
+        0,
+        &[
+            field(b"EDID", b"NullLocalizedName\0"),
+            field(b"FULL", &0u32.to_le_bytes()),
+        ]
+        .concat(),
+    );
+    plugin(
+        data,
+        "Lost.esm",
+        0x80,
+        &[],
+        &[localized(0x806), null_key, keyword(0x801, b"HealthyNeighbor\0")].concat(),
+    );
+}
+
 /// The same safely framed bytes form a complete legacy source for reader-switch replay.
 fn replay_fixture(data: &Path) {
     plugin(
@@ -465,6 +498,31 @@ async fn inhouse_decoder_and_adapter_summaries_reach_report() {
     );
     assert!(adapter.contains("missing localized ID 6515"), "{adapter}");
     incomplete(&report, &output, 2);
+}
+
+/// Missing legacy string keys reach report and manifest; ID zero stays a valid null sentinel.
+#[tokio::test]
+async fn missing_localized_text_marks_both_readers_incomplete_without_losing_neighbors() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    localized_loss_fixture(&data);
+    for (name, reader) in [
+        ("legacy-localized", RecordReader::Legacy),
+        ("inhouse-localized", RecordReader::Inhouse),
+    ] {
+        let output = directory.path().join(name);
+        let report = publish(&data, &output, reader).await;
+        assert_eq!(record_ids(&output), [0x801, 0x806, 0x807]);
+        assert!(report.warnings.iter().any(|line| {
+            line.contains("lost.esm") && line.contains("missing localized ID 17")
+        }), "{:?}", report.warnings);
+        assert!(
+            report.warnings.iter().all(|line| !line.contains("ID 0")),
+            "null localized IDs are not data loss: {:?}",
+            report.warnings
+        );
+        incomplete(&report, &output, 1);
+    }
 }
 
 /// Clean input remains complete under both readers without any new warning lines.
