@@ -153,11 +153,13 @@ fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
     let v1_identity = serde_json::json!({"mode": "legacy", "projection_version": 1});
     let v2_identity = serde_json::json!({"mode": "legacy", "projection_version": 2});
     let v3_identity = serde_json::json!({"mode": "legacy", "projection_version": 3});
-    let historical = configuration_hash_for_schema(&config, 26).unwrap();
+    // Compare every retained contract against the same producer used for verification.
+    let producer = CONVERTER_SCHEMA_VERSION;
+    let historical = configuration_hash_for_schema(&config, producer).unwrap();
     let current = configuration_hash(&config).unwrap();
-    let v1 = legacy_projection_v1_configuration_hash(&config, 26).unwrap();
-    let v2 = legacy_projection_v2_configuration_hash(&config, 26).unwrap();
-    let v3 = legacy_projection_v3_configuration_hash(&config, 26).unwrap();
+    let v1 = legacy_projection_v1_configuration_hash(&config, producer).unwrap();
+    let v2 = legacy_projection_v2_configuration_hash(&config, producer).unwrap();
+    let v3 = legacy_projection_v3_configuration_hash(&config, producer).unwrap();
     let contracts = [
         (&old_identity, historical.as_str()),
         (&v1_identity, v1.as_str()),
@@ -169,23 +171,29 @@ fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
         assert!(
             retained_configuration_matches_for_reader(
                 &config,
-                CONVERTER_SCHEMA_VERSION,
+                producer,
                 matching,
                 identity
             )
-            .unwrap()
+            .unwrap(),
+            "rejected producer {producer} proof {matching} for identity {identity}"
         );
         for (other_identity, other_hash) in contracts {
             if identity != other_identity {
-                assert_ne!(matching, other_hash);
+                assert_ne!(
+                    matching,
+                    other_hash,
+                    "producer {producer} reused proof {other_hash} across identities {identity} and {other_identity}"
+                );
                 assert!(
                     !retained_configuration_matches_for_reader(
                         &config,
-                        CONVERTER_SCHEMA_VERSION,
+                        producer,
                         other_hash,
                         identity
                     )
-                    .unwrap()
+                    .unwrap(),
+                    "accepted producer {producer} proof {other_hash} for identity {identity}, expected {other_identity}"
                 );
             }
         }
@@ -194,18 +202,21 @@ fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
         assert!(
             !retained_configuration_matches_for_reader(
                 &changed,
-                CONVERTER_SCHEMA_VERSION,
+                producer,
                 matching,
                 identity
             )
-            .unwrap()
+            .unwrap(),
+            "accepted producer {producer} proof {matching} for identity {identity} after script ABI changed"
         );
     }
     let french_v3 = serde_json::json!({"mode": "legacy", "projection_version": 3});
     let mut french_config = config.clone();
     french_config.language = "French".to_owned();
     assert!(
-        !retained_configuration_matches_for_reader(&french_config, 26, &v3, &french_v3).unwrap()
+        !retained_configuration_matches_for_reader(&french_config, producer, &v3, &french_v3)
+            .unwrap(),
+        "accepted producer {producer} English v3 proof {v3} for French identity {french_v3}"
     );
     assert!(
         retained_configuration_matches_for_reader(
