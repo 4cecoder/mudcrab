@@ -214,6 +214,7 @@ We welcome community contributions! Whether you're fixing bugs in asset converte
 - 📖 **[CONTRIBUTING.md](CONTRIBUTING.md)** — Guide on development workflow, code style (`cargo fmt`/`clippy`), and PR guidelines.
 - 📜 **[LEGAL.md](LEGAL.md)** — Intellectual property policy and compatibility guidelines.
 - 🐛 **[Issue Tracker](../../issues)** — Search existing issues or report a new bug using our template.
+- 💬 **[Discord](https://discord.gg/29GRf8QShH)** — Join the Mudcrab community to ask questions, discuss development, and coordinate contributions.
 
 ---
 
