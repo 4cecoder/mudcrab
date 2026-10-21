@@ -169,28 +169,19 @@ fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
     ];
     for (identity, matching) in contracts {
         assert!(
-            retained_configuration_matches_for_reader(
-                &config,
-                producer,
-                matching,
-                identity
-            )
-            .unwrap(),
+            retained_configuration_matches_for_reader(&config, producer, matching, identity)
+                .unwrap(),
             "rejected producer {producer} proof {matching} for identity {identity}"
         );
         for (other_identity, other_hash) in contracts {
             if identity != other_identity {
                 assert_ne!(
-                    matching,
-                    other_hash,
+                    matching, other_hash,
                     "producer {producer} reused proof {other_hash} across identities {identity} and {other_identity}"
                 );
                 assert!(
                     !retained_configuration_matches_for_reader(
-                        &config,
-                        producer,
-                        other_hash,
-                        identity
+                        &config, producer, other_hash, identity
                     )
                     .unwrap(),
                     "accepted producer {producer} proof {other_hash} for identity {identity}, expected {other_identity}"
@@ -200,13 +191,8 @@ fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
         let mut changed = config.clone();
         changed.script_abi_version += 1;
         assert!(
-            !retained_configuration_matches_for_reader(
-                &changed,
-                producer,
-                matching,
-                identity
-            )
-            .unwrap(),
+            !retained_configuration_matches_for_reader(&changed, producer, matching, identity)
+                .unwrap(),
             "accepted producer {producer} proof {matching} for identity {identity} after script ABI changed"
         );
     }

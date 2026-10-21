@@ -185,11 +185,7 @@ fn replay_fixture(data: &Path) {
 }
 
 /// Simulate metadata reread after the complete source pack's loose name bank disappears.
-fn remove_replay_strings_after_publication(
-    data: &Path,
-    source: &Path,
-    original: &PipelineReport,
-) {
+fn remove_replay_strings_after_publication(data: &Path, source: &Path, original: &PipelineReport) {
     assert!(original.complete, "{:?}", original.warnings);
     assert!(original.warnings.is_empty(), "{:?}", original.warnings);
     let manifest: serde_json::Value =
@@ -202,7 +198,10 @@ fn remove_replay_strings_after_publication(
         [b"Replay localized name\0".to_vec()]
     );
     let strings = data.join("Strings/Replay_english.strings");
-    assert!(strings.is_file(), "source resolution requires the loose bank");
+    assert!(
+        strings.is_file(),
+        "source resolution requires the loose bank"
+    );
     fs::remove_file(&strings).unwrap();
     assert!(
         !strings.exists(),
