@@ -125,7 +125,7 @@ fn specialize_nif_depth_descriptor(
         let may_discard = fragment
             .shader_defs
             .iter_mut()
-            .find(|def| shader_def_name(*def) == "MAY_DISCARD");
+            .find(|def| shader_def_name(def) == "MAY_DISCARD");
         if let Some(def) = may_discard {
             *def = "MAY_DISCARD".into();
         } else {
