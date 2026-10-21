@@ -207,41 +207,30 @@ pub fn load_cell_cache<'a>(mmap: &'a memmap2::Mmap) -> &'a ArchivedCellCache {
 
 ---
 
-## 5. Rust Implementation (`rusqlite` + `nom` + `rkyv` Crates)
+## 5. Implemented Export Path
 
-```rust
-use rusqlite::{Connection, params};
-use memmap2::Mmap;
+The record-reader entry points in `crates/converter/src/esm/mod.rs` and `esm/inhouse.rs` prepare
+the database schema and pass winning records to the exporter. The transaction in
+`crates/converter/src/esm/exporter.rs` writes the canonical `records` archive and its runtime
+projections together.
 
-pub struct EsmToSqliteConverter {
-    db: Connection,
-}
+For placed references, `insert_reference_with_canonical_data` writes a `references` row with
+the owning cell, worldspace, base object, position, rotation, scale, flags and canonical data.
+Exterior rows also retain cell-local X/Y offsets. It then removes any previous spatial entry
+for that reference, including when a subset update moves it into an interior. For an exterior
+reference, it inserts the global position as equal minimum and maximum bounds, with cell and
+worldspace auxiliary values:
 
-impl EsmToSqliteConverter {
-    pub fn new(db_path: &str) -> Result<Self, rusqlite::Error> {
-        let db = Connection::open(db_path)?;
-        // Enable WAL mode for high-concurrency multi-threaded reads
-        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
-        Ok(Self { db })
-    }
+```sql
+DELETE FROM exterior_spatial WHERE id = ?1;
 
-    pub fn insert_refr_object(&mut self, form_id: u32, x: f32, y: f32, z: f32, load_order: u32, payload: &[u8]) -> Result<(), rusqlite::Error> {
-        let tx = self.db.transaction()?;
-
-        // 1. Insert record into primary table
-        tx.execute(
-            "INSERT OR REPLACE INTO records (form_id, record_type, load_order, data) VALUES (?1, 'REFR', ?2, ?3)",
-            params![form_id, load_order, payload],
-        )?;
-
-        // 2. Insert 3D bounding box into Spatial R-Tree Index
-        let bbox = 64.0; // bounding radius around object
-        tx.execute(
-            "INSERT OR REPLACE INTO exterior_spatial (id, minX, maxX, minY, maxY, minZ, maxZ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![form_id, x - bbox, x + bbox, y - bbox, y + bbox, z - bbox, z + bbox],
-        )?;
-
-        tx.commit()
-    }
-}
+-- Executed only for an exterior reference.
+-- Bind: reference ID, global X, global Y, global Z, cell ID, worldspace ID.
+INSERT OR REPLACE INTO exterior_spatial
+    (id, minX, maxX, minY, maxY, minZ, maxZ, cell_id, worldspace_id)
+VALUES (?1, ?2, ?2, ?3, ?3, ?4, ?4, ?5, ?6);
 ```
+
+Interior references remain in `references` and use its cell index. The exporter writes the
+canonical record and runtime reference rows in addition to these spatial statements; the
+R-Tree entries supply candidates for the queries in section 3.
