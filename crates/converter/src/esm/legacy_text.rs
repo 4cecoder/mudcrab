@@ -1,7 +1,7 @@
 //! Localized text for the legacy reader, matching what the in-house reader publishes.
 //!
 //! A plugin with the TES4 `Localized` flag (0x80) stores each localized string field (`FULL`,
-//! `DESC`, ...) as a four-byte ID into its `Strings/<plugin>_english.<bank>` table; a plain
+//! `DESC`, ...) as a four-byte ID into its `Strings/<plugin>_<language>.<bank>` table; a plain
 //! plugin stores Windows-1252 text. The in-house reader replaces both with UTF-8 text in its
 //! canonical records and leaves a field it cannot resolve out of the runtime projections. This
 //! pass does the same for the legacy reader, for the subrecords the in-house schema types as
@@ -25,18 +25,28 @@ const LOCALIZED: u32 = 0x80;
 /// Fields left without text, by record, as the exporter's runtime projection expects them.
 pub(crate) type UnresolvedFields = HashMap<u32, BTreeSet<usize>>;
 
-/// Resolve every localized string field of the winning `records` in place, returning the fields
-/// that have no text. One warning per plugin, with a count and the first example, is printed.
+type LoadedStringTable = (Option<HashMap<u32, String>>, Option<String>);
+
+/// Resolve every localized string field of the winning `records` in place, returning fields
+/// without text and bounded warnings for actual localization loss.
 pub(crate) fn resolve_localized_fields(
     records: &mut HashMap<u32, RawRecord>,
     plugin_paths: &[PathBuf],
     order: &LoadOrder,
     sources: StringSources<'_>,
-) -> UnresolvedFields {
-    let mut tables: HashMap<(usize, &'static str), Option<HashMap<u32, String>>> = HashMap::new();
+) -> (UnresolvedFields, Vec<String>) {
+    let mut tables: HashMap<(usize, &'static str), LoadedStringTable> = HashMap::new();
     let mut unresolved = UnresolvedFields::new();
     let mut misses: BTreeMap<usize, (usize, String)> = BTreeMap::new();
-    for record in records.values_mut().filter(|record| !record.is_deleted()) {
+    let mut record_ids = records.keys().copied().collect::<Vec<_>>();
+    record_ids.sort_unstable();
+    for record_id in record_ids {
+        let record = records
+            .get_mut(&record_id)
+            .expect("sorted winning record exists");
+        if record.is_deleted() {
+            continue;
+        }
         let priority = record.load_order as usize;
         let localized = order
             .metadata
@@ -57,48 +67,56 @@ pub(crate) fn resolve_localized_fields(
             let id = <[u8; 4]>::try_from(data.as_slice())
                 .ok()
                 .map(u32::from_le_bytes);
-            let table = tables.entry((priority, bank)).or_insert_with(|| {
-                plugin_paths
+            let (table, table_error) = tables.entry((priority, bank)).or_insert_with(|| {
+                match plugin_paths
                     .get(priority)
-                    .and_then(|plugin| read_plugin_strings(plugin, sources, bank).ok())
+                    .map(|plugin| read_plugin_strings(plugin, sources, bank))
+                {
+                    Some(Ok(table)) => (Some(table), None),
+                    Some(Err(error)) => (None, Some(error.to_string())),
+                    None => (None, Some("plugin path unavailable".to_owned())),
+                }
             });
             match id.and_then(|id| localized_text(id, table.as_ref()?)) {
                 Some(text) => *data = runtime_string(text),
                 None => {
                     unresolved.entry(record.form_id).or_default().insert(index);
-                    let miss = misses.entry(priority).or_insert_with(|| {
+                    // Zero is the reader's null-key sentinel, not a failed lookup.
+                    if id != Some(0) {
                         let reason = match id {
                             None => format!("{} bytes, not a four-byte ID", data.len()),
-                            Some(0) => "ID 0".to_owned(),
-                            Some(id) if table.is_none() => {
-                                format!("ID {id}: no readable {bank} table")
-                            }
+                            Some(id) if table.is_none() => format!(
+                                "ID {id}: unreadable {bank} table ({})",
+                                table_error.as_deref().unwrap_or("unavailable")
+                            ),
                             Some(id) => format!("missing localized ID {id}"),
                         };
-                        (
-                            0,
-                            format!(
-                                "{:08X} {} {}",
-                                record.form_id,
-                                String::from_utf8_lossy(tag),
-                                reason
-                            ),
-                        )
-                    });
-                    miss.0 += 1;
+                        let miss = misses.entry(priority).or_insert_with(|| {
+                            (
+                                0,
+                                format!(
+                                    "{:08X} {} {reason}",
+                                    record.form_id,
+                                    String::from_utf8_lossy(tag),
+                                ),
+                            )
+                        });
+                        miss.0 += 1;
+                    }
                     // The in-house reader stores an unresolved name as empty text.
                     *data = runtime_string("");
                 }
             }
         }
     }
+    let mut warnings = Vec::with_capacity(misses.len());
     for (priority, (count, first)) in misses {
-        eprintln!(
+        warnings.push(format!(
             "warning: {}: legacy reader left {count} localized fields without text (first: {first})",
             order.names[priority]
-        );
+        ));
     }
-    unresolved
+    (unresolved, warnings)
 }
 
 #[cfg(test)]

@@ -2363,6 +2363,7 @@ dependencies = [
  "rkyv",
  "rusqlite",
  "ruzstd",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",
@@ -2838,9 +2839,15 @@ dependencies = [
  "converter",
  "crossbeam-channel",
  "ddsfile",
+ "dummy-content",
+ "gltf",
+ "image 0.25.10",
  "ktx2",
+ "libc",
  "memmap2",
  "mlua",
+ "naga_oil",
+ "regex",
  "rkyv",
  "rusqlite",
  "serde",
@@ -2848,8 +2855,13 @@ dependencies = [
  "sha2",
  "shared",
  "tempfile",
+ "time",
+ "tracing",
+ "url",
+ "uuid",
  "wgpu",
  "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]
@@ -6276,6 +6288,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -6953,6 +6975,12 @@ name = "twox-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
+
+[[package]]
+name = "typed-path"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54ec2755506471f54baf5e4bb5499d8e510cc1caf271270e778a736bd2d7336c"
 
 [[package]]
 name = "typeid"
@@ -8062,6 +8090,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "zip"
+version = "9.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
+dependencies = [
+ "crc32fast",
+ "indexmap",
+ "memchr",
+ "nix",
+ "typed-path",
 ]
 
 [[package]]

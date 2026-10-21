@@ -38,19 +38,24 @@ from TX04 and `environment_path` from TX05. TX00 and TX01 provide diffuse and
 normal paths. Both frontends project TX06 into `detail_path` and TX07 into
 `specular_path`, as documented above. Schema 9 also
 projects only XESP byte 4 into `enable_parent_flags`. Separate candidate fixes
-used producer 25/world 8 for different contracts; combined output uses 26/9.
+used producer 25/world 8 for different contracts; the combined output first shipped
+as 26/9, and producer 27 keeps world schema 9.
 The engine, `world-inspect` and launcher accept world schemas **3 through 9**, using
 `shared::supports_runtime_world_database_schema`. Complete converter packages
-support schemas **15 through 26**. Legacy worlds render full detail without
+support schemas **15 through 27**. Legacy worlds render full detail without
 LOD; an advertised LOD package requires the current database contract.
 
 Converter producer 26 also corrects the texture encodings chosen from those
-columns. Normal conversion rebuilds every older KTX2, the database, cell cache
-and derived LOD outputs. Verified producer-24 GLBs, unchanged scripts and
-archive ingestion remain reusable with matching source/dependency,
-configuration and output-byte proof; producers 12-23 still rebuild GLBs.
+columns. Producer 27 adds sphere, multi-sphere and cylinder collision shapes
+and more physical layers to the GLB collision data; the database stays at
+schema 9. Normal conversion rebuilds every older GLB and KTX2, the database,
+cell cache and derived LOD outputs. Unchanged scripts and archive ingestion
+remain reusable with matching source/dependency, configuration and
+output-byte proof; no earlier producer's GLBs are reusable, including the
+producer-24 GLBs that producer 26 accepted.
 Metadata-only rebuilds preserve the original retained producer/configuration
-and texture bytes. Run normal conversion to repair those retained encodings.
+and mesh and texture bytes. Run normal conversion to repair those retained
+encodings and collision data.
 
 The legacy TX06/TX07 alignment changes the SQL role assignment while retaining
 the current texture-byte encoding: multilayer/detail and specular/backlight are
@@ -316,25 +321,27 @@ follows the same rules. `cells.interior_name` is still the cell's Editor ID (`ED
 name; it keeps its column name for compatibility.
 
 `FULL` is a localized string. In a plugin with the TES4 `Localized` flag (0x80) it is a four-byte
-ID into `Strings/<plugin>_english.STRINGS`, looked up in the table of the plugin that supplied the
-winning record: a loose `Data/Strings` file first, then the archives. Otherwise it is
-Windows-1252 text. Both record readers publish the same UTF-8 text:
+ID into `Strings/<plugin>_<language>.STRINGS`, looked up in the configured language's table for the
+plugin that supplied the winning record: a loose `Data/Strings` file first, then the archives.
+English text uses Windows-1252; other languages use UTF-8 with Windows-1252 fallback. Plain plugin
+text uses Windows-1252. Both record readers publish the same UTF-8 text:
 
 - The in-house reader resolves every field its schema types as `lstring`.
 - The legacy reader (`--record-reader legacy`) resolves the subrecords the in-house schema types
   as `lstring` in every occurrence for that record type, using the same table lookup
   (`crates/converter/src/esm/legacy_text.rs`). That covers `FULL` on every record type, and
   `DESC`, `RNAM` and others where the subrecord is unambiguous. This changed the legacy
-  projection, so its reader identity is `projection_version` 4. Packages from versions 1-3 keep
-  their retained assets.
+  projection, so its reader identity is `projection_version` 4 and includes language/encoding.
+  Version-3 retained proofs are accepted only for their historical English setting; all older
+  metadata rebuilds use the configured language. Retained assets keep their independent proof.
 
-A name whose ID is 0, missing from the table, or whose table cannot be read is NULL in these
-columns for both readers, with one warning per plugin. The canonical `records.data` payloads hold
-the same resolved text for both readers.
+A name whose ID is 0 is the existing null sentinel and is NULL without a loss warning. A nonzero ID
+missing from the table, or a table that cannot be read, leaves NULL and adds one bounded warning
+per plugin with a count and first example. The canonical `records.data` payloads hold the same
+resolved text for both readers.
 
 The columns are additive and optional. They did not bump `shared::WORLD_DATABASE_SCHEMA_VERSION`:
-`create_tables` adds them to an older reused table, and a reader must probe for them. No engine
-code reads them yet.
+`create_tables` adds them to an older reused table, and a reader must probe for them.
 
 `cells.flags` and `worldspaces.flags` are the record-header flags. The `DATA` flags (interior,
 has water, show sky, ...) are in `cell_environment.data_flags` and
@@ -564,7 +571,7 @@ CREATE TABLE IF NOT EXISTS references (
     rot_z REAL NOT NULL,                -- Rotation Z (Radians)
     scale REAL NOT NULL DEFAULT 1.0,    -- Scale multiplier
     radius_override REAL,               -- XRDS radius in Creation units (NULL when the REFR has none)
-    header_flags INTEGER NOT NULL DEFAULT 0, -- Winning record header flags, uninterpreted
+    header_flags INTEGER NOT NULL DEFAULT 0, -- Winning record header flags, stored raw
     enable_parent_id INTEGER,           -- Remapped XESP parent FormID; NULL when absent
     enable_parent_flags INTEGER,        -- XESP byte 4 (0 through 255); NULL when absent
     emittance_id INTEGER,               -- Remapped XEMI light or region FormID; NULL when absent
@@ -576,9 +583,11 @@ CREATE INDEX IF NOT EXISTS idx_references_cell ON "references"(cell_id);
 ```
 
 The reference flag and enable-parent columns preserve winning raw-record
-metadata for later object LOD (#106) and enable-state support (#165). Current
-terrain LOD does not consume them; runtime parent enable-state behavior remains
-future work. `header_flags` comes from the record header. `enable_parent_id` is
+metadata for initial spawn filtering (#165) and later object LOD (#106).
+The engine resolves parent chains before spawning. With no parent, header bit
+`0x800` marks an initially disabled reference; the documented rule and
+runtime limits are in [reference enable-state evidence](../../research/reference-enable-state-20261005.md).
+Current terrain LOD does not consume them. `header_flags` comes from the record header. `enable_parent_id` is
 XESP's little-endian parent FormID (bytes 0-3), resolved through plugin load order;
 `enable_parent_flags` is byte 4 alone in both readers. Bit 0 inverts the parent's
 state and bit 1 enables pop-in. The three unused bytes (5-7) remain unchanged
@@ -601,7 +610,8 @@ never renders.
 CREATE TABLE IF NOT EXISTS statics (
     id INTEGER PRIMARY KEY,                    -- base record FormID, load-order numbering
     editor_id TEXT,                            -- EDID
-    model_path TEXT,                           -- MODL (ARMO: MOD2, else MOD4); NULL when absent
+    full_name TEXT,                            -- FULL, resolved localized text when available
+    model_path TEXT,                           -- MODL (ARMO: MOD2, then MOD4); NULL when absent
     flags INTEGER NOT NULL,                    -- record header flags
     bounds_min_x REAL NOT NULL DEFAULT -64, bounds_min_y REAL NOT NULL DEFAULT -64,
     bounds_min_z REAL NOT NULL DEFAULT -64, bounds_max_x REAL NOT NULL DEFAULT 64,
