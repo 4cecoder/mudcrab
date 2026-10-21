@@ -266,7 +266,7 @@ fn malformed_entry_warns_cli_one_and_preserves_healthy_neighbor_and_provenance()
         "Text.esm",
         0x81,
         &[],
-        [
+        &[
             keyword(0x801),
             record(
                 b"NPC_",
