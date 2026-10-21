@@ -35,8 +35,7 @@ impl Plugin for NifMaterialPlugin {
         if !app.is_plugin_added::<MaterialPlugin<NifDepthMaterial>>() {
             app.add_plugins(MaterialPlugin::<NifDepthMaterial>::default());
         }
-        app
-            .register_type::<NifSourceMaterial>()
+        app.register_type::<NifSourceMaterial>()
             .register_type::<NifDepthMaterialSource>()
             .register_type::<EffectPaletteDepthSource>()
             .register_type::<ExternalEmittance>();
@@ -503,13 +502,18 @@ mod tests {
             .init_resource::<GltfExtensionHandlers>()
             .add_plugins(NifMaterialPlugin);
 
-        assert!(app.world().contains_resource::<Assets<EffectPaletteImage>>());
-        assert!(app
-            .world()
-            .contains_resource::<Assets<EffectPaletteMaterial>>());
-        assert!(app
-            .world()
-            .contains_resource::<Assets<EffectPaletteDepthMaterial>>());
+        assert!(
+            app.world()
+                .contains_resource::<Assets<EffectPaletteImage>>()
+        );
+        assert!(
+            app.world()
+                .contains_resource::<Assets<EffectPaletteMaterial>>()
+        );
+        assert!(
+            app.world()
+                .contains_resource::<Assets<EffectPaletteDepthMaterial>>()
+        );
         assert_asset_server_accepts_typed_asset::<EffectPaletteImage>(
             &app,
             "palette-registration-image-probe.no-loader",
@@ -555,21 +559,24 @@ mod tests {
                 NifDepthState::from_flags(DEPTH_TEST | DECAL, 0, AlphaMode::Opaque).unwrap(),
             ));
 
-        assert!(app
-            .world()
-            .resource::<Assets<EffectPaletteImage>>()
-            .get(&image)
-            .is_some());
-        assert!(app
-            .world()
-            .resource::<Assets<EffectPaletteMaterial>>()
-            .get(&palette)
-            .is_some());
-        assert!(app
-            .world()
-            .resource::<Assets<EffectPaletteDepthMaterial>>()
-            .get(&wrapped)
-            .is_some());
+        assert!(
+            app.world()
+                .resource::<Assets<EffectPaletteImage>>()
+                .get(&image)
+                .is_some()
+        );
+        assert!(
+            app.world()
+                .resource::<Assets<EffectPaletteMaterial>>()
+                .get(&palette)
+                .is_some()
+        );
+        assert!(
+            app.world()
+                .resource::<Assets<EffectPaletteDepthMaterial>>()
+                .get(&wrapped)
+                .is_some()
+        );
     }
 
     #[test]
@@ -610,21 +617,24 @@ mod tests {
 
         app.add_plugins((NifMaterialPlugin, NifMaterialPlugin));
 
-        assert!(app
-            .world()
-            .resource::<Assets<EffectPaletteImage>>()
-            .get(&image)
-            .is_some());
-        assert!(app
-            .world()
-            .resource::<Assets<EffectPaletteMaterial>>()
-            .get(&material)
-            .is_some());
-        assert!(app
-            .world()
-            .resource::<Assets<EffectPaletteDepthMaterial>>()
-            .get(&wrapped)
-            .is_some());
+        assert!(
+            app.world()
+                .resource::<Assets<EffectPaletteImage>>()
+                .get(&image)
+                .is_some()
+        );
+        assert!(
+            app.world()
+                .resource::<Assets<EffectPaletteMaterial>>()
+                .get(&material)
+                .is_some()
+        );
+        assert!(
+            app.world()
+                .resource::<Assets<EffectPaletteDepthMaterial>>()
+                .get(&wrapped)
+                .is_some()
+        );
     }
 
     #[test]
@@ -664,21 +674,24 @@ mod tests {
 
         app.add_plugins(NifMaterialPlugin);
 
-        assert!(app
-            .world()
-            .resource::<Assets<EffectPaletteImage>>()
-            .get(&image)
-            .is_some());
-        assert!(app
-            .world()
-            .resource::<Assets<EffectPaletteMaterial>>()
-            .get(&material)
-            .is_some());
-        assert!(app
-            .world()
-            .resource::<Assets<EffectPaletteDepthMaterial>>()
-            .get(&wrapped)
-            .is_some());
+        assert!(
+            app.world()
+                .resource::<Assets<EffectPaletteImage>>()
+                .get(&image)
+                .is_some()
+        );
+        assert!(
+            app.world()
+                .resource::<Assets<EffectPaletteMaterial>>()
+                .get(&material)
+                .is_some()
+        );
+        assert!(
+            app.world()
+                .resource::<Assets<EffectPaletteDepthMaterial>>()
+                .get(&wrapped)
+                .is_some()
+        );
         assert!(app.is_plugin_added::<MaterialPlugin<EffectPaletteMaterial>>());
         assert!(app.is_plugin_added::<MaterialPlugin<EffectPaletteDepthMaterial>>());
     }

@@ -225,7 +225,11 @@ fn main() {
             .disable::<bevy::winit::WinitPlugin>()
             .disable::<bevy::audio::AudioPlugin>(),
     )
-    .add_plugins((EffectPaletteMaterialPlugin, NifMaterialPlugin, PrepassVertexAlphaPlugin))
+    .add_plugins((
+        EffectPaletteMaterialPlugin,
+        NifMaterialPlugin,
+        PrepassVertexAlphaPlugin,
+    ))
     .add_plugins(SkyrimCinematicPostPlugin)
     .add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(
         Duration::from_millis(16),
