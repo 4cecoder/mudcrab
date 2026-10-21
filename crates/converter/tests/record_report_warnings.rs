@@ -579,9 +579,10 @@ async fn missing_localized_text_marks_both_readers_incomplete_without_losing_nei
             RecordReader::Inhouse => "missing localized ID 17",
         };
         assert!(
-            report.warnings.iter().any(|line| {
-                line.contains("lost.esm") && line.contains(expected)
-            }),
+            report
+                .warnings
+                .iter()
+                .any(|line| { line.contains("lost.esm") && line.contains(expected) }),
             "{:?}",
             report.warnings
         );
