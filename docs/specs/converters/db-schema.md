@@ -38,19 +38,24 @@ from TX04 and `environment_path` from TX05. TX00 and TX01 provide diffuse and
 normal paths. Both frontends project TX06 into `detail_path` and TX07 into
 `specular_path`, as documented above. Schema 9 also
 projects only XESP byte 4 into `enable_parent_flags`. Separate candidate fixes
-used producer 25/world 8 for different contracts; combined output uses 26/9.
+used producer 25/world 8 for different contracts; the combined output first shipped
+as 26/9, and producer 27 keeps world schema 9.
 The engine, `world-inspect` and launcher accept world schemas **3 through 9**, using
 `shared::supports_runtime_world_database_schema`. Complete converter packages
-support schemas **15 through 26**. Legacy worlds render full detail without
+support schemas **15 through 27**. Legacy worlds render full detail without
 LOD; an advertised LOD package requires the current database contract.
 
 Converter producer 26 also corrects the texture encodings chosen from those
-columns. Normal conversion rebuilds every older KTX2, the database, cell cache
-and derived LOD outputs. Verified producer-24 GLBs, unchanged scripts and
-archive ingestion remain reusable with matching source/dependency,
-configuration and output-byte proof; producers 12-23 still rebuild GLBs.
+columns. Producer 27 adds sphere, multi-sphere and cylinder collision shapes
+and more physical layers to the GLB collision data; the database stays at
+schema 9. Normal conversion rebuilds every older GLB and KTX2, the database,
+cell cache and derived LOD outputs. Unchanged scripts and archive ingestion
+remain reusable with matching source/dependency, configuration and
+output-byte proof; no earlier producer's GLBs are reusable, including the
+producer-24 GLBs that producer 26 accepted.
 Metadata-only rebuilds preserve the original retained producer/configuration
-and texture bytes. Run normal conversion to repair those retained encodings.
+and mesh and texture bytes. Run normal conversion to repair those retained
+encodings and collision data.
 
 The legacy TX06/TX07 alignment changes the SQL role assignment while retaining
 the current texture-byte encoding: multilayer/detail and specular/backlight are
@@ -322,7 +327,7 @@ CREATE TABLE IF NOT EXISTS references (
     rot_z REAL NOT NULL,                -- Rotation Z (Radians)
     scale REAL NOT NULL DEFAULT 1.0,    -- Scale multiplier
     radius_override REAL,               -- XRDS radius in Creation units (NULL when the REFR has none)
-    header_flags INTEGER NOT NULL DEFAULT 0, -- Winning record header flags, uninterpreted
+    header_flags INTEGER NOT NULL DEFAULT 0, -- Winning record header flags, stored raw
     enable_parent_id INTEGER,           -- Remapped XESP parent FormID; NULL when absent
     enable_parent_flags INTEGER,        -- XESP byte 4 (0 through 255); NULL when absent
     emittance_id INTEGER,               -- Remapped XEMI light or region FormID; NULL when absent
@@ -334,9 +339,11 @@ CREATE INDEX IF NOT EXISTS idx_references_cell_id ON references(cell_id);
 ```
 
 The reference flag and enable-parent columns preserve winning raw-record
-metadata for later object LOD (#106) and enable-state support (#165). Current
-terrain LOD does not consume them; runtime parent enable-state behavior remains
-future work. `header_flags` comes from the record header. `enable_parent_id` is
+metadata for initial spawn filtering (#165) and later object LOD (#106).
+The engine resolves parent chains before spawning. With no parent, header bit
+`0x800` marks an initially disabled reference; the documented rule and
+runtime limits are in [reference enable-state evidence](../../research/reference-enable-state-20261005.md).
+Current terrain LOD does not consume them. `header_flags` comes from the record header. `enable_parent_id` is
 XESP's little-endian parent FormID (bytes 0-3), resolved through plugin load order;
 `enable_parent_flags` is byte 4 alone in both readers. Bit 0 inverts the parent's
 state and bit 1 enables pop-in. The three unused bytes (5-7) remain unchanged
