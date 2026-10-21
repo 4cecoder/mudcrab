@@ -32,13 +32,19 @@ fn adapter_summary_ignores_visit_order() {
     ] {
         reverse.skipped("synthetic.esm", context(offset), message.into(), false);
     }
-    assert_eq!(forward.summary.counts, reverse.summary.counts);
-    assert_eq!(forward.warnings.counts, reverse.warnings.counts);
-    assert_eq!(forward.summary.counts, forward.warnings.counts);
-    assert!(forward.notices.counts.is_empty());
-    assert!(reverse.notices.counts.is_empty());
+    assert_eq!(forward.summary, reverse.summary);
+    assert_eq!(forward.summary_keys, reverse.summary_keys);
+    assert!(forward.notices.is_empty());
+    assert!(reverse.notices.is_empty());
     assert_eq!(
-        forward.summary.counts["synthetic.esm"],
+        forward.summary["synthetic.esm"],
         (2, "Z earliest terrain issue".into())
     );
+    let expected = vec![
+        "warning: synthetic.esm: inhouse adapter reported 2 local decode/lookup issues (first: Z earliest terrain issue)".to_owned(),
+    ];
+    assert_eq!(forward.report(), expected);
+    assert_eq!(reverse.report(), expected);
+    assert!(forward.report_notices().is_empty());
+    assert!(reverse.report_notices().is_empty());
 }
