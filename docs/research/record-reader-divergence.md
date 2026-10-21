@@ -34,33 +34,52 @@ or validate the comparator as an oracle.
 
 ## Run the diagnostic
 
-Use the workspace wrapper for Cargo. Keep generated databases under shared `scratch/` and retained
-reports under shared `evidence/`; choose an owner-specific task name. Replace these quoted paths
-with absolute paths on the host. The angle-bracket characters are explanatory prose only and must
-not appear in shell commands.
+This branch does not track `scripts/workspace.py`. Use the installed workspace bootstrap, selected
+from `MUDCRAB_WORKSPACE_ROOT` when configured or from the shared Git directory otherwise. Keep
+generated databases under shared `scratch/` and retained reports under shared `evidence/`; use an
+owner-specific task name. Replace the quoted absolute plugin and game-data paths with host paths.
 
 ```sh
-storage="/absolute/path/to/.mudcrab-local"
+if [ -n "${MUDCRAB_WORKSPACE_ROOT:-}" ]; then
+  bootstrap="$MUDCRAB_WORKSPACE_ROOT/bin/workspace.py"
+else
+  git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+  bootstrap="$git_common_dir/../.mudcrab-local/bin/workspace.py"
+fi
+storage=$(python3 "$bootstrap" paths | python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"])')
+scratch="$storage/scratch"
+evidence="$storage/evidence"
+mkdir -p "$scratch" "$evidence"
 data="/absolute/path/to/Skyrim/Data"
 plugins="/absolute/path/to/plugins.txt"
-out="$storage/scratch/reader-diff-pr280"
-report="$storage/evidence/reader-diff-pr280.json"
+out="$scratch/pr280-reader-diff-doc-example-20261021"
+report="$evidence/pr280-reader-diff-doc-example-20261021.json"
 
 # Choose a new output root. The command atomically creates it before either reader writes;
 # an existing path is refused without changing its contents.
-python3 scripts/workspace.py cargo --isolated reader-diff-pr280 run --locked --release \
+python3 "$bootstrap" cargo --isolated pr280-reader-diff-doc-example-20261021 run --locked --release \
   -p converter --bin reader-diff -- \
   build "$data" "$plugins" "$out" --json "$report"
 ```
 
 To compare existing databases, pass their absolute paths. This mode still does not verify their
-input identity:
+input identity. This block selects and queries the installed bootstrap independently:
 
 ```sh
+if [ -n "${MUDCRAB_WORKSPACE_ROOT:-}" ]; then
+  bootstrap="$MUDCRAB_WORKSPACE_ROOT/bin/workspace.py"
+else
+  git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+  bootstrap="$git_common_dir/../.mudcrab-local/bin/workspace.py"
+fi
+storage=$(python3 "$bootstrap" paths | python3 -c 'import json,sys; print(json.load(sys.stdin)["storage"])')
+evidence="$storage/evidence"
+mkdir -p "$evidence"
 legacy_db="/absolute/path/to/legacy/skyrim_world.db"
 inhouse_db="/absolute/path/to/inhouse/skyrim_world.db"
+report="$evidence/pr280-reader-diff-compare-doc-example-20261021.json"
 
-python3 scripts/workspace.py cargo --isolated reader-diff-pr280 run --locked --release \
+python3 "$bootstrap" cargo --isolated pr280-reader-diff-doc-example-20261021 run --locked --release \
   -p converter --bin reader-diff -- \
   compare "$legacy_db" "$inhouse_db" --json "$report"
 ```
