@@ -363,7 +363,7 @@ never renders.
 CREATE TABLE IF NOT EXISTS statics (
     id INTEGER PRIMARY KEY,                    -- base record FormID, load-order numbering
     editor_id TEXT,                            -- EDID
-    model_path TEXT,                           -- MODL (ARMO: MOD2, else MOD4); NULL when absent
+    model_path TEXT,                           -- MODL (ARMO: MOD2, then MOD4); NULL when absent
     flags INTEGER NOT NULL,                    -- record header flags
     bounds_min_x REAL NOT NULL DEFAULT -64, bounds_min_y REAL NOT NULL DEFAULT -64,
     bounds_min_z REAL NOT NULL DEFAULT -64, bounds_max_x REAL NOT NULL DEFAULT 64,

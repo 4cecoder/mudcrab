@@ -180,6 +180,6 @@ fn both_record_readers_project_missing_empty_and_valid_models_consistently() {
             model.as_ref().filter(|path| !path.is_empty()).copied()
         );
         let archived = archived_model(root.path(), RecordReader::Inhouse, *base_id);
-        assert_eq!(archived, model.map(|path| text(path)));
+        assert_eq!(archived, model.map(text));
     }
 }
