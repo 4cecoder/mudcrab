@@ -100,7 +100,7 @@ fn legacy_projection_identity_separates_current_and_historical_full_hashes() {
     let identity = crate::esm::inhouse::reader_identity(RecordReader::Legacy);
     assert_eq!(
         identity,
-        serde_json::json!({"mode": "legacy", "projection_version": crate::esm::inhouse::LEGACY_PROJECTION_VERSION})
+        crate::esm::inhouse::reader_identity_in_language(RecordReader::Legacy, &legacy.language)
     );
     assert_ne!(configuration_hash(&legacy).unwrap(), historical);
     assert_eq!(
