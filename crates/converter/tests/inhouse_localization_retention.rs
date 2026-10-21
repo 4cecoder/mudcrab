@@ -297,15 +297,19 @@ fn localized_fields_preserve_zero_missing_resolved_and_repeated_keys() {
             .len()
             < 1024
     );
-    assert!(diagnostics["adapter"]["localizedfields.esp"][1]
-        .as_str()
-        .unwrap()
-        .contains("malformed strings entry for localized ID 42"));
+    assert!(
+        diagnostics["adapter"]["localizedfields.esp"][1]
+            .as_str()
+            .unwrap()
+            .contains("malformed strings entry for localized ID 42")
+    );
     assert_eq!(diagnostics["adapter_notices"]["localizedfields.esp"][0], 3);
-    assert!(diagnostics["adapter_notices"]["localizedfields.esp"][1]
-        .as_str()
-        .unwrap()
-        .contains("missing localized ID 17"));
+    assert!(
+        diagnostics["adapter_notices"]["localizedfields.esp"][1]
+            .as_str()
+            .unwrap()
+            .contains("missing localized ID 17")
+    );
 }
 
 /// English plugin/bank bytes use CP1252 even if they also form valid UTF-8; VMAD uses UTF-8.
@@ -887,10 +891,12 @@ fn moved_localized_projection_complete_public_bundle_and_work_copy_remain_exact(
     assert_eq!(diagnostics, normal_diagnostics);
     assert!(diagnostics["adapter"].get("movefixture.esp").is_none());
     assert_eq!(diagnostics["adapter_notices"]["movefixture.esp"][0], 1);
-    assert!(diagnostics["adapter_notices"]["movefixture.esp"][1]
-        .as_str()
-        .unwrap()
-        .contains("missing localized ID 17"));
+    assert!(
+        diagnostics["adapter_notices"]["movefixture.esp"][1]
+            .as_str()
+            .unwrap()
+            .contains("missing localized ID 17")
+    );
     assert!(!work.join("typed-records.jsonl").exists());
     assert!(!work.join("cell_cache.rkyv").exists());
 }
