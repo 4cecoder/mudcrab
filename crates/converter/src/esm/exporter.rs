@@ -741,8 +741,12 @@ fn export_records(
             // Records without MODL (triggers, markers) store NULL and are
             // skipped at spawn time. `LIGH` is handled above: the light goes
             // in `lights` and only a light with geometry lands in `statics`.
-            "STAT" | "MSTT" | "FURN" | "TREE" | "FLOR" | "CONT" | "DOOR" | "ACTI" | "WEAP"
-            | "MISC" | "BOOK" | "AMMO" | "ALCH" | "INGR" | "SLGM" | "KEYM" | "SCRL" | "ARMO" => {
+            // `TACT` (talking activators), `ADDN` (addon nodes), `APPA`
+            // (apparatus) and `ARTO` (art objects) are placeable `REFR` bases
+            // with a model too (`REFR.NAME` targets in xEdit's TES5 definitions).
+            "STAT" | "MSTT" | "FURN" | "TREE" | "FLOR" | "CONT" | "DOOR" | "ACTI" | "TACT"
+            | "WEAP" | "MISC" | "BOOK" | "AMMO" | "ALCH" | "INGR" | "SLGM" | "KEYM" | "SCRL"
+            | "ARMO" | "APPA" | "ADDN" | "ARTO" => {
                 let view = SubrecordView::new(&record.subrecords);
                 // ARMO has no MODL path; its world models live in the
                 // gendered world-model slots (male first, female fallback).
@@ -752,7 +756,8 @@ fn export_records(
                         .or_else(|| view.get_string(b"MOD4"))
                 } else {
                     view.get_string(b"MODL")
-                };
+                }
+                .filter(|path| !path.is_empty());
                 tx.prepare_cached(
                     "INSERT OR REPLACE INTO statics(id, editor_id, model_path, flags) VALUES (?1, ?2, ?3, ?4)")?.execute(
                     params![form_id, view.get_string(b"EDID"), model, record.flags],
