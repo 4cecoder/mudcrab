@@ -794,7 +794,8 @@ fn export_records(
                         .or_else(|| view.get_string(b"MOD4"))
                 } else {
                     view.get_string(b"MODL")
-                };
+                }
+                .filter(|path| !path.is_empty());
                 tx.prepare_cached(
                     "INSERT OR REPLACE INTO statics(id, editor_id, model_path, flags, full_name) VALUES (?1, ?2, ?3, ?4, ?5)")?.execute(
                     params![form_id, view.get_string(b"EDID"), model, record.flags, view.get_string(b"FULL")],
