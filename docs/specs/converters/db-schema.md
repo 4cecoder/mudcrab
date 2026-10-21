@@ -51,7 +51,7 @@ and more physical layers to the GLB collision data; the database stays at
 schema 9. Producer 28 changes the KTX2 mip layout and alignment; the database
 still uses schema 9. Producer-27 KTX2 files need regeneration, while
 producer-27 GLBs remain reusable because their bytes are unchanged. At producer
-28, no earlier GLB producer is compatible. Normal conversion rebuilds the
+28, GLB producers earlier than 27 are incompatible. Normal conversion rebuilds the
 database, cell cache and derived LOD outputs, and regenerates assets whose
 producer contract or source/configuration/output proof is incompatible.
 Unchanged scripts and archive ingestion remain reusable when their own source,
