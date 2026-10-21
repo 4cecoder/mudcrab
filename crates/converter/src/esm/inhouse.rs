@@ -1569,7 +1569,7 @@ pub(crate) fn resolve_localized_bank(
 }
 
 /// Read the resolved bank, or an empty table when no bank exists for this plugin.
-fn read_plugin_strings(
+pub(super) fn read_plugin_strings(
     plugin: &Path,
     string_sources: StringSources<'_>,
     bank: &str,
