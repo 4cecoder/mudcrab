@@ -273,11 +273,19 @@ fn actual_palette_shaders_compose_with_shadow_discard_enabled_and_disabled() {
     )
     .unwrap_or_else(|error| panic!("shadow prepass composition failed:\n{error}"));
     let shadow_calls = entry_calls(&shadow, "fragment");
-    assert!(shadow_calls.iter().any(|name| name.ends_with("palette_alpha_discard")));
+    assert!(
+        shadow_calls
+            .iter()
+            .any(|name| name.ends_with("palette_alpha_discard"))
+    );
     let discard = function(&shadow, "palette_alpha_discard");
     let mut discard_calls = HashSet::new();
     collect_calls(&discard.body, &shadow, &mut discard_calls);
-    assert!(discard_calls.iter().any(|name| name.ends_with("effect_color")));
+    assert!(
+        discard_calls
+            .iter()
+            .any(|name| name.ends_with("effect_color"))
+    );
     assert!(contains_kill(&discard.body));
 
     let normal_prepass = compose(
@@ -296,11 +304,17 @@ fn actual_palette_shaders_compose_with_shadow_discard_enabled_and_disabled() {
     )
     .unwrap_or_else(|error| panic!("normal prepass composition failed:\n{error}"));
     let normal_calls = entry_calls(&normal_prepass, "fragment");
-    assert!(normal_calls.iter().any(|name| name.ends_with("palette_alpha_discard")));
+    assert!(
+        normal_calls
+            .iter()
+            .any(|name| name.ends_with("palette_alpha_discard"))
+    );
 
     let without_discard = compose(PREPASS, "effect_palette_prepass.wgsl", &["VERTEX_UVS_A"])
         .unwrap_or_else(|error| panic!("opaque shadow composition failed:\n{error}"));
-    assert!(!contains_kill(&function(&without_discard, "palette_alpha_discard").body));
+    assert!(!contains_kill(
+        &function(&without_discard, "palette_alpha_discard").body
+    ));
 
     let main = compose(
         MAIN,
@@ -308,9 +322,11 @@ fn actual_palette_shaders_compose_with_shadow_discard_enabled_and_disabled() {
         &["VERTEX_UVS_A", "VERTEX_UVS_B", "VERTEX_COLORS"],
     )
     .unwrap_or_else(|error| panic!("forward shader composition failed:\n{error}"));
-    assert!(entry_calls(&main, "fragment")
-        .iter()
-        .any(|name| name.ends_with("effect_color")));
+    assert!(
+        entry_calls(&main, "fragment")
+            .iter()
+            .any(|name| name.ends_with("effect_color"))
+    );
 }
 
 #[test]
@@ -345,5 +361,9 @@ fn palette_effect_shadow_cutoffs_match_bevy_alpha_modes() {
 
     let source_fallback = effect_color([0.2, 0.3, 0.4, 1.0], None, 0.0, 0.5);
     assert_eq!(source_fallback, [0.1, 0.15, 0.2, 0.0]);
-    assert!(!shadow_discards(AlphaMode::Premultiplied, source_fallback, 0.5));
+    assert!(!shadow_discards(
+        AlphaMode::Premultiplied,
+        source_fallback,
+        0.5
+    ));
 }
