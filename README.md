@@ -7,6 +7,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE-APACHE)
 [![CI Status](https://img.shields.io/badge/CI-passing-brightgreen.svg)](#-quick-start-development-setup)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows_%7C_Linux_%7C_Android-purple.svg)](docs/specs/meta/platforms.md)
+[![Discord](https://img.shields.io/badge/Discord-Join_the_community-5865F2?logo=discord&logoColor=white)](https://discord.gg/29GRf8QShH)
 
 An open-source, high-performance game engine reimplementation compatible with **The Elder Scrolls V: Skyrim (Special Edition)** assets, built from the ground up in **Rust** using the **Bevy Engine**.
 
