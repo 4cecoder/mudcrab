@@ -144,7 +144,7 @@ fn both_record_readers_publish_models_for_every_placeable_base_type() {
                 0x0A00 + index as u32,
                 *id,
                 Some(format!("Base{index}")),
-                Some((*model.unwrap()).to_owned()),
+                Some(model.unwrap().to_owned()),
             ))
             .collect::<Vec<_>>()
     );

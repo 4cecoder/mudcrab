@@ -210,7 +210,7 @@ async fn unsafe_static_models_recover_through_finalization_and_publication() {
             let archived = canonical_fields(&output, *invalid_id);
             assert!(archived.contains(&(*b"MODL", invalid_model.clone())));
             assert!(integration.issues.iter().any(|issue| {
-                issue.contains(&format!("plugin Skyrim.esm"))
+                issue.contains("plugin Skyrim.esm")
                     && issue.contains(&format!("{invalid_id:08X}"))
                     && issue.contains("../bad.nif")
             }));

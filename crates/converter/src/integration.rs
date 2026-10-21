@@ -659,7 +659,7 @@ mod tests {
                 .find(|issue| issue.contains(&format!("{record_type} {form_id:08X}")))
                 .unwrap();
             assert!(diagnostic.contains("plugin Synthetic.esp"));
-            assert!(diagnostic.contains(source_path));
+            assert!(diagnostic.contains(&format!("{source_path:?}")));
         }
 
         let connection = Connection::open(database).unwrap();
