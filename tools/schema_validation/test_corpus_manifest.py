@@ -147,6 +147,21 @@ class CorpusManifestTests(unittest.TestCase):
             self.assertIn("invalid corpus evidence JSON", stderr.getvalue())
             self.assertFalse(output.exists())
 
+    def test_verified_binary_read_preserves_all_bytes(self):
+        """Verify raw binary reads preserve CRLF, Ctrl-Z, NUL and non-ASCII bytes."""
+        raw = b"line one\r\nline two\x1a\x00\xff\x80\xc3\xa9\n"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "binary-fixture.dat"
+            path.write_bytes(raw)
+
+            digest, size, captured = manifest_tool._read_verified_file(
+                path, capture_bytes=len(raw)
+            )
+
+        self.assertEqual(size, len(raw))
+        self.assertEqual(captured, raw)
+        self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+
     def test_hash_and_tes4_metadata_share_verified_read_with_path_provenance(self):
         """Verify plugin hashes, metadata and provenance describe the same input."""
         with tempfile.TemporaryDirectory() as temp_dir:
