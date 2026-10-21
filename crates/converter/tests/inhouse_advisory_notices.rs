@@ -163,6 +163,8 @@ fn cli(
         .arg(data)
         .arg(output)
         .arg("--no-lod")
+        .arg("--texture-encoder")
+        .arg("cpu")
         .arg("--report-json")
         .arg(report_path);
     if let Some(source) = source {
