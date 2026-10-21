@@ -42,6 +42,29 @@ pub enum SceneGradeMode {
 }
 
 impl SceneGradeMode {
+    pub fn index(self) -> usize {
+        match self {
+            Self::Off => 0,
+            Self::Saturation => 1,
+            Self::Full => 2,
+            Self::SnapshotSrgb => 3,
+            Self::SnapshotLinear => 4,
+            Self::RecordSrgb => 5,
+        }
+    }
+
+    pub fn from_index(index: usize) -> Option<Self> {
+        Some(match index {
+            0 => Self::Off,
+            1 => Self::Saturation,
+            2 => Self::Full,
+            3 => Self::SnapshotSrgb,
+            4 => Self::SnapshotLinear,
+            5 => Self::RecordSrgb,
+            _ => return None,
+        })
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "off" => Some(Self::Off),
@@ -96,6 +119,66 @@ impl SceneGradeMode {
             }
         }
         post
+    }
+}
+
+/// User-selected field overrides layered over the currently resolved grade source.
+/// `None` preserves the approved, record-derived, or legacy source value.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SceneGradeOverrides {
+    pub saturation: Option<f32>,
+    pub brightness: Option<f32>,
+    pub contrast: Option<f32>,
+    pub tint_amount: Option<f32>,
+    pub tint_red: Option<f32>,
+    pub tint_green: Option<f32>,
+    pub tint_blue: Option<f32>,
+    pub pivot: Option<f32>,
+}
+
+impl SceneGradeOverrides {
+    pub fn validate(self) -> Result<(), String> {
+        for (name, value, min, max) in [
+            ("saturation", self.saturation, 0.0, 3.0),
+            ("brightness", self.brightness, 0.0, 3.0),
+            ("contrast", self.contrast, 0.0, 3.0),
+            ("tint amount", self.tint_amount, 0.0, 1.0),
+            ("tint red", self.tint_red, 0.0, 1.0),
+            ("tint green", self.tint_green, 0.0, 1.0),
+            ("tint blue", self.tint_blue, 0.0, 1.0),
+            ("pivot", self.pivot, 0.01, 0.99),
+        ] {
+            if value.is_some_and(|value| !value.is_finite() || !(min..=max).contains(&value)) {
+                return Err(format!(
+                    "grade {name} override must be finite and between {min} and {max}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply(self, grade: &mut SkyrimCinematicGrade) {
+        if let Some(value) = self.saturation {
+            grade.saturation = value;
+        }
+        if let Some(value) = self.brightness {
+            grade.brightness = value;
+        }
+        if let Some(value) = self.contrast {
+            grade.contrast = value;
+        }
+        if let Some(value) = self.tint_amount {
+            grade.tint_amount = value;
+        }
+        if let Some(value) = self.tint_red {
+            grade.tint_rgb[0] = value;
+        }
+        if let Some(value) = self.tint_green {
+            grade.tint_rgb[1] = value;
+        }
+        if let Some(value) = self.tint_blue {
+            grade.tint_rgb[2] = value;
+        }
     }
 }
 
@@ -234,6 +317,16 @@ impl SceneGradeSource {
         mode: SceneGradeMode,
         preset: SceneVisualPreset,
     ) -> Result<ResolvedSceneGrade, String> {
+        self.resolve_with_overrides(mode, preset, SceneGradeOverrides::default())
+    }
+
+    pub fn resolve_with_overrides(
+        &self,
+        mode: SceneGradeMode,
+        preset: SceneVisualPreset,
+        overrides: SceneGradeOverrides,
+    ) -> Result<ResolvedSceneGrade, String> {
+        overrides.validate()?;
         let grade = match mode {
             SceneGradeMode::SnapshotSrgb => self.approved.grade,
             SceneGradeMode::RecordSrgb => {
@@ -248,7 +341,12 @@ impl SceneGradeSource {
             }
             _ => mode.grade(preset),
         };
+        let mut grade = grade;
+        overrides.apply(&mut grade);
         let mut post = grade.post();
+        if let Some(pivot) = overrides.pivot {
+            post.pivot = pivot;
+        }
         match mode {
             SceneGradeMode::Off | SceneGradeMode::Saturation => post.enabled = 0.0,
             SceneGradeMode::SnapshotSrgb
@@ -262,18 +360,35 @@ impl SceneGradeSource {
         Ok(ResolvedSceneGrade {
             grade,
             post,
-            bevy_saturation: mode.bevy_saturation(preset),
+            bevy_saturation: if matches!(mode, SceneGradeMode::Saturation | SceneGradeMode::Full) {
+                grade.saturation
+            } else {
+                mode.bevy_saturation(preset)
+            },
             tonemapping: Tonemapping::TonyMcMapface,
         })
     }
 
     pub fn evidence(&self, mode: SceneGradeMode, preset: SceneVisualPreset) -> serde_json::Value {
-        let resolved = self.resolve(mode, preset);
+        self.evidence_with_overrides(mode, preset, SceneGradeOverrides::default())
+    }
+
+    pub fn evidence_with_overrides(
+        &self,
+        mode: SceneGradeMode,
+        preset: SceneVisualPreset,
+        overrides: SceneGradeOverrides,
+    ) -> serde_json::Value {
+        let resolved = self.resolve_with_overrides(mode, preset, overrides);
+        let base = self.resolve(mode, preset);
         serde_json::json!({
             "mode": mode.name(),
             "source_kind": if mode == SceneGradeMode::RecordSrgb { "authored-image-space-record" } else if mode == SceneGradeMode::SnapshotSrgb { "approved-artistic-override" } else { "legacy-preset" },
+            "grade_base_identity": if mode == SceneGradeMode::RecordSrgb { "loaded-image-space-record" } else if mode == SceneGradeMode::SnapshotSrgb { self.approved_path.as_str() } else { preset.name() },
             "approved_override": { "path": self.approved_path, "data": self.approved, "applied_to_grade": mode == SceneGradeMode::SnapshotSrgb, "applied_to_sky": preset == SceneVisualPreset::CoolGray },
             "loaded_record": self.record,
+            "base_grade": base.as_ref().ok().map(|resolved| resolved.grade),
+            "grade_overrides": overrides,
             "hnam_applied": false,
             "effective_grade": resolved.as_ref().ok().map(|r| r.grade),
             "effective_stages": resolved.as_ref().ok().map(|r| serde_json::json!({
@@ -283,9 +398,10 @@ impl SceneGradeSource {
                 "post_linear_domain": r.post.linear_domain,
                 "pivot": r.post.pivot,
             })),
+            "pivot": resolved.as_ref().ok().map(|r| r.post.pivot),
+            "default_pivot": CINEMATIC_PIVOT,
             "resolution_error": resolved.err(),
             "tonemapping": "TonyMcMapface", "exposure_ev100": DEFAULT_SCENE_EV100,
-            "pivot": CINEMATIC_PIVOT,
             "limits": "CNAM/TNAM experiment only; authored slot is not effective runtime weather; HNAM, adaptation, native tone curve, bloom and modifier composition remain unapplied"
         })
     }
@@ -342,6 +458,18 @@ impl SceneVisualPreset {
     }
 }
 
+fn current_grade_overrides(world: &World) -> SceneGradeOverrides {
+    world
+        .get_resource::<SceneGradeOverrides>()
+        .copied()
+        .or_else(|| {
+            world
+                .get_resource::<crate::settings::RenderingSettings>()
+                .map(crate::settings::RenderingSettings::grade_overrides)
+        })
+        .unwrap_or_default()
+}
+
 fn scene_preset_command() -> ConsoleCommand {
     ConsoleCommand {
         name: "ScenePreset",
@@ -363,6 +491,21 @@ fn scene_preset_command() -> ConsoleCommand {
                 _ => return Err("usage: ScenePreset [vivid|cool-gray|toggle]".into()),
             };
             if let Some(next) = next {
+                let source = world
+                    .get_resource::<SceneGradeSource>()
+                    .cloned()
+                    .unwrap_or_default();
+                let tone = world
+                    .get_resource::<SceneToneMapSource>()
+                    .cloned()
+                    .unwrap_or_default();
+                let overrides = current_grade_overrides(world);
+                tone.resolve_with_overrides(
+                    &source,
+                    *world.resource::<SceneGradeMode>(),
+                    next,
+                    overrides,
+                )?;
                 *world.resource_mut::<SceneVisualPreset>() = next;
                 let next_palette = world
                     .get_resource::<SceneGradeSource>()
@@ -370,6 +513,7 @@ fn scene_preset_command() -> ConsoleCommand {
                 if let Some(mut palette) = world.get_resource_mut::<SkyPalette>() {
                     *palette = next_palette;
                 }
+                sync_settings_from_console(world);
             }
             Ok(format!(
                 "scene preset: {} (grade: {})",
@@ -380,7 +524,7 @@ fn scene_preset_command() -> ConsoleCommand {
     }
 }
 
-fn scene_grade_command() -> ConsoleCommand {
+pub(crate) fn scene_grade_command() -> ConsoleCommand {
     ConsoleCommand {
         name: "SceneGrade",
         short: None,
@@ -396,12 +540,24 @@ fn scene_grade_command() -> ConsoleCommand {
                         .get_resource::<SceneGradeSource>()
                         .cloned()
                         .unwrap_or_default();
-                    world
+                    let tone = world
                         .get_resource::<SceneToneMapSource>()
                         .cloned()
-                        .unwrap_or_default()
-                        .resolve(&source, mode, *world.resource::<SceneVisualPreset>())?;
+                        .unwrap_or_default();
+                    let overrides = current_grade_overrides(world);
+                    tone.resolve_with_overrides(
+                        &source,
+                        mode,
+                        *world.resource::<SceneVisualPreset>(),
+                        overrides,
+                    )?;
+                    if let Some(mut file) =
+                        world.get_resource_mut::<crate::settings::SettingsFile>()
+                    {
+                        file.note_grade_mode_selection();
+                    }
                     *world.resource_mut::<SceneGradeMode>() = mode;
+                    sync_settings_from_console(world);
                 }
                 _ => return Err(format!("usage: {SCENE_GRADE_USAGE}")),
             }
@@ -433,10 +589,11 @@ fn scene_tone_map_command() -> ConsoleCommand {
                         .get_resource::<SceneGradeSource>()
                         .cloned()
                         .unwrap_or_default();
-                    candidate.resolve(
+                    candidate.resolve_with_overrides(
                         &source,
                         *world.resource::<SceneGradeMode>(),
                         *world.resource::<SceneVisualPreset>(),
+                        current_grade_overrides(world),
                     )?;
                     world.insert_resource(candidate.clone());
                 }
@@ -447,13 +604,40 @@ fn scene_tone_map_command() -> ConsoleCommand {
     }
 }
 
-fn apply_scene_grade_mode(
+fn sync_settings_from_console(world: &mut World) {
+    if !world.contains_resource::<crate::settings::RenderingSettings>() {
+        return;
+    }
+    let mode = *world.resource::<SceneGradeMode>();
+    let preset = *world.resource::<SceneVisualPreset>();
+    let source = world
+        .get_resource::<SceneGradeSource>()
+        .cloned()
+        .unwrap_or_default();
+    let tone = world
+        .get_resource::<SceneToneMapSource>()
+        .cloned()
+        .unwrap_or_default();
+    let overrides = current_grade_overrides(world);
+    let Ok(resolved) = tone.resolve_with_overrides(&source, mode, preset, overrides) else {
+        return;
+    };
+    let mut settings = world.resource_mut::<crate::settings::RenderingSettings>();
+    settings.color_grade = mode.index();
+    settings.visual_preset = usize::from(preset == SceneVisualPreset::CoolGray);
+    settings.show_resolved_grade(resolved.grade, resolved.post.pivot);
+}
+
+// Bevy injects these resources and the camera query independently.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_scene_grade_mode(
     mode: Res<SceneGradeMode>,
     preset: Res<SceneVisualPreset>,
     source: Option<Res<SceneGradeSource>>,
     fallback: Local<SceneGradeSource>,
     tone_source: Option<Res<SceneToneMapSource>>,
     tone_fallback: Local<SceneToneMapSource>,
+    overrides: Option<Res<SceneGradeOverrides>>,
     mut cameras: Query<(
         Ref<SceneGradeTarget>,
         &mut ColorGrading,
@@ -465,10 +649,14 @@ fn apply_scene_grade_mode(
     let tone_changed = tone_source
         .as_ref()
         .is_some_and(|source| source.is_changed());
+    let overrides_changed = overrides
+        .as_ref()
+        .is_some_and(|overrides| overrides.is_changed());
     let source = source.as_deref().unwrap_or(&fallback);
     let tone = tone_source.as_deref().unwrap_or(&tone_fallback);
+    let overrides = overrides.as_deref().copied().unwrap_or_default();
     let resolved = tone
-        .resolve(source, *mode, *preset)
+        .resolve_with_overrides(source, *mode, *preset, overrides)
         .expect("validated scene grade source");
     for (target, mut grading, mut post, mut tonemapping) in &mut cameras {
         if *target == SceneGradeTarget::Reflection
@@ -476,6 +664,7 @@ fn apply_scene_grade_mode(
                 || preset.is_changed()
                 || source_changed
                 || tone_changed
+                || overrides_changed
                 || target.is_added())
         {
             continue;
@@ -831,6 +1020,177 @@ mod tests {
     }
 
     #[test]
+    fn optional_grade_overrides_layer_on_custom_base_without_mutating_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("custom-look.json");
+        let mut authored = serde_json::to_value(ApprovedLook::builtin()).unwrap();
+        authored["grade"]["saturation"] = 1.21.into();
+        authored["grade"]["brightness"] = 1.37.into();
+        std::fs::write(&path, authored.to_string()).unwrap();
+        let config = crate::config::EngineConfig {
+            grade_preset: Some(path),
+            ..default()
+        };
+        let source = SceneGradeSource::load(&config, false).unwrap();
+        let base = source
+            .resolve(SceneGradeMode::SnapshotSrgb, SceneVisualPreset::CoolGray)
+            .unwrap();
+        let overrides = SceneGradeOverrides {
+            saturation: Some(1.8),
+            pivot: Some(0.31),
+            ..default()
+        };
+        let tuned = source
+            .resolve_with_overrides(
+                SceneGradeMode::SnapshotSrgb,
+                SceneVisualPreset::CoolGray,
+                overrides,
+            )
+            .unwrap();
+        assert_eq!(base.grade.saturation, 1.21);
+        assert_eq!(base.grade.brightness, 1.37);
+        assert_eq!(tuned.grade.saturation, 1.8);
+        assert_eq!(tuned.grade.brightness, 1.37);
+        assert_eq!(tuned.post.pivot, 0.31);
+        assert_eq!(source.approved.grade.saturation, 1.21);
+        assert_eq!(source.approved.grade.brightness, 1.37);
+        let evidence = source.evidence_with_overrides(
+            SceneGradeMode::SnapshotSrgb,
+            SceneVisualPreset::CoolGray,
+            overrides,
+        );
+        assert_eq!(
+            evidence["base_grade"]["brightness"],
+            serde_json::json!(1.37_f32)
+        );
+        assert_eq!(
+            evidence["grade_overrides"]["saturation"],
+            serde_json::json!(1.8_f32)
+        );
+        assert_eq!(
+            evidence["effective_grade"]["saturation"],
+            serde_json::json!(1.8_f32)
+        );
+        assert_eq!(evidence["pivot"], serde_json::json!(0.31_f32));
+        assert_eq!(evidence["effective_stages"]["pivot"], evidence["pivot"]);
+        assert_eq!(evidence["default_pivot"], serde_json::json!(0.18_f32));
+        let untuned = source.evidence(SceneGradeMode::SnapshotSrgb, SceneVisualPreset::CoolGray);
+        assert_eq!(untuned["pivot"], serde_json::json!(0.18_f32));
+    }
+
+    #[test]
+    fn invalid_grade_override_is_rejected_without_changing_source() {
+        let source = SceneGradeSource::default();
+        let original = source.approved.grade;
+        let invalid = SceneGradeOverrides {
+            brightness: Some(f32::NAN),
+            ..default()
+        };
+        assert!(
+            source
+                .resolve_with_overrides(
+                    SceneGradeMode::SnapshotSrgb,
+                    SceneVisualPreset::CoolGray,
+                    invalid,
+                )
+                .is_err()
+        );
+        assert_eq!(source.approved.grade, original);
+        let evidence = source.evidence_with_overrides(
+            SceneGradeMode::SnapshotSrgb,
+            SceneVisualPreset::CoolGray,
+            invalid,
+        );
+        assert!(evidence["pivot"].is_null());
+        assert!(evidence["effective_stages"].is_null());
+        assert!(evidence["resolution_error"].is_string());
+        assert_eq!(evidence["default_pivot"], serde_json::json!(0.18_f32));
+    }
+
+    #[test]
+    fn grade_overrides_reach_scene_cameras_but_never_reflections() {
+        let mut app = App::new();
+        app.init_resource::<SceneGradeMode>()
+            .insert_resource(SceneVisualPreset::CoolGray)
+            .insert_resource(SceneGradeSource::default())
+            .insert_resource(SceneToneMapSource::default())
+            .insert_resource(SceneGradeOverrides {
+                brightness: Some(1.73),
+                pivot: Some(0.27),
+                ..default()
+            })
+            .add_systems(PostUpdate, apply_scene_grade_mode);
+        let scene = app.world_mut().spawn(SceneColorPipeline::default()).id();
+        let reflection = app.world_mut().spawn(SceneColorPipeline::reflection()).id();
+        app.update();
+        let tuned = app.world().get::<SkyrimCinematicPost>(scene).unwrap();
+        assert_eq!(tuned.brightness, 1.73);
+        assert_eq!(tuned.pivot, 0.27);
+        assert_eq!(
+            *app.world().get::<SkyrimCinematicPost>(reflection).unwrap(),
+            SkyrimCinematicPost::default()
+        );
+        let later = app.world_mut().spawn(SceneColorPipeline::default()).id();
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<SkyrimCinematicPost>(later)
+                .unwrap()
+                .brightness,
+            1.73
+        );
+    }
+
+    #[test]
+    fn console_mode_and_preset_keep_explicit_tuning_and_sync_settings() {
+        let settings = crate::settings::RenderingSettings {
+            grade_brightness: 1.75,
+            grade_override_mask: 1 << 1,
+            ..default()
+        };
+        let mut app = App::new();
+        app.init_resource::<SceneGradeMode>()
+            .insert_resource(SceneVisualPreset::CoolGray)
+            .insert_resource(SceneGradeSource::default())
+            .insert_resource(SceneToneMapSource::default())
+            .insert_resource(SceneGradeOverrides {
+                brightness: Some(1.75),
+                ..default()
+            })
+            .insert_resource(settings)
+            .init_resource::<crate::console::ConsoleState>()
+            .add_console_command(scene_grade_command())
+            .add_console_command(scene_preset_command())
+            .add_systems(PostUpdate, apply_scene_grade_mode);
+        let camera = app.world_mut().spawn(SceneColorPipeline::default()).id();
+        crate::console::execute_line(app.world_mut(), "SceneGrade full");
+        crate::console::execute_line(app.world_mut(), "ScenePreset vivid");
+        app.update();
+        let world = app.world();
+        assert_eq!(*world.resource::<SceneGradeMode>(), SceneGradeMode::Full);
+        assert_eq!(
+            *world.resource::<SceneVisualPreset>(),
+            SceneVisualPreset::Vivid
+        );
+        assert_eq!(
+            world
+                .resource::<crate::settings::RenderingSettings>()
+                .color_grade,
+            SceneGradeMode::Full.index()
+        );
+        assert_eq!(
+            world
+                .resource::<crate::settings::RenderingSettings>()
+                .visual_preset,
+            0
+        );
+        assert_eq!(
+            world.get::<SkyrimCinematicPost>(camera).unwrap().brightness,
+            1.75
+        );
+    }
+
+    #[test]
     fn changed_database_grade_drives_record_mode_and_console_restores_approved() {
         use shared::records::{ArchivedRecordData, ArchivedSubRecord};
         let directory = tempfile::tempdir().unwrap();
@@ -896,11 +1256,49 @@ mod tests {
         );
         assert_eq!(resolved.post.pivot, 0.18);
         assert_eq!(resolved.bevy_saturation, 1.0);
+        let overrides = SceneGradeOverrides {
+            brightness: Some(1.62),
+            tint_red: Some(0.91),
+            ..default()
+        };
+        let tuned = changed
+            .resolve_with_overrides(
+                SceneGradeMode::RecordSrgb,
+                SceneVisualPreset::CoolGray,
+                overrides,
+            )
+            .unwrap();
+        assert_eq!(tuned.grade.saturation, 1.23);
+        assert_eq!(tuned.grade.brightness, 1.62);
+        assert_eq!(tuned.grade.contrast, 1.49);
+        assert_eq!(tuned.grade.tint_rgb, [0.91, 0.47, 0.59]);
+        assert_eq!(changed.record.as_ref().unwrap().cinematic.brightness, 1.29);
+        assert_eq!(
+            changed.record.as_ref().unwrap().tint.rgb,
+            [0.31, 0.47, 0.59]
+        );
         let evidence = changed.evidence(SceneGradeMode::RecordSrgb, SceneVisualPreset::CoolGray);
         assert_eq!(evidence["loaded_record"]["winner_plugin"], "Winner.esm");
         assert_eq!(evidence["loaded_record"]["hdr"]["sky_scale"], 18.0);
         assert_eq!(evidence["hnam_applied"], false);
         assert_eq!(evidence["approved_override"]["applied_to_grade"], false);
+        let tuned_evidence = changed.evidence_with_overrides(
+            SceneGradeMode::RecordSrgb,
+            SceneVisualPreset::CoolGray,
+            overrides,
+        );
+        assert_eq!(
+            tuned_evidence["grade_overrides"]["brightness"],
+            serde_json::json!(1.62_f32)
+        );
+        assert_eq!(
+            tuned_evidence["loaded_record"]["cinematic"]["brightness"],
+            serde_json::json!(1.29_f32)
+        );
+        assert_eq!(
+            tuned_evidence["effective_grade"]["brightness"],
+            serde_json::json!(1.62_f32)
+        );
         let mut app = App::new();
         app.insert_resource(changed)
             .insert_resource(SceneGradeMode::SnapshotSrgb)
@@ -982,6 +1380,10 @@ mod tests {
         app.init_resource::<SceneGradeMode>()
             .insert_resource(SceneVisualPreset::CoolGray)
             .insert_resource(SceneVisualPreset::CoolGray.sky_palette())
+            .insert_resource(SceneGradeSource::default())
+            .insert_resource(SceneToneMapSource::default())
+            .init_resource::<SceneGradeOverrides>()
+            .insert_resource(crate::settings::RenderingSettings::default())
             .init_resource::<crate::console::ConsoleState>()
             .add_console_command(scene_grade_command())
             .add_console_command(scene_preset_command())
@@ -1026,6 +1428,16 @@ mod tests {
             assert_eq!(
                 *world.resource::<SkyPalette>(),
                 SceneVisualPreset::CoolGray.sky_palette()
+            );
+            assert_eq!(
+                world
+                    .resource::<crate::settings::RenderingSettings>()
+                    .color_grade,
+                if domain == 0 {
+                    SceneGradeMode::SnapshotSrgb.index()
+                } else {
+                    SceneGradeMode::SnapshotLinear.index()
+                }
             );
             assert_eq!(
                 *world.get::<SkyrimCinematicPost>(reflection).unwrap(),
