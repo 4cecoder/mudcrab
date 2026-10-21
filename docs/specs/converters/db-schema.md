@@ -831,6 +831,7 @@ reference and cell fields, validated against their expected sizes:
 | `XNDP` | placed references | navmesh (bytes 0-3 of 8) |
 | `XEMI` | placed references | emitted light or region |
 | `XATR` | placed references | attached reference (the in-house reader already remapped it; the legacy reader does since #269) |
+| `SNAM`, `LNAM` | LIGH | sound and lens flare (the in-house reader already remapped them; the legacy reader does since #269) |
 | `XAPR` | placed references | activate-parent reference (one 8-byte subrecord per parent) |
 | `XLRT` | placed references | location reference types (array) |
 | `XHOR` | ACHR | horse reference |
@@ -931,9 +932,28 @@ CREATE TABLE IF NOT EXISTS lights (
     color_r INTEGER NOT NULL, color_g INTEGER NOT NULL, color_b INTEGER NOT NULL,
     flags INTEGER NOT NULL,        -- DATA flags (dynamic, can carry, negative, flicker, off by default, ...)
     falloff REAL NOT NULL,
-    fade REAL                      -- FNAM, if present
+    fade REAL,                     -- FNAM, if present
+    time INTEGER,                  -- DATA[0] i32, the light's duration
+    field_of_view REAL,            -- DATA[20], spotlight cone
+    near_clip REAL,                -- DATA[24]
+    flicker_period REAL,           -- DATA[28], raw (xEdit shows it multiplied by 0.01)
+    flicker_intensity_amplitude REAL, -- DATA[32]
+    flicker_movement_amplitude REAL,  -- DATA[36]
+    value INTEGER,                 -- DATA[40] u32
+    weight REAL,                   -- DATA[44]
+    sound_id INTEGER,              -- SNAM -> SNDR
+    lens_id INTEGER                -- LNAM -> LENS (lens flare)
 );
 ```
+
+The columns from `time` on were added for #269 gap 6. They come from the full 48-byte `DATA`
+(xEdit 4.1.5f `wbDefinitionsTES5.pas`, `LIGH`); the in-house schema accepts only that length, so
+a shorter `DATA` leaves them NULL for both readers, and floats that are not finite are NULL.
+`sound_id` and `lens_id` keep a FormID only when the winning record exists with that type (the
+in-house reader clears links that do not resolve and the legacy reader keeps them), and the legacy
+reader now remaps `LIGH` `SNAM`/`LNAM` as the in-house schema already did. The columns are
+additive and optional, with no `shared::WORLD_DATABASE_SCHEMA_VERSION` bump: `create_tables` adds
+them to an older reused `lights` table. The engine reads radius, colour and flags only.
 
 ---
 

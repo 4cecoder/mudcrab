@@ -45,6 +45,8 @@ mod emittance_parity_tests;
 #[cfg(test)]
 mod environment_parity_tests;
 #[cfg(test)]
+mod light_details_parity_tests;
+#[cfg(test)]
 mod plugin_table_tests;
 #[cfg(test)]
 mod reference_links_parity_tests;
@@ -580,6 +582,8 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         b"XEMI" if placed => Fixed(SINGLE),
         // Attached reference, which the in-house schema remaps too.
         b"XATR" if placed => Fixed(SINGLE),
+        // A light's sound and lens flare, which the in-house schema remaps too.
+        b"SNAM" | b"LNAM" if record_type == b"LIGH" => Fixed(SINGLE),
         // Each activate parent is a separate subrecord: reference plus f32 delay.
         b"XAPR" if placed => Fixed(&[(8, &[0])]),
         // Location reference types.
