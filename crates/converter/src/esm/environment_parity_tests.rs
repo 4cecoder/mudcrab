@@ -301,7 +301,12 @@ fn master_plugin() -> Vec<u8> {
                     sub(b"RDAT", &[3u32.to_le_bytes(), [0, 50, 0, 0]].concat()),
                     sub(
                         b"RDWT",
-                        &[le(RAIN), 100u32.to_le_bytes(), le(0xBEEF)].concat(),
+                        &[
+                            [le(RAIN), 100u32.to_le_bytes(), le(0xBEEF)].concat(),
+                            [le(WEATHER), 0x8000_0000u32.to_le_bytes(), le(GLOBAL)].concat(),
+                            [le(RAIN), u32::MAX.to_le_bytes(), le(0xBEEF)].concat(),
+                        ]
+                        .concat(),
                     ),
                 ]
                 .concat(),
@@ -361,7 +366,12 @@ fn mod_plugin() -> Vec<u8> {
             sub(b"EDID", b"Climate\0"),
             sub(
                 b"WLST",
-                &[le(MOD_WEATHER_AUTHORED), 100i32.to_le_bytes(), le(0)].concat(),
+                &[
+                    [le(MOD_WEATHER_AUTHORED), (-1i32).to_le_bytes(), le(GLOBAL)].concat(),
+                    [le(WEATHER), i32::MIN.to_le_bytes(), le(GLOBAL)].concat(),
+                    [le(RAIN), 100i32.to_le_bytes(), le(GLOBAL)].concat(),
+                ]
+                .concat(),
             ),
         ]
         .concat(),
@@ -594,20 +604,34 @@ fn both_record_readers_publish_the_same_environment() {
         .collect();
     assert_eq!(
         climate,
-        vec![(Some(MOD_WEATHER.into()), 100, None)],
-        "the mod's override wins, its WLST remapped"
+        vec![
+            (Some(MOD_WEATHER.into()), -1, Some(GLOBAL.into())),
+            (
+                Some(WEATHER.into()),
+                i64::from(i32::MIN),
+                Some(GLOBAL.into())
+            ),
+            (Some(RAIN.into()), 100, Some(GLOBAL.into())),
+        ],
+        "the mod's override wins, its WLST links are remapped and signed chances retained"
     );
-    let region: (Option<i64>, i64, Option<i64>) = conn
-        .query_row(
-            "SELECT weather_id, chance, chance_global_id FROM region_weathers",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    let region: Vec<(Option<i64>, i64, Option<i64>)> = conn
+        .prepare(
+            "SELECT weather_id, chance, chance_global_id FROM region_weathers WHERE region_id=?1 ORDER BY position",
         )
-        .unwrap();
+        .unwrap()
+        .query_map([REGION], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
     assert_eq!(
         region,
-        (Some(RAIN.into()), 100, None),
-        "0xBEEF is no global"
+        vec![
+            (Some(RAIN.into()), 100, None),
+            (Some(WEATHER.into()), 0x8000_0000, Some(GLOBAL.into())),
+            (Some(RAIN.into()), i64::from(u32::MAX), None),
+        ],
+        "REGN keeps unsigned high-bit chances nonnegative; 0xBEEF is no global"
     );
 
     let saturation: Option<f64> = get(
