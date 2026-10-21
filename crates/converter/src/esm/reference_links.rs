@@ -51,10 +51,21 @@ CREATE TABLE IF NOT EXISTS reference_details (
 );
 ";
 
-/// Record types a reference link may name.
-const PLACED: &[&[u8; 4]] = &[
-    b"REFR", b"ACHR", b"ACRE", b"PGRE", b"PMIS", b"PHZD", b"PARW", b"PBAR", b"PBEA", b"PCON",
+/// Record types an XLKR reference or XAPR parent may name.
+const LINKED_REFERENCE: &[&[u8; 4]] = &[
+    b"PLYR", b"ACHR", b"REFR", b"PGRE", b"PHZD", b"PMIS", b"PARW", b"PBAR", b"PBEA", b"PCON",
     b"PFLA",
+];
+
+/// XLKR's first field shares the linked-reference targets as well as accepting keywords.
+const LINKED_KEYWORD: &[&[u8; 4]] = &[
+    b"KYWD", b"PLYR", b"ACHR", b"REFR", b"PGRE", b"PHZD", b"PMIS", b"PARW", b"PBAR", b"PBEA",
+    b"PCON", b"PFLA",
+];
+
+/// Record types an XATR attached reference may name.
+const ATTACHED_REFERENCE: &[&[u8; 4]] = &[
+    b"REFR", b"PGRE", b"PHZD", b"PMIS", b"PARW", b"PBAR", b"PBEA", b"PCON", b"PFLA",
 ];
 
 /// What the projection needs beyond the record itself.
@@ -66,14 +77,14 @@ pub(crate) struct Context<'a> {
 }
 
 impl Context<'_> {
-    /// `id` when the winning record it names exists and has one of `targets`' types. The in-house
-    /// reader clears links that do not resolve and the legacy reader keeps them, so this check
-    /// makes both publish the same rows.
+    /// Keep typed winning records and hardcoded nonzero IDs without plugin records. The in-house
+    /// reader clears invalid links and the legacy reader keeps them, so this makes both agree.
     fn resolve(&self, id: Option<u32>, targets: &[&[u8; 4]]) -> Option<u32> {
         id.filter(|id| {
-            self.master.get(id).is_some_and(|record| {
-                !record.is_deleted() && targets.contains(&&record.record_type)
-            })
+            *id != 0
+                && self.master.get(id).map_or(*id < 0x800, |record| {
+                    !record.is_deleted() && targets.contains(&&record.record_type)
+                })
         })
     }
 }
@@ -120,8 +131,8 @@ pub(crate) fn insert(
         .execute(params![
             id,
             position as i64,
-            context.resolve(keyword, &[b"KYWD"]),
-            context.resolve(reference, PLACED),
+            context.resolve(keyword, LINKED_KEYWORD),
+            context.resolve(reference, LINKED_REFERENCE),
         ])?;
     }
 
@@ -138,7 +149,7 @@ pub(crate) fn insert(
         .execute(params![
             id,
             position as i64,
-            context.resolve(u32_at(parent, 0), PLACED),
+            context.resolve(u32_at(parent, 0), LINKED_REFERENCE),
             delay.is_finite().then_some(f64::from(delay)),
         ])?;
     }
@@ -171,7 +182,7 @@ pub(crate) fn insert(
     let location = link(b"XLCN", &[b"LCTN"]);
     let location_ref_type = link(b"XLRL", &[b"LCRT", b"LCTN"]);
     let encounter_zone = link(b"XEZN", &[b"ECZN"]);
-    let attached = link(b"XATR", PLACED);
+    let attached = link(b"XATR", ATTACHED_REFERENCE);
     let any = owner.is_some()
         || owner_rank.is_some()
         || activate_parent_flags.is_some()

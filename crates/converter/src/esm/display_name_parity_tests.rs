@@ -11,6 +11,7 @@ const DOOR: u32 = 0x0802;
 const CHEST: u32 = 0x0803;
 const PERSON: u32 = 0x0804;
 const UNNAMED: u32 = 0x0805;
+const DELETED: u32 = 0x0806;
 const LOCALIZED: u32 = 0x80;
 
 fn sub(tag: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
@@ -124,6 +125,7 @@ fn master_plugin() -> Vec<u8> {
         top(b"DOOR", &base(b"DOOR", DOOR, "HouseDoor", &id(3))),
         top(b"CONT", &base(b"CONT", CHEST, "BreadChest", &id(4))),
         top(b"MISC", &base(b"MISC", UNNAMED, "Unnamed", &id(99))),
+        top(b"MISC", &base(b"MISC", DELETED, "Deleted", &id(6))),
         top(b"NPC_", &person),
         top(b"WRLD", &world),
         top(b"CELL", &group(2, 0, &group(3, 0, &cell))),
@@ -133,9 +135,11 @@ fn master_plugin() -> Vec<u8> {
 
 /// A plain plugin renaming the door in Windows-1252 text.
 fn override_plugin() -> Vec<u8> {
+    let deleted = record(b"MISC", DELETED, 0x20, &[]);
     [
         header(0, &["Skyrim.esm"]),
         top(b"DOOR", &base(b"DOOR", DOOR, "HouseDoor", b"T\xFCr\0")),
+        top(b"MISC", &deleted),
     ]
     .concat()
 }
@@ -198,6 +202,7 @@ fn both_record_readers_publish_the_same_display_names() {
             (3, b"Door"),
             (4, b"Brotkiste f\xFCr K\xE4se"),
             (5, b"Sven"),
+            (6, b"Deleted record name"),
         ]),
     )
     .unwrap();
@@ -228,5 +233,13 @@ fn both_record_readers_publish_the_same_display_names() {
         Some("Brotkiste für Käse")
     );
     assert_eq!(name("statics", UNNAMED), None, "ID 99 has no string");
+    assert!(
+        !legacy.0.iter().any(|(_, id, _)| *id == DELETED),
+        "the winning tombstone removes its earlier projection"
+    );
+    assert!(
+        !legacy.1.iter().any(|(id, _)| *id == DELETED),
+        "the winning tombstone removes its earlier canonical row"
+    );
     assert_eq!(name("npcs", PERSON).as_deref(), Some("Sven"));
 }

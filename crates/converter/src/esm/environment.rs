@@ -613,6 +613,7 @@ pub(crate) fn insert_record(
                 "climate_id",
                 id,
                 [view.find(b"WLST").unwrap_or_default()],
+                |entry| i32_at(entry, 4).map(i64::from),
             )
         }
         b"REGN" => {
@@ -621,7 +622,15 @@ pub(crate) fn insert_record(
                 .iter()
                 .filter(|(tag, _)| tag.as_slice() == b"RDWT")
                 .map(|(_, data)| data.as_slice());
-            insert_weather_list(tx, links, "region_weathers", "region_id", id, lists)
+            insert_weather_list(
+                tx,
+                links,
+                "region_weathers",
+                "region_id",
+                id,
+                lists,
+                |entry| u32_at(entry, 4).map(i64::from),
+            )
         }
         b"IMGS" => {
             let hdr = sized(view, b"HNAM", &[36]);
@@ -755,6 +764,7 @@ fn insert_weather_list<'a>(
     owner: &str,
     id: u32,
     lists: impl IntoIterator<Item = &'a [u8]>,
+    chance: impl Fn(&[u8]) -> Option<i64>,
 ) -> Result<()> {
     tx.prepare_cached(&format!("DELETE FROM {table} WHERE {owner}=?1"))?
         .execute([id])?;
@@ -764,7 +774,7 @@ fn insert_weather_list<'a>(
             .put(owner, id)
             .put("position", position as i64)
             .put("weather_id", links.id(u32_at(entry, 0), &[b"WTHR"]))
-            .put("chance", i32_at(entry, 4))
+            .put("chance", chance(entry))
             .put("chance_global_id", links.id(u32_at(entry, 8), &[b"GLOB"]))
             .insert(tx, table)?;
     }
