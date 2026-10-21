@@ -1,6 +1,6 @@
 # ESM to libSQL (Turso Engine) + rkyv Transformation Specification
 
-This document details the technical specification for parsing Skyrim Master (`.esm`) and Plugin (`.esp` / `.esl`) binary databases into an indexed **libSQL database (`skyrim_world.db`)** (Turso's open-source SQLite fork) paired with a **zero-copy `rkyv` hot storage cache**.
+This document describes how Skyrim master (`.esm`) and plugin (`.esp` / `.esl`) records are projected into the indexed SQLite database (`skyrim_world.db`) and the zero-copy `rkyv` terrain cache.
 
 The default in-house frontend uses MudCrab's authored record schema and generic
 Rust decoder. `--record-reader legacy` selects the hand-written reader, and
@@ -31,13 +31,12 @@ contracts preserve source information beyond the nullable runtime projections.
 
 - **Input:** Skyrim master records (`Skyrim.esm`, `Update.esm`, `Dawnguard.esm`, `.esp` mod files).
 - **Output:**
-  1. `skyrim_world.db` (libSQL / Turso database with R-Tree spatial indexing & async local-first sync).
-  2. `cell_cache.rkyv` (Zero-copy binary memory-mapped blobs for instant terrain heightmaps and dense cell references).
+  1. `skyrim_world.db` (SQLite database with R-Tree spatial indexing).
+  2. `cell_cache.rkyv` (Zero-copy binary memory-mapped terrain and cell data).
 - **Goal:**
-  1. Provide sub-millisecond 3D spatial queries for placed game objects (`REFR`) based on player camera coordinates.
-  2. Maintain `O(1)` primary key resolution for 32-bit `FormID` records.
+  1. Use spatial and cell indexes to select placed-reference rows by worldspace and cell coordinates.
+  2. Index records by 32-bit `FormID` for lookup.
   3. Support priority-weighted plugin load orders (`plugins.txt` overrides).
-  4. Enable optional **Embedded Replication / Cloud Sync** via Turso for cross-device save games and multiplayer world sync!
 
 ---
 
@@ -115,7 +114,7 @@ Placed references have their own `references` table (positions, rotations, base 
 Exterior references use a spatial index with a worldspace filter; interior references use direct cell lookup:
 
 1. **Exterior Worldspace R-Tree (`exterior_spatial`):** The exporter inserts each reference's global X/Y/Z position as a point (equal minimum and maximum bounds). SQLite stores these bounds as single-precision values; the exporter applies no coordinate magnitude limit. `cell_id` and `worldspace_id` are auxiliary fields rather than spatial dimensions. Separate reference columns retain cell-local X/Y offsets.
-2. **Interior Cell Direct Lookup (`cell_id` Hash Index):** Interior dungeons and houses do not use R-Trees. All interior `REFR` objects are indexed directly by `cell_id` for $O(1)$ fast lookup when entering interior doors.
+2. **Interior Cell Index (`idx_references_cell`):** Interior cells do not use the R-Tree. The exporter creates an ordinary SQLite index on `references(cell_id)`, which the engine uses to select reference rows for an interior cell. This is an illustrative query shape; it does not fetch complete objects or establish a lookup-time guarantee.
 
 ```sql
 -- R-Tree virtual table for Exterior 3D bounding box spatial queries
@@ -128,30 +127,41 @@ CREATE VIRTUAL TABLE IF NOT EXISTS exterior_spatial USING rtree(
     +worldspace_id -- Parent WorldSpace FormID (e.g. 0x0000003C for Tamriel)
 );
 
--- Index for Interior Cell O(1) object loading
-CREATE INDEX IF NOT EXISTS idx_records_cell_id ON records(cell_id) WHERE cell_id IS NOT NULL;
+-- Ordinary SQLite index used by interior reference lookup
+CREATE INDEX IF NOT EXISTS idx_references_cell ON "references"(cell_id);
 ```
 
-#### Executing a Sub-Millisecond Exterior Camera Query:
+#### Exterior reference query shape:
 
 ```sql
--- Fetch static 3D objects near player camera in Tamriel (WorldSpace 0x0000003C)
-SELECT r.* FROM records r
-JOIN exterior_spatial s ON r.form_id = s.id
-WHERE s.worldspace_id = 0x0000003C
-  AND s.minX >= -1024.0 AND s.maxX <= 1024.0
-  AND s.minY >= -1024.0 AND s.maxY <= 1024.0
-ORDER BY r.load_order DESC;
+-- Select reference rows in one 4096-unit exterior grid cell.
+-- Bind the worldspace ID and grid-derived lower/upper X and Y bounds.
+SELECT r.id, r.cell_id, r.base_form_id, r.pos_x, r.pos_y, r.pos_z
+FROM exterior_spatial x
+JOIN "references" r ON r.id = x.id
+WHERE x.worldspace_id = ?1
+  AND x.minX >= ?2 AND x.minX < ?3
+  AND x.minY >= ?4 AND x.minY < ?5;
 ```
 
-#### Executing an Instant Interior Cell Query:
+The engine uses half-open bounds `[grid * 4096, (grid + 1) * 4096)` for each axis and filters by
+worldspace. The R-Tree stores point bounds (`minX = maxX`, and likewise for Y and Z), so the engine
+tests the point's minimum coordinates. Its full projection selects explicit reference columns and
+joins the base model plus optional door, emittance and enable-state data; the query above only
+illustrates spatial candidate selection. Cell-local X/Y offsets remain in `references.local_x` and
+`references.local_y`.
+
+#### Interior reference query shape:
 
 ```sql
--- Fetch all 3D objects inside Whiterun Breezehome (CELL 0x00013629)
-SELECT * FROM records
-WHERE cell_id = 0x00013629
-ORDER BY load_order DESC;
+-- Select reference rows for one interior CELL FormID.
+SELECT r.id, r.cell_id, r.base_form_id, r.pos_x, r.pos_y, r.pos_z
+FROM "references" r
+WHERE r.cell_id = ?1;
 ```
+
+The engine may join the same base-model and optional reference data described above. This example
+selects reference rows; it does not represent full object loading or promise a lookup latency.
 
 ---
 

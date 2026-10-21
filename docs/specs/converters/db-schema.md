@@ -555,7 +555,7 @@ unchanged.
 Stores 3D positions, rotations, scales, and cell parentage for all placed world objects (`REFR`, `ACHR`, `ACRE`, `PGRE`, `PMIS`).
 
 ```sql
-CREATE TABLE IF NOT EXISTS references (
+CREATE TABLE IF NOT EXISTS "references" (
     id INTEGER PRIMARY KEY,
     cell_id INTEGER NOT NULL,           -- Parent CELL FormID
     worldspace_id INTEGER,              -- Parent WorldSpace FormID; NULL in an interior
@@ -578,7 +578,7 @@ CREATE TABLE IF NOT EXISTS references (
     data BLOB                           -- Subrecords payload
 );
 
--- Index for O(1) interior cell reference loading
+-- Ordinary SQLite index used for interior cell reference lookup
 CREATE INDEX IF NOT EXISTS idx_references_cell ON "references"(cell_id);
 ```
 
@@ -610,14 +610,13 @@ never renders.
 CREATE TABLE IF NOT EXISTS statics (
     id INTEGER PRIMARY KEY,                    -- base record FormID, load-order numbering
     editor_id TEXT,                            -- EDID
-    full_name TEXT,                            -- FULL, resolved localized text when available
     model_path TEXT,                           -- MODL (ARMO: MOD2, then MOD4); NULL when absent
     flags INTEGER NOT NULL,                    -- record header flags
+    full_name TEXT,                            -- FULL, resolved localized text when available
     bounds_min_x REAL NOT NULL DEFAULT -64, bounds_min_y REAL NOT NULL DEFAULT -64,
     bounds_min_z REAL NOT NULL DEFAULT -64, bounds_max_x REAL NOT NULL DEFAULT 64,
     bounds_max_y REAL NOT NULL DEFAULT 64, bounds_max_z REAL NOT NULL DEFAULT 64,
-    bounds_valid INTEGER NOT NULL DEFAULT 0,   -- 1 once integration measured the converted GLB
-    full_name TEXT                            -- Resolved FULL display name
+    bounds_valid INTEGER NOT NULL DEFAULT 0    -- 1 once integration measured the converted GLB
 );
 ```
 
@@ -678,18 +677,27 @@ CREATE TABLE IF NOT EXISTS reference_details (           -- one row per referenc
 
 Rules:
 
-- Placed references are `REFR`, `ACHR`, `ACRE`, `PGRE`, `PMIS`, `PHZD`, `PARW`, `PBAR`, `PBEA`,
-  `PCON` and `PFLA`. Every link keeps its load-order FormID only when the winning record it names
-  exists with an allowed type; otherwise it is NULL (the row is kept, so `position` still counts
-  every subrecord). The in-house reader clears unresolved links and the legacy reader keeps them,
-  so this check is what makes both readers publish the same rows.
+- These detail rows are projected from winning source references of types `REFR`, `ACHR`, `ACRE`,
+  `PGRE` and `PMIS`. Target types are field-specific and are not the same set as source types:
+  `XLKR.keyword_id` accepts `KYWD`, `PLYR`, `ACHR`, `REFR`, `PGRE`, `PHZD`, `PMIS`, `PARW`,
+  `PBAR`, `PBEA`, `PCON` and `PFLA`; `XLKR.linked_ref_id` and `XAPR.parent_ref_id` accept
+  `PLYR`, `ACHR`, `REFR`, `PGRE`, `PHZD`, `PMIS`, `PARW`, `PBAR`, `PBEA`, `PCON` and `PFLA`.
+  `XATR.attached_ref_id` accepts `REFR`, `PGRE`, `PHZD`, `PMIS`, `PARW`, `PBAR`, `PBEA`, `PCON`
+  and `PFLA` (not `ACHR` or `ACRE`). `owner_id` accepts `FACT`, `ACHR` or `NPC_`; `lock_key_id`
+  accepts `KEYM`; `XLCN` accepts `LCTN`; `XLRL` accepts `LCRT` or `LCTN`; and `XEZN` accepts
+  `ECZN`. A zero ID resolves to NULL. A nonzero hardcoded ID below `0x800` is retained if no
+  plugin record exists; a present winner must be non-deleted and have an allowed type. Other
+  targets resolve to NULL. Valid-length `XLKR` and `XAPR` rows are kept in source order with
+  contiguous positions among accepted-length entries, even when a target resolves to NULL. This
+  makes legacy projection match the in-house reader's invalid-link clearing behavior.
 - A field whose length the in-house schema rejects is skipped for both readers: `XLKR` must be 4
   or 8 bytes, `XAPR` 8, `XAPD` 1, `XOWN`/`XRNK`/`XLCN`/`XLRL`/`XEZN`/`XATR` 4, `FNAM` 1 and `TNAM`
   2.
 - `XLOC` is untyped bytes in the in-house schema, so neither reader remaps its key in
-  `references.data`. The projection remaps it through the supplying plugin's master list
-  (`records::source_identity::header_runtime_id`). A subset export without a load order leaves
-  `lock_key_id` NULL.
+  `references.data`. The projection remaps the key through the supplying plugin's master list
+  (`records::source_identity::header_runtime_id`) and applies the normal `KEYM` target check,
+  including retention of a nonzero absent hardcoded ID below `0x800`. A subset export without a
+  load order leaves `lock_key_id` NULL.
 - The map marker's name (`FULL`, a localized string) is not projected into these tables yet.
   Both readers retain its resolved text in the canonical record payload after #271.
 - Derived data like the other runtime views: a full load-order export recreates the tables, and
@@ -707,7 +715,7 @@ must probe for them first.
 Exterior references use a spatial index with a worldspace filter; interior references use direct cell lookup:
 
 1. **Exterior Worldspace R-Tree (`exterior_spatial`):** Bounds are the reference's global X/Y/Z point position, with equal minimum and maximum values. The exporter does not constrain coordinate magnitudes. SQLite stores single-precision bounds; `cell_id` and `worldspace_id` are auxiliary columns, not spatial dimensions. Cell-local X/Y offsets remain separate columns in `references`.
-2. **Interior Cell Direct Lookup (`idx_references_cell_id`):** Interior dungeons and houses do not use R-Trees. All interior references are loaded directly by `cell_id` for instant $O(1)$ lookup upon entering interior doors.
+2. **Interior Cell Index (`idx_references_cell`):** Interior cells do not use the R-Tree. An ordinary SQLite index on `references(cell_id)` supports the engine's interior reference selection; this description makes no latency or complexity claim.
 
 ```sql
 -- R-Tree virtual table for Exterior 3D bounding box spatial queries
