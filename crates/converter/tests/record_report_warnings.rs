@@ -159,7 +159,7 @@ fn localized_loss_fixture(data: &Path) {
     );
 }
 
-/// The replay source keeps usable neighbors and reports its missing localized string key.
+/// The replay source is complete; the test removes this loose bank only after publication.
 fn replay_fixture(data: &Path) {
     plugin(
         data,
@@ -167,6 +167,46 @@ fn replay_fixture(data: &Path) {
         0x81,
         &[],
         &[keyword(0x801, b"ReplayNeighbor\0"), typed_issues()].concat(),
+    );
+    let mut directory = Vec::new();
+    directory.extend(6515u32.to_le_bytes());
+    directory.extend(0u32.to_le_bytes());
+    let text = b"Replay localized name\0";
+    let bank = [
+        1u32.to_le_bytes().as_slice(),
+        &(text.len() as u32).to_le_bytes(),
+        &directory,
+        text,
+    ]
+    .concat();
+    let strings = data.join("Strings");
+    fs::create_dir_all(&strings).unwrap();
+    fs::write(strings.join("Replay_english.strings"), bank).unwrap();
+}
+
+/// Simulate metadata reread after the complete source pack's loose name bank disappears.
+fn remove_replay_strings_after_publication(
+    data: &Path,
+    source: &Path,
+    original: &PipelineReport,
+) {
+    assert!(original.complete, "{:?}", original.warnings);
+    assert!(original.warnings.is_empty(), "{:?}", original.warnings);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(source.join("conversion-manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["complete"], true);
+    assert_eq!(manifest["record_data_complete"], true);
+    assert_eq!(
+        fields(source, 0x806, b"FULL"),
+        [b"Replay localized name\0".to_vec()]
+    );
+    let strings = data.join("Strings/Replay_english.strings");
+    assert!(strings.is_file(), "source resolution requires the loose bank");
+    fs::remove_file(&strings).unwrap();
+    assert!(
+        !strings.exists(),
+        "metadata reread must see the bank as unavailable"
     );
 }
 
@@ -613,7 +653,7 @@ fn legacy_cli_report_json_marks_published_warning_pack_incomplete() {
     incomplete(&report, &output, 2);
 }
 
-/// Reader-switch metadata replay reports issues in unchanged checksum-matched plugin bytes.
+/// Complete source assets survive while metadata reread sees the removed loose name bank.
 #[tokio::test]
 async fn metadata_rebuild_replays_reader_warnings_without_changing_source() {
     let directory = tempfile::tempdir().unwrap();
@@ -622,17 +662,7 @@ async fn metadata_rebuild_replays_reader_warnings_without_changing_source() {
     let output = directory.path().join("derived");
     replay_fixture(&data);
     let original = publish(&data, &source, RecordReader::Legacy).await;
-    let localization = warning(
-        &original,
-        "replay.esm",
-        "legacy reader left 1 localized fields without text",
-    );
-    assert!(localization.contains("00000806"), "{localization}");
-    assert!(
-        localization.contains("missing localized ID 6515"),
-        "{localization}"
-    );
-    incomplete(&original, &source, 1);
+    remove_replay_strings_after_publication(&data, &source, &original);
     let plugin_before = fs::read(data.join("Replay.esm")).unwrap();
     let manifest_before = fs::read(source.join("conversion-manifest.json")).unwrap();
     let database_before = fs::read(source.join("skyrim_world.db")).unwrap();
@@ -648,11 +678,12 @@ async fn metadata_rebuild_replays_reader_warnings_without_changing_source() {
         database_before
     );
     warning(&report, "replay.esm", "in-house reader skipped");
-    warning(&report, "replay.esm", "inhouse adapter reported");
+    let adapter = warning(&report, "replay.esm", "inhouse adapter reported");
+    assert!(adapter.contains("missing localized ID 6515"), "{adapter}");
     incomplete(&report, &output, 2);
 }
 
-/// --reuse-assets uses the same matched replay warning contract and CLI failure status.
+/// --reuse-assets sees unavailable text after publishing a complete, localized source pack.
 #[tokio::test]
 async fn reuse_assets_cli_report_json_replays_reader_warnings() {
     let directory = tempfile::tempdir().unwrap();
@@ -662,17 +693,7 @@ async fn reuse_assets_cli_report_json_replays_reader_warnings() {
     let report_path = directory.path().join("report.json");
     replay_fixture(&data);
     let original = publish(&data, &source, RecordReader::Legacy).await;
-    let localization = warning(
-        &original,
-        "replay.esm",
-        "legacy reader left 1 localized fields without text",
-    );
-    assert!(localization.contains("00000806"), "{localization}");
-    assert!(
-        localization.contains("missing localized ID 6515"),
-        "{localization}"
-    );
-    incomplete(&original, &source, 1);
+    remove_replay_strings_after_publication(&data, &source, &original);
     let run = Command::new(env!("CARGO_BIN_EXE_converter"))
         .arg(&data)
         .arg(&output)
@@ -695,7 +716,8 @@ async fn reuse_assets_cli_report_json_replays_reader_warnings() {
         String::from_utf8_lossy(&run.stderr)
     );
     warning(&report, "replay.esm", "in-house reader skipped");
-    warning(&report, "replay.esm", "inhouse adapter reported");
+    let adapter = warning(&report, "replay.esm", "inhouse adapter reported");
+    assert!(adapter.contains("missing localized ID 6515"), "{adapter}");
     incomplete(&report, &output, 2);
 }
 
