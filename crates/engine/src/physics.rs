@@ -1537,8 +1537,8 @@ fn release_walk_spawn_hold(
                 hold.sampled_ground_y
                     .filter(|ground_y| ground_y.is_finite())
                     .is_none_or(|ground_y| {
-                        (body.translation.y - hit.1 - ground_y).abs()
-                            <= WALK_SPAWN_SURFACE_TOLERANCE
+                        // A loaded bridge or platform above the terrain is valid support too.
+                        body.translation.y - hit.1 >= ground_y - WALK_SPAWN_SURFACE_TOLERANCE
                     })
             })
             .map(|_| {
@@ -2358,6 +2358,34 @@ mod world_startup_tests {
             .y = -10_000.0;
         tick(&mut app, 10);
         assert!(app.world().resource::<WalkSpawnHold>().active);
+        assert_mode(&mut app, MoveMode::Walk);
+    }
+
+    #[test]
+    fn sampled_elevated_start_accepts_loaded_platform_above_terrain() {
+        let mut app = world_app();
+        let entity = body(&mut app);
+        app.world_mut()
+            .get_mut::<Transform>(entity)
+            .unwrap()
+            .translation
+            .y = 5_000.0;
+        app.world_mut()
+            .resource_mut::<WalkSpawnHold>()
+            .sampled_ground_y = Some(0.0);
+        let platform = floor(&mut app, true);
+        app.world_mut()
+            .get_mut::<Transform>(platform)
+            .unwrap()
+            .translation
+            .y = 990.0;
+        tick(&mut app, 5);
+        assert!(app.world().resource::<WalkSpawnHold>().active);
+        app.world_mut()
+            .entity_mut(platform)
+            .remove::<ColliderDisabled>();
+        tick(&mut app, 2);
+        assert!(!app.world().resource::<WalkSpawnHold>().active);
         assert_mode(&mut app, MoveMode::Walk);
     }
 

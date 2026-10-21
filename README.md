@@ -106,7 +106,7 @@ If placement is blocked, or collision does not appear within 30 seconds of fixed
 simulation time, the session falls back to **NOCLIP** and shows the reason in the
 overlay. Press **V** or run **tcl** to cancel a hold, toggle modes, or retry WALK.
 NOCLIP teleports stay camera-only. Ordinary airborne WALK retains its existing
-behavior, and door-crossing movement and hold release remain guarded until recovery.
+behavior, and door-crossing movement and hold release remain guarded through the crossing.
 
 The asset-free `--physics-fixture` still starts in NOCLIP. Automated camera paths
 are unchanged. Full-world validation should check delayed terrain/static collision,
