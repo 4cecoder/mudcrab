@@ -286,7 +286,8 @@ CREATE TABLE IF NOT EXISTS worldspaces (
     parent_world INTEGER,               -- Parent WorldSpace FormID (if child worldspace)
     flags INTEGER NOT NULL,
     lod_origin_x INTEGER,               -- Validated sidecar/explicit origin; NULL if unresolved
-    lod_origin_y INTEGER
+    lod_origin_y INTEGER,
+    full_name TEXT                      -- Display name (FULL, e.g. 'Skyrim'); see "Display names"
 );
 ```
 
@@ -304,9 +305,40 @@ CREATE TABLE IF NOT EXISTS cells (
     grid_y INTEGER,                     -- Exterior cell Grid Y (NULL if interior)
     interior_name TEXT,                 -- Interior cell name (NULL if exterior)
     flags INTEGER NOT NULL,
-    data BLOB                           -- Optional cell binary payload
+    data BLOB,                          -- Optional cell binary payload
+    full_name TEXT                      -- Display name (FULL); see "Display names" below
 );
 ```
+
+#### Display names (`full_name`)
+
+`worldspaces.full_name`, `cells.full_name` and `statics.full_name` hold the record's `FULL`, the
+name the game shows (door prompts, the crosshair label, container menus, the map). `npcs.full_name`
+follows the same rules. `cells.interior_name` is still the cell's Editor ID (`EDID`), not its
+name; it keeps its column name for compatibility.
+
+`FULL` is a localized string. In a plugin with the TES4 `Localized` flag (0x80) it is a four-byte
+ID into `Strings/<plugin>_<language>.STRINGS`, looked up in the configured language's table for the
+plugin that supplied the winning record: a loose `Data/Strings` file first, then the archives.
+English text uses Windows-1252; other languages use UTF-8 with Windows-1252 fallback. Plain plugin
+text uses Windows-1252. Both record readers publish the same UTF-8 text:
+
+- The in-house reader resolves every field its schema types as `lstring`.
+- The legacy reader (`--record-reader legacy`) resolves the subrecords the in-house schema types
+  as `lstring` in every occurrence for that record type, using the same table lookup
+  (`crates/converter/src/esm/legacy_text.rs`). That covers `FULL` on every record type, and
+  `DESC`, `RNAM` and others where the subrecord is unambiguous. This changed the legacy
+  projection, so its reader identity is `projection_version` 4 and includes language/encoding.
+  Version-3 retained proofs are accepted only for their historical English setting; all older
+  metadata rebuilds use the configured language. Retained assets keep their independent proof.
+
+A name whose ID is 0 is the existing null sentinel and is NULL without a loss warning. A nonzero ID
+missing from the table, or a table that cannot be read, leaves NULL and adds one bounded warning
+per plugin with a count and first example. The canonical `records.data` payloads hold the same
+resolved text for both readers.
+
+The columns are additive and optional. They did not bump `shared::WORLD_DATABASE_SCHEMA_VERSION`:
+`create_tables` adds them to an older reused table, and a reader must probe for them.
 
 ---
 
@@ -363,6 +395,7 @@ never renders.
 CREATE TABLE IF NOT EXISTS statics (
     id INTEGER PRIMARY KEY,                    -- base record FormID, load-order numbering
     editor_id TEXT,                            -- EDID
+    full_name TEXT,                            -- FULL, resolved localized text when available
     model_path TEXT,                           -- MODL (ARMO: MOD2, then MOD4); NULL when absent
     flags INTEGER NOT NULL,                    -- record header flags
     bounds_min_x REAL NOT NULL DEFAULT -64, bounds_min_y REAL NOT NULL DEFAULT -64,
