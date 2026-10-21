@@ -538,7 +538,7 @@ mod tests {
             ("32-byte", 22, true),
             ("incomplete-colors", 17, false),
         ];
-        for (index, (name, value_count, complete)) in cases.into_iter().enumerate() {
+        for (index, (name, value_count, _)) in cases.into_iter().enumerate() {
             let cell_id = 100 + index as u32;
             let template_id = 200 + index as u32;
             let weather_id = 300 + index as u32;
