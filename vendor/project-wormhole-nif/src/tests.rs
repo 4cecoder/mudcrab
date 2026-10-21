@@ -130,7 +130,7 @@ pub fn test_all_in_archive() {
 
 mod multi_bound {
     use project_wormhole_ba2::dev::MaxRef;
-    use project_wormhole_shared::glam::{Mat3, Vec3};
+    use project_wormhole_shared::glam::{self, Mat3, Vec3};
 
     use crate::dev::*;
 

@@ -1087,9 +1087,10 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
     use crate::test_strategies::{config, corrupted};
+    use project_wormhole_esm::structs::strings::{SizedString32, StringN};
     use project_wormhole_nif::{
-        dev::{Endianess, NifFileVersion, NifHeader, SizedString32, StringN},
         nif_file::nif_to_static_model,
+        nif_header::{Endianess, NifFileVersion, NifHeader},
     };
     use proptest::prelude::*;
 
