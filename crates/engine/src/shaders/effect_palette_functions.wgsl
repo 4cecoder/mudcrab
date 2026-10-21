@@ -1,5 +1,4 @@
-// The palette lookup shared by the effect palette material's main pass and its prepass, so the
-// depth, shadow and colour passes keep and discard the same fragments.
+// The palette colour lookup shared by the effect palette material's forward and prepass shaders.
 #define_import_path engine::effect_palette
 
 #import bevy_pbr::{
@@ -7,6 +6,7 @@
     pbr_types::STANDARD_MATERIAL_FLAGS_BASE_COLOR_TEXTURE_BIT,
     mesh_view_bindings::view,
 }
+#import bevy_render::color_operations::linear_to_srgb
 
 struct EffectPaletteSettings {
     // x = 1 when the palette gives the colour, y = 1 when it gives the alpha,
@@ -47,4 +47,14 @@ fn effect_alpha(texel: vec4<f32>, tint: vec4<f32>) -> f32 {
         return palette_sample(texel.a, tint.a).a;
     }
     return texel.a * tint.a;
+}
+
+// Match the colour assembled by the forward effect shader before Bevy applies alpha handling.
+fn effect_color(standard_color: vec4<f32>, texel: vec4<f32>, tint: vec4<f32>) -> vec4<f32> {
+    var color = vec4<f32>(standard_color.rgb, effect_alpha(texel, tint));
+    if effect.lookup.x > 0.5 {
+        let grey = linear_to_srgb(texel.rgb).g;
+        color = vec4<f32>(palette_sample(grey, tint.r).rgb, color.a);
+    }
+    return vec4<f32>(color.rgb * effect.lookup.z, color.a);
 }

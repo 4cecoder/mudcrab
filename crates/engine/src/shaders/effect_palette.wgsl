@@ -10,8 +10,7 @@
     pbr_functions::{alpha_discard, main_pass_post_lighting_processing},
     forward_io::{VertexOutput, FragmentOutput},
 }
-#import bevy_render::color_operations::linear_to_srgb
-#import engine::effect_palette::{effect, effect_alpha, palette_sample, source_texel}
+#import engine::effect_palette::{effect_color, source_texel}
 
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
@@ -32,16 +31,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     tint *= in.color;
 #endif
 
-    // Without a palette colour the effect draws its texture times its tint, as the standard
-    // material already computed.
-    var color = vec4<f32>(pbr_input.material.base_color.rgb, effect_alpha(texel, tint));
-    if effect.lookup.x > 0.5 {
-        // The source texture is decoded from sRGB on sampling, but the game looks up the stored
-        // value. The palette itself is decoded once on sampling, like any colour texture.
-        let grey = linear_to_srgb(texel.rgb).g;
-        color = vec4<f32>(palette_sample(grey, tint.r).rgb, color.a);
-    }
-    color = vec4<f32>(color.rgb * effect.lookup.z, color.a);
+    let color = effect_color(pbr_input.material.base_color, texel, tint);
 
     pbr_input.material.base_color = alpha_discard(pbr_input.material, color);
     var out: FragmentOutput;

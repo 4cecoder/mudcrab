@@ -10,17 +10,11 @@
     pbr_types,
     prepass_io,
 }
-#import engine::effect_palette::{effect_alpha, source_texel}
+#import engine::effect_palette::{effect_color, source_texel}
 
 fn palette_alpha_discard(in: prepass_io::VertexOutput) {
 #ifdef MAY_DISCARD
     let alpha_mode = pbr_bindings::material.flags & pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_RESERVED_BITS;
-    // Alpha-to-coverage falls back to a cutoff test in the main pass when MSAA is off, and that is
-    // the only case that reaches this shader with MAY_DISCARD set.
-    if alpha_mode != pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_MASK &&
-            alpha_mode != pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_ALPHA_TO_COVERAGE {
-        return;
-    }
     var texel = vec4<f32>(1.0);
 #ifdef VERTEX_UVS_B
 #ifdef STANDARD_MATERIAL_BASE_COLOR_UV_B
@@ -35,8 +29,23 @@ fn palette_alpha_discard(in: prepass_io::VertexOutput) {
 #ifdef VERTEX_COLORS
     tint *= in.color;
 #endif
-    if effect_alpha(texel, tint) < pbr_bindings::material.alpha_cutoff {
-        discard;
+    // This matches StandardMaterial's base color input while sharing the effect override and
+    // scale with the forward shader. The source texture uses the same transformed mesh UV.
+    let color = effect_color(texel * tint, texel, tint);
+    if alpha_mode == pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_MASK {
+        if color.a < pbr_bindings::material.alpha_cutoff {
+            discard;
+        }
+    } else if alpha_mode == pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_BLEND ||
+            alpha_mode == pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_ADD ||
+            alpha_mode == pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_ALPHA_TO_COVERAGE {
+        if color.a < pbr_prepass_functions::PREMULTIPLIED_ALPHA_CUTOFF {
+            discard;
+        }
+    } else if alpha_mode == pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_PREMULTIPLIED {
+        if all(color < vec4<f32>(pbr_prepass_functions::PREMULTIPLIED_ALPHA_CUTOFF)) {
+            discard;
+        }
     }
 #endif
 }

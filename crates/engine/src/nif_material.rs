@@ -454,6 +454,10 @@ impl GltfExtensionHandler for NativeMaterialHandler {
 }
 
 #[cfg(test)]
+#[path = "nif_material/palette_shader_check.rs"]
+mod palette_shader_check;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::nif_depth::{CAST_SHADOWS, DECAL, DEPTH_TEST, DEPTH_WRITE, DYNAMIC_DECAL};
