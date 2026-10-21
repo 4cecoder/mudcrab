@@ -217,7 +217,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         crate::world::environment::EnvironmentCatalog::open(
             &config.assets_dir.join("skyrim_world.db"),
         )
-        .unwrap_or_default()
+        .unwrap_or_else(|error| {
+            // LogPlugin is installed later, so report this startup failure directly.
+            eprintln!(
+                "warning: environment: cannot open the world database ({error}); using an empty catalog"
+            );
+            Default::default()
+        })
     });
     // The streamed world's merged terrain (#215): the land texture table of this conversion, if it
     // has one. Opening it reads one small file; the arrays and chunks load as they are needed.
