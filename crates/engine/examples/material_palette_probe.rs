@@ -592,10 +592,13 @@ fn render_and_capture(
             probe.missing_palette_failure_seen,
         );
         probe.loader_passed &= passed;
+        let failure_path = probe
+            .missing_palette_failure_seen
+            .then_some(MISSING_PALETTE_TEXTURE_PATH);
         probe.loaded.push(serde_json::json!({
             "case":"missing_palette",
             "recursive_load":if recursive_failed {"failed"} else {"loaded"},
-            "failure_path":probe.missing_palette_failure_seen.then_some(MISSING_PALETTE_TEXTURE_PATH),
+            "failure_path":failure_path,
             "passed":passed
         }));
         for (case, material) in CASES.iter().zip(&loaded) {
