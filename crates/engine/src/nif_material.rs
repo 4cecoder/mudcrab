@@ -456,6 +456,8 @@ impl GltfExtensionHandler for NativeMaterialHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::{pbr::Material, shader::ShaderRef};
+    use std::path::Path;
     use crate::nif_depth::{CAST_SHADOWS, DECAL, DEPTH_TEST, DEPTH_WRITE, DYNAMIC_DECAL};
 
     #[test]
@@ -784,8 +786,17 @@ mod tests {
                     alpha: false,
                 }),
             ),
+            (
+                effect(0xC000_0028, "effect", greyscale.clone()),
+                Some(PaletteLookup {
+                    texture: 2,
+                    color: false,
+                    alpha: true,
+                }),
+            ),
             // The forge glow: an effect with no palette flag.
             (effect(0xC000_0008, "effect", greyscale.clone()), None),
+            (effect(0, "effect", greyscale.clone()), None),
             // Bits 4 and 5 mean other things on a lighting shader.
             (effect(0xC000_0078, "lighting", greyscale.clone()), None),
             (
@@ -802,6 +813,16 @@ mod tests {
             let source = document.materials().next().unwrap();
             assert_eq!(palette_lookup(&source), expected, "{material}");
         }
+    }
+
+    #[test]
+    fn authored_depth_wrapper_keeps_palette_shadow_fragment_shader() {
+        let shader = <EffectPaletteDepthMaterial as Material>::prepass_fragment_shader();
+        assert!(matches!(
+            shader,
+            ShaderRef::Path(path)
+                if path.path() == Path::new("embedded://engine/shaders/effect_palette_prepass.wgsl")
+        ));
     }
 
     #[test]

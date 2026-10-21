@@ -1,10 +1,11 @@
 //! Converter → Bevy glTF loader → GPU effect palette check. No Skyrim assets required.
 //! --output <directory> [--interior] [--standard-material] (negative control).
 //!
-//! Also checks that a palette material counts its palette image as a dependency: with the palette
-//! file missing, the material's recursive load must fail rather than finish. The decal cases draw
+//! Also checks that a palette material counts its palette image as a dependency: the recursive
+//! load must fail with an Image error for the exact missing palette path. The decal cases draw
 //! through the depth override's wrapper (`/nif_palette_depth`) and must match the same references.
 use bevy::{
+    asset::AssetLoadFailedEvent,
     camera::{RenderTarget, ScalingMode},
     core_pipeline::tonemapping::DebandDither,
     prelude::*,
@@ -32,12 +33,13 @@ use engine::{
     },
 };
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 const PALETTE_COLOR: u32 = 1 << 4;
 const PALETTE_ALPHA: u32 = 1 << 5;
+const MISSING_PALETTE_TEXTURE_PATH: &str = "textures/missing_palette.dds";
 /// A depth-tested decal: an authored depth override, so the palette draws through its wrapper.
 const DEPTH_DECAL: u32 = DEPTH_TEST | DECAL;
 /// 4×4 palette. Red rises and alpha falls along U, green rises along V, so a wrong coordinate
@@ -245,6 +247,7 @@ struct Probe {
     requested: bool,
     loaded: Vec<serde_json::Value>,
     loader_passed: bool,
+    missing_palette_failure_seen: bool,
 }
 
 fn write_texture(
@@ -341,6 +344,40 @@ fn write_gltf(path: PathBuf, contract: &[NifShapeMaterial]) {
     std::fs::write(path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
 }
 
+fn is_missing_palette_failure_path(path: &Path) -> bool {
+    path == Path::new(MISSING_PALETTE_TEXTURE_PATH)
+}
+
+fn missing_palette_negative_control_passed(
+    recursive_failed: bool,
+    expected_image_failure_seen: bool,
+) -> bool {
+    recursive_failed && expected_image_failure_seen
+}
+
+#[cfg(test)]
+mod missing_palette_failure_tests {
+    use super::*;
+
+    #[test]
+    fn negative_control_requires_the_named_palette_image_failure() {
+        let expected = Path::new(MISSING_PALETTE_TEXTURE_PATH);
+        let unrelated = Path::new("textures/missing_normal.dds");
+
+        let expected_failure = is_missing_palette_failure_path(expected);
+        assert!(missing_palette_negative_control_passed(true, expected_failure));
+
+        let unrelated_dependency_failure = is_missing_palette_failure_path(unrelated);
+        assert!(!missing_palette_negative_control_passed(true, unrelated_dependency_failure));
+
+        // A malformed parent glTF can fail recursively without an Image failure event.
+        assert!(!missing_palette_negative_control_passed(true, false));
+
+        // A successfully loaded parent and dependencies do not satisfy a negative control.
+        assert!(!missing_palette_negative_control_passed(false, false));
+    }
+}
+
 fn fixtures(output: &std::path::Path) -> PathBuf {
     let assets = output.join("fixtures");
     let textures = assets.join("textures");
@@ -377,7 +414,7 @@ fn fixtures(output: &std::path::Path) -> PathBuf {
         &[effect_material(
             0,
             &CASES[0],
-            "textures/missing_palette.dds",
+            MISSING_PALETTE_TEXTURE_PATH,
         )],
     );
     assets
@@ -484,6 +521,7 @@ fn main() {
             requested: false,
             loaded: vec![],
             loader_passed: true,
+            missing_palette_failure_seen: false,
         })
         .add_systems(Update, render_and_capture)
         .run();
@@ -502,8 +540,12 @@ fn render_and_capture(
     mut meshes: ResMut<Assets<Mesh>>,
     images: Res<Assets<Image>>,
     server: Res<AssetServer>,
+    mut image_failures: MessageReader<AssetLoadFailedEvent<Image>>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    probe.missing_palette_failure_seen |= image_failures
+        .read()
+        .any(|failure| is_missing_palette_failure_path(failure.path.path()));
     if probe.started.elapsed() > Duration::from_secs(90) {
         eprintln!("material load/render timed out");
         exit.write(AppExit::error());
@@ -538,15 +580,22 @@ fn render_and_capture(
         }
         use bevy::asset::RecursiveDependencyLoadState;
         let missing = server.get_recursive_dependency_load_state(&probe.missing_palette);
-        if !matches!(
-            missing,
-            Some(RecursiveDependencyLoadState::Loaded | RecursiveDependencyLoadState::Failed(_))
-        ) {
+        let recursive_failed = matches!(missing, Some(RecursiveDependencyLoadState::Failed(_)));
+        let recursive_loaded = matches!(missing, Some(RecursiveDependencyLoadState::Loaded));
+        if !recursive_failed && !recursive_loaded {
             return;
         }
-        let failed = matches!(missing, Some(RecursiveDependencyLoadState::Failed(_)));
-        probe.loader_passed &= failed;
-        probe.loaded.push(serde_json::json!({"case":"missing_palette","recursive_load":if failed {"failed"} else {"loaded"},"passed":failed}));
+        let passed = missing_palette_negative_control_passed(
+            recursive_failed,
+            probe.missing_palette_failure_seen,
+        );
+        probe.loader_passed &= passed;
+        probe.loaded.push(serde_json::json!({
+            "case":"missing_palette",
+            "recursive_load":if recursive_failed {"failed"} else {"loaded"},
+            "failure_path":probe.missing_palette_failure_seen.then_some(MISSING_PALETTE_TEXTURE_PATH),
+            "passed":passed
+        }));
         for (case, material) in CASES.iter().zip(&loaded) {
             let format = format!(
                 "{:?}",
