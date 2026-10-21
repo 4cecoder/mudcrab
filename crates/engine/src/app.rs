@@ -170,6 +170,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             AssetCatalog::open(&database_path)?,
             CellCache::open(&config.assets_dir.join("cell_cache.rkyv"))?,
             InitialCameraGroundHeight(0.0),
+            None,
         ))
     } else if config.benchmark_only
         || config.material_fixture
@@ -184,6 +185,16 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         let database_path = config.assets_dir.join("skyrim_world.db");
         let cache = CellCache::open(&config.assets_dir.join("cell_cache.rkyv"))?;
         let ground_height = initial_camera_ground_height(&config, &database_path, &cache)?;
+        let spawn_ground_height = if interactive_world_physics {
+            initial_walk_ground_height(
+                &config,
+                &database_path,
+                &cache,
+                start_camera.as_ref().map(|pose| &pose.shot),
+            )?
+        } else {
+            None
+        };
         if let Some(plan) = &route {
             route_ground = Some(RouteGround::load(
                 plan,
@@ -197,6 +208,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             AssetCatalog::open(&database_path)?,
             cache,
             InitialCameraGroundHeight(ground_height),
+            spawn_ground_height,
         ))
     };
     // The streamed world's merged terrain (#215): the land texture table of this conversion, if it
@@ -362,11 +374,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         app.init_resource::<StreamingBenchmarkRoute>()
             .add_systems(PreUpdate, drive_streaming_benchmark_route);
     }
-    if let Some((database, catalog, cache, ground_height)) = runtime_data {
+    if let Some((database, catalog, cache, ground_height, spawn_ground_height)) = runtime_data {
         app.insert_resource(database)
             .insert_resource(catalog)
             .insert_resource(cache)
             .insert_resource(ground_height)
+            .insert_resource(crate::physics::WalkSpawnGroundHeight(spawn_ground_height))
             .add_plugins(StreamingPlugin);
         if let (Some(plan), Some(ground)) = (route, route_ground) {
             info!(
@@ -2330,6 +2343,57 @@ fn initial_camera_ground_height(
         cache,
     )?
     .unwrap_or(0.0))
+}
+
+/// Sample finite local terrain below the actual startup camera pose, if available.
+fn initial_walk_ground_height(
+    config: &EngineConfig,
+    database_path: &std::path::Path,
+    cache: &CellCache,
+    shot: Option<&crate::shots::Shot>,
+) -> Result<Option<f32>> {
+    let sample_position = shot.map_or_else(
+        || {
+            Vec2::new(
+                (config.start_grid.0 as f32 + 0.5) * crate::world::components::CELL_SIZE,
+                (config.start_grid.1 as f32 + 0.5) * crate::world::components::CELL_SIZE,
+            )
+        },
+        |shot| Vec2::new(shot.position[0], shot.position[1]),
+    );
+    if !sample_position.is_finite()
+        || (sample_position.x / crate::world::components::CELL_SIZE).floor() as i32
+            != config.start_grid.0
+        || (sample_position.y / crate::world::components::CELL_SIZE).floor() as i32
+            != config.start_grid.1
+    {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .wrap_err_with(|| format!("failed to open {}", database_path.display()))?;
+    let cell_id = connection
+        .query_row(
+            crate::world::database::EXTERIOR_CELL_ID_SQL,
+            params![
+                config.worldspace_id,
+                config.start_grid.0,
+                config.start_grid.1
+            ],
+            |row| row.get::<_, u32>(0),
+        )
+        .optional()?;
+    let Some(terrain) = cell_id.and_then(|cell_id| cache.terrain(cell_id)) else {
+        return Ok(None);
+    };
+    if usize::from(terrain.width) != 33
+        || usize::from(terrain.height) != 33
+        || terrain.heights.iter().any(|height| !height.is_finite())
+    {
+        return Ok(None);
+    }
+    let height =
+        RouteGround::from_cells([(config.start_grid, terrain.heights)]).height_at(sample_position);
+    Ok(height.filter(|height| height.is_finite()))
 }
 
 /// The terrain height at the middle of one exterior cell, or `None` when the cell has no terrain
@@ -4810,6 +4874,70 @@ mod tests {
 
         let ground_height = initial_camera_ground_height(&config, &database_path, &cache).unwrap();
         assert_eq!(ground_height, 4.0);
+    }
+
+    #[test]
+    fn walk_spawn_ground_query_interpolates_at_authored_shot_xy() {
+        let database_directory = tempfile::tempdir().unwrap();
+        let database_path = database_directory.path().join("skyrim_world.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
+                 CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
+                 INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(42,7,0,0);
+                 INSERT INTO land(cell_id) VALUES(42);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let cache_directory = tempfile::tempdir().unwrap();
+        let cache_path = cache_directory.path().join("cell_cache.rkyv");
+        let heights = (0..33)
+            .flat_map(|y| (0..33).map(move |x| (x + y) as f32))
+            .collect();
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: vec![shared::CachedLand {
+                cell_id: 42,
+                width: 33,
+                height: 33,
+                heights,
+                normals: vec![0; 33 * 33 * 3],
+                vertex_colors: vec![255; 33 * 33 * 3],
+                layers: vec![],
+                water_height: None,
+                water_type_form_id: None,
+            }],
+        })
+        .unwrap();
+        std::fs::write(&cache_path, bytes).unwrap();
+        let cache = CellCache::open(&cache_path).unwrap();
+        let config = EngineConfig {
+            worldspace_id: 7,
+            start_grid: (0, 0),
+            ..default()
+        };
+        let shot = crate::shots::Shot {
+            name: "elevated".to_owned(),
+            worldspace_id: Some(7),
+            interior_cell_id: None,
+            position: [
+                crate::world::components::CELL_SIZE * 0.25,
+                crate::world::components::CELL_SIZE * 0.75,
+                5_000.0,
+            ],
+            yaw: 123.0,
+            pitch: -17.0,
+            hfov: 60.0,
+            reference: None,
+            note: None,
+        };
+
+        assert_eq!(
+            initial_walk_ground_height(&config, &database_path, &cache, Some(&shot)).unwrap(),
+            Some(32.0)
+        );
     }
 
     #[test]
