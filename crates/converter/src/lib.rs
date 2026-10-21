@@ -18,8 +18,13 @@ pub mod progress;
 pub mod records;
 pub mod repair;
 pub mod script;
+pub mod streaming_costs;
+pub mod terrain_arrays;
+pub mod terrain_chunks;
+pub mod terrain_pipeline;
 pub mod texture;
 pub mod texture_gpu;
+mod texture_ktx2;
 
 #[cfg(test)]
 mod test_strategies;
