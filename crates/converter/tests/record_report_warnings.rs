@@ -121,7 +121,7 @@ fn malformed_fixture(data: &Path) {
     plugin(data, "Broken.esm", 0x81, &[], &body);
 }
 
-/// Localized names with one missing key and one valid null sentinel retain a clean neighbor.
+/// A missing name bank and one valid null sentinel retain a clean neighbor.
 fn localized_loss_fixture(data: &Path) {
     let localized = |id| {
         record(
@@ -468,7 +468,7 @@ async fn legacy_malformed_frames_warn_once_and_publish_neighbors() {
     );
     assert!(localization.contains("00000806"), "{localization}");
     assert!(
-        localization.contains("missing localized ID 6515"),
+        localization.contains("FULL ID 6515: unreadable strings table"),
         "{localization}"
     );
     incomplete(&report, &output, 2);
@@ -561,7 +561,7 @@ async fn inhouse_decoder_and_adapter_summaries_reach_report() {
     incomplete(&report, &output, 2);
 }
 
-/// Missing legacy string keys reach report and manifest; ID zero stays a valid null sentinel.
+/// Missing required string banks reach report and manifest; ID zero stays a valid null sentinel.
 #[tokio::test]
 async fn missing_localized_text_marks_both_readers_incomplete_without_losing_neighbors() {
     let directory = tempfile::tempdir().unwrap();
@@ -574,9 +574,13 @@ async fn missing_localized_text_marks_both_readers_incomplete_without_losing_nei
         let output = directory.path().join(name);
         let report = publish(&data, &output, reader).await;
         assert_eq!(record_ids(&output), [0x801, 0x806, 0x807]);
+        let expected = match reader {
+            RecordReader::Legacy => "FULL ID 17: unreadable strings table",
+            RecordReader::Inhouse => "missing localized ID 17",
+        };
         assert!(
             report.warnings.iter().any(|line| {
-                line.contains("lost.esm") && line.contains("missing localized ID 17")
+                line.contains("lost.esm") && line.contains(expected)
             }),
             "{:?}",
             report.warnings
@@ -653,7 +657,7 @@ fn legacy_cli_report_json_marks_published_warning_pack_incomplete() {
     );
     assert!(localization.contains("00000806"), "{localization}");
     assert!(
-        localization.contains("missing localized ID 6515"),
+        localization.contains("FULL ID 6515: unreadable strings table"),
         "{localization}"
     );
     incomplete(&report, &output, 2);
