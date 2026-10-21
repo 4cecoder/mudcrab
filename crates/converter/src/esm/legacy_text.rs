@@ -25,6 +25,8 @@ const LOCALIZED: u32 = 0x80;
 /// Fields left without text, by record, as the exporter's runtime projection expects them.
 pub(crate) type UnresolvedFields = HashMap<u32, BTreeSet<usize>>;
 
+type LoadedStringTable = (Option<HashMap<u32, String>>, Option<String>);
+
 /// Resolve every localized string field of the winning `records` in place, returning fields
 /// without text and bounded warnings for actual localization loss.
 pub(crate) fn resolve_localized_fields(
@@ -33,8 +35,7 @@ pub(crate) fn resolve_localized_fields(
     order: &LoadOrder,
     sources: StringSources<'_>,
 ) -> (UnresolvedFields, Vec<String>) {
-    let mut tables: HashMap<(usize, &'static str), (Option<HashMap<u32, String>>, Option<String>)> =
-        HashMap::new();
+    let mut tables: HashMap<(usize, &'static str), LoadedStringTable> = HashMap::new();
     let mut unresolved = UnresolvedFields::new();
     let mut misses: BTreeMap<usize, (usize, String)> = BTreeMap::new();
     let mut record_ids = records.keys().copied().collect::<Vec<_>>();
