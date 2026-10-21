@@ -39,7 +39,8 @@ use std::{
 
 const PALETTE_COLOR: u32 = 1 << 4;
 const PALETTE_ALPHA: u32 = 1 << 5;
-const MISSING_PALETTE_TEXTURE_PATH: &str = "textures/missing_palette.dds";
+const MISSING_PALETTE_SOURCE_TEXTURE_PATH: &str = "textures/missing_palette.dds";
+const MISSING_PALETTE_RUNTIME_TEXTURE_PATH: &str = "textures/missing_palette.ktx2";
 /// A depth-tested decal: an authored depth override, so the palette draws through its wrapper.
 const DEPTH_DECAL: u32 = DEPTH_TEST | DECAL;
 /// 4×4 palette. Red rises and alpha falls along U, green rises along V, so a wrong coordinate
@@ -345,7 +346,7 @@ fn write_gltf(path: PathBuf, contract: &[NifShapeMaterial]) {
 }
 
 fn is_missing_palette_failure_path(path: &Path) -> bool {
-    path == Path::new(MISSING_PALETTE_TEXTURE_PATH)
+    path == Path::new(MISSING_PALETTE_RUNTIME_TEXTURE_PATH)
 }
 
 fn missing_palette_negative_control_passed(
@@ -360,27 +361,81 @@ mod missing_palette_failure_tests {
     use super::*;
 
     #[test]
-    fn negative_control_requires_the_named_palette_image_failure() {
-        let expected = Path::new(MISSING_PALETTE_TEXTURE_PATH);
-        let unrelated = Path::new("textures/missing_normal.dds");
+    fn converter_published_palette_uri_matches_only_its_image_failure() {
+        let material = effect_material(
+            0,
+            &CASES[0],
+            MISSING_PALETTE_SOURCE_TEXTURE_PATH,
+        );
+        let NifMaterialDisposition::Validated {
+            material: validated,
+        } = &material.disposition
+        else {
+            panic!("palette fixture must have a validated material");
+        };
+        assert_eq!(
+            validated
+                .textures
+                .iter()
+                .find(|slot| slot.semantic == NifTextureSemantic::Greyscale)
+                .unwrap()
+                .path,
+            MISSING_PALETTE_SOURCE_TEXTURE_PATH
+        );
 
-        let expected_failure = is_missing_palette_failure_path(expected);
+        let mut document = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "meshes": [{"primitives": [{}]}]
+        });
+        publish_gltf_materials(
+            &mut document,
+            &[material],
+            &[0],
+            Path::new("materials.glb"),
+        )
+        .unwrap();
+
+        let texture_slots = document["materials"][0]["extensions"]["OPEN_SKYRIM_material"]
+            ["textureSlots"]
+            .as_array()
+            .unwrap();
+        let greyscale_texture_index = texture_slots
+            .iter()
+            .find(|slot| slot["semantic"] == "greyscale")
+            .unwrap()["texture"]
+            .as_u64()
+            .unwrap() as usize;
+        let image_index = document["textures"][greyscale_texture_index]["source"]
+            .as_u64()
+            .unwrap() as usize;
+        let published_uri = document["images"][image_index]["uri"]
+            .as_str()
+            .unwrap();
+
+        assert_eq!(published_uri, MISSING_PALETTE_RUNTIME_TEXTURE_PATH);
+        let expected_failure = is_missing_palette_failure_path(Path::new(published_uri));
         assert!(missing_palette_negative_control_passed(
             true,
             expected_failure
         ));
 
-        let unrelated_dependency_failure = is_missing_palette_failure_path(unrelated);
+        let source_dds_failure = is_missing_palette_failure_path(Path::new(
+            MISSING_PALETTE_SOURCE_TEXTURE_PATH,
+        ));
+        assert!(!missing_palette_negative_control_passed(true, source_dds_failure));
+
+        let unrelated_runtime_failure =
+            is_missing_palette_failure_path(Path::new("textures/missing_normal.ktx2"));
         assert!(!missing_palette_negative_control_passed(
             true,
-            unrelated_dependency_failure
+            unrelated_runtime_failure
         ));
 
         // A malformed parent glTF can fail recursively without an Image failure event.
         assert!(!missing_palette_negative_control_passed(true, false));
 
-        // A successfully loaded parent and dependencies do not satisfy a negative control.
-        assert!(!missing_palette_negative_control_passed(false, false));
+        // A successful parent must fail the negative control even if a stale event was seen.
+        assert!(!missing_palette_negative_control_passed(false, expected_failure));
     }
 }
 
@@ -417,7 +472,7 @@ fn fixtures(output: &std::path::Path) -> PathBuf {
     // No such palette file: the material must not count as loaded with its dependencies.
     write_gltf(
         assets.join("missing_palette.gltf"),
-        &[effect_material(0, &CASES[0], MISSING_PALETTE_TEXTURE_PATH)],
+        &[effect_material(0, &CASES[0], MISSING_PALETTE_SOURCE_TEXTURE_PATH)],
     );
     assets
 }
@@ -594,7 +649,7 @@ fn render_and_capture(
         probe.loader_passed &= passed;
         let failure_path = probe
             .missing_palette_failure_seen
-            .then_some(MISSING_PALETTE_TEXTURE_PATH);
+            .then_some(MISSING_PALETTE_RUNTIME_TEXTURE_PATH);
         probe.loaded.push(serde_json::json!({
             "case":"missing_palette",
             "recursive_load":if recursive_failed {"failed"} else {"loaded"},
