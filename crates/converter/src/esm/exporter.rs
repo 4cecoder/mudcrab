@@ -287,6 +287,10 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
 
     // Optional environment, weather and image-space tables (db-schema.md, #269 gaps 1 and 2).
     conn.execute_batch(&crate::esm::environment::tables_sql())?;
+
+    // Optional reference link and detail tables (db-schema.md, #269 gap 3).
+    conn.execute_batch(crate::esm::reference_links::REFERENCE_LINK_TABLES_SQL)?;
+
     // Optional load-door table (db-schema.md section 17), added the same way.
     super::doors::ensure_table(conn)?;
     // `CREATE TABLE IF NOT EXISTS` leaves a reused older table as it was; give it the columns
@@ -477,7 +481,10 @@ fn replace_complete_snapshot(tx: &Transaction<'_>) -> Result<()> {
         DROP TABLE IF EXISTS lod_build;
         DROP TABLE IF EXISTS lod;"#,
     )?;
-    for table in crate::esm::environment::ENVIRONMENT_TABLES {
+    for table in crate::esm::environment::ENVIRONMENT_TABLES
+        .iter()
+        .chain(crate::esm::reference_links::REFERENCE_LINK_TABLES.iter())
+    {
         tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
     }
     create_tables(tx)?;
@@ -746,6 +753,12 @@ fn export_records(
                     record.flags,
                     &record.subrecords,
                     &canonical_record.subrecords,
+                )?;
+                crate::esm::reference_links::insert(
+                    &tx,
+                    &crate::esm::reference_links::Context { master, order },
+                    record,
+                    &SubrecordView::new(&record.subrecords),
                 )?;
             }
             "LAND" => {
