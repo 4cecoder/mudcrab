@@ -3449,6 +3449,7 @@ fn toggle_collision_geometry_command() -> ConsoleCommand {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Bevy system parameters are supplied independently.
 fn overlay_system(
     mode: Res<MoveMode>,
     hold: Option<Res<WalkSpawnHold>>,
