@@ -1555,7 +1555,7 @@ fn release_walk_spawn_hold(
         }
     }
     *hold = WalkSpawnHold::default();
-    reset.clear();
+    reset.clear_input();
 }
 
 /// Marker for the player body entity (V9).
