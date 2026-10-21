@@ -46,6 +46,8 @@ plugins="/absolute/path/to/plugins.txt"
 out="$storage/scratch/reader-diff-pr280"
 report="$storage/evidence/reader-diff-pr280.json"
 
+# Choose a new output root. The command atomically creates it before either reader writes;
+# an existing path is refused without changing its contents.
 python3 scripts/workspace.py cargo --isolated reader-diff-pr280 run --locked --release \
   -p converter --bin reader-diff -- \
   build "$data" "$plugins" "$out" --json "$report"

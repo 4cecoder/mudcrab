@@ -3,7 +3,7 @@
 //! gate. See `docs/research/record-reader-divergence.md`.
 
 use converter::reader_diff::{Options, Report, compare};
-use std::{fs, path::Path};
+use std::{fs, path::Path, process::Command};
 
 const TEXT: u32 = 0x0800;
 const OUT_OF_ORDER: u32 = 0x0801;
@@ -232,7 +232,7 @@ fn strings_table(entries: &[(u32, &[u8])]) -> Vec<u8> {
     bytes
 }
 
-fn build(root: &Path) -> Report {
+fn write_inputs(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let data = root.join("Data");
     fs::create_dir_all(data.join("Strings")).unwrap();
     fs::write(data.join("Skyrim.esm"), master_plugin()).unwrap();
@@ -245,6 +245,11 @@ fn build(root: &Path) -> Report {
     .unwrap();
     let plugins = root.join("plugins.txt");
     fs::write(&plugins, "*Other.esm\n*Mod.esp\n").unwrap();
+    (data, plugins)
+}
+
+fn build(root: &Path) -> Report {
+    let (data, plugins) = write_inputs(root);
     let paths = converter::esm::read_plugins_txt(&plugins, &data).unwrap();
     assert_eq!(
         paths
@@ -333,4 +338,66 @@ fn reader_differences_are_reported_without_untyped_causal_labels() {
         report.tables["statics"].columns["model_path"].samples[0].legacy,
         "\"mod_chest.nif\""
     );
+}
+
+#[test]
+fn build_refuses_existing_output_root_before_either_writer_runs() {
+    let root = tempfile::tempdir().unwrap();
+    let (data, plugins) = write_inputs(root.path());
+    let output = root.path().join("existing-output");
+    let legacy = output.join("legacy/skyrim_world.db");
+    let inhouse_marker = output.join("inhouse/keep.txt");
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::create_dir_all(inhouse_marker.parent().unwrap()).unwrap();
+    fs::write(&legacy, b"legacy database that must not change").unwrap();
+    fs::write(&inhouse_marker, b"existing in-house output").unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_reader-diff"))
+        .arg("build")
+        .arg(&data)
+        .arg(&plugins)
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("the root must not already exist"));
+    assert!(!stderr.contains("legacy reader:"));
+    assert_eq!(
+        fs::read(&legacy).unwrap(),
+        b"legacy database that must not change"
+    );
+    assert_eq!(
+        fs::read(&inhouse_marker).unwrap(),
+        b"existing in-house output"
+    );
+}
+
+#[test]
+fn build_creates_fresh_output_root_and_writes_both_synthetic_databases() {
+    let root = tempfile::tempdir().unwrap();
+    let (data, plugins) = write_inputs(root.path());
+    let output = root.path().join("new-output");
+    let report = root.path().join("reader-diff-report.json");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_reader-diff"))
+        .arg("build")
+        .arg(&data)
+        .arg(&plugins)
+        .arg(&output)
+        .arg("--json")
+        .arg(&report)
+        .output()
+        .unwrap();
+
+    assert!(
+        result.status.success(),
+        "reader-diff build failed:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.join("legacy/skyrim_world.db").is_file());
+    assert!(output.join("inhouse/skyrim_world.db").is_file());
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+    assert!(report.get("records").is_some());
 }

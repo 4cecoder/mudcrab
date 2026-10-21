@@ -2,16 +2,23 @@
 //! not verified; see `docs/research/record-reader-divergence.md`.
 //!
 //! ```text
-//! reader-diff compare <legacy skyrim_world.db> <in-house skyrim_world.db> [--json FILE] [--samples N]
-//! reader-diff build <Data dir> <plugins.txt> <empty output dir> [--json FILE] [--samples N]
+//! reader-diff compare LEGACY_DB INHOUSE_DB [--json FILE] [--samples N]
+//! reader-diff build DATA_DIR PLUGINS_TXT NEW_OUTPUT_ROOT [--json FILE] [--samples N]
 //! ```
 //!
-//! `build` writes `legacy/skyrim_world.db` (records only) and `inhouse/` (the in-house record
-//! bundle, no asset conversion) under the output directory, then compares them. The result is a
+//! `build` atomically creates a new output root before either writer runs. The root must not
+//! already exist. It writes `legacy/skyrim_world.db` (records only) and `inhouse/` (the in-house
+//! record bundle, no asset conversion) under that root, then compares them. The result is a
 //! diagnostic, not a reader correctness or source-completeness result.
-use color_eyre::{Result, eyre::bail};
+use color_eyre::{
+    Result,
+    eyre::{WrapErr, bail},
+};
 use converter::reader_diff::{Options, compare, summary};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -40,7 +47,8 @@ fn main() -> Result<()> {
                 PathBuf::from(plugins),
                 PathBuf::from(output),
             );
-            fs::create_dir_all(output.join("legacy"))?;
+            create_new_output_root(&output)?;
+            fs::create_dir(output.join("legacy"))?;
             let legacy = output.join("legacy").join("skyrim_world.db");
             let paths = converter::esm::read_plugins_txt(&plugins, &data)?;
             eprintln!("legacy reader: {} plugins", paths.len());
@@ -54,7 +62,7 @@ fn main() -> Result<()> {
             (legacy, output.join("inhouse").join("skyrim_world.db"))
         }
         _ => bail!(
-            "usage: reader-diff compare <legacy.db> <inhouse.db> | build <Data> <plugins.txt> <out> [--json FILE] [--samples N]"
+            "usage: reader-diff compare LEGACY_DB INHOUSE_DB | build DATA_DIR PLUGINS_TXT NEW_OUTPUT_ROOT [--json FILE] [--samples N]"
         ),
     };
     let report = compare(&legacy, &inhouse, &options)?;
@@ -62,5 +70,21 @@ fn main() -> Result<()> {
     if let Some(path) = json {
         fs::write(path, serde_json::to_vec_pretty(&report)?)?;
     }
+    Ok(())
+}
+
+fn create_new_output_root(output: &Path) -> Result<()> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .wrap_err_with(|| format!("creating output parent {}", parent.display()))?;
+    fs::create_dir(output).wrap_err_with(|| {
+        format!(
+            "creating fresh output root {} (the root must not already exist)",
+            output.display()
+        )
+    })?;
     Ok(())
 }
