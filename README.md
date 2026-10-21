@@ -98,13 +98,15 @@ Choose **Skyrim Data** to convert the physical Data folder, or **MO2 profile** t
 ### Interactive player startup
 
 Interactive world sessions start in first-person **WALK** with the player capsule
-active. During initial collision streaming, movement and gravity wait for a
-nearby Rapier world-collision hit below the player, followed by the usual safe capsule
-placement check. If placement is blocked, or no collision appears within 30
-seconds of fixed simulation time, the session falls back to **NOCLIP** and shows
-the reason in the overlay. Press **V** or run **tcl** to toggle modes or retry WALK.
-Toggling or teleporting cancels the one-time startup hold. Ordinary airborne WALK
-and subsequent toggles retain their existing behavior.
+active. During startup and WALK teleports, movement and gravity wait for an enabled
+Rapier world-collision hit, followed by the usual safe capsule placement check. A
+validated local terrain sample bounds the startup query for elevated `--start-shot`
+poses and sampled `coe`/`coc` destinations; it does not prove collision is loaded.
+If placement is blocked, or collision does not appear within 30 seconds of fixed
+simulation time, the session falls back to **NOCLIP** and shows the reason in the
+overlay. Press **V** or run **tcl** to cancel a hold, toggle modes, or retry WALK.
+NOCLIP teleports stay camera-only. Ordinary airborne WALK retains its existing
+behavior, and door-crossing movement and hold release remain guarded until recovery.
 
 The asset-free `--physics-fixture` still starts in NOCLIP. Automated camera paths
 are unchanged. Full-world validation should check delayed terrain/static collision,

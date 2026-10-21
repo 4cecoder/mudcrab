@@ -571,7 +571,7 @@ impl Plugin for PlayerControlsPlugin {
             )
             .add_systems(
                 FixedUpdate,
-                // Both startup release and movement pause while the destination is unloaded or
+                // Both hold release and movement pause while the destination is unloaded or
                 // gameplay input belongs to the console/settings menu.
                 (release_walk_spawn_hold, walk_movement_system)
                     .chain()
@@ -1484,15 +1484,23 @@ pub struct WalkEntryStatus {
     pub blocked_reason: Option<String>,
 }
 
-/// One-time protection while startup world collision reaches Rapier. A failed
+/// Bounded startup and destination protection while world collision reaches Rapier. A failed
 /// load must leave debug flight available rather than freeze the player forever.
 #[derive(Debug, Default, Resource)]
 pub struct WalkSpawnHold {
     active: bool,
     elapsed: f32,
+    sampled_ground_y: Option<f32>,
+    destination: bool,
 }
 
+/// Validated local terrain height for the initial interactive player pose.
+#[derive(Debug, Default, Resource)]
+pub struct WalkSpawnGroundHeight(pub Option<f32>);
+
 const WALK_SPAWN_TIMEOUT_SECONDS: f32 = 30.0;
+const WALK_SPAWN_MAX_PROBE_DISTANCE: f32 = 65_536.0;
+const WALK_SPAWN_SURFACE_TOLERANCE: f32 = 64.0;
 
 /// Read actual Rapier collision, not render/streaming completion counters. Run
 /// before movement; colliders enabled by Update reach Rapier on a later tick.
@@ -1514,17 +1522,25 @@ fn release_walk_spawn_hold(
     let Ok((entity, mut body, collider)) = player.single_mut() else {
         return;
     };
+    let probe_distance =
+        walk_spawn_probe_distance(body.translation.y, hold.sampled_ground_y, tuning);
     let placement = context.single().ok().and_then(|context| {
         context
             .cast_ray(
                 body.translation,
                 Vec3::NEG_Y,
-                // Startup is normally just above sampled terrain. A distant
-                // cave floor must not stand in for missing local collision.
-                tuning.capsule_standing_height * 2.0,
+                probe_distance,
                 true,
                 QueryFilter::default().groups(CollisionGroups::new(GROUP_PLAYER, GROUP_WORLD)),
             )
+            .filter(|hit| {
+                hold.sampled_ground_y
+                    .filter(|ground_y| ground_y.is_finite())
+                    .is_none_or(|ground_y| {
+                        (body.translation.y - hit.1 - ground_y).abs()
+                            <= WALK_SPAWN_SURFACE_TOLERANCE
+                    })
+            })
             .map(|_| {
                 try_enter_walk(
                     &context,
@@ -1536,10 +1552,13 @@ fn release_walk_spawn_hold(
     });
     let result = match placement {
         Some(result) => result,
-        None if hold.elapsed >= WALK_SPAWN_TIMEOUT_SECONDS => Err(
+        None if hold.elapsed >= WALK_SPAWN_TIMEOUT_SECONDS => Err(if hold.destination {
+            "WALK destination collision unavailable after 30 seconds; use V or tcl to retry WALK"
+                .into()
+        } else {
             "startup world collision unavailable after 30 seconds; use V or tcl to retry WALK"
-                .into(),
-        ),
+                .into()
+        }),
         None => return,
     };
     match result {
@@ -1550,12 +1569,28 @@ fn release_walk_spawn_hold(
         Err(reason) => {
             commands.entity(entity).insert(RigidBodyDisabled);
             *mode = MoveMode::Noclip;
-            warn!("WALK startup fallback: {reason}");
+            warn!("WALK collision fallback: {reason}");
             status.blocked_reason = Some(reason);
         }
     }
     *hold = WalkSpawnHold::default();
     reset.clear_input();
+}
+
+fn walk_spawn_probe_distance(
+    body_y: f32,
+    sampled_ground_y: Option<f32>,
+    tuning: &MovementTuning,
+) -> f32 {
+    let fallback = tuning.capsule_standing_height * 2.0;
+    let Some(ground_y) = sampled_ground_y.filter(|height| height.is_finite()) else {
+        return fallback;
+    };
+    let distance_to_ground = body_y - ground_y;
+    if !distance_to_ground.is_finite() || distance_to_ground < 0.0 {
+        return 0.0;
+    }
+    (distance_to_ground + WALK_SPAWN_SURFACE_TOLERANCE).min(WALK_SPAWN_MAX_PROBE_DISTANCE)
 }
 
 /// Marker for the player body entity (V9).
@@ -1802,6 +1837,8 @@ fn clear_motion_state(
 #[derive(Message, Debug, Clone, Copy, PartialEq)]
 pub struct TeleportPlayer {
     pub position: Vec3,
+    /// Known destination terrain height in render space, when the sender sampled it.
+    pub sampled_ground_y: Option<f32>,
     /// Heading in radians about +Y, as `Quat::from_euler(EulerRot::YXZ, yaw, ..)`.
     pub yaw: f32,
 }
@@ -1829,9 +1866,9 @@ type TeleportBodyQuery<'w, 's> = Query<
     (With<PlayerBody>, Without<StreamingCamera>),
 >;
 
-/// Applies [`TeleportPlayer`]: places the body, zeroes its velocity and walk state (so a fall in
-/// progress does not carry over), and sets the camera and look yaw. In NOCLIP the body is
-/// disabled and left alone: only the camera moves.
+/// Applies [`TeleportPlayer`]: places the body, zeroes its velocity and walk state, and holds WALK
+/// until bounded destination collision is available. In NOCLIP the body stays disabled and only
+/// the camera moves.
 #[allow(clippy::too_many_arguments)]
 fn apply_teleport_player(
     mut teleports: MessageReader<TeleportPlayer>,
@@ -1847,6 +1884,13 @@ fn apply_teleport_player(
         return;
     };
     *hold = WalkSpawnHold::default();
+    if *mode == MoveMode::Walk {
+        hold.active = true;
+        hold.sampled_ground_y = teleport
+            .sampled_ground_y
+            .filter(|height| height.is_finite());
+        hold.destination = true;
+    }
     look.yaw = teleport.yaw;
     *intent = WalkIntent::default();
     let rotation = Quat::from_euler(EulerRot::YXZ, teleport.yaw, 0.0, 0.0);
@@ -2187,7 +2231,7 @@ mod world_startup_tests {
             .single(app.world())
             .unwrap();
         assert!(text.0.starts_with("NOCLIP: OFF"));
-        assert!(text.0.contains("waiting for startup collision"));
+        assert!(text.0.contains("waiting for WALK collision"));
     }
 
     #[test]
@@ -2228,6 +2272,84 @@ mod world_startup_tests {
     #[test]
     fn distant_world_floor_does_not_release_startup_hold() {
         let mut app = world_app();
+        let ground = floor(&mut app, false);
+        app.world_mut()
+            .get_mut::<Transform>(ground)
+            .unwrap()
+            .translation
+            .y = -10_000.0;
+        tick(&mut app, 10);
+        assert!(app.world().resource::<WalkSpawnHold>().active);
+        assert_mode(&mut app, MoveMode::Walk);
+    }
+
+    #[test]
+    fn sampled_elevated_start_probe_releases_only_after_rapier_collision() {
+        let mut app = world_app();
+        let entity = body(&mut app);
+        let authored_rotation = app.world().get::<Transform>(entity).unwrap().rotation;
+        let camera = app
+            .world_mut()
+            .query_filtered::<&Transform, With<StreamingCamera>>()
+            .single(app.world())
+            .unwrap()
+            .rotation;
+        let authored_camera_y = 5_000.0;
+        app.world_mut()
+            .get_mut::<Transform>(entity)
+            .unwrap()
+            .translation
+            .y = authored_camera_y - MovementTuning::default().eye_height;
+        app.world_mut()
+            .resource_mut::<WalkSpawnHold>()
+            .sampled_ground_y = Some(0.0);
+        let ground = floor(&mut app, true);
+        tick(&mut app, 10);
+        assert!(app.world().resource::<WalkSpawnHold>().active);
+        assert!(
+            (walk_spawn_probe_distance(
+                authored_camera_y - MovementTuning::default().eye_height,
+                Some(0.0),
+                &MovementTuning::default(),
+            ) - MovementTuning::default().capsule_standing_height * 2.0)
+                > 4_000.0
+        );
+
+        app.world_mut()
+            .entity_mut(ground)
+            .remove::<ColliderDisabled>();
+        tick(&mut app, 2);
+        assert!(!app.world().resource::<WalkSpawnHold>().active);
+        assert_mode(&mut app, MoveMode::Walk);
+        let body_transform = app.world().get::<Transform>(entity).unwrap();
+        assert!(
+            (body_transform.translation.y + MovementTuning::default().eye_height
+                - authored_camera_y)
+                .abs()
+                < 1.0
+        );
+        assert!(body_transform.rotation.dot(authored_rotation).abs() > 0.999_99);
+        let current_camera_rotation = app
+            .world_mut()
+            .query_filtered::<&Transform, With<StreamingCamera>>()
+            .single(app.world())
+            .unwrap()
+            .rotation;
+        assert!(current_camera_rotation.dot(camera).abs() > 0.999_99);
+    }
+
+    #[test]
+    fn sampled_elevated_start_rejects_floor_far_below_local_surface() {
+        let mut app = world_app();
+        let entity = body(&mut app);
+        app.world_mut()
+            .get_mut::<Transform>(entity)
+            .unwrap()
+            .translation
+            .y = 5_000.0;
+        app.world_mut()
+            .resource_mut::<WalkSpawnHold>()
+            .sampled_ground_y = Some(0.0);
         let ground = floor(&mut app, false);
         app.world_mut()
             .get_mut::<Transform>(ground)
@@ -2294,15 +2416,18 @@ mod world_startup_tests {
     }
 
     #[test]
-    fn explicit_teleport_clears_startup_hold() {
+    fn explicit_walk_teleport_rearms_destination_hold() {
         let mut app = world_app();
         app.world_mut().write_message(TeleportPlayer {
             position: Vec3::new(20.0, 300.0, 40.0),
+            sampled_ground_y: None,
             yaw: 1.0,
         });
         app.update();
         assert_mode(&mut app, MoveMode::Walk);
-        assert!(!app.world().resource::<WalkSpawnHold>().active);
+        assert!(app.world().resource::<WalkSpawnHold>().active);
+        assert!(app.world().resource::<WalkSpawnHold>().elapsed <= PHYSICS_TIMESTEP);
+        assert!(app.world().resource::<WalkSpawnHold>().destination);
     }
 
     fn send_state(app: &mut App, state: bevy::input::ButtonState) {
@@ -2385,6 +2510,132 @@ mod world_startup_tests {
 
         app.insert_resource(crate::door_crossing::DoorCrossing::default());
         tick(&mut app, 1);
+        assert_mode(&mut app, MoveMode::Noclip);
+        assert!(!app.world().resource::<WalkSpawnHold>().active);
+    }
+
+    #[test]
+    fn tcl_cancels_a_walk_destination_hold() {
+        let mut app = world_app();
+        app.world_mut().write_message(TeleportPlayer {
+            position: Vec3::new(0.0, 16.0, 0.0),
+            sampled_ground_y: Some(0.0),
+            yaw: 0.0,
+        });
+        tick(&mut app, 1);
+        assert!(app.world().resource::<WalkSpawnHold>().active);
+        crate::console::execute_line(app.world_mut(), "tcl");
+        assert_mode(&mut app, MoveMode::Noclip);
+        assert!(!app.world().resource::<WalkSpawnHold>().active);
+        crate::console::execute_line(app.world_mut(), "tcl");
+        assert_mode(&mut app, MoveMode::Walk);
+        assert!(!app.world().resource::<WalkSpawnHold>().active);
+    }
+
+    #[test]
+    fn walk_teleport_waits_for_destination_rapier_collision_then_grounds() {
+        let mut app = world_app();
+        let ground = floor(&mut app, true);
+        app.world_mut().write_message(TeleportPlayer {
+            position: Vec3::new(0.0, 16.0, 0.0),
+            sampled_ground_y: Some(0.0),
+            yaw: 0.0,
+        });
+        tick(&mut app, 10);
+        let entity = body(&mut app);
+        let held_at = app.world().get::<Transform>(entity).unwrap().translation;
+        assert!(app.world().resource::<WalkSpawnHold>().active);
+        assert!(app.world().resource::<WalkSpawnHold>().destination);
+        assert_eq!(
+            held_at,
+            body_and_camera_for_feet(&MovementTuning::default(), Vec3::new(0.0, 16.0, 0.0),).0
+        );
+
+        app.world_mut()
+            .entity_mut(ground)
+            .remove::<ColliderDisabled>();
+        tick(&mut app, 120);
+        assert!(!app.world().resource::<WalkSpawnHold>().active);
+        assert_mode(&mut app, MoveMode::Walk);
+        assert!(headless::player_pose(&mut app).1);
+    }
+
+    #[test]
+    fn repeated_walk_teleport_replaces_sample_and_restarts_timeout() {
+        let mut app = world_app();
+        app.world_mut().write_message(TeleportPlayer {
+            position: Vec3::new(0.0, 16.0, 0.0),
+            sampled_ground_y: Some(0.0),
+            yaw: 0.0,
+        });
+        tick(&mut app, 1);
+        app.world_mut().resource_mut::<WalkSpawnHold>().elapsed = 12.0;
+        app.world_mut().write_message(TeleportPlayer {
+            position: Vec3::new(100.0, 516.0, 100.0),
+            sampled_ground_y: Some(500.0),
+            yaw: 0.5,
+        });
+        tick(&mut app, 1);
+        let hold = app.world().resource::<WalkSpawnHold>();
+        assert!(hold.active && hold.destination);
+        assert_eq!(hold.sampled_ground_y, Some(500.0));
+        assert!(hold.elapsed <= PHYSICS_TIMESTEP);
+        assert_mode(&mut app, MoveMode::Walk);
+    }
+
+    #[test]
+    fn noclip_teleport_does_not_arm_destination_hold() {
+        let mut app = world_app();
+        crate::console::execute_line(app.world_mut(), "tcl");
+        assert_mode(&mut app, MoveMode::Noclip);
+        app.world_mut().write_message(TeleportPlayer {
+            position: Vec3::new(0.0, 16.0, 0.0),
+            sampled_ground_y: Some(0.0),
+            yaw: 0.0,
+        });
+        tick(&mut app, 1);
+        assert!(!app.world().resource::<WalkSpawnHold>().active);
+        assert_mode(&mut app, MoveMode::Noclip);
+    }
+
+    #[test]
+    fn destination_hold_times_out_to_visible_noclip_fallback() {
+        let mut app = world_app();
+        app.world_mut().write_message(TeleportPlayer {
+            position: Vec3::new(0.0, 16.0, 0.0),
+            sampled_ground_y: Some(0.0),
+            yaw: 0.0,
+        });
+        tick(&mut app, 1);
+        app.world_mut().resource_mut::<WalkSpawnHold>().elapsed = WALK_SPAWN_TIMEOUT_SECONDS;
+        tick(&mut app, 2);
+        assert_mode(&mut app, MoveMode::Noclip);
+        assert!(!app.world().resource::<WalkSpawnHold>().active);
+        assert!(
+            app.world()
+                .resource::<WalkEntryStatus>()
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("destination collision unavailable"))
+        );
+    }
+
+    #[test]
+    fn destination_hold_is_paused_during_door_crossing_and_recovery_clears_it() {
+        let mut app = world_app();
+        app.insert_resource(crate::door_crossing::DoorCrossing::recovery_for_test());
+        app.world_mut().write_message(TeleportPlayer {
+            position: Vec3::new(0.0, 16.0, 0.0),
+            sampled_ground_y: Some(0.0),
+            yaw: 0.0,
+        });
+        tick(&mut app, 1);
+        let elapsed = app.world().resource::<WalkSpawnHold>().elapsed;
+        tick(&mut app, 5);
+        assert!(app.world().resource::<WalkSpawnHold>().active);
+        assert_eq!(app.world().resource::<WalkSpawnHold>().elapsed, elapsed);
+
+        crate::console::execute_line(app.world_mut(), "tcl");
         assert_mode(&mut app, MoveMode::Noclip);
         assert!(!app.world().resource::<WalkSpawnHold>().active);
     }
@@ -2931,6 +3182,7 @@ fn setup_fixture_player(
 fn setup_world_player(
     mut commands: Commands,
     tuning: Res<MovementTuning>,
+    ground_height: Option<Res<WalkSpawnGroundHeight>>,
     mut look: ResMut<LookIntent>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -2950,6 +3202,8 @@ fn setup_world_player(
     commands.insert_resource(WalkSpawnHold {
         active: true,
         elapsed: 0.0,
+        sampled_ground_y: ground_height.as_deref().and_then(|height| height.0),
+        destination: false,
     });
     commands.insert_resource(tankard_visuals(&mut meshes, &mut materials));
 }
@@ -3330,6 +3584,7 @@ fn toggle_move_mode_effect(
             };
             commands.entity(entity).insert(RigidBodyDisabled);
             *mode = MoveMode::Noclip;
+            *hold = WalkSpawnHold::default();
             clear_motion_state(&mut intent, &mut sprint, &mut states, &mut controllers);
             crossing.finish_recovery();
             return;
@@ -3465,7 +3720,7 @@ fn overlay_system(
     };
     let mut label = noclip_overlay_text(*mode, &status);
     if hold.as_ref().is_some_and(|hold| hold.active) {
-        label.push_str("  waiting for startup collision");
+        label.push_str("  waiting for WALK collision");
     }
     if *mode == MoveMode::Walk {
         let speed = actual_walk_speed(player.single().ok().flatten());
@@ -4429,6 +4684,7 @@ mod console_tests {
                 app.insert_resource(initial);
                 app.insert_resource(CursorCapture::Captured);
                 app.insert_resource(crate::door_crossing::DoorCrossing::recovery_for_test());
+                app.world_mut().resource_mut::<WalkSpawnHold>().active = true;
                 if keyed {
                     press(&mut app, KeyCode::KeyV);
                     app.world_mut().run_system_once(toggle_mode_system).unwrap();
@@ -4437,6 +4693,7 @@ mod console_tests {
                     assert!(scrollback(&app).contains("noclip ON"));
                 }
                 assert_eq!(mode(&app), MoveMode::Noclip);
+                assert!(!app.world().resource::<WalkSpawnHold>().active);
                 assert!(
                     !app.world()
                         .resource::<crate::door_crossing::DoorCrossing>()
@@ -4856,6 +5113,7 @@ mod teleport_tests {
         let target = Vec3::new(40_000.0, 900.0, -2_000.0);
         app.world_mut().write_message(TeleportPlayer {
             position: target,
+            sampled_ground_y: None,
             yaw: 1.0,
         });
         app.update();
@@ -4890,6 +5148,7 @@ mod teleport_tests {
         app.insert_resource(MoveMode::Noclip);
         app.world_mut().write_message(TeleportPlayer {
             position: feet,
+            sampled_ground_y: None,
             yaw: 0.0,
         });
         app.update();
