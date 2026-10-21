@@ -896,7 +896,7 @@ pub const CONTROL_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("Console: tcg", "Toggle collision outlines"),
             (
                 "Console: SceneGrade",
-                "Color grade: off, saturation or full (also in Graphics settings)",
+                "Color grade: off, saturation, full, snapshot-srgb, snapshot-linear or record-srgb (also in Graphics settings)",
             ),
         ],
     ),

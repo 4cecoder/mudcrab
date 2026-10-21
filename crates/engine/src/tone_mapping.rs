@@ -317,6 +317,18 @@ impl SceneToneMapSource {
                 })
             })
             .into();
+        evidence["pivot"] = resolved
+            .as_ref()
+            .ok()
+            .map(|resolved| resolved.post.pivot)
+            .into();
+        let grade_pivot_source = if resolved.is_err() {
+            "unresolved"
+        } else if overrides.pivot.is_some() {
+            "explicit user pivot override; independent of sampled_luminance"
+        } else {
+            "approved artistic pivot; independent of sampled_luminance"
+        };
         evidence["tone_mapping"] = serde_json::json!({
             "mode": self.mode,
             "applied": active,
@@ -330,7 +342,7 @@ impl SceneToneMapSource {
             "native_gpu_upload_verified": false,
             "native_runtime_parameters_observed": false,
             "luminance_source": "explicit experimental overrides for native texture sample P.x and P.y; no adaptation history",
-            "grade_pivot_source": "approved artistic pivot; independent of sampled_luminance",
+            "grade_pivot_source": grade_pivot_source,
             "native_final_exponent_applied": false,
             "bloom_input_applied": false,
         });
@@ -580,6 +592,38 @@ mod tests {
             serde_json::json!(1.8_f32)
         );
         assert_eq!(evidence["effective_stages"]["tone_operator"], 2);
+        assert_eq!(evidence["pivot"], serde_json::json!(0.29_f32));
+        assert_eq!(evidence["effective_stages"]["pivot"], evidence["pivot"]);
+        assert_eq!(evidence["default_pivot"], serde_json::json!(0.18_f32));
+        assert_eq!(
+            evidence["tone_mapping"]["grade_pivot_source"],
+            "explicit user pivot override; independent of sampled_luminance"
+        );
+        let untuned = tone.evidence(
+            &source,
+            SceneGradeMode::RecordSrgb,
+            SceneVisualPreset::CoolGray,
+        );
+        assert_eq!(untuned["pivot"], serde_json::json!(0.18_f32));
+        assert_eq!(
+            untuned["tone_mapping"]["grade_pivot_source"],
+            "approved artistic pivot; independent of sampled_luminance"
+        );
+        let mut missing_parameters = tone;
+        missing_parameters.parameters = None;
+        let unresolved = missing_parameters.evidence_with_overrides(
+            &source,
+            SceneGradeMode::RecordSrgb,
+            SceneVisualPreset::CoolGray,
+            overrides,
+        );
+        assert!(unresolved["pivot"].is_null());
+        assert!(unresolved["effective_stages"].is_null());
+        assert!(unresolved["resolution_error"].is_string());
+        assert_eq!(
+            unresolved["tone_mapping"]["grade_pivot_source"],
+            "unresolved"
+        );
     }
 
     #[test]

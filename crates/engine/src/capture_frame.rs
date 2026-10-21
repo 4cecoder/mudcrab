@@ -431,6 +431,8 @@ mod tests {
             serde_json::json!(0.67_f32)
         );
         assert_eq!(capture.resolved_grade["pivot"], serde_json::json!(0.29_f32));
+        assert_eq!(capture.source["pivot"], serde_json::json!(0.29_f32));
+        assert_eq!(capture.source["default_pivot"], serde_json::json!(0.18_f32));
         assert_eq!(
             capture.source["grade_overrides"]["brightness"],
             serde_json::json!(1.74_f32)

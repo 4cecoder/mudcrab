@@ -126,10 +126,7 @@ settings foundation's earlier white/blue approximations. The fog-density slider
 scales atmospheric extinction and inscattering while retaining the preset,
 including its quarter-density Cool Gray baseline.
 
-Historical validation from the earlier settings-UI integration reported 12
-Python comparison/capture tests (10 comparison and 2 capture), Python compileall, Rust syntax parsing and
-`cargo fmt --all -- --check` as passing. Its `cargo test -p engine --lib settings`
-attempt stopped in `wayland-sys` because pkg-config/Wayland development
-dependencies were unavailable. Those results predate this PR #262 integration
-and do not validate its current Rust source. Current Rust tests, builds, native
-Metal, converted-scene appearance, gameplay and performance remain unverified.
+At commit `52266688`, 1,054 engine-library CPU tests passed with 1 ignored,
+strict engine/shared Clippy passed for all targets and features with `-D warnings`,
+and workspace formatting passed. Native UI, GPU behavior, visual parity, gameplay
+and performance were not exercised. CI on the published head remains a merge gate.

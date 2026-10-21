@@ -398,9 +398,10 @@ impl SceneGradeSource {
                 "post_linear_domain": r.post.linear_domain,
                 "pivot": r.post.pivot,
             })),
+            "pivot": resolved.as_ref().ok().map(|r| r.post.pivot),
+            "default_pivot": CINEMATIC_PIVOT,
             "resolution_error": resolved.err(),
             "tonemapping": "TonyMcMapface", "exposure_ev100": DEFAULT_SCENE_EV100,
-            "pivot": CINEMATIC_PIVOT,
             "limits": "CNAM/TNAM experiment only; authored slot is not effective runtime weather; HNAM, adaptation, native tone curve, bloom and modifier composition remain unapplied"
         })
     }
@@ -1070,6 +1071,11 @@ mod tests {
             evidence["effective_grade"]["saturation"],
             serde_json::json!(1.8_f32)
         );
+        assert_eq!(evidence["pivot"], serde_json::json!(0.31_f32));
+        assert_eq!(evidence["effective_stages"]["pivot"], evidence["pivot"]);
+        assert_eq!(evidence["default_pivot"], serde_json::json!(0.18_f32));
+        let untuned = source.evidence(SceneGradeMode::SnapshotSrgb, SceneVisualPreset::CoolGray);
+        assert_eq!(untuned["pivot"], serde_json::json!(0.18_f32));
     }
 
     #[test]
@@ -1090,6 +1096,15 @@ mod tests {
                 .is_err()
         );
         assert_eq!(source.approved.grade, original);
+        let evidence = source.evidence_with_overrides(
+            SceneGradeMode::SnapshotSrgb,
+            SceneVisualPreset::CoolGray,
+            invalid,
+        );
+        assert!(evidence["pivot"].is_null());
+        assert!(evidence["effective_stages"].is_null());
+        assert!(evidence["resolution_error"].is_string());
+        assert_eq!(evidence["default_pivot"], serde_json::json!(0.18_f32));
     }
 
     #[test]
