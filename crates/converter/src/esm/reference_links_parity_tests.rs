@@ -220,15 +220,12 @@ fn master_plugin() -> Vec<u8> {
         named(b"DOOR", DOOR_BASE),
         named(b"ACHR", ACTOR),
         named(b"ACRE", CREATURE),
-        top(
-            b"REFR",
-            &record_with_flags(b"REFR", DELETED_REFERENCE, 0x20, &[]),
-        ),
         interior(
             &[
                 chest,
                 reference(LEVER, &[]),
                 reference(TRAP, &[]),
+                reference(DELETED_REFERENCE, &[]),
                 marker,
                 reference(DESTINATION, &[]),
                 reference(PLATE_ACRE, &[sub(b"XATR", &le(CREATURE))]),
@@ -236,6 +233,18 @@ fn master_plugin() -> Vec<u8> {
                 reference(PLATE_VALID, &[sub(b"XATR", &le(LEVER))]),
             ]
             .concat(),
+        ),
+    ]
+    .concat()
+}
+
+/// Deletes a live reference from the earlier master plugin.
+fn deletion_plugin() -> Vec<u8> {
+    [
+        header(0, &["Skyrim.esm"]),
+        top(
+            b"REFR",
+            &record_with_flags(b"REFR", DELETED_REFERENCE, 0x20, &[]),
         ),
     ]
     .concat()
@@ -308,8 +317,9 @@ fn rows(conn: &Connection) -> Rows {
 fn publish(
     reader: RecordReader,
     root: &Path,
+    plugins: &[&str],
 ) -> (Connection, HashMap<u32, super::records::RawRecord>) {
-    let paths = ["Skyrim.esm", "Other.esm", "Mod.esp"].map(|name| root.join(name));
+    let paths: Vec<_> = plugins.iter().map(|name| root.join(name)).collect();
     let database = root.join(format!("{reader:?}.db"));
     let records = EsmParser::convert_plugins_with_reader(&paths, &database, reader, root).unwrap();
     (Connection::open(database).unwrap(), records)
@@ -323,17 +333,36 @@ fn get<T: rusqlite::types::FromSql>(conn: &Connection, sql: &str) -> T {
 fn both_record_readers_publish_the_same_reference_links() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("Skyrim.esm"), master_plugin()).unwrap();
-    fs::write(root.path().join("Other.esm"), header(1, &[])).unwrap();
+    fs::write(root.path().join("Other.esm"), deletion_plugin()).unwrap();
     fs::write(root.path().join("Mod.esp"), mod_plugin()).unwrap();
 
-    let (legacy, legacy_records) = publish(RecordReader::Legacy, root.path());
-    let (inhouse, _) = publish(RecordReader::Inhouse, root.path());
-    assert!(
-        legacy_records
-            .get(&DELETED_REFERENCE)
-            .is_some_and(super::records::RawRecord::is_deleted),
-        "fixture keeps the deleted target in the winning-record map"
-    );
+    for reader in [RecordReader::Legacy, RecordReader::Inhouse] {
+        let (before_deletion, records) = publish(reader, root.path(), &["Skyrim.esm"]);
+        assert!(records.contains_key(&DELETED_REFERENCE));
+        let live_link: Option<i64> = get(
+            &before_deletion,
+            &format!(
+                "SELECT linked_ref_id FROM reference_linked_refs WHERE reference_id={CHEST} AND position=7"
+            ),
+        );
+        assert_eq!(live_link, Some(DELETED_REFERENCE.into()));
+    }
+
+    let plugins = ["Skyrim.esm", "Other.esm", "Mod.esp"];
+    let (legacy, legacy_records) = publish(RecordReader::Legacy, root.path(), &plugins);
+    let (inhouse, inhouse_records) = publish(RecordReader::Inhouse, root.path(), &plugins);
+    assert!(!legacy_records.contains_key(&DELETED_REFERENCE));
+    assert!(!inhouse_records.contains_key(&DELETED_REFERENCE));
+    let deleted_link = |conn: &Connection| -> Option<i64> {
+        get(
+            conn,
+            &format!(
+                "SELECT linked_ref_id FROM reference_linked_refs WHERE reference_id={CHEST} AND position=7"
+            ),
+        )
+    };
+    assert_eq!(deleted_link(&legacy), None);
+    assert_eq!(deleted_link(&inhouse), None);
     assert_eq!(rows(&legacy), rows(&inhouse));
 
     let conn = inhouse;
