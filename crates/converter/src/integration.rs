@@ -93,7 +93,12 @@ pub fn finalize_world_database_with_sources(
             "SELECT s.id,s.model_path,r.record_type,p.name
              FROM statics s
              LEFT JOIN records r ON r.form_id=s.id
-             LEFT JOIN plugins p ON p.priority=r.load_order
+             LEFT JOIN (
+                 SELECT priority,
+                        CASE WHEN COUNT(*)=1 THEN MIN(name) ELSE NULL END AS name
+                 FROM plugins
+                 GROUP BY priority
+             ) p ON p.priority=r.load_order
              WHERE s.model_path IS NOT NULL AND s.model_path <> ''
              ORDER BY s.id",
         )?;
@@ -699,6 +704,107 @@ mod tests {
         )
         .unwrap();
         assert!(published.passed);
+        assert_eq!(published.issues, report.issues);
+    }
+
+    #[test]
+    fn duplicate_plugin_priorities_do_not_duplicate_static_integration_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("skyrim_world.db");
+        let connection = Connection::open(&database).unwrap();
+        crate::esm::exporter::create_tables(&connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO plugins(id,name,priority,checksum)
+                     VALUES(1,'First.esm',0,X''),(2,'Second.esm',0,X'');
+                 INSERT INTO statics(id,model_path,flags) VALUES
+                     (1,'architecture/wall.nif',0),
+                     (2,'../unsafe.nif',0),
+                     (3,'architecture/unavailable.nif',0),
+                     (4,'../without-plugin.nif',0);
+                 INSERT INTO records(form_id,record_type,load_order,data) VALUES
+                     (1,'STAT',0,X'01'),
+                     (2,'TACT',0,X'02'),
+                     (3,'ADDN',0,X'03'),
+                     (4,'APPA',7,X'04');",
+            )
+            .unwrap();
+        drop(connection);
+        write_file(
+            directory.path(),
+            "Meshes/Architecture/Wall.GLB",
+            &bounded_glb([-2.0, -3.0, -4.0], [5.0, 6.0, 7.0], [3.0, 4.0, 5.0]),
+        );
+        empty_cache(directory.path());
+
+        let report = finalize_world_database(directory.path()).unwrap().unwrap();
+
+        assert!(report.passed, "{:?}", report.issues);
+        assert_eq!(report.statics_total, 4);
+        assert_eq!(report.bounds_updated, 1);
+        assert_eq!(report.missing_model_count, 0);
+        assert_eq!(report.unavailable_model_source_count, 1);
+        assert_eq!(report.statics_with_models, 2);
+        assert_eq!(report.issues.len(), 2);
+        let ambiguous_priority_diagnostic = report
+            .issues
+            .iter()
+            .find(|issue| issue.contains("TACT 00000002"))
+            .unwrap();
+        assert!(ambiguous_priority_diagnostic.contains("../unsafe.nif"));
+        assert!(!ambiguous_priority_diagnostic.contains("First.esm"));
+        assert!(!ambiguous_priority_diagnostic.contains("Second.esm"));
+        assert_eq!(
+            report
+                .issues
+                .iter()
+                .filter(|issue| issue.contains("TACT 00000002"))
+                .count(),
+            1
+        );
+        let absent_metadata_diagnostic = report
+            .issues
+            .iter()
+            .find(|issue| issue.contains("APPA 00000004"))
+            .unwrap();
+        assert!(absent_metadata_diagnostic.contains("../without-plugin.nif"));
+        assert!(!absent_metadata_diagnostic.contains("plugin "));
+
+        let connection = Connection::open(database).unwrap();
+        let projections: Vec<(u32, Option<String>)> = connection
+            .prepare("SELECT id,model_path FROM statics ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            projections,
+            [
+                (1, Some("architecture/wall.nif".into())),
+                (2, None),
+                (3, Some("architecture/unavailable.nif".into())),
+                (4, None),
+            ]
+        );
+        let archived: Vec<(u32, Vec<u8>)> = connection
+            .prepare("SELECT form_id,data FROM records ORDER BY form_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            archived,
+            [(1, vec![1]), (2, vec![2]), (3, vec![3]), (4, vec![4])]
+        );
+        let published: IntegrationReport = serde_json::from_slice(
+            &fs::read(directory.path().join("integration-report.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(published.passed);
+        assert_eq!(published.bounds_updated, 1);
+        assert_eq!(published.unavailable_model_source_count, 1);
         assert_eq!(published.issues, report.issues);
     }
 
