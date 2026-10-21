@@ -27,11 +27,9 @@ impl Plugin for NifMaterialPlugin {
         // Bevy 0.19's MaterialPlugin::build calls init_asset unconditionally.
         // Keep this plugin's registrations conditional so it can also support headless
         // NIF loading without replacing stores initialized by the rendering plugin.
-        if !app.is_plugin_added::<Self>() {
-            init_asset_if_missing::<EffectPaletteImage>(app);
-            init_asset_if_missing::<EffectPaletteMaterial>(app);
-            init_asset_if_missing::<EffectPaletteDepthMaterial>(app);
-        }
+        init_asset_if_missing::<EffectPaletteImage>(app);
+        init_asset_if_missing::<EffectPaletteMaterial>(app);
+        init_asset_if_missing::<EffectPaletteDepthMaterial>(app);
         if !app.is_plugin_added::<MaterialPlugin<NifDepthMaterial>>() {
             app.add_plugins(MaterialPlugin::<NifDepthMaterial>::default());
         }
@@ -39,13 +37,11 @@ impl Plugin for NifMaterialPlugin {
             .register_type::<NifDepthMaterialSource>()
             .register_type::<EffectPaletteDepthSource>()
             .register_type::<ExternalEmittance>();
-        if !app.is_plugin_added::<Self>() {
-            app.world_mut()
-                .resource_mut::<GltfExtensionHandlers>()
-                .0
-                .write_blocking()
-                .push(Box::new(NativeMaterialHandler::default()));
-        }
+        app.world_mut()
+            .resource_mut::<GltfExtensionHandlers>()
+            .0
+            .write_blocking()
+            .push(Box::new(NativeMaterialHandler::default()));
     }
 }
 
@@ -62,9 +58,6 @@ pub struct EffectPaletteMaterialPlugin;
 
 impl Plugin for EffectPaletteMaterialPlugin {
     fn build(&self, app: &mut App) {
-        if app.is_plugin_added::<Self>() {
-            return;
-        }
         load_shader_library!(app, "shaders/effect_palette_functions.wgsl");
         embedded_asset!(app, "shaders/effect_palette.wgsl");
         embedded_asset!(app, "shaders/effect_palette_prepass.wgsl");
@@ -615,7 +608,7 @@ mod tests {
                 NifDepthState::from_flags(DEPTH_TEST | DECAL, 0, AlphaMode::Opaque).unwrap(),
             ));
 
-        app.add_plugins((NifMaterialPlugin, NifMaterialPlugin));
+        app.add_plugins(NifMaterialPlugin);
 
         assert!(
             app.world()
@@ -643,7 +636,7 @@ mod tests {
         app.add_plugins((MinimalPlugins, AssetPlugin::default()))
             .init_asset::<Shader>()
             .init_resource::<GltfExtensionHandlers>()
-            .add_plugins((EffectPaletteMaterialPlugin, EffectPaletteMaterialPlugin));
+            .add_plugins(EffectPaletteMaterialPlugin);
 
         let palette = effect_palette_material(
             PaletteLookup {
