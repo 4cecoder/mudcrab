@@ -1,13 +1,14 @@
-//! Compare what the legacy and in-house record readers publish from the same plugins.
+//! Compare observed differences between two world databases. Input identity and completeness are
+//! not verified; see `docs/research/record-reader-divergence.md`.
 //!
 //! ```text
 //! reader-diff compare <legacy skyrim_world.db> <in-house skyrim_world.db> [--json FILE] [--samples N]
 //! reader-diff build <Data dir> <plugins.txt> <empty output dir> [--json FILE] [--samples N]
 //! ```
 //!
-//! `build` writes `legacy/skyrim_world.db` (the legacy reader, records only) and `inhouse/` (the
-//! in-house record bundle, records only, no asset conversion) under the output directory, then
-//! compares them. See `docs/research/record-reader-divergence.md`.
+//! `build` writes `legacy/skyrim_world.db` (records only) and `inhouse/` (the in-house record
+//! bundle, no asset conversion) under the output directory, then compares them. The result is a
+//! diagnostic, not a reader correctness or source-completeness result.
 use color_eyre::{Result, eyre::bail};
 use converter::reader_diff::{Options, compare, summary};
 use std::{fs, path::PathBuf};

@@ -1,7 +1,6 @@
-//! Characterizes how the legacy and in-house record readers still differ (#269): one synthetic
-//! case per known mechanism, run through both readers and `reader_diff`. When a divergence is
-//! fixed, its case here changes from "differs" to "identical"; see
-//! `docs/research/record-reader-divergence.md`.
+//! Synthetic examples of observed legacy and in-house reader differences. `reader_diff` reports
+//! these differences conservatively; this fixture is not a correctness oracle or completeness
+//! gate. See `docs/research/record-reader-divergence.md`.
 
 use converter::reader_diff::{Options, Report, compare};
 use std::{fs, path::Path};
@@ -15,8 +14,6 @@ const DANGLING: u32 = 0x0A00;
 /// The mod's records, in load-order numbering (the mod is the third plugin; it authors them with
 /// its master count, 1, as the file index).
 const MOD_IMAGE_SPACE: u32 = 0x0100_0801;
-const MOD_WEATHER: u32 = 0x0200_0802;
-const MOD_ROCK: u32 = 0x0200_0803;
 const LOCALIZED: u32 = 0x80;
 
 fn sub(tag: &[u8; 4], bytes: &[u8]) -> Vec<u8> {
@@ -284,21 +281,28 @@ fn field_keys(report: &Report, class: &str, group: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn any_field_keys(report: &Report, group: &str) -> Vec<String> {
+    report
+        .records
+        .fields
+        .values()
+        .filter_map(|groups| groups.get(group))
+        .flat_map(|bucket| bucket.samples.iter().map(|sample| sample.key.clone()))
+        .collect()
+}
+
 fn id(value: u32) -> String {
     format!("{value:08X}")
 }
 
 #[test]
-fn each_known_divergence_mechanism_is_classified() {
+fn reader_differences_are_reported_without_untyped_causal_labels() {
     let root = tempfile::tempdir().unwrap();
     let report = build(root.path());
     eprintln!("{}", converter::reader_diff::summary(&report));
 
-    // Text: legacy keeps Windows-1252 bytes, in-house stores UTF-8.
-    assert_eq!(
-        field_keys(&report, "text_encoding", "STAT EDID"),
-        [id(TEXT)]
-    );
+    // Text bytes differ, but the comparator has no field type provenance to assign a cause.
+    assert_eq!(field_keys(&report, "other_length", "STAT EDID"), [id(TEXT)]);
     // A known subrecord out of the schema's order is dropped by the in-house decoder.
     assert_eq!(
         field_keys(&report, "omitted_by_inhouse", "STAT EDID"),
@@ -313,21 +317,15 @@ fn each_known_divergence_mechanism_is_classified() {
         field_keys(&report, "omitted_by_inhouse", "LIGH FNAM"),
         [id(NAN_LIGHT)]
     );
-    // A link to a record that does not exist is set to 0 by the in-house reader only.
+    // A link-shaped value is reported as bytes without reliable schema context.
     assert_eq!(
-        field_keys(&report, "link_cleared", "REFR XEMI"),
+        field_keys(&report, "other_bytes", "REFR XEMI"),
         [id(DANGLING)]
     );
-    // A typed link the legacy reader has no layout for stays plugin-local in legacy output.
-    assert_eq!(
-        field_keys(&report, "form_id_remap", "WTHR IMSP"),
-        [id(MOD_WEATHER)]
-    );
-    // A localized name: legacy keeps the string ID.
-    assert_eq!(
-        field_keys(&report, "localized_string", "ACTI FULL"),
-        [id(MOD_ROCK)]
-    );
+    // Current main remaps this typed link in both readers, so it converges.
+    assert!(any_field_keys(&report, "WTHR IMSP").is_empty());
+    // Current main resolves localized text in both readers, so it converges.
+    assert!(any_field_keys(&report, "ACTI FULL").is_empty());
     // A candidate whose mandatory field is malformed loses to the earlier winner in-house only.
     let winners = &report.records.records["different_winner"]["CONT"];
     assert_eq!(winners.samples[0].key, id(CHEST));

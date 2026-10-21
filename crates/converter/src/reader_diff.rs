@@ -1,12 +1,10 @@
-//! Compare the world databases the legacy and in-house record readers produce from the same
-//! plugins, and classify every difference by the mechanism that causes it (#269, "readers still
-//! differ"). The research notes are in `docs/research/record-reader-divergence.md`.
+//! Bounded differential diagnostic for two world databases. It reports observed differences; it
+//! does not verify shared source inputs, establish reader correctness, or prove source-record
+//! completeness. Causal field labels require typed provenance that this comparison does not have.
 //!
-//! Every table both databases share is compared row by row on its primary key. The canonical
-//! `records.data` blobs are compared subrecord by subrecord and each difference is classified
-//! (omitted field, cleared link, FormID remap, text encoding, localized string, ...). The
-//! `data` blobs of `cells`, `references` and `waters` serialize the same subrecords as
-//! `records.data`, so they are left to the record classification.
+//! Shared table rows are compared by primary key. Canonical `records.data` archives are validated
+//! and compared subrecord by subrecord. Other projected columns, including `cells.data`,
+//! `references.data`, and `waters.data`, are compared directly.
 
 use crate::esm::types::ArchivedRecordData;
 use color_eyre::{Result, eyre::eyre};
@@ -33,14 +31,6 @@ const BY_DESIGN: &[&str] = &[
     "inhouse_terrain_source_order",
     "inhouse_terrain_layers",
     "inhouse_unresolved_terrain_textures",
-];
-
-/// Columns holding serialized subrecords already covered by the `records.data` comparison.
-const SUBRECORD_BLOBS: &[(&str, &str)] = &[
-    ("records", "data"),
-    ("cells", "data"),
-    ("references", "data"),
-    ("waters", "data"),
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,15 +66,17 @@ pub struct TableDiff {
 }
 
 /// How one subrecord occurrence differs between the readers.
+///
+/// Legacy causal labels remain in the public enum for report compatibility. The comparator emits
+/// only observed presence/length/byte differences unless typed evidence supports a cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldClass {
-    /// The legacy record has the occurrence; the in-house record does not (a field the in-house
-    /// decoder rejected or found out of schema order).
+    /// The legacy record has the occurrence; the in-house record does not.
     OmittedByInhouse,
     /// Only the in-house record has the occurrence.
     OnlyInhouse,
-    /// A FormID the in-house reader set to 0 (absent or disallowed target).
+    /// Legacy causal label: a typed FormID was cleared by the in-house reader.
     LinkCleared,
     /// A FormID with the same local ID but a different load-order index: one reader remapped it.
     FormIdRemap,
@@ -108,7 +100,7 @@ pub enum FieldClass {
 pub enum RecordClass {
     OnlyLegacy,
     OnlyInhouse,
-    /// Both have the record, from different plugins (a candidate one reader rejected).
+    /// Both have the record, with different publishing plugin/load-order values.
     DifferentWinner,
     RecordType,
     CellOrWorldspace,
@@ -135,6 +127,8 @@ pub struct RecordDiff {
 
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
+    /// Explicit limits on what this output establishes.
+    pub diagnostic_notice: String,
     pub tables: BTreeMap<String, TableDiff>,
     pub tables_only_legacy: Vec<String>,
     pub tables_only_inhouse: Vec<String>,
@@ -146,24 +140,26 @@ pub struct Options {
     pub samples: usize,
 }
 
+const DIAGNOSTIC_NOTICE: &str = "bounded diagnostic only; source/plugin/load-order/schema/language identity is not validated as matching, and cause or source completeness is not established";
+
 impl Default for Options {
     fn default() -> Self {
         Self { samples: 5 }
     }
 }
 
-/// Compare two world databases: `legacy` from `--record-reader legacy`, `inhouse` from the
-/// default reader, both from the same plugins.
-pub fn compare(legacy: &Path, inhouse: &Path, options: &Options) -> Result<Report> {
+/// Compare two world databases without asserting that their source inputs are equivalent.
+pub fn compare(legacy_path: &Path, inhouse_path: &Path, options: &Options) -> Result<Report> {
     let open = |path: &Path| {
         Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| eyre!("{}: {error}", path.display()))
     };
-    let legacy = open(legacy)?;
-    let inhouse = open(inhouse)?;
+    let legacy = open(legacy_path)?;
+    let inhouse = open(inhouse_path)?;
     let legacy_tables = tables(&legacy)?;
     let inhouse_tables = tables(&inhouse)?;
     let mut report = Report {
+        diagnostic_notice: DIAGNOSTIC_NOTICE.to_owned(),
         tables_only_legacy: legacy_tables.difference(&inhouse_tables).cloned().collect(),
         tables_only_inhouse: inhouse_tables.difference(&legacy_tables).cloned().collect(),
         ..Default::default()
@@ -174,7 +170,7 @@ pub fn compare(legacy: &Path, inhouse: &Path, options: &Options) -> Result<Repor
             compare_table(&legacy, &inhouse, table, options)?,
         );
     }
-    report.records = compare_records(&legacy, &inhouse, options)?;
+    report.records = compare_records(&legacy, legacy_path, &inhouse, inhouse_path, options)?;
     Ok(report)
 }
 
@@ -331,7 +327,7 @@ fn compare_table(
     let compared: Vec<String> = legacy_columns
         .iter()
         .filter(|name| inhouse_columns.contains(name) && !key.contains(name))
-        .filter(|name| !SUBRECORD_BLOBS.contains(&(table, name.as_str())))
+        .filter(|name| !(table == "records" && name.as_str() == "data"))
         .cloned()
         .collect();
     let select = key
@@ -439,7 +435,8 @@ fn record_rows(conn: &Connection) -> Result<rusqlite::Statement<'_>> {
     )?)
 }
 
-fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordRow> {
+fn decode_row(row: &rusqlite::Row<'_>, path: &Path) -> rusqlite::Result<RecordRow> {
+    let form_id: u32 = row.get(0)?;
     let data: Vec<u8> = row.get(5)?;
     let subrecords = rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&data)
         .map(|record| {
@@ -449,9 +446,21 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordRow> {
                 .map(|sub| (sub.tag, sub.data))
                 .collect()
         })
-        .unwrap_or_default();
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Blob,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: record {form_id:08X} has invalid records.data archive: {error}",
+                        path.display()
+                    ),
+                )),
+            )
+        })?;
     Ok(RecordRow {
-        form_id: row.get(0)?,
+        form_id,
         record_type: row.get(1)?,
         cell_id: row.get(2)?,
         worldspace_id: row.get(3)?,
@@ -474,14 +483,16 @@ fn bucket(
 
 fn compare_records(
     legacy: &Connection,
+    legacy_path: &Path,
     inhouse: &Connection,
+    inhouse_path: &Path,
     options: &Options,
 ) -> Result<RecordDiff> {
     let mut diff = RecordDiff::default();
     let mut legacy_statement = record_rows(legacy)?;
     let mut inhouse_statement = record_rows(inhouse)?;
-    let mut legacy_rows = legacy_statement.query_map([], decode_row)?;
-    let mut inhouse_rows = inhouse_statement.query_map([], decode_row)?;
+    let mut legacy_rows = legacy_statement.query_map([], |row| decode_row(row, legacy_path))?;
+    let mut inhouse_rows = inhouse_statement.query_map([], |row| decode_row(row, inhouse_path))?;
     let mut left = legacy_rows.next().transpose()?;
     let mut right = inhouse_rows.next().transpose()?;
     let record = |diff: &mut RecordDiff,
@@ -601,6 +612,7 @@ fn show_field(bytes: &[u8]) -> String {
 type FieldDifference = (FieldClass, [u8; 4], Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// Pair the occurrences of each signature in order and classify every difference.
+/// Compare untyped field bytes. Causal classes are not inferred without field schema context.
 pub fn classify_fields(
     legacy: &[([u8; 4], Vec<u8>)],
     inhouse: &[([u8; 4], Vec<u8>)],
@@ -654,93 +666,19 @@ pub fn classify_fields(
     differences
 }
 
-/// Windows-1252 code points for 0x80..0xA0; the rest of the byte range maps to itself.
-const WINDOWS_1252_HIGH: [char; 32] = [
-    '\u{20AC}', '\u{81}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
-    '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{8D}', '\u{017D}', '\u{8F}',
-    '\u{90}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
-    '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{9D}', '\u{017E}', '\u{0178}',
-];
-
-fn windows_1252(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|&byte| match byte {
-            0x80..0xa0 => WINDOWS_1252_HIGH[usize::from(byte - 0x80)],
-            _ => char::from(byte),
-        })
-        .collect()
-}
-
-/// Nonempty text with no control bytes, ending at its first NUL or at the end.
-fn looks_like_text(bytes: &[u8]) -> bool {
-    let text = until_nul(bytes);
-    !text.is_empty()
-        && text.iter().all(|&byte| byte >= 0x20 || byte == b'\t')
-        && bytes[text.len()..].iter().all(|&byte| byte == 0)
-}
-
-fn until_nul(bytes: &[u8]) -> &[u8] {
-    &bytes[..bytes
-        .iter()
-        .position(|&byte| byte == 0)
-        .unwrap_or(bytes.len())]
-}
-
 fn classify_pair(legacy: &[u8], inhouse: &[u8]) -> FieldClass {
-    // Text: the same characters, Windows-1252 on one side and UTF-8 on the other.
-    if looks_like_text(legacy)
-        && looks_like_text(inhouse)
-        && let Ok(text) = std::str::from_utf8(until_nul(inhouse))
-        && windows_1252(until_nul(legacy)) == text
-    {
-        return FieldClass::TextEncoding;
-    }
-    // A localized string: a four-byte ID on the legacy side, NUL-terminated text in-house.
-    if legacy.len() == 4
-        && inhouse.last() == Some(&0)
-        && std::str::from_utf8(&inhouse[..inhouse.len() - 1]).is_ok_and(|text| !text.contains('\0'))
-    {
-        return FieldClass::LocalizedString;
-    }
     if legacy.len() != inhouse.len() {
-        return FieldClass::OtherLength;
-    }
-    let (mut cleared, mut remapped, mut other) = (false, false, false);
-    for (offset, (a, b)) in legacy.iter().zip(inhouse).enumerate() {
-        if a == b {
-            continue;
-        }
-        let word = offset / 4 * 4;
-        let (Some(a), Some(b)) = (legacy.get(word..word + 4), inhouse.get(word..word + 4)) else {
-            other = true;
-            continue;
-        };
-        let a = u32::from_le_bytes(a.try_into().expect("four bytes"));
-        let b = u32::from_le_bytes(b.try_into().expect("four bytes"));
-        if b == 0 && a != 0 {
-            cleared = true;
-        } else if a & 0x00ff_ffff == b & 0x00ff_ffff
-            || (b >> 24 == 0xfe && a & 0xfff == b & 0xfff)
-            || (a >> 24 == 0xfe && a & 0xfff == b & 0xfff)
-        {
-            remapped = true;
-        } else {
-            other = true;
-        }
-    }
-    match (cleared, remapped, other) {
-        (_, _, true) => FieldClass::OtherBytes,
-        (true, true, false) => FieldClass::LinkClearedAndRemap,
-        (true, false, false) => FieldClass::LinkCleared,
-        (false, true, false) => FieldClass::FormIdRemap,
-        (false, false, false) => FieldClass::OtherBytes,
+        FieldClass::OtherLength
+    } else {
+        // This layer has no field schema or localization provenance. Equal-length values stay
+        // unexplained; byte shape alone cannot establish string, link, or FormID semantics.
+        FieldClass::OtherBytes
     }
 }
 
 /// A plain-text summary: every divergent table and field class, largest first.
 pub fn summary(report: &Report) -> String {
-    let mut out = String::new();
+    let mut out = format!("{}\n", report.diagnostic_notice);
     let records = &report.records;
     out += &format!(
         "records: legacy {}, in-house {}, identical {}\n",
@@ -808,6 +746,7 @@ pub fn summary(report: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     fn fields(list: &[(&[u8; 4], &[u8])]) -> Vec<([u8; 4], Vec<u8>)> {
         list.iter()
@@ -815,33 +754,133 @@ mod tests {
             .collect()
     }
 
+    fn minimal_database(path: &Path, record_data: &[u8], projection: Option<(&str, &[u8])>) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE records(
+                    form_id INTEGER PRIMARY KEY, record_type TEXT, cell_id INTEGER,
+                    worldspace_id INTEGER, load_order INTEGER, data BLOB
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO records VALUES(4660, 'STAT', NULL, NULL, 0, ?1)",
+                [record_data],
+            )
+            .unwrap();
+        for table in ["cells", "references", "waters"] {
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE \"{table}\"(id INTEGER PRIMARY KEY, data BLOB);"
+                ))
+                .unwrap();
+            let payload = projection
+                .filter(|(changed, _)| *changed == table)
+                .map_or(&b"same"[..], |(_, value)| value);
+            connection
+                .execute(
+                    &format!("INSERT INTO \"{table}\"(id,data) VALUES(1,?1)"),
+                    params![payload],
+                )
+                .unwrap();
+        }
+    }
+
+    fn empty_record_archive() -> Vec<u8> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(&ArchivedRecordData {
+            subrecords: Vec::new(),
+        })
+        .unwrap()
+        .to_vec()
+    }
+
     #[test]
-    fn classifies_each_mechanism() {
+    fn projected_payload_blobs_are_compared_independently_of_canonical_records() {
+        let canonical = empty_record_archive();
+        for table in ["cells", "references", "waters"] {
+            let directory = tempfile::tempdir().unwrap();
+            let legacy_path = directory.path().join("legacy.db");
+            let inhouse_path = directory.path().join("inhouse.db");
+            minimal_database(&legacy_path, &canonical, Some((table, b"left")));
+            minimal_database(&inhouse_path, &canonical, Some((table, b"right")));
+
+            let report = compare(&legacy_path, &inhouse_path, &Options::default()).unwrap();
+            assert_eq!(report.records.identical, 1, "{table}");
+            assert_eq!(report.records.records.len(), 0, "{table}");
+            assert_eq!(report.tables[table].differing_rows, 1, "{table}");
+            assert_eq!(report.tables[table].columns["data"].rows, 1, "{table}");
+            for unchanged in ["cells", "references", "waters"] {
+                if unchanged != table {
+                    assert_eq!(report.tables[unchanged].differing_rows, 0, "{unchanged}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_record_archives_fail_with_path_and_form_id_context() {
+        let valid = empty_record_archive();
+        let cases = [
+            (b"corrupt".as_slice(), &valid[..]),
+            (&valid[..], b"corrupt"),
+        ];
+        for (legacy_data, inhouse_data) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let legacy_path = directory.path().join("legacy.db");
+            let inhouse_path = directory.path().join("inhouse.db");
+            minimal_database(&legacy_path, legacy_data, None);
+            minimal_database(&inhouse_path, inhouse_data, None);
+            let error = compare(&legacy_path, &inhouse_path, &Options::default()).unwrap_err();
+            let detail = format!("{error:#}");
+            let bad_path = if legacy_data == b"corrupt" {
+                &legacy_path
+            } else {
+                &inhouse_path
+            };
+            assert!(detail.contains(&bad_path.display().to_string()), "{detail}");
+            assert!(detail.contains("record 00001234"), "{detail}");
+            assert!(detail.contains("invalid records.data archive"), "{detail}");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let legacy_path = directory.path().join("both-corrupt-legacy.db");
+        let inhouse_path = directory.path().join("both-corrupt-inhouse.db");
+        minimal_database(&legacy_path, b"corrupt", None);
+        minimal_database(&inhouse_path, b"corrupt", None);
+        assert!(compare(&legacy_path, &inhouse_path, &Options::default()).is_err());
+    }
+
+    #[test]
+    fn untyped_field_shapes_do_not_claim_causal_mechanisms() {
         let legacy = fields(&[
-            (b"EDID", b"Caf\xe9\0"),
-            (b"FULL", &7u32.to_le_bytes()),
-            (b"XLKR", &[0x00, 0x08, 0x00, 0x01, 0xAD, 0xDE, 0x00, 0x00]),
-            (b"LNAM", &0x0100_0800u32.to_le_bytes()),
-            (b"DATA", &[1, 2, 3]),
-            (b"BAD_", &[9]),
+            (b"LSTR", &7u32.to_le_bytes()),
+            (b"ZERO", &[b'A', b'B', b'C', 0]),
+            (b"LINK", &0x0100_0800u32.to_le_bytes()),
+            (b"NULL", &0xDEADu32.to_le_bytes()),
+            (b"FLOT", &1.0f32.to_le_bytes()),
+            (b"RAND", &[0x91, 0x25, 0xF0, 0x33]),
+            (b"TEXT", b"Caf\xe9\0"),
         ]);
         let inhouse = fields(&[
-            (b"EDID", "Café\0".as_bytes()),
-            (b"FULL", b"Sword\0"),
-            (b"XLKR", &[0x00, 0x08, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]),
-            (b"LNAM", &0x0200_0800u32.to_le_bytes()),
-            (b"DATA", &[1, 2, 4]),
+            (b"LSTR", b"Rock\0"),
+            (b"ZERO", b"XYZ\0"),
+            (b"LINK", &0x0200_0800u32.to_le_bytes()),
+            (b"NULL", &0u32.to_le_bytes()),
+            (b"FLOT", &0.0f32.to_le_bytes()),
+            (b"RAND", &[0x81, 0x25, 0xF0, 0x33]),
+            (b"TEXT", "Café\0".as_bytes()),
         ]);
         let classes: BTreeMap<String, FieldClass> = classify_fields(&legacy, &inhouse)
             .into_iter()
             .map(|(class, tag, _, _)| (String::from_utf8_lossy(&tag).into_owned(), class))
             .collect();
-        assert_eq!(classes["EDID"], FieldClass::TextEncoding);
-        assert_eq!(classes["FULL"], FieldClass::LocalizedString);
-        assert_eq!(classes["XLKR"], FieldClass::LinkClearedAndRemap);
-        assert_eq!(classes["LNAM"], FieldClass::FormIdRemap);
-        assert_eq!(classes["DATA"], FieldClass::OtherBytes);
-        assert_eq!(classes["BAD_"], FieldClass::OmittedByInhouse);
+        for tag in ["ZERO", "LINK", "NULL", "FLOT", "RAND"] {
+            assert_eq!(classes[tag], FieldClass::OtherBytes, "{tag}");
+        }
+        assert_eq!(classes["LSTR"], FieldClass::OtherLength);
+        assert_eq!(classes["TEXT"], FieldClass::OtherLength);
     }
 
     #[test]
