@@ -17,6 +17,7 @@ pub mod binary;
 pub mod cell_cache;
 pub mod doors;
 pub mod emittance;
+mod environment;
 pub mod exporter;
 pub mod extractors;
 pub mod inhouse;
@@ -40,6 +41,8 @@ mod base_model_parity_tests;
 mod display_name_parity_tests;
 #[cfg(test)]
 mod emittance_parity_tests;
+#[cfg(test)]
+mod environment_parity_tests;
 #[cfg(test)]
 mod plugin_table_tests;
 #[cfg(test)]
@@ -552,7 +555,8 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         b"XCWT" if record_type == b"CELL" => Fixed(SINGLE),
         // RNAM is a compound large-reference payload and TNAM is a texture path;
         // preserve those bytes under the existing unsupported-layout policy.
-        b"NAM2" | b"NAM3" | b"WNAM" | b"CNAM" if record_type == b"WRLD" => Fixed(SINGLE),
+        // Music (`ZNAM`) as well, which the in-house schema remaps too.
+        b"NAM2" | b"NAM3" | b"WNAM" | b"CNAM" | b"ZNAM" if record_type == b"WRLD" => Fixed(SINGLE),
         b"RNAM" | b"CNAM" | b"INAM" if record_type == b"NPC_" => Fixed(SINGLE),
         // xEdit 9fb016884bec138ea6c7b872cec831537d464c3e,
         // wbDefinitionsTES5.pas:9463-9468. Match the in-house actors schema.
@@ -607,6 +611,17 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
             stride: 12,
             form_ids: &[0, 8],
         },
+        // A climate's weathers, laid out like a region's.
+        b"WLST" if record_type == b"CLMT" => Array {
+            stride: 12,
+            form_ids: &[0, 8],
+        },
+        // A weather's precipitation, visual effect, sky static and sun glare lens.
+        b"MNAM" | b"NNAM" | b"TNAM" | b"GNAM" if record_type == b"WTHR" => Fixed(SINGLE),
+        // Its image spaces and volumetric lighting at sunrise, day, sunset and night.
+        b"IMSP" | b"HNAM" if record_type == b"WTHR" => Fixed(&[(16, &[0, 4, 8, 12])]),
+        // Each sound is its own subrecord: descriptor, then a u32 kind.
+        b"SNAM" if record_type == b"WTHR" => Fixed(&[(8, &[0])]),
         _ => return None,
     })
 }

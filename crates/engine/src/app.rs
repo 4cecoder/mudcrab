@@ -211,6 +211,20 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             spawn_ground_height,
         ))
     };
+    // Authored lighting, weather, climate and image space, when the database has them (#269).
+    // Read only; nothing renders from it yet.
+    let environment = runtime_data.as_ref().map(|_| {
+        crate::world::environment::EnvironmentCatalog::open(
+            &config.assets_dir.join("skyrim_world.db"),
+        )
+        .unwrap_or_else(|error| {
+            // LogPlugin is installed later, so report this startup failure directly.
+            eprintln!(
+                "warning: environment: cannot open the world database ({error}); using an empty catalog"
+            );
+            Default::default()
+        })
+    });
     // The streamed world's merged terrain (#215): the land texture table of this conversion, if it
     // has one. Opening it reads one small file; the arrays and chunks load as they are needed.
     let terrain_merge = runtime_data
@@ -375,6 +389,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .add_systems(PreUpdate, drive_streaming_benchmark_route);
     }
     if let Some((database, catalog, cache, ground_height, spawn_ground_height)) = runtime_data {
+        if let Some(environment) = environment {
+            app.insert_resource(environment);
+        }
         app.insert_resource(database)
             .insert_resource(catalog)
             .insert_resource(cache)
