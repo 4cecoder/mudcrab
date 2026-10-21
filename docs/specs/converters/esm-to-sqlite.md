@@ -195,13 +195,20 @@ pub struct CachedLand {
 
 ### Reading Zero-Copy at Runtime:
 
+The runtime's `CellCache::open` in `crates/engine/src/world/cache.rs` maps the file,
+validates the archive, checks `CELL_CACHE_VERSION`, and builds its cell index, returning errors
+on failure. This helper illustrates the archive-validation step and returns its result;
+version checking remains a separate step before using the cache.
+
 ```rust
 use rkyv::access;
-use memmap2::MmapOptions;
+use shared::ArchivedCellCache;
 
-pub fn load_cell_cache<'a>(mmap: &'a memmap2::Mmap) -> &'a ArchivedCellCache {
+pub fn load_cell_cache<'a>(
+    mmap: &'a memmap2::Mmap,
+) -> Result<&'a ArchivedCellCache, rkyv::rancor::Error> {
     // Validated access: the archive is checked before it is read in place.
-    access::<ArchivedCellCache, rkyv::rancor::Error>(&mmap[..]).unwrap()
+    access::<ArchivedCellCache, rkyv::rancor::Error>(&mmap[..])
 }
 ```
 
