@@ -384,7 +384,7 @@ mod missing_palette_failure_tests {
             "meshes": [{"primitives": [{}]}]
         });
         publish_gltf_materials(&mut document, &[material], &[0], Path::new("materials.glb"))
-        .unwrap();
+            .unwrap();
 
         let texture_slots =
             document["materials"][0]["extensions"]["OPEN_SKYRIM_material"]["textureSlots"]
