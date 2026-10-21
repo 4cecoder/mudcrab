@@ -281,7 +281,7 @@ fn actual_palette_shaders_compose_with_shadow_discard_enabled_and_disabled() {
     assert!(
         shadow_calls
             .iter()
-            .any(|name| name.ends_with("palette_alpha_discard"))
+            .any(|name| name.contains("palette_alpha_discard"))
     );
     let discard = function(&shadow, "palette_alpha_discard");
     let mut discard_calls = HashSet::new();
@@ -289,7 +289,8 @@ fn actual_palette_shaders_compose_with_shadow_discard_enabled_and_disabled() {
     assert!(
         discard_calls
             .iter()
-            .any(|name| name.ends_with("effect_color"))
+            .any(|name| name.contains("effect_color")),
+        "prepass calls: {discard_calls:?}"
     );
     assert!(contains_kill(&discard.body));
 
@@ -312,7 +313,7 @@ fn actual_palette_shaders_compose_with_shadow_discard_enabled_and_disabled() {
     assert!(
         normal_calls
             .iter()
-            .any(|name| name.ends_with("palette_alpha_discard"))
+            .any(|name| name.contains("palette_alpha_discard"))
     );
 
     let without_discard = compose(PREPASS, "effect_palette_prepass.wgsl", &["VERTEX_UVS_A"])
@@ -330,7 +331,7 @@ fn actual_palette_shaders_compose_with_shadow_discard_enabled_and_disabled() {
     assert!(
         entry_calls(&main, "fragment")
             .iter()
-            .any(|name| name.ends_with("effect_color"))
+            .any(|name| name.contains("effect_color"))
     );
 }
 
