@@ -6,9 +6,9 @@ use naga_oil::compose::{
 };
 use std::collections::{HashMap, HashSet};
 
-const FUNCTIONS: &str = include_str!("../../shaders/effect_palette_functions.wgsl");
-const MAIN: &str = include_str!("../../shaders/effect_palette.wgsl");
-const PREPASS: &str = include_str!("../../shaders/effect_palette_prepass.wgsl");
+const FUNCTIONS: &str = include_str!("../shaders/effect_palette_functions.wgsl");
+const MAIN: &str = include_str!("../shaders/effect_palette.wgsl");
+const PREPASS: &str = include_str!("../shaders/effect_palette_prepass.wgsl");
 const SHADOW_ALPHA_CUTOFF: f32 = 0.05;
 
 const PBR_TYPES: &str = r#"
