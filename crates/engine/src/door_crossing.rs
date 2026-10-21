@@ -399,6 +399,7 @@ fn switch_space(world: &mut World, landing: Landing) {
     }
     world.write_message(TeleportPlayer {
         position: landing.position,
+        sampled_ground_y: None,
         yaw: landing.yaw,
     });
 }
@@ -418,6 +419,7 @@ fn place_again(commands: &mut Commands, landing: &Landing) {
         };
         world.write_message(TeleportPlayer {
             position,
+            sampled_ground_y: None,
             yaw: landing.yaw,
         });
     });

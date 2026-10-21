@@ -178,14 +178,44 @@ pub struct IngestedFile {
     pub hash: String,
 }
 
+/// Which archive entries an ingestion cache proves it contains.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestionSelection {
+    /// Older manifests extracted every archive entry.
+    #[default]
+    All,
+    /// Runtime mesh/texture/script inputs, LOD settings, and English string banks.
+    RuntimeEnglishV1,
+    ConverterInputsV1,
+}
+
+impl IngestionSelection {
+    pub fn can_satisfy(self, requested: Self) -> bool {
+        self == Self::All
+            || self == requested
+            || (self == Self::ConverterInputsV1 && requested == Self::RuntimeEnglishV1)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IngestionCacheEntry {
     pub source_hash: String,
-    /// Extraction selection and checkpoint contract. Empty entries are legacy,
-    /// fully extracted archives whose individual files were synced.
+    #[serde(default)]
+    pub selection: IngestionSelection,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub recipe: String,
     pub files: Vec<IngestedFile>,
+    /// Version of the archive reader that produced `files`, for formats whose reader changed
+    /// what it stores (BSA names are decoded as Windows-1252 from version 1). Absent means 0,
+    /// the reader before any such change; an entry is reused only when it matches the current
+    /// reader, so a changed reader re-extracts the archive once instead of keeping old paths.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reader_version: u32,
+}
+
+pub(crate) fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 const INGESTION_JOURNAL_FILE: &str = ".ingestion-archives.jsonl";
@@ -300,21 +330,26 @@ pub struct ConversionManifest {
 /// Script ABI/settings, source and output proofs still have to match. Archive
 /// extraction uses its own source/blob integrity proof, independent of this gate.
 /// Schema 25 is excluded: two unmerged candidates both used it for different contracts.
+/// The producer-27 to producer-28 transition changes only texture container bytes,
+/// so producer-27 scripts remain valid.
 pub(crate) fn can_reuse_scripts_and_archives(schema: u32) -> bool {
-    matches!(schema, 12..=24 | 26)
+    matches!(schema, 12..=24 | 26 | 27)
 }
 
-/// Published producer-24 meshes retain the producer-26 byte contract. Producer 27
-/// changes the GLB collision data, so no earlier producer's meshes pass this gate
-/// at 27. This never authorizes texture reuse or bypasses source/configuration/
+/// Published producer-24 meshes retain the producer-26 byte contract, and producer-27
+/// meshes retain the producer-28 byte contract (only texture containers changed).
+/// Producer 27 changed the GLB collision data, so no producer before 27 passes this
+/// gate at 28 or later. This never authorizes texture reuse or bypasses source/configuration/
 /// output proof.
 pub(crate) fn can_reuse_meshes(schema: u32) -> bool {
     can_reuse_meshes_for_producer(schema, CONVERTER_SCHEMA_VERSION)
 }
 
 /// Check the explicit producer pair so later contracts cannot inherit old mesh reuse.
+/// Each pair names a byte-identical GLB contract; `(24, 26)` must never be read as
+/// transitive, so `(24, 28)` and `(26, 28)` are deliberately absent.
 pub(crate) fn can_reuse_meshes_for_producer(schema: u32, current: u32) -> bool {
-    schema == current || matches!((schema, current), (24, 26))
+    schema == current || matches!((schema, current), (24, 26) | (27, 28))
 }
 
 impl ConversionManifest {
@@ -349,7 +384,7 @@ impl ConversionManifest {
                 && mesh_schema <= manifest.schema_version
                 && (manifest.retained_mesh_schema_version.is_some() || !metadata_rebuild);
             // All old textures regenerate. GLBs of a producer `can_reuse_meshes`
-            // accepts (none for an earlier producer at 27) and scripts remain
+            // accepts (at 28: producers 27 only, never 24 or 26) and scripts remain
             // candidates for the usual per-asset verification.
             manifest.complete = false;
             manifest.entries.retain(|_, entry| {
@@ -510,6 +545,18 @@ pub(crate) fn legacy_projection_v1_configuration_hash(
     )
 }
 
+/// Reproduce the exact version-3 legacy projection proof for retained assets.
+pub(crate) fn legacy_projection_v3_configuration_hash(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+) -> Result<String> {
+    configuration_hash_with_identity(
+        config,
+        schema,
+        Some(&serde_json::json!({"mode": "legacy", "projection_version": 3})),
+    )
+}
+
 /// Reproduce the exact version-2 legacy projection proof for retained assets.
 pub(crate) fn legacy_projection_v2_configuration_hash(
     config: &crate::config::PipelineConfig,
@@ -585,17 +632,17 @@ fn link_or_copy_with(
     to: &Path,
     link: fn(&Path, &Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    if to.exists() {
-        // Removing `to` would delete `from` itself when `to` is the same path as `from`, so that
-        // state is success rather than a reason to touch anything.
-        let names_one_file = match fs::canonicalize(from) {
-            Ok(from) => fs::canonicalize(to).is_ok_and(|to| to == from),
-            Err(_) => false,
-        };
-        if names_one_file {
-            return Ok(());
+    match fs::symlink_metadata(to) {
+        Ok(_) => {
+            // Removing the source itself would lose its bytes; a dangling destination symlink
+            // must still be removed before the copy fallback can follow it.
+            if same_path(from, to) {
+                return Ok(());
+            }
+            fs::remove_file(to)?;
         }
-        fs::remove_file(to)?;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     link(from, to).or_else(|_| fs::copy(from, to).map(|_| ()))
 }
@@ -742,15 +789,48 @@ fn link_or_copy_spilling_with(
     link: &impl Fn(&Path, &Path) -> std::io::Result<()>,
     hash: &impl Fn(&fs::File) -> std::io::Result<String>,
 ) -> std::io::Result<()> {
-    if same_path(blob, to) {
-        return Ok(());
-    }
-    if to.exists() {
-        fs::remove_file(to)?;
+    link_or_copy_spilling_impl(blob, to, cache, link, hash, &mut |from, to, spill| {
+        if !spill {
+            return fs::copy(from, to).map(|_| ());
+        }
+        let temporary = tempfile::NamedTempFile::new_in(to.parent().unwrap())?;
+        fs::copy(from, temporary.path())?;
+        temporary.persist(to).map_err(|error| error.error)?;
+        Ok(())
+    })
+}
+
+pub(crate) fn link_or_copy_spilling_with_copy_and_link(
+    blob: &Path,
+    to: &Path,
+    cache: &SpillCache,
+    link: &impl Fn(&Path, &Path) -> std::io::Result<()>,
+    mut copy: impl FnMut(&Path, &Path, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    link_or_copy_spilling_impl(blob, to, cache, link, &hash_open_file, &mut copy)
+}
+
+fn link_or_copy_spilling_impl(
+    blob: &Path,
+    to: &Path,
+    cache: &SpillCache,
+    link: &impl Fn(&Path, &Path) -> std::io::Result<()>,
+    hash: &impl Fn(&fs::File) -> std::io::Result<String>,
+    copy: &mut impl FnMut(&Path, &Path, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match fs::symlink_metadata(to) {
+        Ok(metadata) => {
+            if metadata.is_file() && same_path(blob, to) {
+                return Ok(());
+            }
+            fs::remove_file(to)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     match link(blob, to) {
         Ok(()) => return Ok(()),
-        Err(error) if !is_too_many_links(&error) => return fs::copy(blob, to).map(|_| ()),
+        Err(error) if !is_too_many_links(&error) => return copy(blob, to, false),
         Err(_) => {}
     }
     let lease = cache.lease(blob);
@@ -785,18 +865,16 @@ fn link_or_copy_spilling_with(
             if valid {
                 state.active = candidate;
             } else {
-                // Same-blob writers share this lock; the temporary name also
-                // protects creation from independent extractions.
-                let temporary =
-                    tempfile::NamedTempFile::new_in(blob.parent().unwrap_or(Path::new(".")))?;
-                fs::copy(blob, temporary.path())?;
-                let proof = SpillProof::open(temporary.path())?;
+                // The callback atomically replaces the logical spill path and records
+                // that physical file's durability, rather than a disposable temporary name.
+                copy(blob, &spill, true)?;
+                let proof = SpillProof::open(&spill)?;
                 if &proof.hash(hash)? != expected {
-                    return Err(std::io::Error::other(
-                        "cache file changed before spill copy",
+                    return Err(discard_unverified(
+                        &spill,
+                        std::io::Error::other("cache file changed before spill copy"),
                     ));
                 }
-                temporary.persist(&spill).map_err(|error| error.error)?;
                 state.active = Some(proof);
             }
         }
@@ -811,7 +889,7 @@ fn link_or_copy_spilling_with(
     }
     // Beyond the bounded spill count, verify this derived copy before use.
     let result = (|| {
-        fs::copy(blob, to)?;
+        copy(blob, to, false)?;
         let copied = SpillProof::open(to)?;
         if copied.hash(hash)? != state.base.as_ref().unwrap().1 {
             return Err(std::io::Error::other("cache file changed before copying"));
@@ -892,6 +970,15 @@ pub(crate) fn retained_configuration_matches_for_reader(
         && identity == &serde_json::json!({"mode": "legacy", "projection_version": 2})
     {
         return Ok(recorded == legacy_projection_v2_configuration_hash(config, schema)?);
+    }
+    if config.record_reader == crate::config::RecordReader::Legacy
+        && identity == &serde_json::json!({"mode": "legacy", "projection_version": 3})
+    {
+        // Projection v3 resolved only English banks. Preserve old proofs under that contract.
+        if !crate::esm::inhouse::is_english(&config.language) {
+            return Ok(false);
+        }
+        return Ok(recorded == legacy_projection_v3_configuration_hash(config, schema)?);
     }
     let current = crate::esm::inhouse::configured_reader_identity(config)?;
     if identity == &current {
@@ -1248,12 +1335,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let entry = IngestionCacheEntry {
             source_hash: "ab".repeat(32),
+            selection: IngestionSelection::ConverterInputsV1,
             recipe: "converter-inputs-v1".to_owned(),
             files: vec![IngestedFile {
                 path: "lodsettings/tamriel.lod".to_owned(),
                 size: 4,
                 hash: "cd".repeat(32),
             }],
+            reader_version: 0,
         };
         let mut journal = IngestionJournal::open(directory.path()).unwrap();
         journal.record("base.bsa", &entry).unwrap();
@@ -1381,7 +1470,50 @@ mod tests {
         }
     }
 
-    /// Historical schema-15 hashes retain their explicit legacy reader and original settings.
+    #[test]
+    fn both_prior_cache_contracts_limit_coverage_and_unknown_recipes_miss() {
+        let pack_entry: IngestionCacheEntry = serde_json::from_value(serde_json::json!({
+            "source_hash": "source", "recipe": "converter-inputs-v1", "files": []
+        }))
+        .unwrap();
+        assert!(pack_entry.covers(IngestionSelection::RuntimeEnglishV1));
+        assert!(pack_entry.covers(IngestionSelection::ConverterInputsV1));
+        assert!(!pack_entry.covers(IngestionSelection::All));
+        let raw_entry: IngestionCacheEntry = serde_json::from_value(serde_json::json!({
+            "source_hash": "source", "selection": "runtime_english_v1", "files": []
+        }))
+        .unwrap();
+        assert!(raw_entry.covers(IngestionSelection::RuntimeEnglishV1));
+        assert!(!raw_entry.covers(IngestionSelection::All));
+        assert!(!raw_entry.covers(IngestionSelection::ConverterInputsV1));
+        let mut conflicting = raw_entry.clone();
+        conflicting.recipe = "all-v1".into();
+        assert!(!conflicting.covers(IngestionSelection::All));
+        conflicting.recipe = "unknown-v99".into();
+        assert!(!conflicting.covers(IngestionSelection::RuntimeEnglishV1));
+        let roundtrip: IngestionCacheEntry =
+            serde_json::from_slice(&serde_json::to_vec(&pack_entry).unwrap()).unwrap();
+        assert_eq!(roundtrip, pack_entry);
+    }
+
+    #[test]
+    fn older_ingestion_entries_prove_all_files_and_coverage_is_directional() {
+        let entry: IngestionCacheEntry = serde_json::from_value(serde_json::json!({
+            "source_hash": "source", "files": [],
+        }))
+        .unwrap();
+        assert_eq!(entry.selection, IngestionSelection::All);
+        assert!(
+            entry
+                .selection
+                .can_satisfy(IngestionSelection::RuntimeEnglishV1)
+        );
+        assert!(!IngestionSelection::RuntimeEnglishV1.can_satisfy(IngestionSelection::All));
+        assert!(
+            IngestionSelection::RuntimeEnglishV1.can_satisfy(IngestionSelection::RuntimeEnglishV1)
+        );
+    }
+
     #[test]
     fn retained_schema15_fixed_zstd_proof_preserves_quality_abi_and_cache_identity() {
         let mut config = crate::config::PipelineConfig::new("Data", "output");
@@ -1471,6 +1603,61 @@ mod tests {
             hash_bytes(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn sha256_matches_known_padding_boundary_vectors() {
+        // Fixed digests computed independently with Python's hashlib.
+        let vectors = [
+            (
+                0,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                55,
+                "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+            ),
+            (
+                56,
+                "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+            ),
+            (
+                63,
+                "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34",
+            ),
+            (
+                64,
+                "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+            ),
+            (
+                65,
+                "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0",
+            ),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("padding-vector.bin");
+        for (size, expected) in vectors {
+            let bytes = vec![b'a'; size];
+            assert_eq!(hash_bytes(&bytes), expected, "byte vector length {size}");
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                hash_file(&path).unwrap(),
+                expected,
+                "file vector length {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn sha256_file_matches_known_multiblock_vector() {
+        // Standard SHA-256 million-'a' vector, spanning many file read chunks.
+        let bytes = vec![b'a'; 1_000_000];
+        let expected = "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
+        assert_eq!(hash_bytes(&bytes), expected);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("million-a.bin");
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(hash_file(&path).unwrap(), expected);
     }
 
     #[test]
@@ -1574,6 +1761,55 @@ mod tests {
 
         assert_eq!(fs::read(&blob).unwrap(), b"archive bytes");
         assert_eq!(fs::read(&vfs).unwrap(), b"archive bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_replaces_destination_symlinks_without_touching_their_targets() {
+        use std::os::unix::fs::symlink;
+
+        fn force_copy(_: &Path, _: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::other("no hard links here"))
+        }
+        type Restore = fn(&Path, &Path) -> std::io::Result<()>;
+        let restores: [Restore; 2] = [
+            |from, to| link_or_copy_with(from, to, force_copy),
+            |from, to| {
+                link_or_copy_spilling_with(
+                    from,
+                    to,
+                    &SpillCache::default(),
+                    &force_copy,
+                    &hash_open_file,
+                )
+            },
+        ];
+        for restore in restores {
+            for target_exists in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let blob = directory.path().join("blob");
+                fs::write(&blob, b"archive bytes").unwrap();
+                let outside = directory.path().join("outside");
+                if target_exists {
+                    fs::write(&outside, b"external bytes").unwrap();
+                }
+                let staging = directory.path().join("staging");
+                fs::create_dir(&staging).unwrap();
+                let destination = staging.join("restored.bin");
+                symlink(&outside, &destination).unwrap();
+
+                restore(&blob, &destination).unwrap();
+
+                assert!(fs::symlink_metadata(&destination).unwrap().is_file());
+                assert_eq!(fs::read(&destination).unwrap(), b"archive bytes");
+                assert_eq!(fs::read(&blob).unwrap(), b"archive bytes");
+                if target_exists {
+                    assert_eq!(fs::read(&outside).unwrap(), b"external bytes");
+                } else {
+                    assert!(fs::symlink_metadata(&outside).is_err());
+                }
+            }
+        }
     }
 
     #[test]
