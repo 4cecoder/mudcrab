@@ -29,7 +29,7 @@ fn record(tag: &[u8; 4], id: u32, flags: u32, payload: Vec<u8>) -> Vec<u8> {
     .concat()
 }
 
-/// A localized master whose classes name their `FULL` by string ID 1, 2 and 3.
+/// A localized master whose classes name their `FULL` by string IDs 1, 2, 3 and 4.
 fn localized_master(data: &Path) {
     let mut bytes = record(b"TES4", 0, 0x1 | LOCALIZED, sub(b"HEDR", &[0; 12]));
     for (id, string) in [(0x800, 1u32), (0x801, 2), (0x802, 3), (0x803, 4)] {
@@ -237,7 +237,7 @@ async fn names_come_from_the_tables_of_the_configured_language() {
         "{:?}",
         report.warnings
     );
-    assert_eq!(names(&output), [None, None, None]);
+    assert_eq!(names(&output), [None, None, None, None]);
 
     // A corrupt selected bank keeps its parser reason in the legacy warning.
     let broken = dir.path().join("BrokenData");
