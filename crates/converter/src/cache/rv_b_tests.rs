@@ -204,13 +204,9 @@ fn retained_legacy_hash_validation_does_not_upgrade_old_reader_provenance() {
     let french_v3 = serde_json::json!({"mode": "legacy", "projection_version": 3});
     let mut french_config = config.clone();
     french_config.language = "French".to_owned();
-    assert!(!retained_configuration_matches_for_reader(
-        &french_config,
-        26,
-        &v3,
-        &french_v3
-    )
-    .unwrap());
+    assert!(
+        !retained_configuration_matches_for_reader(&french_config, 26, &v3, &french_v3).unwrap()
+    );
     assert!(
         retained_configuration_matches_for_reader(
             &config,

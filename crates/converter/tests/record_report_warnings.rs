@@ -150,7 +150,12 @@ fn localized_loss_fixture(data: &Path) {
         "Lost.esm",
         0x80,
         &[],
-        &[localized(0x806), null_key, keyword(0x801, b"HealthyNeighbor\0")].concat(),
+        &[
+            localized(0x806),
+            null_key,
+            keyword(0x801, b"HealthyNeighbor\0"),
+        ]
+        .concat(),
     );
 }
 
@@ -513,9 +518,13 @@ async fn missing_localized_text_marks_both_readers_incomplete_without_losing_nei
         let output = directory.path().join(name);
         let report = publish(&data, &output, reader).await;
         assert_eq!(record_ids(&output), [0x801, 0x806, 0x807]);
-        assert!(report.warnings.iter().any(|line| {
-            line.contains("lost.esm") && line.contains("missing localized ID 17")
-        }), "{:?}", report.warnings);
+        assert!(
+            report.warnings.iter().any(|line| {
+                line.contains("lost.esm") && line.contains("missing localized ID 17")
+            }),
+            "{:?}",
+            report.warnings
+        );
         assert!(
             report.warnings.iter().all(|line| !line.contains("ID 0")),
             "null localized IDs are not data loss: {:?}",

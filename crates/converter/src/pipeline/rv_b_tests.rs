@@ -329,11 +329,13 @@ async fn known_legacy_full_hashes_reuse_assets_without_kind_keys() {
                 CONVERTER_SCHEMA_VERSION,
             )
             .unwrap(),
-            "projection-3" | "projection-3-nonenglish" => crate::cache::legacy_projection_v3_configuration_hash(
-                &config,
-                CONVERTER_SCHEMA_VERSION,
-            )
-            .unwrap(),
+            "projection-3" | "projection-3-nonenglish" => {
+                crate::cache::legacy_projection_v3_configuration_hash(
+                    &config,
+                    CONVERTER_SCHEMA_VERSION,
+                )
+                .unwrap()
+            }
             "current" => configuration_hash(&config).unwrap(),
             _ => "unproven-settings".into(),
         };
@@ -344,7 +346,9 @@ async fn known_legacy_full_hashes_reuse_assets_without_kind_keys() {
             "historical" => Some(serde_json::json!({"mode": "legacy"})),
             "projection-1" => Some(serde_json::json!({"mode": "legacy", "projection_version": 1})),
             "projection-2" => Some(serde_json::json!({"mode": "legacy", "projection_version": 2})),
-            "projection-3" | "projection-3-nonenglish" => Some(serde_json::json!({"mode": "legacy", "projection_version": 3})),
+            "projection-3" | "projection-3-nonenglish" => {
+                Some(serde_json::json!({"mode": "legacy", "projection_version": 3}))
+            }
             _ => None,
         };
         if let Some(source_reader) = source_reader {
@@ -357,10 +361,7 @@ async fn known_legacy_full_hashes_reuse_assets_without_kind_keys() {
         let report = publish(config.clone()).await;
         let rejected = matches!(contract, "unproven" | "projection-3-nonenglish");
         assert_eq!(report.converted, if rejected { 5 } else { 0 });
-        assert_eq!(
-            report.cache_hits,
-            if rejected { 1 } else { 6 }
-        );
+        assert_eq!(report.cache_hits, if rejected { 1 } else { 6 });
         assert_asset_bytes(&fixture.output, &expected);
         let published = manifest(&fixture.output);
         assert_eq!(published.archives, archive_proof);

@@ -187,9 +187,7 @@ impl EsmParser {
         Self::convert_legacy_plugins_report(
             plugin_paths,
             db_path,
-            inhouse::StringSources::default_language(inhouse::StringRoots::PluginLooseFirst(
-                loose,
-            )),
+            inhouse::StringSources::default_language(inhouse::StringRoots::PluginLooseFirst(loose)),
         )
     }
 

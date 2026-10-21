@@ -96,9 +96,11 @@ fn names(output: &Path) -> Vec<Option<String>> {
 fn legacy_full(output: &Path, form_id: u32) -> Option<String> {
     let connection = Connection::open(output.join("skyrim_world.db")).unwrap();
     let bytes: Vec<u8> = connection
-        .query_row("SELECT data FROM records WHERE form_id=?1", [form_id], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT data FROM records WHERE form_id=?1",
+            [form_id],
+            |row| row.get(0),
+        )
         .unwrap();
     let record = rkyv::from_bytes::<ArchivedRecordData, rkyv::rancor::Error>(&bytes).unwrap();
     let full = record
@@ -253,10 +255,14 @@ async fn names_come_from_the_tables_of_the_configured_language() {
     let broken_output = dir.path().join("broken-legacy");
     let report = convert_with(&broken, &broken_output, "english", RecordReader::Legacy).await;
     assert!(!report.complete);
-    assert!(report.warnings.iter().any(|warning| {
-        warning.contains("unreadable strings table")
-            && warning.contains("truncated STRINGS header")
-    }), "{:?}", report.warnings);
+    assert!(
+        report.warnings.iter().any(|warning| {
+            warning.contains("unreadable strings table")
+                && warning.contains("truncated STRINGS header")
+        }),
+        "{:?}",
+        report.warnings
+    );
 }
 
 /// The language changes the database, never the converted assets: it is part of the reader
@@ -312,7 +318,10 @@ fn only_another_language_changes_the_reader_identity() {
     assert_eq!(legacy_english["language"], "english");
     assert!(legacy_english.get("string_table_encoding").is_none());
     assert_eq!(legacy_german["language"], "german");
-    assert_eq!(legacy_german["string_table_encoding"], "utf-8-or-windows-1252");
+    assert_eq!(
+        legacy_german["string_table_encoding"],
+        "utf-8-or-windows-1252"
+    );
     assert_ne!(legacy_english, legacy_german);
 }
 
@@ -350,10 +359,9 @@ async fn database_cache_follows_language_and_winning_bank_for_both_readers() {
             "{reader:?} cold english"
         );
         assert!(cold.warnings.is_empty(), "{reader:?}: {:?}", cold.warnings);
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &fs::read(output.join("conversion-manifest.json")).unwrap(),
-        )
-        .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("conversion-manifest.json")).unwrap())
+                .unwrap();
         assert_eq!(manifest["record_data_complete"], true);
         let warm = convert_with(&data, &output, "english", reader).await;
         assert!(
@@ -404,7 +412,10 @@ async fn database_cache_follows_language_and_winning_bank_for_both_readers() {
         if reader == RecordReader::Inhouse {
             assert_eq!(names(&output)[0], Some("Lydia die Huscarl".into()));
         } else {
-            assert_eq!(legacy_full(&output, 0x800), Some("Lydia die Huscarl".into()));
+            assert_eq!(
+                legacy_full(&output, 0x800),
+                Some("Lydia die Huscarl".into())
+            );
         }
         let repeated = convert_with(&data, &output, "german", reader).await;
         assert!(
