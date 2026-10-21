@@ -282,7 +282,7 @@ fn localized_fields_preserve_zero_missing_resolved_and_repeated_keys() {
     let diagnostics: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("inhouse-reader-diagnostics.json")).unwrap())
             .unwrap();
-    assert_eq!(diagnostics["adapter"]["localizedfields.esp"][0], 5);
+    assert_eq!(diagnostics["adapter"]["localizedfields.esp"][0], 4);
     assert_eq!(
         diagnostics["adapter"]["localizedfields.esp"]
             .as_array()
@@ -297,6 +297,15 @@ fn localized_fields_preserve_zero_missing_resolved_and_repeated_keys() {
             .len()
             < 1024
     );
+    assert!(diagnostics["adapter"]["localizedfields.esp"][1]
+        .as_str()
+        .unwrap()
+        .contains("malformed strings entry for localized ID 42"));
+    assert_eq!(diagnostics["adapter_notices"]["localizedfields.esp"][0], 3);
+    assert!(diagnostics["adapter_notices"]["localizedfields.esp"][1]
+        .as_str()
+        .unwrap()
+        .contains("missing localized ID 17"));
 }
 
 /// English plugin/bank bytes use CP1252 even if they also form valid UTF-8; VMAD uses UTF-8.
@@ -510,13 +519,13 @@ async fn winning_full_and_light_banks_preserve_ids_and_bound_missing_text_notice
         &data,
         "WinnerFull.esp",
         "strings",
-        &strings(&[(100, "Winning full text")], Some(18), false),
+        &strings(&[(100, "Winning full text")], None, false),
     );
     write_strings(
         &data,
         "SecondLight.esl",
         "strings",
-        &strings(&[(100, "Distinct second-light text")], Some(17), false),
+        &strings(&[(100, "Distinct second-light text")], None, false),
     );
     let plugins = temp.path().join("plugins.txt");
     fs::write(&plugins, "*Skyrim.esm\n*EarlierFull.esm\n*Filler.esm\n*FirstLight.esl\n*WinnerFull.esp\n*SecondLight.esl\n").unwrap();
@@ -621,8 +630,9 @@ async fn winning_full_and_light_banks_preserve_ids_and_bound_missing_text_notice
         serde_json::from_slice(&fs::read(output.join("inhouse-reader-diagnostics.json")).unwrap())
             .unwrap();
     for (plugin, count) in [("winnerfull.esp", 129), ("secondlight.esl", 1)] {
-        assert_eq!(diagnostics["adapter"][plugin][0], count);
-        let summary = diagnostics["adapter"][plugin].as_array().unwrap();
+        assert!(diagnostics["adapter"].get(plugin).is_none());
+        assert_eq!(diagnostics["adapter_notices"][plugin][0], count);
+        let summary = diagnostics["adapter_notices"][plugin].as_array().unwrap();
         assert_eq!(
             summary.len(),
             2,
@@ -875,7 +885,12 @@ fn moved_localized_projection_complete_public_bundle_and_work_copy_remain_exact(
         serde_json::from_slice(&fs::read(normal.join("inhouse-reader-diagnostics.json")).unwrap())
             .unwrap();
     assert_eq!(diagnostics, normal_diagnostics);
-    assert_eq!(diagnostics["adapter"]["movefixture.esp"][0], 1);
+    assert!(diagnostics["adapter"].get("movefixture.esp").is_none());
+    assert_eq!(diagnostics["adapter_notices"]["movefixture.esp"][0], 1);
+    assert!(diagnostics["adapter_notices"]["movefixture.esp"][1]
+        .as_str()
+        .unwrap()
+        .contains("missing localized ID 17"));
     assert!(!work.join("typed-records.jsonl").exists());
     assert!(!work.join("cell_cache.rkyv").exists());
 }
