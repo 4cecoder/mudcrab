@@ -297,9 +297,12 @@ fn malformed_entry_warns_cli_one_and_preserves_healthy_neighbor_and_provenance()
     assert_eq!(status, 1);
     completeness(&report, &output, false);
     assert_eq!(ids(&output), [0x801, 0x802, 0x803]);
-    assert!(report.notices.is_empty(), "{:?}", report.notices);
+    assert_eq!(
+        report.notices,
+        ["Terrain LOD compilation disabled by --no-lod".to_owned()]
+    );
     assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
-    assert!(report.warnings[0].contains("malformed STRINGS entry for localized ID 6515"));
+    assert!(report.warnings[0].contains("malformed strings entry for localized ID 6515"));
     let db = Connection::open(output.join("skyrim_world.db")).unwrap();
     type TextProvenance = (u32, u32, Option<String>, String);
     let provenance: Vec<TextProvenance> = db
@@ -370,13 +373,16 @@ fn null_only_missing_bank_is_complete_but_later_reference_warns() {
             )
             .unwrap();
         assert_eq!(null_status, "null_id");
+        assert_eq!(
+            report.notices,
+            ["Terrain LOD compilation disabled by --no-lod".to_owned()]
+        );
         if include_nonzero {
             assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
             assert!(report.warnings[0].contains("2 local decode/lookup issues"));
             assert!(!report.warnings[0].contains("null_id"));
         } else {
             assert!(report.warnings.is_empty(), "{:?}", report.warnings);
-            assert!(report.notices.is_empty(), "{:?}", report.notices);
         }
     }
 }
