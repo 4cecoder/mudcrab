@@ -6,9 +6,15 @@ use std::{
     fs,
     io::{BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Condvar, Mutex},
+    time::SystemTime,
 };
 
-// Combined native-BC, lighting and LOD producer. Earlier numeric identities
+#[cfg(test)]
+#[path = "cache/rv_b_tests.rs"]
+mod rv_b_tests;
+
+// Combined native-BC, lighting, LOD, TXST and XESP producer. Earlier numeric identities
 // alone do not establish compatible output semantics.
 pub const CONVERTER_SCHEMA_VERSION: u32 = shared::LOD_CONVERTER_SCHEMA_VERSION;
 
@@ -16,10 +22,12 @@ pub const CONVERTER_SCHEMA_VERSION: u32 = shared::LOD_CONVERTER_SCHEMA_VERSION;
 ///
 /// A staging directory outlives the run that filled it, so a resumed run finds
 /// outputs this process did not write. The journal records, per output, the
-/// source hash, the converter schema and the configuration hash it was produced
+/// source hash, converter schema and asset-kind settings hash it was produced
 /// under, together with the output's size and hash, appended as the output is
 /// written. A resumed run reuses a staged output only while its record still
-/// matches the current source, schema and configuration and the bytes on disk.
+/// matches the current source, schema, kind settings and bytes on disk. The
+/// serialized `configuration_hash` field carries this narrow settings proof;
+/// the published manifest separately records the full metadata identity.
 /// The name is dotted so it can never collide with a converted asset, and the
 /// file is dropped from the output directory once the staging directory has
 /// been published.
@@ -29,6 +37,7 @@ pub const STAGING_JOURNAL_FILE: &str = ".conversion-staging-journal.jsonl";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StagedOutput {
     pub schema_version: u32,
+    /// Asset-kind settings proof; independent of full reader/schema metadata.
     pub configuration_hash: String,
     pub source_hash: String,
     pub output_size: u64,
@@ -169,10 +178,106 @@ pub struct IngestedFile {
     pub hash: String,
 }
 
+/// Which archive entries an ingestion cache proves it contains.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestionSelection {
+    /// Older manifests extracted every archive entry.
+    #[default]
+    All,
+    /// Runtime mesh/texture/script inputs, LOD settings, and English string banks.
+    RuntimeEnglishV1,
+    ConverterInputsV1,
+}
+
+impl IngestionSelection {
+    pub fn can_satisfy(self, requested: Self) -> bool {
+        self == Self::All
+            || self == requested
+            || (self == Self::ConverterInputsV1 && requested == Self::RuntimeEnglishV1)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IngestionCacheEntry {
     pub source_hash: String,
+    #[serde(default)]
+    pub selection: IngestionSelection,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recipe: String,
     pub files: Vec<IngestedFile>,
+    /// Version of the archive reader that produced `files`, for formats whose reader changed
+    /// what it stores (BSA names are decoded as Windows-1252 from version 1). Absent means 0,
+    /// the reader before any such change; an entry is reused only when it matches the current
+    /// reader, so a changed reader re-extracts the archive once instead of keeping old paths.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reader_version: u32,
+}
+
+pub(crate) fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+const INGESTION_JOURNAL_FILE: &str = ".ingestion-archives.jsonl";
+
+#[derive(Serialize, Deserialize)]
+struct IngestionJournalLine {
+    archive: String,
+    entry: IngestionCacheEntry,
+}
+
+/// Completed archive inventories. Sealed batch packs carry the durable bytes;
+/// this journal avoids decoding completed archives when resuming a staging run.
+pub(crate) struct IngestionJournal(fs::File);
+
+impl IngestionJournal {
+    pub(crate) fn open(staging: &Path) -> Result<Self> {
+        let path = staging.join(INGESTION_JOURNAL_FILE);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
+        let length = file.metadata()?.len();
+        if length > 0 {
+            let mut last = [0_u8];
+            file.seek(SeekFrom::Start(length - 1))?;
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
+        Ok(Self(file))
+    }
+
+    pub(crate) fn record(&mut self, archive: &str, entry: &IngestionCacheEntry) -> Result<()> {
+        let mut bytes = serde_json::to_vec(&IngestionJournalLine {
+            archive: archive.to_owned(),
+            entry: entry.clone(),
+        })?;
+        bytes.push(b'\n');
+        self.0.write_all(&bytes)?;
+        self.0.sync_all()?;
+        Ok(())
+    }
+
+    pub(crate) fn load(staging: &Path) -> Result<BTreeMap<String, IngestionCacheEntry>> {
+        let path = staging.join(INGESTION_JOURNAL_FILE);
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut entries = BTreeMap::new();
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if let Ok(record) = serde_json::from_slice::<IngestionJournalLine>(line) {
+                entries.insert(record.archive, record.entry);
+            }
+        }
+        Ok(entries)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,8 +291,19 @@ pub struct ConversionManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_asset_configuration_hash: Option<String>,
     pub complete: bool,
+    /// Whether the last authoritative record conversion had no data-loss warnings.
+    /// Missing historical proof stays unknown; asset repair cannot establish it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_data_complete: Option<bool>,
     #[serde(default)]
     pub configuration_hash: String,
+    /// Ordered identities of the runtime schema add-ons used by this pack.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schema_addons: Vec<crate::records::addons::SchemaAddonIdentity>,
+    /// Original producer settings of each converted asset kind, independent of
+    /// record-reader metadata. A metadata-only migration retains these values.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub asset_configuration_hashes: BTreeMap<String, String>,
     #[serde(default)]
     pub inputs_by_kind: BTreeMap<String, u64>,
     #[serde(default)]
@@ -210,13 +326,34 @@ pub struct ConversionManifest {
     pub entries: BTreeMap<String, CacheEntry>,
 }
 
-/// These schema changes affect GLBs/textures/world data, leaving script/archive
-/// bytes compatible. Configuration and source hashes still have to match.
+/// Historical producers whose scripts may pass normal reuse eligibility.
+/// Script ABI/settings, source and output proofs still have to match. Archive
+/// extraction uses its own source/blob integrity proof, independent of this gate.
+/// Schema 25 is excluded: two unmerged candidates both used it for different contracts.
+/// The producer-27 to producer-28 transition changes only texture container bytes,
+/// so producer-27 scripts remain valid.
 pub(crate) fn can_reuse_scripts_and_archives(schema: u32) -> bool {
-    matches!(schema, 12..=23)
+    matches!(schema, 12..=24 | 26 | 27)
+}
+
+/// Published producer-24 meshes retain the producer-26 byte contract, and producer-27
+/// meshes retain the producer-28 byte contract (only texture containers changed).
+/// Producer 27 changed the GLB collision data, so no producer before 27 passes this
+/// gate at 28 or later. This never authorizes texture reuse or bypasses source/configuration/
+/// output proof.
+pub(crate) fn can_reuse_meshes(schema: u32) -> bool {
+    can_reuse_meshes_for_producer(schema, CONVERTER_SCHEMA_VERSION)
+}
+
+/// Check the explicit producer pair so later contracts cannot inherit old mesh reuse.
+/// Each pair names a byte-identical GLB contract; `(24, 26)` must never be read as
+/// transitive, so `(24, 28)` and `(26, 28)` are deliberately absent.
+pub(crate) fn can_reuse_meshes_for_producer(schema: u32, current: u32) -> bool {
+    schema == current || matches!((schema, current), (24, 26) | (27, 28))
 }
 
 impl ConversionManifest {
+    /// Load archive candidates independently of converted-output producer eligibility.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.is_file() {
             return Ok(Self {
@@ -228,30 +365,42 @@ impl ConversionManifest {
             fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
         let mut manifest: Self =
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
-        let retained_meshes_are_stale = (manifest.schema_version == CONVERTER_SCHEMA_VERSION)
+        let metadata_rebuild = path
+            .parent()
+            .is_some_and(|root| root.join("metadata-rebuild.json").exists());
+        let retained_assets_are_stale = (manifest.schema_version == CONVERTER_SCHEMA_VERSION)
             && match manifest.retained_mesh_schema_version {
                 Some(schema) => schema != CONVERTER_SCHEMA_VERSION,
-                None => path
-                    .parent()
-                    .is_some_and(|root| root.join("metadata-rebuild.json").exists()),
+                None => metadata_rebuild,
             };
         if (can_reuse_scripts_and_archives(manifest.schema_version)
             && manifest.schema_version != CONVERTER_SCHEMA_VERSION)
-            || retained_meshes_are_stale
+            || retained_assets_are_stale
         {
-            // Legacy producers lack the combined texture and lighting contracts.
-            // Preserve only verified scripts; regenerate GLBs, textures and world data.
+            let mesh_schema = manifest
+                .retained_mesh_schema_version
+                .unwrap_or(manifest.schema_version);
+            let compatible_meshes = can_reuse_meshes(mesh_schema)
+                && mesh_schema <= manifest.schema_version
+                && (manifest.retained_mesh_schema_version.is_some() || !metadata_rebuild);
+            // All old textures regenerate. GLBs of a producer `can_reuse_meshes`
+            // accepts (at 28: producers 27 only, never 24 or 26) and scripts remain
+            // candidates for the usual per-asset verification.
             manifest.complete = false;
-            manifest
-                .entries
-                .retain(|_, entry| entry.output.to_ascii_lowercase().ends_with(".luau"));
+            manifest.entries.retain(|_, entry| {
+                let output = entry.output.to_ascii_lowercase();
+                output.ends_with(".luau") || (compatible_meshes && output.ends_with(".glb"))
+            });
             return Ok(manifest);
         }
         if manifest.schema_version != CONVERTER_SCHEMA_VERSION {
-            return Ok(Self {
-                schema_version: CONVERTER_SCHEMA_VERSION,
-                ..Self::default()
-            });
+            // Archive extraction is independent of converted output schemas.
+            // Preserve its candidates and original producer metadata; each
+            // archive still has to pass its source/integrity checks. Unknown
+            // producers never establish normal converted-output eligibility.
+            manifest.complete = false;
+            manifest.entries.clear();
+            return Ok(manifest);
         }
         Ok(manifest)
     }
@@ -272,16 +421,79 @@ impl ConversionManifest {
     }
 }
 
+/// Full configuration identity for metadata provenance and older manifests.
+/// New converted outputs use separate per-kind settings proofs.
 pub fn configuration_hash(config: &crate::config::PipelineConfig) -> Result<String> {
     // no_lod only selects regenerated outputs; it does not change converted asset
     // bytes. Resume invalidates database/LOD outputs before evaluating this proof.
-    configuration_hash_for_schema(config, CONVERTER_SCHEMA_VERSION)
+    current_configuration_hash_for_schema(config, CONVERTER_SCHEMA_VERSION)
 }
 
-/// Hashes conversion settings and MO2 identity; winning inputs are hashed per source.
+/// Recreate the historical combined proof for a recorded producer schema.
+/// Legacy proofs predate projection versions and omit the reader identity; the
+/// non-MO2 calculation remains byte-identical. New publication uses `configuration_hash`.
+/// Matching this known hash is the conservative fallback when per-kind settings
+/// are absent; an arbitrary historical hash cannot establish those settings.
+/// MO2 instance/profile paths also bind source selection; winning input bytes
+/// remain independently hashed per source.
 pub fn configuration_hash_for_schema(
     config: &crate::config::PipelineConfig,
     schema: u32,
+) -> Result<String> {
+    let identity = if config.record_reader == crate::config::RecordReader::Inhouse {
+        Some(crate::esm::inhouse::configured_reader_identity(config)?)
+    } else {
+        None
+    };
+    configuration_hash_with_identity(config, schema, identity.as_ref())
+}
+
+/// Bind current metadata projections independently of per-kind asset settings.
+pub(crate) fn current_configuration_hash_for_schema(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+) -> Result<String> {
+    let identity = crate::esm::inhouse::configured_reader_identity(config)?;
+    configuration_hash_with_identity(config, schema, Some(&identity))
+}
+
+/// Reconstruct the exact adapter-10 reader proof for unchanged retained asset settings.
+/// These compatibility pairs are limited to metadata adapters 11 and 12; a future
+/// adapter must establish its own retained-byte compatibility instead of inheriting it.
+pub(crate) fn inhouse_adapter10_reader_identity(
+    schemas: &crate::records::addons::RuntimeSchemas,
+) -> Option<serde_json::Value> {
+    if !matches!(crate::esm::inhouse::ADAPTER_VERSION, 11 | 12) {
+        return None;
+    }
+    let mut identity = crate::esm::inhouse::reader_identity_with_schemas(
+        crate::config::RecordReader::Inhouse,
+        schemas,
+    );
+    identity["adapter_version"] = serde_json::json!(10);
+    Some(identity)
+}
+
+/// Adapter 12 corrects metadata identities while retaining adapter-11 asset bytes.
+pub(crate) fn inhouse_adapter11_reader_identity(
+    schemas: &crate::records::addons::RuntimeSchemas,
+) -> Option<serde_json::Value> {
+    if crate::esm::inhouse::ADAPTER_VERSION != 12 {
+        return None;
+    }
+    let mut identity = crate::esm::inhouse::reader_identity_with_schemas(
+        crate::config::RecordReader::Inhouse,
+        schemas,
+    );
+    identity["adapter_version"] = serde_json::json!(11);
+    Some(identity)
+}
+
+/// Hash the unchanged settings payload with an explicitly selected metadata identity.
+fn configuration_hash_with_identity(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+    identity: Option<&serde_json::Value>,
 ) -> Result<String> {
     let mut relevant = serde_json::json!({
         "schema": schema,
@@ -289,6 +501,10 @@ pub fn configuration_hash_for_schema(
         "texture_uastc_level": config.texture_uastc_level,
         "script_abi_version": config.script_abi_version,
     });
+    // Actual DDS roles remain in per-source proofs rather than this broad identity.
+    if let Some(identity) = identity {
+        relevant["record_reader"] = identity.clone();
+    }
     if let Some(selection) = &config.mo2 {
         let instance = mo2::Instance::open(&selection.instance_path)?;
         let profile = instance.profile_dir(&selection.profile)?;
@@ -299,7 +515,6 @@ pub fn configuration_hash_for_schema(
             "mods": instance.mods_dir,
             "overwrite": instance.overwrite_dir,
             "data": std::fs::canonicalize(&config.data_dir)?,
-
         });
     }
     if schema >= 16 {
@@ -308,6 +523,70 @@ pub fn configuration_hash_for_schema(
     if schema >= 22 {
         // CPU native-BC output and GPU UASTC output have different contracts;
         // quality changes bytes, while GPU batch size only changes scheduling.
+        relevant["texture_encoder"] = match config.texture_encoder {
+            crate::config::TextureEncoder::Cpu => serde_json::json!({"mode": "cpu"}),
+            crate::config::TextureEncoder::Gpu { quality, .. } => {
+                serde_json::json!({"mode": "gpu", "quality": quality})
+            }
+        };
+    }
+    Ok(hash_bytes(&serde_json::to_vec(&relevant)?))
+}
+
+/// Reproduce the exact version-1 legacy projection proof for retained assets.
+pub(crate) fn legacy_projection_v1_configuration_hash(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+) -> Result<String> {
+    configuration_hash_with_identity(
+        config,
+        schema,
+        Some(&serde_json::json!({"mode": "legacy", "projection_version": 1})),
+    )
+}
+
+/// Reproduce the exact version-2 legacy projection proof for retained assets.
+pub(crate) fn legacy_projection_v2_configuration_hash(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+) -> Result<String> {
+    configuration_hash_with_identity(
+        config,
+        schema,
+        Some(&serde_json::json!({"mode": "legacy", "projection_version": 2})),
+    )
+}
+
+/// Settings that change one asset kind's bytes, excluding full reader metadata.
+///
+/// Mesh conversion consumes NIF/skeleton/material source dependencies. Texture
+/// source proofs additionally include the resolved encoding from fresh SQL/GLB
+/// usage. Producer compatibility remains a separate eligibility check; matching
+/// one of these hashes does not authorize an unknown or retained old producer.
+pub fn asset_configuration_hash_for_schema(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+    source_ext: &str,
+) -> Result<String> {
+    let mut relevant = match source_ext {
+        "nif" => serde_json::json!({"mesh_producer": schema}),
+        "dds" => serde_json::json!({
+            "texture_producer": schema,
+            "texture_etc1s_quality": config.texture_fallback_quality,
+            "texture_uastc_level": config.texture_uastc_level,
+        }),
+        // Script producer eligibility is checked separately. The configured ABI
+        // must advance when script-emission behavior changes; metadata migrations
+        // keep the original ABI settings hash with the retained script bytes.
+        "pex" => serde_json::json!({
+            "script_abi_version": config.script_abi_version,
+        }),
+        _ => color_eyre::eyre::bail!("unsupported asset cache kind {source_ext}"),
+    };
+    if source_ext == "dds" && schema >= 16 {
+        relevant["texture_zstd_level"] = serde_json::json!(config.texture_zstd_level);
+    }
+    if source_ext == "dds" && schema >= 22 {
         relevant["texture_encoder"] = match config.texture_encoder {
             crate::config::TextureEncoder::Cpu => serde_json::json!({"mode": "cpu"}),
             crate::config::TextureEncoder::Gpu { quality, .. } => {
@@ -341,17 +620,17 @@ fn link_or_copy_with(
     to: &Path,
     link: fn(&Path, &Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    if to.exists() {
-        // Removing `to` would delete `from` itself when `to` is the same path as `from`, so that
-        // state is success rather than a reason to touch anything.
-        let names_one_file = match fs::canonicalize(from) {
-            Ok(from) => fs::canonicalize(to).is_ok_and(|to| to == from),
-            Err(_) => false,
-        };
-        if names_one_file {
-            return Ok(());
+    match fs::symlink_metadata(to) {
+        Ok(_) => {
+            // Removing the source itself would lose its bytes; a dangling destination symlink
+            // must still be removed before the copy fallback can follow it.
+            if same_path(from, to) {
+                return Ok(());
+            }
+            fs::remove_file(to)?;
         }
-        fs::remove_file(to)?;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     link(from, to).or_else(|_| fs::copy(from, to).map(|_| ()))
 }
@@ -359,53 +638,264 @@ fn link_or_copy_with(
 /// How many spill copies of one blob `link_or_copy_spilling` makes before it gives up and copies.
 const MAX_SPILLS: u32 = 64;
 
-/// Like [`link_or_copy`], for a blob that many paths share.
-///
-/// A file can carry only so many names (1,024 on NTFS), and some game content is stored under
-/// thousands of paths (terrain and face textures), more again during a reconversion, while the
-/// previous output still holds its own names. When the blob is full, the destination is linked to
-/// a spill copy beside it (`<blob>.1`, `<blob>.2`, ...), made once and shared by the next thousand
-/// or so paths, instead of each path becoming its own copy. `blob` must be a file this run owns:
-/// the spill copies are written beside it.
-pub(crate) fn link_or_copy_spilling(blob: &Path, to: &Path) -> std::io::Result<()> {
-    link_or_copy_spilling_with(blob, to, |from, to| fs::hard_link(from, to))
+/// Verification and spill cursors belong to one extraction. Only blobs that
+/// reach the filesystem's link limit enter this bounded cache. A state retains
+/// the base and active spill handles; saturated prior spills are discarded.
+#[derive(Default)]
+pub(crate) struct SpillCache {
+    states: Mutex<BTreeMap<PathBuf, Arc<Mutex<SpillState>>>>,
+    available: Condvar,
+}
+
+const MAX_SPILL_STATES: usize = 128;
+
+#[derive(Default)]
+struct SpillState {
+    base: Option<(SpillProof, String)>,
+    active: Option<SpillProof>,
+    cursor: u32,
+}
+
+struct SpillLease<'a> {
+    cache: &'a SpillCache,
+    state: Option<Arc<Mutex<SpillState>>>,
+}
+
+impl SpillCache {
+    fn lease(&self, blob: &Path) -> SpillLease<'_> {
+        let mut states = self.states.lock().unwrap();
+        let state = loop {
+            if let Some(state) = states.get(blob) {
+                break Arc::clone(state);
+            }
+            if states.len() >= MAX_SPILL_STATES {
+                let idle = states
+                    .iter()
+                    .find(|(_, state)| Arc::strong_count(state) == 1)
+                    .map(|(path, _)| path.clone());
+                if let Some(idle) = idle {
+                    states.remove(&idle);
+                } else {
+                    states = self.available.wait(states).unwrap();
+                    continue;
+                }
+            }
+            let state = Arc::new(Mutex::new(SpillState::default()));
+            states.insert(blob.to_owned(), Arc::clone(&state));
+            break state;
+        };
+        SpillLease {
+            cache: self,
+            state: Some(state),
+        }
+    }
+}
+
+impl Drop for SpillLease<'_> {
+    fn drop(&mut self) {
+        // Pair the state-release notification with the lease predicate's mutex.
+        let _states = self.cache.states.lock().unwrap();
+        drop(self.state.take());
+        self.cache.available.notify_all();
+    }
+}
+
+struct SpillProof {
+    handle: same_file::Handle,
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+impl SpillProof {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let handle = same_file::Handle::from_path(path)?;
+        let metadata = handle.as_file().metadata()?;
+        Ok(Self {
+            handle,
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.handle == other.handle
+            && self.length == other.length
+            // Unsupported modification metadata requires hashing again.
+            && self.modified.is_some()
+            && self.modified == other.modified
+    }
+
+    fn hash(
+        &self,
+        hash: &impl Fn(&fs::File) -> std::io::Result<String>,
+    ) -> std::io::Result<String> {
+        let digest = hash(self.handle.as_file())?;
+        let after = self.handle.as_file().metadata()?;
+        if after.len() != self.length || after.modified().ok() != self.modified {
+            return Err(std::io::Error::other("cache file changed while hashing"));
+        }
+        Ok(digest)
+    }
+
+    fn verify_link(&self, destination: &Path) -> std::io::Result<()> {
+        let result = (|| {
+            let linked = Self::open(destination)?;
+            if self.handle != linked.handle
+                || self.length != linked.length
+                || self.modified != linked.modified
+            {
+                return Err(std::io::Error::other("cache file changed before linking"));
+            }
+            Ok(())
+        })();
+        result.map_err(|error| discard_unverified(destination, error))
+    }
+}
+
+/// Link through verified spill instances, avoiding repeated reads and scans.
+/// Owned cache inodes stay immutable during extraction; writers replace paths.
+/// Replacement or observable size/mtime changes invalidate saved proofs, and
+/// fresh extractions rehash restored spills. Different blobs have separate locks.
+pub(crate) fn link_or_copy_spilling(
+    blob: &Path,
+    to: &Path,
+    cache: &SpillCache,
+) -> std::io::Result<()> {
+    link_or_copy_spilling_with(
+        blob,
+        to,
+        cache,
+        &|from, to| fs::hard_link(from, to),
+        &hash_open_file,
+    )
 }
 
 fn link_or_copy_spilling_with(
     blob: &Path,
     to: &Path,
-    link: fn(&Path, &Path) -> std::io::Result<()>,
+    cache: &SpillCache,
+    link: &impl Fn(&Path, &Path) -> std::io::Result<()>,
+    hash: &impl Fn(&fs::File) -> std::io::Result<String>,
 ) -> std::io::Result<()> {
-    if same_path(blob, to) {
-        return Ok(());
-    }
-    if to.exists() {
-        fs::remove_file(to)?;
+    link_or_copy_spilling_impl(blob, to, cache, link, hash, &mut |from, to, spill| {
+        if !spill {
+            return fs::copy(from, to).map(|_| ());
+        }
+        let temporary = tempfile::NamedTempFile::new_in(to.parent().unwrap())?;
+        fs::copy(from, temporary.path())?;
+        temporary.persist(to).map_err(|error| error.error)?;
+        Ok(())
+    })
+}
+
+pub(crate) fn link_or_copy_spilling_with_copy_and_link(
+    blob: &Path,
+    to: &Path,
+    cache: &SpillCache,
+    link: &impl Fn(&Path, &Path) -> std::io::Result<()>,
+    mut copy: impl FnMut(&Path, &Path, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    link_or_copy_spilling_impl(blob, to, cache, link, &hash_open_file, &mut copy)
+}
+
+fn link_or_copy_spilling_impl(
+    blob: &Path,
+    to: &Path,
+    cache: &SpillCache,
+    link: &impl Fn(&Path, &Path) -> std::io::Result<()>,
+    hash: &impl Fn(&fs::File) -> std::io::Result<String>,
+    copy: &mut impl FnMut(&Path, &Path, bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match fs::symlink_metadata(to) {
+        Ok(metadata) => {
+            if metadata.is_file() && same_path(blob, to) {
+                return Ok(());
+            }
+            fs::remove_file(to)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     match link(blob, to) {
         Ok(()) => return Ok(()),
-        Err(error) if !is_too_many_links(&error) => return fs::copy(blob, to).map(|_| ()),
+        Err(error) if !is_too_many_links(&error) => return copy(blob, to, false),
         Err(_) => {}
     }
-    for index in 1..=MAX_SPILLS {
+    let lease = cache.lease(blob);
+    let mut state = lease.state.as_ref().unwrap().lock().unwrap();
+    let base = SpillProof::open(blob)?;
+    if !state
+        .base
+        .as_ref()
+        .is_some_and(|(proof, _)| proof.matches(&base))
+    {
+        let digest = base.hash(hash)?;
+        state.base = Some((base, digest));
+        state.cursor = 1;
+        state.active = None;
+    }
+    while state.cursor <= MAX_SPILLS {
         let mut name = blob.as_os_str().to_owned();
-        name.push(format!(".{index}"));
-        let spill = std::path::PathBuf::from(name);
-        if !spill.is_file() {
-            // Written under a temporary name and renamed, so a reader never sees half a spill.
-            let mut partial = spill.as_os_str().to_owned();
-            partial.push(format!(".partial-{}", std::process::id()));
-            let partial = std::path::PathBuf::from(partial);
-            fs::copy(blob, &partial)?;
-            fs::rename(&partial, &spill)?;
+        name.push(format!(".{}", state.cursor));
+        let spill = PathBuf::from(name);
+        let candidate = SpillProof::open(&spill).ok();
+        let unchanged = candidate.as_ref().is_some_and(|candidate| {
+            state
+                .active
+                .as_ref()
+                .is_some_and(|proof| proof.matches(candidate))
+        });
+        if !unchanged {
+            let expected = &state.base.as_ref().unwrap().1;
+            let valid = candidate.as_ref().is_some_and(|candidate| {
+                candidate.hash(hash).is_ok_and(|digest| &digest == expected)
+            });
+            if valid {
+                state.active = candidate;
+            } else {
+                // The callback atomically replaces the logical spill path and records
+                // that physical file's durability, rather than a disposable temporary name.
+                copy(blob, &spill, true)?;
+                let proof = SpillProof::open(&spill)?;
+                if &proof.hash(hash)? != expected {
+                    return Err(discard_unverified(
+                        &spill,
+                        std::io::Error::other("cache file changed before spill copy"),
+                    ));
+                }
+                state.active = Some(proof);
+            }
         }
         match link(&spill, to) {
-            Ok(()) => return Ok(()),
-            Err(error) if is_too_many_links(&error) => continue,
+            Ok(()) => return state.active.as_ref().unwrap().verify_link(to),
+            Err(error) if is_too_many_links(&error) => {
+                state.cursor += 1;
+                state.active = None;
+            }
             Err(_) => break,
         }
     }
-    fs::copy(blob, to).map(|_| ())
+    // Beyond the bounded spill count, verify this derived copy before use.
+    let result = (|| {
+        copy(blob, to, false)?;
+        let copied = SpillProof::open(to)?;
+        if copied.hash(hash)? != state.base.as_ref().unwrap().1 {
+            return Err(std::io::Error::other("cache file changed before copying"));
+        }
+        Ok(())
+    })();
+    result.map_err(|error| discard_unverified(to, error))
+}
+
+fn discard_unverified(path: &Path, error: std::io::Error) -> std::io::Error {
+    match fs::remove_file(path) {
+        Ok(()) => error,
+        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
+        Err(cleanup) => std::io::Error::other(format!(
+            "{error}; failed to remove unverified destination {}: {cleanup}",
+            path.display()
+        )),
+    }
 }
 
 /// A link refused because the file already has as many names as the filesystem allows.
@@ -422,7 +912,9 @@ fn same_path(from: &Path, to: &Path) -> bool {
     }
 }
 
-/// The native collision producer includes its fixed Zstd level in schema 16.
+/// Retained schema-15/16 producers also recorded their fixed Zstd level of 6.
+/// The protected schema-15 source manifest proves this exact configuration
+/// variant; quality and script ABI must still match its recorded hash.
 /// This compatibility route verifies retained bytes, not normal cache reuse.
 pub(crate) fn retained_configuration_matches(
     config: &crate::config::PipelineConfig,
@@ -432,7 +924,7 @@ pub(crate) fn retained_configuration_matches(
     if recorded == configuration_hash_for_schema(config, schema)? {
         return Ok(true);
     }
-    if schema != 16 {
+    if !matches!(schema, 15 | 16) || config.texture_zstd_level != 6 {
         return Ok(false);
     }
     let native = serde_json::json!({
@@ -445,6 +937,45 @@ pub(crate) fn retained_configuration_matches(
     Ok(recorded == hash_bytes(&serde_json::to_vec(&native)?))
 }
 
+/// Verify full settings under their recorded projection contract without upgrading it.
+pub(crate) fn retained_configuration_matches_for_reader(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+    recorded: &str,
+    identity: &serde_json::Value,
+) -> Result<bool> {
+    if config.record_reader == crate::config::RecordReader::Legacy
+        && identity == &serde_json::json!({"mode": "legacy"})
+    {
+        return retained_configuration_matches(config, schema, recorded);
+    }
+    if config.record_reader == crate::config::RecordReader::Legacy
+        && identity == &serde_json::json!({"mode": "legacy", "projection_version": 1})
+    {
+        return Ok(recorded == legacy_projection_v1_configuration_hash(config, schema)?);
+    }
+    if config.record_reader == crate::config::RecordReader::Legacy
+        && identity == &serde_json::json!({"mode": "legacy", "projection_version": 2})
+    {
+        return Ok(recorded == legacy_projection_v2_configuration_hash(config, schema)?);
+    }
+    let current = crate::esm::inhouse::configured_reader_identity(config)?;
+    if identity == &current {
+        return Ok(recorded == current_configuration_hash_for_schema(config, schema)?);
+    }
+    if config.record_reader == crate::config::RecordReader::Inhouse
+        && [
+            inhouse_adapter10_reader_identity(config.schemas()?.as_ref()),
+            inhouse_adapter11_reader_identity(config.schemas()?.as_ref()),
+        ]
+        .iter()
+        .any(|prior| prior.as_ref() == Some(identity))
+    {
+        return Ok(recorded == configuration_hash_with_identity(config, schema, Some(identity))?);
+    }
+    Ok(false)
+}
+
 pub fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -453,13 +984,16 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 pub fn hash_file(path: &Path) -> Result<String> {
     let file = fs::File::open(path)
         .wrap_err_with(|| format!("failed to open {} for hashing", path.display()))?;
+    hash_open_file(&file).wrap_err_with(|| format!("failed to hash {}", path.display()))
+}
+
+fn hash_open_file(mut file: &fs::File) -> std::io::Result<String> {
+    file.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::with_capacity(1024 * 1024, file);
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let read = reader
-            .read(&mut buffer)
-            .wrap_err_with(|| format!("failed to hash {}", path.display()))?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -476,13 +1010,521 @@ pub fn hash_file(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// Historical absence stays unknown while known loss and success round-trip distinctly.
     #[test]
-    fn ambiguous_legacy_producers_cannot_reuse_staged_meshes_or_textures() {
+    fn parallel_spill_creation_uses_unique_temporary_files() {
+        let barrier = std::sync::Barrier::new(4);
+        let full_blob = |from: &Path, to: &Path| -> std::io::Result<()> {
+            if from.file_name().is_some_and(|name| name == "parallel_blob") {
+                barrier.wait();
+                Err(std::io::ErrorKind::TooManyLinks.into())
+            } else {
+                fs::hard_link(from, to)
+            }
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let blob = directory.path().join("parallel_blob");
+        fs::write(&blob, b"immutable bytes").unwrap();
+        let cache = SpillCache::default();
+        std::thread::scope(|scope| {
+            for index in 0..4 {
+                let blob = &blob;
+                let cache = &cache;
+                let full_blob = &full_blob;
+                let destination = directory.path().join(format!("asset{index}"));
+                scope.spawn(move || {
+                    link_or_copy_spilling_with(
+                        blob,
+                        &destination,
+                        cache,
+                        full_blob,
+                        &hash_open_file,
+                    )
+                    .unwrap();
+                    assert_eq!(fs::read(destination).unwrap(), b"immutable bytes");
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn corrupt_derived_spills_are_replaced_before_reuse() {
+        fn full_blob(from: &Path, to: &Path) -> std::io::Result<()> {
+            if from.file_name().is_some_and(|name| name == "blob") {
+                Err(std::io::ErrorKind::TooManyLinks.into())
+            } else {
+                fs::hard_link(from, to)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let blob = directory.path().join("blob");
+        fs::write(&blob, b"valid bytes").unwrap();
+        fs::write(directory.path().join("blob.1"), b"wrong bytes").unwrap();
+        let destination = directory.path().join("asset");
+        link_or_copy_spilling_with(
+            &blob,
+            &destination,
+            &SpillCache::default(),
+            &full_blob,
+            &hash_open_file,
+        )
+        .unwrap();
+        assert_eq!(fs::read(destination).unwrap(), b"valid bytes");
+    }
+
+    fn full_base(from: &Path, to: &Path) -> std::io::Result<()> {
+        if from.file_name().is_some_and(|name| name == "blob") {
+            Err(std::io::ErrorKind::TooManyLinks.into())
+        } else {
+            fs::hard_link(from, to)
+        }
+    }
+
+    #[test]
+    fn spill_verification_reads_and_link_attempts_grow_linearly() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for count in [8, 16, 32] {
+            let directory = tempfile::tempdir().unwrap();
+            let blob = directory.path().join("blob");
+            fs::write(&blob, [0x5a; 4096]).unwrap();
+            let cache = SpillCache::default();
+            let links = Mutex::new(BTreeMap::<PathBuf, usize>::new());
+            let attempts = AtomicUsize::new(0);
+            let reads = AtomicUsize::new(0);
+            let link = |from: &Path, to: &Path| {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                let mut links = links.lock().unwrap();
+                let used = links.entry(from.to_owned()).or_default();
+                if *used >= 2 {
+                    return Err(std::io::ErrorKind::TooManyLinks.into());
+                }
+                fs::hard_link(from, to)?;
+                *used += 1;
+                Ok(())
+            };
+            let hash = |file: &fs::File| {
+                reads.fetch_add(1, Ordering::Relaxed);
+                hash_open_file(file)
+            };
+            for index in 0..count {
+                let destination = directory.path().join(format!("asset{index}"));
+                link_or_copy_spilling_with(&blob, &destination, &cache, &link, &hash).unwrap();
+                assert_eq!(fs::read(destination).unwrap(), [0x5a; 4096]);
+            }
+            // One base hash and one per new spill. With the previous scan,
+            // the same cases read 15, 63 and 255 full files.
+            assert_eq!(reads.load(Ordering::Relaxed), count / 2);
+            assert!(attempts.load(Ordering::Relaxed) < count * 3);
+        }
+    }
+
+    #[test]
+    fn cached_spill_revalidates_corruption_and_same_metadata_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let blob = directory.path().join("blob");
+        let spill = directory.path().join("blob.1");
+        fs::write(&blob, b"valid bytes").unwrap();
+        let cache = SpillCache::default();
+        let restore = |index| {
+            let destination = directory.path().join(format!("asset{index}"));
+            link_or_copy_spilling_with(&blob, &destination, &cache, &full_base, &hash_open_file)
+                .unwrap();
+            assert_eq!(fs::read(destination).unwrap(), b"valid bytes");
+        };
+        restore(0);
+        fs::write(&spill, b"wrong bytes").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&spill)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
+        restore(1);
+        let modified = fs::metadata(&spill).unwrap().modified().unwrap();
+        let replacement = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        fs::write(replacement.path(), b"wrong bytes").unwrap();
+        replacement
+            .as_file()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        replacement.persist(&spill).unwrap();
+        assert_eq!(fs::metadata(&spill).unwrap().modified().unwrap(), modified);
+        restore(2);
+        // A new extraction must verify a restored spill even if the previous
+        // extraction already trusted the path.
+        let fresh = SpillCache::default();
+        fs::write(&spill, b"wrong bytes").unwrap();
+        let destination = directory.path().join("fresh");
+        link_or_copy_spilling_with(&blob, &destination, &fresh, &full_base, &hash_open_file)
+            .unwrap();
+        assert_eq!(fs::read(destination).unwrap(), b"valid bytes");
+    }
+
+    #[test]
+    fn replacement_during_link_cannot_publish_unverified_spill_bytes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let blob = directory.path().join("blob");
+        fs::write(&blob, b"valid bytes").unwrap();
+        let cache = SpillCache::default();
+        let replace = AtomicBool::new(true);
+        let link = |from: &Path, to: &Path| {
+            if from == blob {
+                return Err(std::io::ErrorKind::TooManyLinks.into());
+            }
+            if replace.swap(false, Ordering::Relaxed) {
+                let modified = fs::metadata(from)?.modified()?;
+                let replacement = tempfile::NamedTempFile::new_in(directory.path())?;
+                fs::write(replacement.path(), b"wrong bytes")?;
+                replacement
+                    .as_file()
+                    .set_times(fs::FileTimes::new().set_modified(modified))?;
+                replacement.persist(from).map_err(|error| error.error)?;
+            }
+            fs::hard_link(from, to)
+        };
+        let destination = directory.path().join("asset");
+        assert!(
+            link_or_copy_spilling_with(&blob, &destination, &cache, &link, &hash_open_file)
+                .is_err()
+        );
+        assert!(!destination.exists());
+        link_or_copy_spilling_with(&blob, &destination, &cache, &link, &hash_open_file).unwrap();
+        assert_eq!(fs::read(destination).unwrap(), b"valid bytes");
+    }
+
+    #[test]
+    fn failed_final_copy_verification_removes_only_the_new_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let blob = directory.path().join("blob");
+        fs::write(&blob, b"valid bytes").unwrap();
+        let cache = SpillCache::default();
+        let verified = directory.path().join("verified");
+        link_or_copy_spilling_with(&blob, &verified, &cache, &full_base, &hash_open_file).unwrap();
+        {
+            let states = cache.states.lock().unwrap();
+            let mut state = states[&blob].lock().unwrap();
+            state.cursor = MAX_SPILLS + 1;
+            state.active = None;
+        }
+        let destination = directory.path().join("new");
+        let fail_hash = |_: &fs::File| Err(std::io::Error::other("injected verification failure"));
+        let error = link_or_copy_spilling_with(&blob, &destination, &cache, &full_base, &fail_hash)
+            .unwrap_err();
+        assert!(error.to_string().contains("injected verification failure"));
+        assert!(!destination.exists());
+        assert_eq!(fs::read(verified).unwrap(), b"valid bytes");
+    }
+
+    #[test]
+    fn base_replacement_resets_the_spill_cursor_and_keeps_previous_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let blob = directory.path().join("blob");
+        fs::write(&blob, b"first bytes").unwrap();
+        let cache = SpillCache::default();
+        let link = |from: &Path, to: &Path| {
+            if from == blob || (from.ends_with("blob.1") && to.ends_with("second")) {
+                Err(std::io::ErrorKind::TooManyLinks.into())
+            } else {
+                fs::hard_link(from, to)
+            }
+        };
+        let first = directory.path().join("first");
+        link_or_copy_spilling_with(&blob, &first, &cache, &link, &hash_open_file).unwrap();
+        link_or_copy_spilling_with(
+            &blob,
+            &directory.path().join("second"),
+            &cache,
+            &link,
+            &hash_open_file,
+        )
+        .unwrap();
+        let replacement = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        fs::write(replacement.path(), b"later bytes").unwrap();
+        replacement.persist(&blob).unwrap();
+        let later = directory.path().join("later");
+        link_or_copy_spilling_with(&blob, &later, &cache, &link, &hash_open_file).unwrap();
+        assert_eq!(fs::read(later).unwrap(), b"later bytes");
+        assert_eq!(fs::read(first).unwrap(), b"first bytes");
+        assert_eq!(
+            cache.states.lock().unwrap()[&blob].lock().unwrap().cursor,
+            1
+        );
+    }
+
+    #[test]
+    fn a_full_spill_cache_wakes_a_waiter_after_a_lease_is_released() {
+        let cache = SpillCache::default();
+        std::thread::scope(|scope| {
+            let mut leases = (0..MAX_SPILL_STATES)
+                .map(|index| cache.lease(Path::new(&format!("blob{index}"))))
+                .collect::<Vec<_>>();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let cache = &cache;
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let _lease = cache.lease(Path::new("extra"));
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(matches!(
+                done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            drop(leases.pop());
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(cache.states.lock().unwrap().len(), MAX_SPILL_STATES);
+        });
+    }
+
+    #[test]
+    fn spill_cache_evicts_idle_states_and_releases_their_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = SpillCache::default();
+        for index in 0..MAX_SPILL_STATES + 2 {
+            let blob = directory.path().join(format!("blob{index}"));
+            fs::write(&blob, b"bytes").unwrap();
+            let link = |from: &Path, to: &Path| {
+                if from == blob {
+                    Err(std::io::ErrorKind::TooManyLinks.into())
+                } else {
+                    fs::hard_link(from, to)
+                }
+            };
+            link_or_copy_spilling_with(
+                &blob,
+                &directory.path().join(format!("asset{index}")),
+                &cache,
+                &link,
+                &hash_open_file,
+            )
+            .unwrap();
+        }
+        let states = cache.states.lock().unwrap();
+        assert_eq!(states.len(), MAX_SPILL_STATES);
+        assert!(!states.contains_key(&directory.path().join("blob0")));
+        assert!(states.values().all(|state| Arc::strong_count(state) == 1));
+    }
+
+    #[test]
+    fn ingestion_journal_resumes_completed_inventories_and_drops_partial_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let entry = IngestionCacheEntry {
+            source_hash: "ab".repeat(32),
+            selection: IngestionSelection::ConverterInputsV1,
+            recipe: "converter-inputs-v1".to_owned(),
+            files: vec![IngestedFile {
+                path: "lodsettings/tamriel.lod".to_owned(),
+                size: 4,
+                hash: "cd".repeat(32),
+            }],
+            reader_version: 0,
+        };
+        let mut journal = IngestionJournal::open(directory.path()).unwrap();
+        journal.record("base.bsa", &entry).unwrap();
+        drop(journal);
+        let path = directory.path().join(INGESTION_JOURNAL_FILE);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"archive\":\"truncated")
+            .unwrap();
+        assert_eq!(
+            IngestionJournal::load(directory.path()).unwrap()["base.bsa"],
+            entry
+        );
+        let mut journal = IngestionJournal::open(directory.path()).unwrap();
+        journal.record("dlc.bsa", &entry).unwrap();
+        let loaded = IngestionJournal::load(directory.path()).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded["dlc.bsa"], entry);
+    }
+
+    #[test]
+    fn record_completeness_preserves_unknown_false_and_true() {
+        let original = serde_json::to_value(ConversionManifest::default()).unwrap();
+        assert!(original.get("record_data_complete").is_none());
+        let historical: ConversionManifest = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(historical.record_data_complete, None);
+        for complete in [false, true] {
+            let mut json = original.clone();
+            json["record_data_complete"] = serde_json::json!(complete);
+            let manifest: ConversionManifest = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(manifest.record_data_complete, Some(complete));
+            assert_eq!(serde_json::to_value(manifest).unwrap(), json);
+        }
+    }
+
+    /// Known prior adapter proofs retain asset bytes without accepting unknown readers.
+    #[test]
+    fn adapter10_retained_settings_keep_original_identity_and_require_exact_proofs() {
+        let mut config = crate::config::PipelineConfig::new("Data", "output");
+        config.record_reader = crate::config::RecordReader::Inhouse;
+        for adapter in [10, 11] {
+            let mut original = crate::esm::inhouse::reader_identity(config.record_reader);
+            original["adapter_version"] = serde_json::json!(adapter);
+            let recorded = configuration_hash_with_identity(
+                &config,
+                CONVERTER_SCHEMA_VERSION,
+                Some(&original),
+            )
+            .unwrap();
+            assert!(
+                retained_configuration_matches_for_reader(
+                    &config,
+                    CONVERTER_SCHEMA_VERSION,
+                    &recorded,
+                    &original
+                )
+                .unwrap(),
+                "the exact original adapter-{adapter} proof must survive the metadata-only adapter change"
+            );
+            assert_ne!(recorded, configuration_hash(&config).unwrap());
+            assert_eq!(original["adapter_version"], adapter);
+
+            let mut changed = config.clone();
+            changed.texture_fallback_quality = 191;
+            assert!(
+                !retained_configuration_matches_for_reader(
+                    &changed,
+                    CONVERTER_SCHEMA_VERSION,
+                    &recorded,
+                    &original
+                )
+                .unwrap()
+            );
+            let mut changed = config.clone();
+            changed.script_abi_version = 2;
+            assert!(
+                !retained_configuration_matches_for_reader(
+                    &changed,
+                    CONVERTER_SCHEMA_VERSION,
+                    &recorded,
+                    &original
+                )
+                .unwrap()
+            );
+            assert!(
+                !retained_configuration_matches_for_reader(
+                    &config,
+                    CONVERTER_SCHEMA_VERSION,
+                    "different-proof",
+                    &original
+                )
+                .unwrap()
+            );
+            for (key, value) in [
+                ("adapter_version", serde_json::json!(8)),
+                ("schema_sha256", serde_json::json!("different-schema")),
+                ("text_encoding", serde_json::json!("utf-8")),
+                ("extra", serde_json::json!(true)),
+            ] {
+                let mut altered = original.clone();
+                altered[key] = value;
+                assert!(
+                    !retained_configuration_matches_for_reader(
+                        &config,
+                        CONVERTER_SCHEMA_VERSION,
+                        &recorded,
+                        &altered
+                    )
+                    .unwrap(),
+                    "accepted altered {key}"
+                );
+            }
+            for kind in ["nif", "dds", "pex"] {
+                let mut legacy = config.clone();
+                legacy.record_reader = crate::config::RecordReader::Legacy;
+                assert_eq!(
+                    asset_configuration_hash_for_schema(&config, CONVERTER_SCHEMA_VERSION, kind)
+                        .unwrap(),
+                    asset_configuration_hash_for_schema(&legacy, CONVERTER_SCHEMA_VERSION, kind)
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn both_prior_cache_contracts_limit_coverage_and_unknown_recipes_miss() {
+        let pack_entry: IngestionCacheEntry = serde_json::from_value(serde_json::json!({
+            "source_hash": "source", "recipe": "converter-inputs-v1", "files": []
+        }))
+        .unwrap();
+        assert!(pack_entry.covers(IngestionSelection::RuntimeEnglishV1));
+        assert!(pack_entry.covers(IngestionSelection::ConverterInputsV1));
+        assert!(!pack_entry.covers(IngestionSelection::All));
+        let raw_entry: IngestionCacheEntry = serde_json::from_value(serde_json::json!({
+            "source_hash": "source", "selection": "runtime_english_v1", "files": []
+        }))
+        .unwrap();
+        assert!(raw_entry.covers(IngestionSelection::RuntimeEnglishV1));
+        assert!(!raw_entry.covers(IngestionSelection::All));
+        assert!(!raw_entry.covers(IngestionSelection::ConverterInputsV1));
+        let mut conflicting = raw_entry.clone();
+        conflicting.recipe = "all-v1".into();
+        assert!(!conflicting.covers(IngestionSelection::All));
+        conflicting.recipe = "unknown-v99".into();
+        assert!(!conflicting.covers(IngestionSelection::RuntimeEnglishV1));
+        let roundtrip: IngestionCacheEntry =
+            serde_json::from_slice(&serde_json::to_vec(&pack_entry).unwrap()).unwrap();
+        assert_eq!(roundtrip, pack_entry);
+    }
+
+    #[test]
+    fn older_ingestion_entries_prove_all_files_and_coverage_is_directional() {
+        let entry: IngestionCacheEntry = serde_json::from_value(serde_json::json!({
+            "source_hash": "source", "files": [],
+        }))
+        .unwrap();
+        assert_eq!(entry.selection, IngestionSelection::All);
+        assert!(
+            entry
+                .selection
+                .can_satisfy(IngestionSelection::RuntimeEnglishV1)
+        );
+        assert!(!IngestionSelection::RuntimeEnglishV1.can_satisfy(IngestionSelection::All));
+        assert!(
+            IngestionSelection::RuntimeEnglishV1.can_satisfy(IngestionSelection::RuntimeEnglishV1)
+        );
+    }
+
+    #[test]
+    fn retained_schema15_fixed_zstd_proof_preserves_quality_abi_and_cache_identity() {
+        let mut config = crate::config::PipelineConfig::new("Data", "output");
+        config.record_reader = crate::config::RecordReader::Legacy;
+        // Exact configuration hash in the protected original schema-15
+        // manifest and its metadata rebuild's retained producer provenance.
+        let recorded = "b23881a864cdcfe1609779a9a27fefab2de629b50ec339101d4e0ad592e7e435";
+        assert!(retained_configuration_matches(&config, 15, recorded).unwrap());
+        assert_eq!(
+            configuration_hash_for_schema(&config, 15).unwrap(),
+            "9a58fda00b27d0f2a8e46afb9334ea869602556393a35bffd7fcb39582a08a4f"
+        );
+        assert!(!retained_configuration_matches(&config, 16, recorded).unwrap());
+        assert!(!retained_configuration_matches(&config, 15, "different-hash").unwrap());
+        let mut changed = config.clone();
+        changed.texture_fallback_quality = 191;
+        assert!(!retained_configuration_matches(&changed, 15, recorded).unwrap());
+        let mut changed = config.clone();
+        changed.script_abi_version = 2;
+        assert!(!retained_configuration_matches(&changed, 15, recorded).unwrap());
+        let mut changed = config;
+        changed.texture_zstd_level = 7;
+        assert!(!retained_configuration_matches(&changed, 15, recorded).unwrap());
+    }
+
+    #[test]
+    fn prior_producers_cannot_reuse_staged_meshes_or_textures() {
         let directory = tempfile::tempdir().unwrap();
         for name in ["old.glb", "old.ktx2"] {
             let path = directory.path().join(name);
             fs::write(&path, b"verified old bytes").unwrap();
-            for schema_version in [17, 18, 19, 20, 21, 22, 23] {
+            for schema_version in [17, 18, 19, 20, 21, 22, 23, 24, 25, 26] {
                 let record = StagedOutput {
                     schema_version,
                     configuration_hash: "matching-config".to_owned(),
@@ -540,6 +1582,61 @@ mod tests {
             hash_bytes(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn sha256_matches_known_padding_boundary_vectors() {
+        // Fixed digests computed independently with Python's hashlib.
+        let vectors = [
+            (
+                0,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                55,
+                "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+            ),
+            (
+                56,
+                "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+            ),
+            (
+                63,
+                "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34",
+            ),
+            (
+                64,
+                "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+            ),
+            (
+                65,
+                "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0",
+            ),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("padding-vector.bin");
+        for (size, expected) in vectors {
+            let bytes = vec![b'a'; size];
+            assert_eq!(hash_bytes(&bytes), expected, "byte vector length {size}");
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                hash_file(&path).unwrap(),
+                expected,
+                "file vector length {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn sha256_file_matches_known_multiblock_vector() {
+        // Standard SHA-256 million-'a' vector, spanning many file read chunks.
+        let bytes = vec![b'a'; 1_000_000];
+        let expected = "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
+        assert_eq!(hash_bytes(&bytes), expected);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("million-a.bin");
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(hash_file(&path).unwrap(), expected);
     }
 
     #[test]
@@ -645,6 +1742,55 @@ mod tests {
         assert_eq!(fs::read(&vfs).unwrap(), b"archive bytes");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn restore_replaces_destination_symlinks_without_touching_their_targets() {
+        use std::os::unix::fs::symlink;
+
+        fn force_copy(_: &Path, _: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::other("no hard links here"))
+        }
+        type Restore = fn(&Path, &Path) -> std::io::Result<()>;
+        let restores: [Restore; 2] = [
+            |from, to| link_or_copy_with(from, to, force_copy),
+            |from, to| {
+                link_or_copy_spilling_with(
+                    from,
+                    to,
+                    &SpillCache::default(),
+                    &force_copy,
+                    &hash_open_file,
+                )
+            },
+        ];
+        for restore in restores {
+            for target_exists in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let blob = directory.path().join("blob");
+                fs::write(&blob, b"archive bytes").unwrap();
+                let outside = directory.path().join("outside");
+                if target_exists {
+                    fs::write(&outside, b"external bytes").unwrap();
+                }
+                let staging = directory.path().join("staging");
+                fs::create_dir(&staging).unwrap();
+                let destination = staging.join("restored.bin");
+                symlink(&outside, &destination).unwrap();
+
+                restore(&blob, &destination).unwrap();
+
+                assert!(fs::symlink_metadata(&destination).unwrap().is_file());
+                assert_eq!(fs::read(&destination).unwrap(), b"archive bytes");
+                assert_eq!(fs::read(&blob).unwrap(), b"archive bytes");
+                if target_exists {
+                    assert_eq!(fs::read(&outside).unwrap(), b"external bytes");
+                } else {
+                    assert!(fs::symlink_metadata(&outside).is_err());
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_full_blob_shares_one_spill_copy_instead_of_copying_per_path() {
         // Stands in for ERROR_TOO_MANY_LINKS: the original blob takes no more names, a spill does.
@@ -660,8 +1806,9 @@ mod tests {
         let first = directory.path().join("first.dds");
         let second = directory.path().join("second.dds");
 
-        link_or_copy_spilling_with(&blob, &first, blob_is_full).unwrap();
-        link_or_copy_spilling_with(&blob, &second, blob_is_full).unwrap();
+        let cache = SpillCache::default();
+        link_or_copy_spilling_with(&blob, &first, &cache, &blob_is_full, &hash_open_file).unwrap();
+        link_or_copy_spilling_with(&blob, &second, &cache, &blob_is_full, &hash_open_file).unwrap();
 
         // Both paths name the one spill copy: a write through one shows in the other, and the
         // blob itself is untouched.
@@ -685,9 +1832,13 @@ mod tests {
         fs::write(&blob, b"archive bytes").unwrap();
         let vfs = directory.path().join("rock.dds");
 
-        link_or_copy_spilling_with(&blob, &vfs, |_, _| {
-            Err(std::io::Error::other("cross-volume"))
-        })
+        link_or_copy_spilling_with(
+            &blob,
+            &vfs,
+            &SpillCache::default(),
+            &|_, _| Err(std::io::Error::other("cross-volume")),
+            &hash_open_file,
+        )
         .unwrap();
 
         assert_eq!(fs::read(&vfs).unwrap(), b"archive bytes");
@@ -741,7 +1892,7 @@ mod tests {
             output_hash: hash_file(&path).unwrap(),
         };
         assert!(record.is_current(&path, "source", "config"));
-        for schema_version in [16, 17, 18, 19, 20, 21, 22, 23] {
+        for schema_version in [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26] {
             let stale = StagedOutput {
                 schema_version,
                 ..record.clone()
@@ -752,7 +1903,7 @@ mod tests {
 
     #[test]
     fn recent_schema_migrations_reuse_only_unchanged_asset_kinds() {
-        for schema_version in [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23] {
+        for schema_version in [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("conversion-manifest.json");
             let mut manifest = ConversionManifest {
@@ -783,6 +1934,56 @@ mod tests {
         }
     }
 
+    /// Producer 27 changed the GLB collision data, so no earlier producer's meshes
+    /// (including the producer-24 and producer-26 contract) are reusable. Provenance
+    /// is still kept as recorded, scripts stay reusable, and textures never are.
+    #[test]
+    fn database_only_migration_discards_meshes_of_earlier_producers() {
+        for (producer, retained, compatible) in [
+            (24, None, false),
+            (26, None, false),
+            (CONVERTER_SCHEMA_VERSION, Some(24), false),
+            (CONVERTER_SCHEMA_VERSION, Some(26), false),
+            (24, Some(CONVERTER_SCHEMA_VERSION), false),
+            (26, Some(CONVERTER_SCHEMA_VERSION), false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("conversion-manifest.json");
+            let mut manifest = ConversionManifest {
+                schema_version: producer,
+                retained_mesh_schema_version: retained,
+                retained_asset_configuration_hash: retained.map(|_| "original-config".into()),
+                configuration_hash: "producer-config".into(),
+                complete: true,
+                ..ConversionManifest::default()
+            };
+            for output in ["meshes/a.glb", "textures/a.ktx2", "scripts/a.luau"] {
+                manifest.entries.insert(
+                    output.into(),
+                    CacheEntry {
+                        source_hash: "source".into(),
+                        output: output.into(),
+                        output_size: 1,
+                        output_hash: "output".into(),
+                    },
+                );
+            }
+            manifest.save(&path).unwrap();
+            let migrated = ConversionManifest::load(&path).unwrap();
+            assert!(!migrated.complete);
+            assert_eq!(migrated.entries.contains_key("meshes/a.glb"), compatible);
+            assert!(!migrated.entries.contains_key("textures/a.ktx2"));
+            assert!(migrated.entries.contains_key("scripts/a.luau"));
+            assert_eq!(migrated.retained_mesh_schema_version, retained);
+            assert_eq!(migrated.configuration_hash, "producer-config");
+            assert_eq!(
+                migrated.retained_asset_configuration_hash,
+                manifest.retained_asset_configuration_hash
+            );
+        }
+    }
+
+    /// Unproven older contracts never gain the current mesh identity.
     #[test]
     fn current_metadata_never_promotes_an_older_or_unknown_mesh_contract() {
         for mesh_schema in [
@@ -795,6 +1996,9 @@ mod tests {
             21,
             22,
             23,
+            24,
+            25,
+            26,
             CONVERTER_SCHEMA_VERSION + 1,
         ] {
             let directory = tempfile::tempdir().unwrap();

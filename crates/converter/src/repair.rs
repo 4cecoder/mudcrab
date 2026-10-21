@@ -1,6 +1,6 @@
 //! Targeted repair of a published pack, including asset-aware database finalization.
 use crate::{
-    archive::{ArchiveExtractor, safe_relative_path},
+    archive::{ArchiveExtractor, archive_reader_version, safe_relative_path},
     asset_path::{AssetKind, canonical_asset_path, is_authoring_resource, resolve_asset_uri},
     cache::{
         CONVERTER_SCHEMA_VERSION, CacheEntry, ConversionManifest, configuration_hash, hash_file,
@@ -22,12 +22,13 @@ use crate::{
 };
 use color_eyre::{
     Result,
-    eyre::{WrapErr, ensure},
+    eyre::{WrapErr, bail, ensure},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
@@ -38,6 +39,9 @@ pub struct RepairReport {
     pub converted: usize,
     pub excluded: usize,
     pub published: bool,
+    /// Record data was verified complete by its last authoritative conversion.
+    /// False also covers historical manifests without that proof.
+    pub record_data_complete: bool,
     pub failures: BTreeMap<String, String>,
 }
 
@@ -187,6 +191,7 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
         converted: 0,
         excluded: 0,
         published: false,
+        record_data_complete: manifest.record_data_complete == Some(true),
         failures: BTreeMap::new(),
     };
 
@@ -316,6 +321,22 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
         let Some(entry) = manifest.archives.get(archive_key) else {
             continue;
         };
+        let mut magic = [0u8; 4];
+        fs::File::open(&archive)
+            .wrap_err_with(|| format!("cannot read archive header {}", archive.display()))?
+            .read_exact(&mut magic)
+            .wrap_err_with(|| format!("cannot read archive header {}", archive.display()))?;
+        let current_reader_version = archive_reader_version(&magic);
+        if entry.reader_version != current_reader_version {
+            fs::remove_dir_all(&directory)
+                .wrap_err("cannot discard repair staging for a stale archive reader entry")?;
+            bail!(
+                "archive {} was ingested with reader version {} but current archive requires {}; run a normal conversion before repair",
+                archive.display(),
+                entry.reader_version,
+                current_reader_version
+            );
+        }
         for file in &entry.files {
             if kind(&file.path).is_none() {
                 continue;
@@ -661,12 +682,15 @@ pub fn repair_failed(config: &PipelineConfig, apply: bool) -> Result<RepairRepor
                 }
             }
         }
-        manifest.complete = true;
+        // Asset repair leaves record data and its exact known/unknown proof untouched.
+        manifest.complete = report.record_data_complete;
         manifest.save(&staged.join("conversion-manifest.json"))?;
         changed.insert("conversion-manifest.json".into());
         let check = check_output(&staged, CheckMode::Full, |_, _| {})?;
         ensure!(
-            check.problems.is_empty(),
+            check.problems.iter().all(|problem| {
+                !manifest.complete && matches!(problem, CheckProblem::Incomplete)
+            }),
             "repaired pack failed full validation: {:?}",
             check.problems
         );
@@ -1265,6 +1289,7 @@ mod tests {
                 converted: 0,
                 excluded: 0,
                 published: false,
+                record_data_complete: false,
                 failures: BTreeMap::new(),
             };
             attempt(

@@ -1,4 +1,6 @@
 //! Exercise automatic plugin discovery through the production conversion path.
+mod common;
+
 use converter::{
     AssetPipeline, PipelineConfig,
     esm::{EsmParser, load_order::LoadOrder, read_plugins_txt},
@@ -90,7 +92,7 @@ async fn fallback_orders_dependencies_and_ignores_nested_plugins_but_keeps_asset
     fs::write(data.join("Optional/ZMod.esp"), b"invalid duplicate backup").unwrap();
     fs::write(data.join("Optional/Unused.esp"), b"invalid optional plugin").unwrap();
     let output = dir.path().join("modern");
-    let config = PipelineConfig::new(&data, &output);
+    let config = common::cpu_lod_config(&data, &output);
     assert!(config.plugins_file.is_none());
     assert!(run(config.clone()).await.unwrap().complete);
     let conn = Connection::open(output.join("skyrim_world.db")).unwrap();
@@ -145,7 +147,7 @@ async fn nested_only_plugins_warn_but_asset_conversion_completes_without_databas
     fs::rename(data.join("Skyrim.esm"), nested.join("Skyrim.esm")).unwrap();
     fs::write(nested.join("Backup.esp"), b"invalid ignored plugin").unwrap();
     let output = dir.path().join("modern");
-    let report = run(PipelineConfig::new(&data, &output)).await.unwrap();
+    let report = run(common::cpu_lod_config(&data, &output)).await.unwrap();
     assert!(report.complete, "{report:?}");
     assert!(report.converted > 0);
     assert_eq!(report.skipped, 0);
@@ -186,7 +188,7 @@ async fn nested_only_plugin_notice_reaches_the_progress_channel() {
         }
         notices
     });
-    let report = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx)
+    let report = AssetPipeline::run_async(common::cpu_lod_config(&data, &output), tx)
         .await
         .map_err(|error| format!("{error:?}"))
         .unwrap();
@@ -224,7 +226,7 @@ async fn no_plugins_converts_assets_without_warning_or_database() {
     )
     .unwrap();
     let output = dir.path().join("modern");
-    let report = run(PipelineConfig::new(&data, &output)).await.unwrap();
+    let report = run(common::cpu_lod_config(&data, &output)).await.unwrap();
     assert!(report.complete, "{report:?}");
     assert!(report.converted > 0);
     assert_eq!(report.skipped, 0);
@@ -247,7 +249,7 @@ async fn fallback_keeps_espfe_in_regular_order_without_changing_light_slots() {
     plugin(&data, "ZLight.esp", &["Skyrim.esm"], 0x200, Some(222.0));
     let output = dir.path().join("modern");
     assert!(
-        run(PipelineConfig::new(&data, &output))
+        run(common::cpu_lod_config(&data, &output))
             .await
             .unwrap()
             .complete
@@ -356,7 +358,7 @@ async fn fallback_fails_clearly_when_no_discovered_plugin_survives() {
         if cycle {
             plugin(&data, "B.esp", &["A.esp"], 0, None);
         }
-        let error = run(PipelineConfig::new(&data, dir.path().join("modern")))
+        let error = run(common::cpu_lod_config(&data, dir.path().join("modern")))
             .await
             .unwrap_err();
         assert!(
@@ -388,7 +390,7 @@ async fn explicit_plugin_order_is_preserved_and_inversions_are_skipped_not_repai
     let list = dir.path().join("plugins.txt");
     fs::write(&list, "Skyrim.esm\n*Z.esp\n*A.esp\n").unwrap();
     let output = dir.path().join("modern");
-    let mut config = PipelineConfig::new(&data, &output);
+    let mut config = common::cpu_lod_config(&data, &output);
     config.plugins_file = Some(list.clone());
     assert!(run(config.clone()).await.unwrap().complete);
     let conn = Connection::open(output.join("skyrim_world.db")).unwrap();
@@ -435,7 +437,7 @@ async fn explicit_regular_override_beats_a_master_listed_after_it() {
     let list = dir.path().join("plugins.txt");
     fs::write(&list, "Skyrim.esm\n*A.esp\n*B.esm\n").unwrap();
     let output = dir.path().join("modern");
-    let mut config = PipelineConfig::new(&data, &output);
+    let mut config = common::cpu_lod_config(&data, &output);
     config.plugins_file = Some(list);
     let report = run(config).await.unwrap();
     assert!(report.complete, "{report:?}");
@@ -604,7 +606,7 @@ async fn explicit_plugin_list_loads_master_files_before_regular_plugins() {
 
     // The regular plugins now follow all masters; ESL-flagged Small.esp is last.
     let output = dir.path().join("modern");
-    let mut config = PipelineConfig::new(&data, &output);
+    let mut config = common::cpu_lod_config(&data, &output);
     config.plugins_file = Some(list.clone());
     let first = run(config.clone()).await.unwrap();
     assert!(first.complete, "{first:?}");
@@ -753,7 +755,7 @@ async fn explicit_master_keeps_its_transitive_regular_prerequisites() {
     )
     .unwrap();
     let output = dir.path().join("modern");
-    let mut config = PipelineConfig::new(&data, &output);
+    let mut config = common::cpu_lod_config(&data, &output);
     config.plugins_file = Some(list);
     let report = run(config).await.unwrap();
     assert!(report.complete, "{report:?}");
@@ -784,19 +786,37 @@ async fn explicit_master_keeps_its_transitive_regular_prerequisites() {
     assert_eq!(setting, (50.0, "Last.esp".to_string()));
 }
 
+/// Unusable headers identify their source, while malformed framed records preserve a valid neighbor.
 #[test]
-fn header_and_record_errors_include_the_plugin_path() {
+fn header_errors_include_the_plugin_path_and_framed_record_errors_recover_locally() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("Broken.esp");
     fs::write(&path, b"TES4").unwrap();
     let error = LoadOrder::read(std::slice::from_ref(&path)).err().unwrap();
     assert!(format!("{error:?}").contains(path.to_str().unwrap()));
     let malformed = record(b"STAT", 0x800, 0, b"DATA\x04\x00\x01".to_vec());
-    fs::write(&path, [record(b"TES4", 0, 0, vec![]), malformed].concat()).unwrap();
-    let error = EsmParser::merge_plugins(std::slice::from_ref(&path)).unwrap_err();
-    let message = format!("{error:?}");
-    assert!(
-        message.contains(path.to_str().unwrap()) && message.contains("truncated DATA"),
-        "{message}"
-    );
+    fs::write(
+        &path,
+        [
+            record(b"TES4", 0, 0, vec![]),
+            malformed,
+            record(b"STAT", 0x801, 0, sub(b"EDID", b"Neighbor\0")),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let merged = EsmParser::merge_plugins(std::slice::from_ref(&path)).unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[&0x801].subrecords[0].1, b"Neighbor\0");
+    let db = dir.path().join("world.db");
+    EsmParser::convert_plugins(&[path], &db).unwrap();
+    let conn = Connection::open(db).unwrap();
+    let ids: Vec<u32> = conn
+        .prepare("SELECT form_id FROM records ORDER BY form_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(ids, [0x801]);
 }
