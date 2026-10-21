@@ -639,18 +639,18 @@ mod multi_bound {
         let ordered_index = node_index("ordered");
         let billboard_index = node_index("billboard");
         let value_index = node_index("value");
-        let shape_index = gltf.nodes[value_index].children.as_ref().unwrap()[0].value() as usize;
+        let shape_index = gltf.nodes[value_index].children.as_ref().unwrap()[0].value();
         assert_eq!(
             gltf.nodes[root_index].children.as_ref().unwrap()[0].value(),
-            ordered_index as u32
+            ordered_index
         );
         assert_eq!(
             gltf.nodes[ordered_index].children.as_ref().unwrap()[0].value(),
-            billboard_index as u32
+            billboard_index
         );
         assert_eq!(
             gltf.nodes[billboard_index].children.as_ref().unwrap()[0].value(),
-            value_index as u32
+            value_index
         );
         let local = |index: usize| {
             let node = &gltf.nodes[index];

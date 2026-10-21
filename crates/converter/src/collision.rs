@@ -1239,11 +1239,7 @@ mod tests {
         let parent = nodes.iter().enumerate().find_map(|(index, node)| {
             node.children
                 .as_ref()
-                .is_some_and(|children| {
-                    children
-                        .iter()
-                        .any(|child| child.value() as usize == target)
-                })
+                .is_some_and(|children| children.iter().any(|child| child.value() == target))
                 .then_some(index)
         });
         parent.map_or_else(
