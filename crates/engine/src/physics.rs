@@ -1523,7 +1523,7 @@ fn release_walk_spawn_hold(
         return;
     };
     let probe_distance =
-        walk_spawn_probe_distance(body.translation.y, hold.sampled_ground_y, tuning);
+        walk_spawn_probe_distance(body.translation.y, hold.sampled_ground_y, &tuning);
     let placement = context.single().ok().and_then(|context| {
         context
             .cast_ray(
