@@ -362,11 +362,7 @@ mod missing_palette_failure_tests {
 
     #[test]
     fn converter_published_palette_uri_matches_only_its_image_failure() {
-        let material = effect_material(
-            0,
-            &CASES[0],
-            MISSING_PALETTE_SOURCE_TEXTURE_PATH,
-        );
+        let material = effect_material(0, &CASES[0], MISSING_PALETTE_SOURCE_TEXTURE_PATH);
         let NifMaterialDisposition::Validated {
             material: validated,
         } = &material.disposition
@@ -387,18 +383,13 @@ mod missing_palette_failure_tests {
             "asset": {"version": "2.0"},
             "meshes": [{"primitives": [{}]}]
         });
-        publish_gltf_materials(
-            &mut document,
-            &[material],
-            &[0],
-            Path::new("materials.glb"),
-        )
+        publish_gltf_materials(&mut document, &[material], &[0], Path::new("materials.glb"))
         .unwrap();
 
-        let texture_slots = document["materials"][0]["extensions"]["OPEN_SKYRIM_material"]
-            ["textureSlots"]
-            .as_array()
-            .unwrap();
+        let texture_slots =
+            document["materials"][0]["extensions"]["OPEN_SKYRIM_material"]["textureSlots"]
+                .as_array()
+                .unwrap();
         let greyscale_texture_index = texture_slots
             .iter()
             .find(|slot| slot["semantic"] == "greyscale")
@@ -408,9 +399,7 @@ mod missing_palette_failure_tests {
         let image_index = document["textures"][greyscale_texture_index]["source"]
             .as_u64()
             .unwrap() as usize;
-        let published_uri = document["images"][image_index]["uri"]
-            .as_str()
-            .unwrap();
+        let published_uri = document["images"][image_index]["uri"].as_str().unwrap();
 
         assert_eq!(published_uri, MISSING_PALETTE_RUNTIME_TEXTURE_PATH);
         let expected_failure = is_missing_palette_failure_path(Path::new(published_uri));
@@ -419,10 +408,12 @@ mod missing_palette_failure_tests {
             expected_failure
         ));
 
-        let source_dds_failure = is_missing_palette_failure_path(Path::new(
-            MISSING_PALETTE_SOURCE_TEXTURE_PATH,
+        let source_dds_failure =
+            is_missing_palette_failure_path(Path::new(MISSING_PALETTE_SOURCE_TEXTURE_PATH));
+        assert!(!missing_palette_negative_control_passed(
+            true,
+            source_dds_failure
         ));
-        assert!(!missing_palette_negative_control_passed(true, source_dds_failure));
 
         let unrelated_runtime_failure =
             is_missing_palette_failure_path(Path::new("textures/missing_normal.ktx2"));
@@ -435,7 +426,10 @@ mod missing_palette_failure_tests {
         assert!(!missing_palette_negative_control_passed(true, false));
 
         // A successful parent must fail the negative control even if a stale event was seen.
-        assert!(!missing_palette_negative_control_passed(false, expected_failure));
+        assert!(!missing_palette_negative_control_passed(
+            false,
+            expected_failure
+        ));
     }
 }
 
@@ -472,7 +466,11 @@ fn fixtures(output: &std::path::Path) -> PathBuf {
     // No such palette file: the material must not count as loaded with its dependencies.
     write_gltf(
         assets.join("missing_palette.gltf"),
-        &[effect_material(0, &CASES[0], MISSING_PALETTE_SOURCE_TEXTURE_PATH)],
+        &[effect_material(
+            0,
+            &CASES[0],
+            MISSING_PALETTE_SOURCE_TEXTURE_PATH,
+        )],
     );
     assets
 }
