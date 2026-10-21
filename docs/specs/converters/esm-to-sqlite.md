@@ -1,4 +1,4 @@
-# ESM to libSQL (Turso Engine) + rkyv Transformation Specification
+# ESM to SQLite + rkyv Transformation Specification
 
 This document describes how Skyrim master (`.esm`) and plugin (`.esp` / `.esl`) records are projected into the indexed SQLite database (`skyrim_world.db`) and the zero-copy `rkyv` terrain cache.
 
