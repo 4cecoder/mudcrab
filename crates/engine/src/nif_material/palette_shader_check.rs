@@ -33,11 +33,15 @@ const STANDARD_MATERIAL_FLAGS_ALPHA_MODE_ALPHA_TO_COVERAGE: u32 = 6u << 29u;
 const PBR_BINDINGS: &str = r#"
 #define_import_path bevy_pbr::pbr_bindings
 #import bevy_pbr::pbr_types::StandardMaterial
-struct View { mip_bias: f32 }
 @group(0) @binding(0) var<uniform> material: StandardMaterial;
 @group(0) @binding(1) var base_color_texture: texture_2d<f32>;
 @group(0) @binding(2) var base_color_sampler: sampler;
-@group(0) @binding(3) var<uniform> view: View;
+"#;
+
+const MESH_VIEW_BINDINGS: &str = r#"
+#define_import_path bevy_pbr::mesh_view_bindings
+struct View { mip_bias: f32 }
+@group(1) @binding(0) var<uniform> view: View;
 "#;
 
 const PREPASS_IO: &str = r#"
@@ -133,6 +137,7 @@ fn compose(source: &str, file_path: &str, defs: &[&str]) -> Result<wgpu::naga::M
     for (path, module_source) in [
         ("pbr_types.wgsl", PBR_TYPES),
         ("pbr_bindings.wgsl", PBR_BINDINGS),
+        ("mesh_view_bindings.wgsl", MESH_VIEW_BINDINGS),
         ("prepass_io.wgsl", PREPASS_IO),
         ("forward_io.wgsl", FORWARD_IO),
         ("pbr_functions.wgsl", PBR_FUNCTIONS),
