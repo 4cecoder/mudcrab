@@ -116,6 +116,20 @@ fn readable_bank() -> Vec<u8> {
     .concat()
 }
 
+/// Keep one healthy STRINGS entry beside one directory entry with an invalid offset.
+fn malformed_bank() -> Vec<u8> {
+    [
+        2u32.to_le_bytes().as_slice(),
+        &9u32.to_le_bytes(),
+        &7u32.to_le_bytes(),
+        &0u32.to_le_bytes(),
+        &6515u32.to_le_bytes(),
+        &u32::MAX.to_le_bytes(),
+        b"Existing\0",
+    ]
+    .concat()
+}
+
 /// Keep asset work minimal while using the normal public conversion configuration.
 fn config(data: &Path, output: &Path, reader: RecordReader) -> PipelineConfig {
     let mut config = PipelineConfig::new(data, output);
@@ -236,6 +250,132 @@ async fn missing_id_in_readable_table_is_complete_notice() {
         );
         assert_eq!(ids(&output), [0x801, 0x802]);
         completeness(&report, &output, true);
+    }
+}
+
+/// A referenced malformed entry warns and makes CLI incomplete while healthy text survives.
+#[test]
+fn malformed_entry_warns_cli_one_and_preserves_healthy_neighbor_and_provenance() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    let output = directory.path().join("pack");
+    plugin(
+        &data,
+        "Text.esm",
+        0x81,
+        &[],
+        [
+            keyword(0x801),
+            record(
+                b"NPC_",
+                0x802,
+                0,
+                &[
+                    field(b"EDID", b"MalformedName\0"),
+                    field(b"FULL", &6515u32.to_le_bytes()),
+                ]
+                .concat(),
+            ),
+            record(
+                b"NPC_",
+                0x803,
+                0,
+                &[
+                    field(b"EDID", b"HealthyName\0"),
+                    field(b"FULL", &7u32.to_le_bytes()),
+                ]
+                .concat(),
+            ),
+        ]
+        .concat(),
+    );
+    fs::create_dir(data.join("Strings")).unwrap();
+    fs::write(data.join("Strings/Text_english.strings"), malformed_bank()).unwrap();
+    let (status, report) = cli(&data, &output, &directory.path().join("report.json"), None);
+    assert_eq!(status, 1);
+    completeness(&report, &output, false);
+    assert_eq!(ids(&output), [0x801, 0x802, 0x803]);
+    assert!(report.notices.is_empty(), "{:?}", report.notices);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(report.warnings[0].contains("malformed STRINGS entry for localized ID 6515"));
+    let db = Connection::open(output.join("skyrim_world.db")).unwrap();
+    type TextProvenance = (u32, u32, Option<String>, String);
+    let provenance: Vec<TextProvenance> = db
+        .prepare("SELECT form_id,string_id,resolved_text,status FROM inhouse_localized_fields ORDER BY form_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        provenance,
+        [
+            (0x802, 6515, None, "missing".into()),
+            (0x803, 7, Some("Existing".into()), "resolved".into()),
+        ]
+    );
+    let source_records: Vec<(u32, u64)> = db
+        .prepare("SELECT form_id,length(payload) FROM inhouse_source_records WHERE form_id IN (?1,?2) ORDER BY form_id")
+        .unwrap()
+        .query_map([0x802u32, 0x803], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(source_records.len(), 2);
+    assert!(source_records.iter().all(|(_, bytes)| *bytes > 0));
+}
+
+/// Null IDs need no bank; a later nonzero reference still reports the missing bank.
+#[test]
+fn null_only_missing_bank_is_complete_but_later_reference_warns() {
+    for include_nonzero in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("Data");
+        let output = directory.path().join("pack");
+        let mut body = keyword(0x801);
+        body.extend(record(
+            b"NPC_",
+            0x802,
+            0,
+            &[
+                field(b"EDID", b"NullName\0"),
+                field(b"FULL", &0u32.to_le_bytes()),
+            ]
+            .concat(),
+        ));
+        if include_nonzero {
+            body.extend(record(
+                b"NPC_",
+                0x803,
+                0,
+                &[
+                    field(b"EDID", b"MissingName\0"),
+                    field(b"FULL", &6515u32.to_le_bytes()),
+                ]
+                .concat(),
+            ));
+        }
+        plugin(&data, "Text.esm", 0x81, &[], &body);
+        let (status, report) = cli(&data, &output, &directory.path().join("report.json"), None);
+        assert_eq!(status, if include_nonzero { 1 } else { 0 });
+        completeness(&report, &output, !include_nonzero);
+        let db = Connection::open(output.join("skyrim_world.db")).unwrap();
+        let null_status: String = db
+            .query_row(
+                "SELECT status FROM inhouse_localized_fields WHERE form_id=?1",
+                [0x802u32],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_status, "null_id");
+        if include_nonzero {
+            assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+            assert!(report.warnings[0].contains("2 local decode/lookup issues"));
+            assert!(!report.warnings[0].contains("null_id"));
+        } else {
+            assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+            assert!(report.notices.is_empty(), "{:?}", report.notices);
+        }
     }
 }
 
