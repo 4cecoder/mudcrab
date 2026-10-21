@@ -38,11 +38,13 @@ This branch does not track `scripts/workspace.py`. Use the installed workspace b
 from `MUDCRAB_WORKSPACE_ROOT` when configured or from the shared Git directory otherwise. Keep
 generated databases under shared `scratch/` and retained reports under shared `evidence/`; use an
 owner-specific task name. Replace the quoted absolute plugin and game-data paths with host paths.
+Each example reserves a unique evidence directory so reruns preserve earlier JSON reports.
 
 ```sh
 if [ -n "${MUDCRAB_WORKSPACE_ROOT:-}" ]; then
   bootstrap="$MUDCRAB_WORKSPACE_ROOT/bin/workspace.py"
 else
+  unset MUDCRAB_WORKSPACE_ROOT
   git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
   bootstrap="$git_common_dir/../.mudcrab-local/bin/workspace.py"
 fi
@@ -53,7 +55,8 @@ mkdir -p "$scratch" "$evidence"
 data="/absolute/path/to/Skyrim/Data"
 plugins="/absolute/path/to/plugins.txt"
 out="$scratch/pr280-reader-diff-doc-example-20261021"
-report="$evidence/pr280-reader-diff-doc-example-20261021.json"
+report_dir=$(mktemp -d "$evidence/pr280-reader-diff-doc-example-20261021.XXXXXX")
+report="$report_dir/report.json"
 
 # Choose a new output root. The command atomically creates it before either reader writes;
 # an existing path is refused without changing its contents.
@@ -69,6 +72,7 @@ input identity. This block selects and queries the installed bootstrap independe
 if [ -n "${MUDCRAB_WORKSPACE_ROOT:-}" ]; then
   bootstrap="$MUDCRAB_WORKSPACE_ROOT/bin/workspace.py"
 else
+  unset MUDCRAB_WORKSPACE_ROOT
   git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir)
   bootstrap="$git_common_dir/../.mudcrab-local/bin/workspace.py"
 fi
@@ -77,7 +81,8 @@ evidence="$storage/evidence"
 mkdir -p "$evidence"
 legacy_db="/absolute/path/to/legacy/skyrim_world.db"
 inhouse_db="/absolute/path/to/inhouse/skyrim_world.db"
-report="$evidence/pr280-reader-diff-compare-doc-example-20261021.json"
+report_dir=$(mktemp -d "$evidence/pr280-reader-diff-compare-doc-example-20261021.XXXXXX")
+report="$report_dir/report.json"
 
 python3 "$bootstrap" cargo --isolated pr280-reader-diff-doc-example-20261021 run --locked --release \
   -p converter --bin reader-diff -- \
