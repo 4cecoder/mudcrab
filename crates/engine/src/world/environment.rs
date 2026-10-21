@@ -33,12 +33,12 @@ impl TimeOfDay {
     }
 }
 
-/// A directional ambient lighting block (`DALC`): colours along X+, X-, Y+, Y-, Z+, Z-, then the
-/// specular colour and a scale. Colours are 8-bit sRGB.
+/// A directional ambient block (`DALC`): colours along X+, X-, Y+, Y-, Z+, and Z-.
+/// Specular colour and scale are optional. Colours are 8-bit sRGB.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct DirectionalAmbient {
     pub colors: [[u8; 3]; 6],
-    pub specular: [u8; 3],
+    pub specular: Option<[u8; 3]>,
     pub scale: Option<f32>,
 }
 
@@ -197,7 +197,7 @@ fn rgb(row: &Row<'_>, first: usize) -> rusqlite::Result<Option<[u8; 3]>> {
     )
 }
 
-/// A directional ambient block, or `None` unless all seven colours are present.
+/// A directional ambient block, or `None` unless all six directional colours are present.
 fn dalc(row: &Row<'_>, first: usize) -> rusqlite::Result<Option<DirectionalAmbient>> {
     let mut colors = [[0; 3]; 6];
     for (index, colour) in colors.iter_mut().enumerate() {
@@ -206,12 +206,9 @@ fn dalc(row: &Row<'_>, first: usize) -> rusqlite::Result<Option<DirectionalAmbie
         };
         *colour = value;
     }
-    let Some(specular) = rgb(row, first + 18)? else {
-        return Ok(None);
-    };
     Ok(Some(DirectionalAmbient {
         colors,
-        specular,
+        specular: rgb(row, first + 18)?,
         scale: row.get(first + 21)?,
     }))
 }
@@ -530,6 +527,122 @@ mod tests {
         assert!(catalog.weather(7).is_none());
     }
 
+    #[test]
+    fn optional_dalc_fields_survive_weather_template_and_cell_reads() {
+        let connection = Connection::open_in_memory().unwrap();
+        converter::esm::exporter::create_tables(&connection).unwrap();
+
+        let cases = [
+            ("24-byte", 18, true),
+            ("28-byte", 21, true),
+            ("32-byte", 22, true),
+            ("incomplete-colors", 17, false),
+        ];
+        for (index, (name, value_count, _)) in cases.into_iter().enumerate() {
+            let cell_id = 100 + index as u32;
+            let template_id = 200 + index as u32;
+            let weather_id = 300 + index as u32;
+            connection
+                .execute("INSERT INTO cell_lighting(cell_id) VALUES (?1)", [cell_id])
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO lighting_templates(id) VALUES (?1)",
+                    [template_id],
+                )
+                .unwrap();
+            connection
+                .execute("INSERT INTO weathers(id) VALUES (?1)", [weather_id])
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO weather_directional_ambient(weather_id, time_of_day) VALUES (?1, 'day')",
+                    [weather_id],
+                )
+                .unwrap();
+
+            let seed = 40 + index as u8 * 40;
+            for (table, key, prefix) in [
+                ("cell_lighting", cell_id, "dalc_"),
+                ("lighting_templates", template_id, "subrecord_dalc_"),
+                ("weather_directional_ambient", weather_id, ""),
+            ] {
+                let columns: Vec<_> = dalc_columns(prefix).split(',').map(str::to_owned).collect();
+                let updates = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(column_index, column)| {
+                        if column_index < value_count {
+                            let value = if column_index == 21 {
+                                format!("{}", 2.5 + index as f32)
+                            } else {
+                                (seed + column_index as u8).to_string()
+                            };
+                            format!("{column}={value}")
+                        } else {
+                            format!("{column}=NULL")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let key_column = match table {
+                    "cell_lighting" => "cell_id",
+                    "lighting_templates" => "id",
+                    _ => "weather_id",
+                };
+                connection
+                    .execute(
+                        &format!("UPDATE {table} SET {updates} WHERE {key_column}=?1"),
+                        [key],
+                    )
+                    .unwrap_or_else(|error| panic!("{name} {table}: {error}"));
+            }
+        }
+
+        let catalog = EnvironmentCatalog::from_connection(&connection);
+        for (index, (_, _, complete)) in cases.into_iter().enumerate() {
+            let seed = 40 + index as u8 * 40;
+            let expected = complete.then(|| DirectionalAmbient {
+                colors: std::array::from_fn(|color| {
+                    std::array::from_fn(|channel| seed + (color * 3 + channel) as u8)
+                }),
+                specular: (cases[index].1 >= 21)
+                    .then(|| std::array::from_fn(|channel| seed + (18 + channel) as u8)),
+                scale: (cases[index].1 == 22).then_some(2.5 + index as f32),
+            });
+            assert_eq!(
+                catalog
+                    .cell_lighting(100 + index as u32)
+                    .unwrap()
+                    .lighting
+                    .directional_ambient,
+                expected,
+                "cell lighting case {}",
+                cases[index].0
+            );
+            assert_eq!(
+                catalog
+                    .lighting_template(200 + index as u32)
+                    .unwrap()
+                    .directional_ambient,
+                expected,
+                "lighting template case {}",
+                cases[index].0
+            );
+            assert_eq!(
+                catalog
+                    .weather(300 + index as u32)
+                    .unwrap()
+                    .directional_ambient
+                    .get(&TimeOfDay::Day)
+                    .copied(),
+                expected,
+                "weather case {}",
+                cases[index].0
+            );
+        }
+    }
+
     /// The tables exactly as the converter creates them, read back through the catalog.
     #[test]
     fn reads_the_converter_tables() {
@@ -587,7 +700,7 @@ mod tests {
         assert_eq!(template.lighting.fog_far, Some(9000.0));
         let block = template.directional_ambient.unwrap();
         assert_eq!(block.colors[0], [1, 2, 3]);
-        assert_eq!(block.specular, [19, 20, 21]);
+        assert_eq!(block.specular, Some([19, 20, 21]));
         assert_eq!(block.scale, Some(22.0));
 
         let weather = catalog.weather(0x81A).unwrap();

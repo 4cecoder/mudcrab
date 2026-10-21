@@ -31,6 +31,7 @@ pub mod plugins_txt;
 pub mod records;
 mod reference_links;
 pub mod rooms;
+pub mod terrain_mesh;
 pub mod types;
 pub use plugins_txt::{
     OFFICIAL_MASTERS, read_plugins_txt, read_plugins_txt_with_options, read_skyrim_ccc,
@@ -58,6 +59,8 @@ pub(crate) struct RecordConversion {
     pub(crate) records: HashMap<u32, RawRecord>,
     pub(crate) warnings: Vec<String>,
     pub(crate) notices: Vec<String>,
+    /// In-house stage seconds for the database profile; legacy exports record none.
+    pub(crate) phases: std::collections::BTreeMap<String, f64>,
 }
 
 /// Populate the common plugin metadata contract without allocating each complete input.
@@ -112,24 +115,30 @@ impl EsmParser {
             db_path,
             reader,
             strings_root,
+            crate::config::DEFAULT_LANGUAGE,
             None,
         )
         .map(|conversion| conversion.records)
     }
 
     /// Publish with one immutable schema batch and retain summaries for the pipeline report.
+    /// Localized names come from `strings_root`'s tables in `language`.
     pub(crate) fn convert_plugins_with_reader_and_schemas(
         plugin_paths: &[PathBuf],
         db_path: &Path,
         reader: crate::config::RecordReader,
         strings_root: &Path,
+        language: &str,
         schemas: Option<&crate::records::addons::RuntimeSchemas>,
     ) -> Result<RecordConversion> {
         Self::convert_plugins_with_reader_and_schemas_with_string_sources(
             plugin_paths,
             db_path,
             reader,
-            inhouse::StringSources::PluginLooseFirst(strings_root),
+            inhouse::StringSources {
+                roots: inhouse::StringRoots::PluginLooseFirst(strings_root),
+                language,
+            },
             schemas,
         )
     }
@@ -184,7 +193,7 @@ impl EsmParser {
         Self::convert_legacy_plugins_report(
             plugin_paths,
             db_path,
-            inhouse::StringSources::PluginLooseFirst(loose),
+            inhouse::StringSources::default_language(inhouse::StringRoots::PluginLooseFirst(loose)),
         )
     }
 
@@ -196,7 +205,7 @@ impl EsmParser {
     ) -> Result<RecordConversion> {
         let order = load_order::LoadOrder::read(plugin_paths)?;
         let mut master = Self::merge_plugins_with_load_order(plugin_paths, &order)?;
-        let unresolved = legacy_text::resolve_localized_fields(
+        let (unresolved, localization_warnings) = legacy_text::resolve_localized_fields(
             &mut master.records,
             plugin_paths,
             &order,
@@ -206,6 +215,10 @@ impl EsmParser {
         create_tables(&conn)?;
         exporter::export_plugins_to_db(&conn, &master.records, &order, plugin_paths, &unresolved)?;
 
+        for warning in &localization_warnings {
+            eprintln!("{warning}");
+        }
+        master.warnings.extend(localization_warnings);
         Ok(master)
     }
 
@@ -329,6 +342,7 @@ impl EsmParser {
             records: merged,
             warnings: summaries,
             notices,
+            phases: std::collections::BTreeMap::new(),
         })
     }
 }
@@ -547,7 +561,11 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         // Music (`ZNAM`) as well, which the in-house schema remaps too.
         b"NAM2" | b"NAM3" | b"WNAM" | b"CNAM" | b"ZNAM" if record_type == b"WRLD" => Fixed(SINGLE),
         b"RNAM" | b"CNAM" | b"INAM" if record_type == b"NPC_" => Fixed(SINGLE),
-        b"WKMV" | b"RNMV" if record_type == b"RACE" => Fixed(SINGLE),
+        // xEdit 9fb016884bec138ea6c7b872cec831537d464c3e,
+        // wbDefinitionsTES5.pas:9463-9468. Match the in-house actors schema.
+        b"WKMV" | b"RNMV" | b"SWMV" | b"FLMV" | b"SNMV" | b"SPMV" if record_type == b"RACE" => {
+            Fixed(SINGLE)
+        }
         b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL" => Fixed(SINGLE),
         // Door destination reference, then position, rotation and flags.
         b"XTEL" if placed => Fixed(&[(32, &[0])]),
@@ -993,6 +1011,88 @@ mod tests {
             ]
             .concat()
         );
+    }
+
+    #[test]
+    fn remaps_all_race_base_movement_links_for_normal_and_light_plugins() {
+        for light in [false, true] {
+            for global_index in [3, 7] {
+                let normal = HashMap::from([
+                    ("skyrim.esm".to_owned(), 0),
+                    ("movement.esp".to_owned(), global_index),
+                ]);
+                let lights = if light {
+                    HashMap::from([("movement.esp".to_owned(), global_index)])
+                } else {
+                    HashMap::new()
+                };
+                let tags = [b"WKMV", b"RNMV", b"SWMV", b"FLMV", b"SNMV", b"SPMV"];
+                // The patch owns each referenced MOVT at local index 1.
+                // Also retain a null link and unrelated authored bytes.
+                let mut subrecords: Vec<_> = tags
+                    .iter()
+                    .enumerate()
+                    .map(|(i, tag)| {
+                        (
+                            tag.to_vec(),
+                            (0x0100_0340u32 + i as u32).to_le_bytes().to_vec(),
+                        )
+                    })
+                    .collect();
+                subrecords.push((b"SPMV".to_vec(), 0u32.to_le_bytes().to_vec()));
+                subrecords.push((b"DATA".to_vec(), vec![1, 2, 3, 4]));
+                let mut race = RawRecord {
+                    form_id: 0x0001_3746,
+                    record_type: *b"RACE",
+                    flags: 0,
+                    subrecords,
+                    cell_form_id: None,
+                    worldspace_form_id: None,
+                    load_order: global_index,
+                };
+                remap_record_form_ids(
+                    &mut race,
+                    "movement.esp",
+                    &["skyrim.esm".to_owned()],
+                    &normal,
+                    &lights,
+                    &RemapWarnings::default(),
+                )
+                .unwrap();
+                assert_eq!(race.form_id, 0x0001_3746);
+                for (i, (_, bytes)) in race.subrecords[..6].iter().enumerate() {
+                    let expected = if light {
+                        0xFE00_0000 | (global_index << 12) | (0x340 + i as u32)
+                    } else {
+                        (global_index << 24) | (0x340 + i as u32)
+                    };
+                    assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), expected);
+                }
+                assert_eq!(race.subrecords[6].1, 0u32.to_le_bytes());
+                assert_eq!(race.subrecords[7].1, [1, 2, 3, 4]);
+                // Exercise the actual stored raw-record path, not just the
+                // classifier. Future resolvers must see canonical identities.
+                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                exporter::create_tables(&conn).unwrap();
+                exporter::export_to_db(&conn, &HashMap::from([(race.form_id, race.clone())]))
+                    .unwrap();
+                let (blob, source): (Vec<u8>, u32) = conn
+                    .query_row(
+                        "SELECT data, load_order FROM records WHERE form_id=?1",
+                        [race.form_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                let stored =
+                    rkyv::from_bytes::<types::ArchivedRecordData, rkyv::rancor::Error>(&blob)
+                        .unwrap();
+                assert_eq!(source, global_index);
+                for (stored, (tag, bytes)) in stored.subrecords.iter().zip(&race.subrecords) {
+                    assert_eq!(stored.tag.as_slice(), tag);
+                    assert_eq!(&stored.data, bytes);
+                }
+            }
+        }
     }
 
     #[test]
