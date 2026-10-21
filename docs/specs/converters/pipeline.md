@@ -22,37 +22,29 @@ retain the existing default-height cache behavior.
 
 Both readers retain their terminal diagnostics and return bounded per-plugin
 summaries by severity. `PipelineReport.warnings` contains data-loss summaries:
-malformed records/frames, unusable candidates, omitted fields, unexpected
-subrecords, truncated light IDs, unavailable or unreadable localized string
-tables, runtime-projection skips and terrain-provenance skips. Legacy's existing
-invalid optional FormID recovery summaries remain warnings.
-`PipelineReport.notices` contains faithful outcomes: successful master-index
-and supplier-self compatibility remaps, in-house links cleared because their
-targets are absent, disallowed or beyond the master list, and individual
-localized IDs missing from a readable string table. A valid empty table is
-readable; an absent or malformed table remains a warning. Counts and first
-examples remain bounded per plugin and kind. If a target is absent because its
-record was skipped, that record-loss warning remains alongside the link notice.
+malformed records/frames, unusable candidates, cleared optional links, truncated
+light IDs, and in-house decoder/adapter issues such as omitted fields or missing
+localized text. `PipelineReport.notices` contains successful compatibility
+remaps: master indices past a plugin's list treated as the plugin's own, and the
+in-house reader's supplier-self compatibility lines. Counts and first examples
+remain bounded per plugin and kind.
 
 The existing completeness rule requires zero skipped asset inputs and no
 warnings. Usable neighboring records still publish, but data-loss warnings mark
 both the report and conversion manifest incomplete and make the CLI exit with
-code 1. Faithful-outcome notices remain visible without affecting completeness or
+code 1. Compatibility notices remain visible without affecting completeness or
 the exit code; a mixed run retains both severities and stays incomplete.
 `--report-json`, the CLI and the launcher show the warnings and notices. Reader
 recovery does not increment the separate skipped-asset counter. Metadata rebuild
 and `--reuse-assets` use the same severity and completeness rules when they
-re-export records. Official inputs with only faithful-outcome notices remain complete.
-This severity split does not align reader behavior for an index past the master
-list: Legacy keeps the link using the plugin's own identity, while Inhouse clears
-the link. Both outcomes remain visible as notices.
+re-export records. Official inputs with only compatibility remaps remain complete.
 
 `record-reader.json` stamps the selected frontend. Legacy `projection_version=3`
 preserves WRLD RNAM payloads and TNAM strings and restores record-aware VMAD
 ownership compatibility. Version 2 added corrected faction links, strict native
 link ownership and local recovery to version 1's corrected TX06/TX07 and ARMO
 world-model projections. These metadata contracts are independent of asset
-producer 26. In-house adapter version 11 adds projection-aware winner admission
+producer 27. In-house adapter version 11 adds projection-aware winner admission
 to version 10's corrected schema layouts, GMST winner admission, union localization
 and filename namespaces. Required runtime projection checks resolve localized
 fields before admission, so an unusable later candidate preserves its usable
@@ -60,7 +52,7 @@ predecessor without crossing an admitted deletion.
 Version 12 keeps zero-FormID GMST settings distinct and prevents a rejected
 identity collision from blocking a later usable definition.
 In-house identity includes the
-authored schema SHA-256, adapter version and English localization choice, and
+authored schema SHA-256, adapter version, string-table language and encodings, and
 `inhouse-reader-diagnostics.json` records bounded decoder and adapter issues.
 The manifest's `configuration_hash` keeps the full reader identity for metadata
 provenance. Database, terrain cache and LOD artifacts are rebuilt on every
@@ -69,19 +61,23 @@ Converted assets use separate producer, settings and source proofs, described
 below; a full reader identity change alone does not discard those candidates or
 the archive extraction manifest.
 
-Localized fields in in-house mode use their declared English STRINGS, DLSTRINGS
-or ILSTRINGS bank from the effective archive VFS, with loose files taking
-precedence. Every validated occurrence remains in canonical records. Null or
+Localized fields in in-house mode use their declared STRINGS, DLSTRINGS or
+ILSTRINGS bank, `Strings/<plugin>_<language>.<bank>`, from the effective archive VFS,
+with loose files taking precedence. `--language` (`PipelineConfig.language`, default
+`english`) selects the language as Skyrim's `sLanguage` does; it must be letters,
+digits and underscores, since it is part of a file name. Resume commands keep it. Every validated occurrence remains in canonical records. Null or
 missing IDs yield empty canonical text and retain their original ID, bank,
 winning plugin and status in `inhouse_localized_fields`; nullable runtime name
-columns remain NULL. Missing nonzero keys in readable tables produce counted
-notices; missing or unreadable tables produce warnings. Explicitly
-resolved empty text remains distinguishable from unresolved text. Other language
-selection is not implemented. A selected union or definition leaf's explicit
+columns remain NULL. Missing nonzero keys produce counted warnings. Explicitly
+resolved empty text remains distinguishable from unresolved text. A selected union or definition leaf's explicit
 bank overrides its parent's bank; an unspecified leaf inherits the parent bank,
 then defaults to STRINGS.
 Ordinary plugin text and English string banks use Windows-1252, including bytes
-that happen to form valid UTF-8. VMAD strings use their independent UTF-8 format.
+that happen to form valid UTF-8. Banks in another language are read as UTF-8, as
+Skyrim SE's non-English banks are (Cyrillic, Polish), falling back to Windows-1252
+for text that is not valid UTF-8; the reader identity of a non-English pack records
+this as `string_table_encoding`, while an English pack's identity is unchanged.
+VMAD strings use their independent UTF-8 format.
 Text requiring normalization is encoded as UTF-8 after decoding; already exact
 ASCII codes retain their original width and termination. Original source bytes
 remain available in provenance. The reader identity records both encoding contracts.
@@ -94,7 +90,9 @@ contracts and are not upgraded to the current projection.
 Adapter-12 metadata recognizes the exact adapter-10 and adapter-11 retained-asset contracts
 with matching original schema/add-on bytes, reader fields and combined settings
 hash. The original reader and asset producer remain recorded across repeated
-metadata rebuilds. These explicit compatibility pairs do not authorize arbitrary
+metadata rebuilds. The string-table language changes database text only, so a pack
+read in one language is a valid source for a rebuild in another; its proof is
+checked in the language it recorded. These explicit compatibility pairs do not authorize arbitrary
 older in-house identities or automatically extend to future adapters.
 New full configuration hashes
 include the versioned legacy identity, while `configuration_hash_for_schema`
@@ -133,7 +131,8 @@ compatibility proof does not alter normal conversion or staging cache identities
 For record-only diagnostics, `inhouse-records <Data> <plugins.txt> <new directory>`
 writes the database, cell caches, reader identity and diagnostic report without
 running asset stages or publishing a runtime pack. The new directory also keeps
-selected English archive STRINGS inputs under `.strings-input` for comparison.
+selected English archive STRINGS inputs under `.strings-input` for comparison; it does
+not take `--language`.
 
 `--typed-signatures TAG1,TAG2` selects the authored typed envelopes to retain;
 `--database-work-dir <new directory>` builds SQLite on a separate local disk and
@@ -211,7 +210,7 @@ Metadata rebuilds use the source package's checksum-matched plugin order for arc
 
 Asset repair selects replacement sources with the same installed-owner filters after recovering the selected plugins. It keeps recorded database plugin provenance and existing assets outside the repair targets. It retains non-MO2 standalone admission and MO2 unowned-archive exclusion. Archive sorting uses the same shared matcher and longest matching active stem, keeping the first load-order slot for equal stems.
 
-Creation fallback warnings are typed entries in the report's `selection_warnings`, naming the CCC path, read failure and installed built-in fallback. CLI summaries, progress and the launcher show them as warnings. They describe input-selection policy and do not count as failed asset conversions or make healthy published output incomplete. The `warnings` field describes conversion failures and reader data loss; successful compatibility remaps, faithfully cleared in-house links and missing IDs in readable string tables remain `notices`. Empty `skipped_plugins`, `load_order` and `selection_warnings` fields are omitted; old reports deserialize with empty vectors.
+Creation fallback warnings are typed entries in the report's `selection_warnings`, naming the CCC path, read failure and installed built-in fallback. CLI summaries, progress and the launcher show them as warnings. They describe input-selection policy and do not count as failed asset conversions or make healthy published output incomplete. The `warnings` field describes conversion failures and reader data loss; successful compatibility remaps remain `notices`. Empty `skipped_plugins`, `load_order` and `selection_warnings` fields are omitted; old reports deserialize with empty vectors.
 
 ---
 
@@ -345,7 +344,8 @@ entries carrying a full configuration hash do not acquire a new proof implicitly
 
 Normal producer eligibility remains independent of explicit metadata retention.
 The only cross-producer mesh allowance is producer 24 -> 26; a future producer
-does not inherit that allowance. Older textures regenerate, and scripts require
+does not inherit that allowance, so producer 27 (which changes the GLB collision
+data) reuses only its own meshes. Older textures regenerate, and scripts require
 both a supported producer and matching ABI settings. A retained producer remains
 the producer of its original bytes after any number of metadata rebuilds.
 
