@@ -132,10 +132,8 @@ fn specialize_nif_depth_descriptor(
             fragment.shader_defs.push("MAY_DISCARD".into());
         }
     }
-    if color_pass {
-        if let Some(depth) = descriptor.depth_stencil.as_mut() {
-            state.apply(depth);
-        }
+    if color_pass && let Some(depth) = descriptor.depth_stencil.as_mut() {
+        state.apply(depth);
     }
 }
 
@@ -197,27 +195,19 @@ mod tests {
     }
 
     fn has_may_discard(descriptor: &RenderPipelineDescriptor) -> bool {
-        descriptor
-            .fragment
-            .as_ref()
-            .is_some_and(|fragment| {
-                fragment.shader_defs.iter().any(
-                    |def| {
-                        shader_def_name(def) == "MAY_DISCARD"
-                            && matches!(def, bevy::shader::ShaderDefVal::Bool(_, true))
-                    },
-                )
+        descriptor.fragment.as_ref().is_some_and(|fragment| {
+            fragment.shader_defs.iter().any(|def| {
+                shader_def_name(def) == "MAY_DISCARD"
+                    && matches!(def, bevy::shader::ShaderDefVal::Bool(_, true))
             })
+        })
     }
 
     #[test]
     fn masked_palette_specialization_discards_in_shadow_without_overriding_light_depth() {
-        let state = NifDepthState::from_flags(
-            DEPTH_TEST | DECAL,
-            DEPTH_WRITE,
-            AlphaMode::Mask(0.5),
-        )
-        .unwrap();
+        let state =
+            NifDepthState::from_flags(DEPTH_TEST | DECAL, DEPTH_WRITE, AlphaMode::Mask(0.5))
+                .unwrap();
         let mut shadow = descriptor(vec![None]);
         shadow
             .fragment
@@ -239,12 +229,9 @@ mod tests {
 
     #[test]
     fn color_pass_keeps_authored_depth_override_and_alpha_mask_definition() {
-        let state = NifDepthState::from_flags(
-            DEPTH_TEST | DECAL,
-            DEPTH_WRITE,
-            AlphaMode::Mask(0.5),
-        )
-        .unwrap();
+        let state =
+            NifDepthState::from_flags(DEPTH_TEST | DECAL, DEPTH_WRITE, AlphaMode::Mask(0.5))
+                .unwrap();
         let mut color = descriptor(vec![color_target()]);
 
         specialize_nif_depth_descriptor(&mut color, state);

@@ -365,10 +365,16 @@ mod missing_palette_failure_tests {
         let unrelated = Path::new("textures/missing_normal.dds");
 
         let expected_failure = is_missing_palette_failure_path(expected);
-        assert!(missing_palette_negative_control_passed(true, expected_failure));
+        assert!(missing_palette_negative_control_passed(
+            true,
+            expected_failure
+        ));
 
         let unrelated_dependency_failure = is_missing_palette_failure_path(unrelated);
-        assert!(!missing_palette_negative_control_passed(true, unrelated_dependency_failure));
+        assert!(!missing_palette_negative_control_passed(
+            true,
+            unrelated_dependency_failure
+        ));
 
         // A malformed parent glTF can fail recursively without an Image failure event.
         assert!(!missing_palette_negative_control_passed(true, false));
@@ -411,11 +417,7 @@ fn fixtures(output: &std::path::Path) -> PathBuf {
     // No such palette file: the material must not count as loaded with its dependencies.
     write_gltf(
         assets.join("missing_palette.gltf"),
-        &[effect_material(
-            0,
-            &CASES[0],
-            MISSING_PALETTE_TEXTURE_PATH,
-        )],
+        &[effect_material(0, &CASES[0], MISSING_PALETTE_TEXTURE_PATH)],
     );
     assets
 }

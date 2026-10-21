@@ -456,9 +456,8 @@ impl GltfExtensionHandler for NativeMaterialHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy::{pbr::Material, shader::ShaderRef};
-    use std::path::Path;
     use crate::nif_depth::{CAST_SHADOWS, DECAL, DEPTH_TEST, DEPTH_WRITE, DYNAMIC_DECAL};
+    use bevy::{pbr::Material, shader::ShaderRef};
 
     #[test]
     fn native_depth_reads_authored_shadow_flag_for_decals_and_depth_overrides() {
@@ -821,7 +820,7 @@ mod tests {
         assert!(matches!(
             shader,
             ShaderRef::Path(path)
-                if path.path() == Path::new("embedded://engine/shaders/effect_palette_prepass.wgsl")
+                if path == bevy::asset::AssetPath::from("embedded://engine/shaders/effect_palette_prepass.wgsl")
         ));
     }
 
