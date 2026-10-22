@@ -1320,7 +1320,14 @@ mod tests {
             let previous = directory.path().join("previous");
             fs::write(&destination, b"old bytes").unwrap();
             fs::hard_link(&destination, &previous).unwrap();
+            // Ordinary persistence cannot replace an open destination on Windows, so the proof
+            // checks the prior bytes and closes before publication.
             let proof = SpillProof::open(&destination).unwrap();
+            assert_eq!(
+                proof.hash(&hash_open_file).unwrap(),
+                hash_file(&previous).unwrap()
+            );
+            drop(proof);
             let temporary = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
             let temporary_path = temporary.path().to_owned();
             fs::write(temporary.path(), b"new bytes").unwrap();
@@ -1334,15 +1341,54 @@ mod tests {
             assert_eq!(fs::read(&destination).unwrap(), b"new bytes");
             assert_eq!(fs::read(&previous).unwrap(), b"old bytes");
             assert_eq!(
-                proof.hash(&hash_open_file).unwrap(),
-                hash_file(&previous).unwrap()
-            );
-            assert_eq!(
                 hash_open_file(&published).unwrap(),
                 hash_file(&destination).unwrap()
             );
             assert!(!temporary_path.exists());
+
+            // An absent destination takes the same fallback without any prior proof.
+            let absent = directory.path().join("absent");
+            let temporary = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+            let temporary_path = temporary.path().to_owned();
+            fs::write(temporary.path(), b"absent bytes").unwrap();
+            let published = publish_cache_file(temporary, &absent, |_, _| {
+                Err(std::io::Error::from_raw_os_error(code))
+            })
+            .unwrap();
+            assert_eq!(fs::read(&absent).unwrap(), b"absent bytes");
+            assert_eq!(
+                hash_open_file(&published).unwrap(),
+                hash_file(&absent).unwrap()
+            );
+            assert!(!temporary_path.exists());
         }
+    }
+
+    /// On Windows, ordinary persistence cannot replace a destination that is still open. The
+    /// fallback must fail, leaving the prior bytes in place and the temporary removed.
+    #[cfg(windows)]
+    #[test]
+    fn cache_publication_fallback_fails_safely_when_an_open_destination_cannot_be_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("cache");
+        let previous = directory.path().join("previous");
+        fs::write(&destination, b"old bytes").unwrap();
+        fs::hard_link(&destination, &previous).unwrap();
+        let proof = SpillProof::open(&destination).unwrap();
+        let temporary = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        let temporary_path = temporary.path().to_owned();
+        fs::write(temporary.path(), b"new bytes").unwrap();
+        let result = publish_cache_file(temporary, &destination, |_, _| {
+            Err(std::io::Error::from_raw_os_error(ERROR_NOT_SUPPORTED))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            proof.hash(&hash_open_file).unwrap(),
+            hash_file(&previous).unwrap()
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"old bytes");
+        assert_eq!(fs::read(&previous).unwrap(), b"old bytes");
+        assert!(!temporary_path.exists());
     }
 
     #[test]
