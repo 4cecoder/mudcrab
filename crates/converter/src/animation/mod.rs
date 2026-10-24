@@ -87,6 +87,7 @@ pub fn decode_skeleton(bytes: &[u8]) -> Result<SkeletonBones> {
 }
 
 /// How a clip's animated bones matched the bone names of the body it plays on.
+/// Duplicate names and tracks whose target node is already claimed are skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BoneBindingReport {
     /// Tracks whose bone name matched a body node exactly.

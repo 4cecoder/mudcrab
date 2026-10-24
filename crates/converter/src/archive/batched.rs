@@ -1394,8 +1394,11 @@ mod tests {
         assert!(!options.selection.accepts_recipe("future-unknown-v1"));
     }
 
+    // This checks the extraction outcome with a matching selection. The omitted HKX paths also
+    // make the selected-file inventory incomplete, so the unit `covers` test proves the
+    // recipe-less cache contract while this test checks that ingestion still extracts both.
     #[test]
-    fn recipe_less_filtered_cache_cannot_hide_skeleton_or_animation_inputs() {
+    fn recipe_less_filtered_entry_does_not_suppress_hkx_extraction() {
         let directory = tempfile::tempdir().unwrap();
         let archive = fixture(
             directory.path(),
@@ -1412,7 +1415,9 @@ mod tests {
         let archive_bytes = fs::read(&archive).unwrap();
         let stale = IngestionCacheEntry {
             source_hash: hash_bytes(&archive_bytes),
-            selection: ArchiveSelection::RuntimeEnglishV1,
+            // Match the requested selection. HKX entries remain absent from this filtered
+            // fixture, so extraction's expected-file coverage still forces a cache miss.
+            selection: ArchiveSelection::ConverterInputsV1,
             recipe: String::new(),
             files: vec![IngestedFile {
                 path: "strings/game_english.strings".to_owned(),

@@ -1516,6 +1516,14 @@ mod tests {
         assert!(!raw_entry.covers(IngestionSelection::RuntimeEnglishV1));
         assert!(!raw_entry.covers(IngestionSelection::All));
         assert!(!raw_entry.covers(IngestionSelection::ConverterInputsV1));
+        let recipe_less_converter_entry: IngestionCacheEntry =
+            serde_json::from_value(serde_json::json!({
+                "source_hash": "source",
+                "selection": "converter_inputs_v1",
+                "files": []
+            }))
+            .unwrap();
+        assert!(!recipe_less_converter_entry.covers(IngestionSelection::ConverterInputsV1));
         let mut conflicting = raw_entry.clone();
         conflicting.recipe = "all-v1".into();
         assert!(!conflicting.covers(IngestionSelection::All));

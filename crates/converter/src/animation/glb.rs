@@ -67,6 +67,25 @@ fn encode_clip_glb(
         "clip frame rate {} is invalid",
         clip.frames_per_second
     );
+    let mut bound_tracks = 0;
+    for track in &clip.tracks {
+        let Some(name) = track.bone_name.as_deref() else {
+            continue;
+        };
+        ensure!(
+            body_bones.bones.contains_key(name),
+            "clip track {} bound to bone {name}, which the body does not have",
+            track.bone_index
+        );
+        ensure!(
+            track.samples.len() == frame_count,
+            "clip track {} ({name}) has {} samples but the clip has {frame_count} frames",
+            track.bone_index,
+            track.samples.len()
+        );
+        bound_tracks += 1;
+    }
+    ensure!(bound_tracks > 0, "clip has no bound transform tracks");
 
     let mut root = Root {
         scene: Some(Index::new(0)),
@@ -104,13 +123,6 @@ fn encode_clip_glb(
                 track.bone_index
             )
         })?;
-        ensure!(
-            track.samples.len() == frame_count,
-            "clip track {} ({name}) has {} samples but the clip has {frame_count} frames",
-            track.bone_index,
-            track.samples.len()
-        );
-
         values.clear();
         values.extend(track.samples.iter().flat_map(|sample| sample.translation));
         push_sampler(
