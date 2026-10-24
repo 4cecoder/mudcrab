@@ -1395,6 +1395,67 @@ mod tests {
     }
 
     #[test]
+    fn recipe_less_filtered_cache_cannot_hide_skeleton_or_animation_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = fixture(
+            directory.path(),
+            "legacy-filtered.bsa",
+            &[
+                ("strings/game_english.strings", b"english"),
+                (
+                    "meshes/actors/character/character assets/skeleton.hkx",
+                    b"skeleton",
+                ),
+                ("meshes/actors/character/animations/mt_idle.hkx", b"clip"),
+            ],
+        );
+        let archive_bytes = fs::read(&archive).unwrap();
+        let stale = IngestionCacheEntry {
+            source_hash: hash_bytes(&archive_bytes),
+            selection: ArchiveSelection::RuntimeEnglishV1,
+            recipe: String::new(),
+            files: vec![IngestedFile {
+                path: "strings/game_english.strings".to_owned(),
+                size: 7,
+                hash: hash_bytes(b"english"),
+            }],
+            reader_version: archive_reader_version(&archive_bytes),
+        };
+        let output = directory.path().join("vfs");
+        let cache = directory.path().join("cache");
+        let result = ArchiveExtractor::extract_batched(
+            &archive,
+            &output,
+            Path::new("unused"),
+            &cache,
+            Some(&stale),
+            false,
+            &options(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(!result.cache_hit);
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|file| file.path.ends_with("skeleton.hkx"))
+        );
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|file| file.path.ends_with("mt_idle.hkx"))
+        );
+        assert_eq!(
+            fs::read(output.join("meshes/actors/character/animations/mt_idle.hkx")).unwrap(),
+            b"clip"
+        );
+    }
+
+    #[test]
     fn deduplicated_pack_recovers_aliases_after_all_derived_blobs_are_removed() {
         let directory = tempfile::tempdir().unwrap();
         let archive = fixture(

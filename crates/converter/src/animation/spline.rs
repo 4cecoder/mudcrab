@@ -436,6 +436,11 @@ pub struct Decoded {
     frames_per_block: usize,
 }
 
+/// Supported format limit for block knots, whose frame indices use a byte.
+const SUPPORTED_MAX_FRAMES_PER_BLOCK: i32 = 256;
+/// Bound decoded transform samples before any per-track or per-block allocation.
+const MAX_DECODED_SAMPLE_BYTES: usize = 256 * 1024 * 1024;
+
 impl Decoded {
     pub fn new(animation: &SplineAnimation) -> Result<Self> {
         ensure!(
@@ -468,6 +473,11 @@ impl Decoded {
             "max frames per block {} leaves no frame step",
             animation.max_frames_per_block
         );
+        ensure!(
+            animation.max_frames_per_block <= SUPPORTED_MAX_FRAMES_PER_BLOCK,
+            "max frames per block {} exceeds supported limit of {SUPPORTED_MAX_FRAMES_PER_BLOCK}",
+            animation.max_frames_per_block
+        );
         // Blocks share their boundary frame, so the layout holds at most this many frames;
         // a larger count would sample past the last block's data.
         let layout_frames =
@@ -478,6 +488,19 @@ impl Decoded {
             animation.num_frames,
             animation.num_blocks,
             animation.max_frames_per_block
+        );
+        let decoded_sample_bytes = usize::try_from(animation.num_frames)
+            .ok()
+            .and_then(|frames| {
+                usize::try_from(animation.num_transform_tracks)
+                    .ok()
+                    .and_then(|tracks| frames.checked_mul(tracks))
+            })
+            .and_then(|samples| samples.checked_mul(std::mem::size_of::<super::TransformSample>()))
+            .ok_or_else(|| eyre!("decoded-sample size overflow"))?;
+        ensure!(
+            decoded_sample_bytes <= MAX_DECODED_SAMPLE_BYTES,
+            "clip decoded samples require {decoded_sample_bytes} bytes, exceeding the 256 MiB decoded-sample budget"
         );
         ensure!(
             animation.frame_duration.is_finite() && animation.frame_duration > 0.0,
@@ -723,6 +746,58 @@ mod tests {
                 error(num_frames)
             );
         }
+    }
+
+    #[test]
+    fn decoded_accepts_supported_block_boundary_and_rejects_257() {
+        let mut animation = header_only_animation(1);
+        animation.num_blocks = 1;
+        animation.block_offsets = vec![0];
+        animation.max_frames_per_block = 256;
+        assert!(Decoded::new(&animation).is_ok());
+
+        animation.max_frames_per_block = 257;
+        let error = Decoded::new(&animation)
+            .err()
+            .expect("block bound rejected")
+            .to_string();
+        assert!(error.contains("supported limit of 256"), "{error}");
+    }
+
+    #[test]
+    fn decoded_rejects_sample_budget_and_size_overflow_before_block_allocation() {
+        let mut animation = header_only_animation(100_000_000);
+        animation.num_blocks = 400_000;
+        animation.block_offsets.clear();
+        animation.num_transform_tracks = 1;
+        animation.num_frames = 100_000_000;
+        let error = Decoded::new(&animation)
+            .err()
+            .expect("sample budget rejected")
+            .to_string();
+        assert!(error.contains("256 MiB decoded-sample budget"), "{error}");
+
+        animation.num_frames = i32::MAX;
+        animation.num_blocks = i32::MAX;
+        animation.num_transform_tracks = i32::MAX;
+        let error = Decoded::new(&animation)
+            .err()
+            .expect("sample size overflow rejected")
+            .to_string();
+        assert!(error.contains("decoded-sample size overflow"), "{error}");
+    }
+
+    #[test]
+    fn decoded_rejects_one_block_i32_max_frame_declaration() {
+        let mut animation = header_only_animation(i32::MAX);
+        animation.num_blocks = 1;
+        animation.block_offsets = vec![0];
+        animation.max_frames_per_block = i32::MAX;
+        let error = Decoded::new(&animation)
+            .err()
+            .expect("large declared block rejected")
+            .to_string();
+        assert!(error.contains("supported limit of 256"), "{error}");
     }
 
     #[test]

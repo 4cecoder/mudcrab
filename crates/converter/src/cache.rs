@@ -1513,7 +1513,7 @@ mod tests {
             "source_hash": "source", "selection": "runtime_english_v1", "files": []
         }))
         .unwrap();
-        assert!(raw_entry.covers(IngestionSelection::RuntimeEnglishV1));
+        assert!(!raw_entry.covers(IngestionSelection::RuntimeEnglishV1));
         assert!(!raw_entry.covers(IngestionSelection::All));
         assert!(!raw_entry.covers(IngestionSelection::ConverterInputsV1));
         let mut conflicting = raw_entry.clone();
@@ -1533,6 +1533,9 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(entry.selection, IngestionSelection::All);
+        assert!(entry.covers(IngestionSelection::All));
+        assert!(entry.covers(IngestionSelection::RuntimeEnglishV1));
+        assert!(entry.covers(IngestionSelection::ConverterInputsV1));
         assert!(
             entry
                 .selection

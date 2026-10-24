@@ -631,6 +631,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exact_track_wins_alias_and_channels_are_unique_per_node_path() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let output = directory.path().join("priority.glb");
+        let mut clip = fixture_clip();
+        clip.tracks = vec![
+            TransformTrack {
+                bone_index: 0,
+                bone_name: Some("childa".to_owned()),
+                samples: vec![sample(9.0); 3],
+            },
+            TransformTrack {
+                bone_index: 1,
+                bone_name: Some("ChildA".to_owned()),
+                samples: vec![sample(2.0); 3],
+            },
+            TransformTrack {
+                bone_index: 2,
+                bone_name: Some("ChildB".to_owned()),
+                samples: vec![sample(3.0); 3],
+            },
+        ];
+
+        let report =
+            write_clip_glb(&mut clip, &fixture_bones(), "priority", &output).expect("write clip");
+        assert_eq!(report.exact, 2);
+        assert_eq!(report.skipped, vec!["childa"]);
+
+        let (root, bin) = read_glb(&output);
+        let animation = &root.animations[0];
+        assert_eq!(animation.channels.len(), 6, "two nodes each emit TRS");
+        let targets: BTreeSet<_> = animation
+            .channels
+            .iter()
+            .map(|channel| {
+                (
+                    channel.target.node.value(),
+                    format!("{:?}", channel.target.path),
+                )
+            })
+            .collect();
+        assert_eq!(
+            targets.len(),
+            animation.channels.len(),
+            "node/path targets are unique"
+        );
+
+        let (child_a, _) = node_named(&root.nodes, "ChildA");
+        let translation = animation
+            .channels
+            .iter()
+            .find(|channel| {
+                channel.target.node.value() == child_a
+                    && channel.target.path == Checked::Valid(Property::Translation)
+            })
+            .expect("ChildA translation channel");
+        let sampler = &animation.samplers[translation.sampler.value()];
+        assert_eq!(accessor_values(&root, &bin, sampler.output.value())[0], 2.0);
+    }
+
     fn animation_root() -> PathBuf {
         std::env::var_os("MUDCRAB_ANIMATION_DIR")
             .map(PathBuf::from)

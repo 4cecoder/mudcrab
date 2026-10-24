@@ -93,7 +93,7 @@ pub struct BoneBindingReport {
     pub exact: usize,
     /// Tracks renamed to a node that differs only in case: `(clip name, body name)`.
     pub aliased: Vec<(String, String)>,
-    /// Tracks whose bone has no unique body node, sorted by clip name.
+    /// Tracks that do not uniquely own a body node, sorted by clip name.
     pub skipped: Vec<String>,
 }
 
@@ -117,22 +117,37 @@ pub fn bind_clip_to_bones(
     body_bone_names: &BTreeSet<String>,
 ) -> BoneBindingReport {
     let mut report = BoneBindingReport::default();
+    let mut claimed = BTreeSet::new();
+
+    // Reserve exact targets first so an alias earlier in clip order cannot take them.
+    for track in &mut clip.tracks {
+        let Some(name) = track.bone_name.as_ref() else {
+            continue;
+        };
+        if !body_bone_names.contains(name) {
+            continue;
+        }
+        if claimed.insert(name.clone()) {
+            report.exact += 1;
+        } else {
+            report.skipped.push(name.clone());
+            track.bone_name = None;
+        }
+    }
 
     for track in &mut clip.tracks {
         let Some(name) = track.bone_name.clone() else {
             continue;
         };
         if body_bone_names.contains(&name) {
-            report.exact += 1;
             continue;
         }
-
         let folded = name.to_ascii_lowercase();
         let mut candidates = body_bone_names
             .iter()
             .filter(|body| body.to_ascii_lowercase() == folded);
         match (candidates.next(), candidates.next()) {
-            (Some(only), None) => {
+            (Some(only), None) if claimed.insert(only.clone()) => {
                 track.bone_name = Some(only.clone());
                 report.aliased.push((name, only.clone()));
             }
@@ -396,16 +411,64 @@ mod tests {
         assert_eq!(report.exact, 2);
         assert_eq!(
             report.aliased,
-            vec![
-                ("QUIVER".to_owned(), "Quiver".to_owned()),
-                ("weapon".to_owned(), "WEAPON".to_owned()),
-            ]
+            vec![("weapon".to_owned(), "WEAPON".to_owned()),]
         );
-        assert_eq!(report.skipped, vec!["Missing".to_owned()]);
-        assert_eq!(report.bound(), 4);
-        assert_eq!(clip.tracks[1].bone_name.as_deref(), Some("Quiver"));
+        assert_eq!(
+            report.skipped,
+            vec!["Missing".to_owned(), "QUIVER".to_owned()]
+        );
+        assert_eq!(report.bound(), 3);
+        assert_eq!(clip.tracks[1].bone_name, None);
         assert_eq!(clip.tracks[4].bone_name.as_deref(), Some("WEAPON"));
         assert_eq!(clip.tracks[3].bone_name, None);
+    }
+
+    #[test]
+    fn exact_binding_wins_alias_in_either_track_order_and_keeps_distinct_nodes() {
+        for names in [["QUIVER", "Quiver"], ["Quiver", "QUIVER"]] {
+            let mut clip = clip_with_bones(&names);
+            clip.tracks[0].samples = vec![TransformSample {
+                translation: [1.0, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0; 3],
+            }];
+            clip.tracks[1].samples = vec![TransformSample {
+                translation: [2.0, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0; 3],
+            }];
+            let body: BTreeSet<String> = ["Quiver", "Shield"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+
+            let report = bind_clip_to_bones(&mut clip, &body);
+
+            assert_eq!(report.exact, 1);
+            assert!(report.aliased.is_empty());
+            assert_eq!(report.skipped, vec!["QUIVER"]);
+            let exact = clip
+                .tracks
+                .iter()
+                .find(|track| track.bone_name.as_deref() == Some("Quiver"))
+                .unwrap();
+            let expected = if names[0] == "Quiver" { 1.0 } else { 2.0 };
+            assert_eq!(exact.samples[0].translation[0], expected);
+            let distinct = clip_with_bones(&["Quiver", "Shield"]);
+            let distinct_report = bind_clip_to_bones(&mut distinct.clone(), &body);
+            assert_eq!(distinct_report.bound(), 2);
+        }
+    }
+
+    #[test]
+    fn duplicate_exact_tracks_are_skipped_after_first_mapping() {
+        let mut clip = clip_with_bones(&["Spine", "Spine"]);
+        let body: BTreeSet<String> = ["Spine"].into_iter().map(str::to_owned).collect();
+        let report = bind_clip_to_bones(&mut clip, &body);
+        assert_eq!(report.exact, 1);
+        assert_eq!(report.skipped, vec!["Spine"]);
+        assert_eq!(clip.tracks[0].bone_name.as_deref(), Some("Spine"));
+        assert_eq!(clip.tracks[1].bone_name, None);
     }
 
     #[test]

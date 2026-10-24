@@ -487,7 +487,12 @@ impl IngestionSelection {
 
 impl IngestionCacheEntry {
     pub(crate) fn covers(&self, requested: IngestionSelection) -> bool {
-        self.selection.can_satisfy(requested) && requested.accepts_recipe(&self.recipe)
+        self.selection.can_satisfy(requested)
+            && if self.recipe.is_empty() {
+                self.selection == IngestionSelection::All
+            } else {
+                requested.accepts_recipe(&self.recipe)
+            }
     }
 }
 
