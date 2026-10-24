@@ -1,4 +1,4 @@
-//! Actor model catalog: `NPC_` -> race skin -> armature -> biped parts, plus a head path.
+//! Actor model catalog: effective Traits root -> skin -> armature -> biped parts and head path.
 //!
 //! The exporter publishes this catalog to the world database (`actor_models`,
 //! `actor_model_parts`). The tables are additive and optional: consumers must
@@ -6,7 +6,7 @@
 //! `records.data`; the caller hands the merged record map in and gets rows back.
 
 use crate::esm::{extractors::SubrecordView, load_order::StableId, records::RawRecord};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// `DefaultRace`, the armature race every humanoid body is shared through.
 pub const DEFAULT_RACE_FORM_ID: u32 = 25;
@@ -50,10 +50,28 @@ impl ActorModelSlot {
 /// Why a base has no complete model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnresolvedReason {
-    /// The `NPC_` has no `ACBS`; sex defaults to male.
+    /// The effective Traits root has no `ACBS`; sex defaults to male.
     MissingAcbs,
     /// The `NPC_` has no `RNAM` race link.
     NoRnam,
+    /// Use Traits is enabled, but TPLT is absent, zero, or malformed.
+    MissingTraitsTemplate,
+    /// TPLT points at a deleted record.
+    DeletedTraitsTemplate,
+    /// TPLT points at a record other than `NPC_` or `LVLN`.
+    WrongTypeTraitsTemplate,
+    /// Use Traits chain contains an NPC more than once.
+    TraitsTemplateCycle,
+    /// TPLT points at `LVLN`, whose NPC is selected at runtime.
+    LeveledTraitsTemplate,
+    /// The NPC's explicit WNAM override is zero.
+    ZeroNpcSkinOverride,
+    /// The NPC's explicit WNAM override does not resolve.
+    MissingNpcSkinOverride,
+    /// The NPC's explicit WNAM override points at a deleted record.
+    DeletedNpcSkinOverride,
+    /// The NPC's explicit WNAM override resolves to a non-ARMO record.
+    WrongTypeNpcSkinOverride,
     /// The `RNAM` race has no record in the load order.
     NoRaceRecord,
     /// The race has no `WNAM` skin armor.
@@ -62,7 +80,7 @@ pub enum UnresolvedReason {
     NoArmoRecord,
     /// The armor has no `MODL` armature list.
     ArmoNoModl,
-    /// No armature matched the race, exactly or through `DefaultRace`.
+    /// No armature matched the primary or additional race, or `DefaultRace`.
     NoMatchingArma,
     /// No head is available: the race has no FaceGen flag and no default head.
     NoFacegenAndNoDefault,
@@ -77,6 +95,15 @@ impl UnresolvedReason {
         match self {
             Self::MissingAcbs => "missing_acbs",
             Self::NoRnam => "no_rnam",
+            Self::MissingTraitsTemplate => "missing_traits_template",
+            Self::DeletedTraitsTemplate => "deleted_traits_template",
+            Self::WrongTypeTraitsTemplate => "wrong_type_traits_template",
+            Self::TraitsTemplateCycle => "traits_template_cycle",
+            Self::LeveledTraitsTemplate => "leveled_traits_template",
+            Self::ZeroNpcSkinOverride => "zero_npc_skin_override",
+            Self::MissingNpcSkinOverride => "missing_npc_skin_override",
+            Self::DeletedNpcSkinOverride => "deleted_npc_skin_override",
+            Self::WrongTypeNpcSkinOverride => "wrong_type_npc_skin_override",
             Self::NoRaceRecord => "no_race_record",
             Self::RaceNoWnam => "race_no_wnam",
             Self::NoArmoRecord => "no_armo_record",
@@ -93,11 +120,11 @@ impl UnresolvedReason {
 pub struct ActorModelRow {
     /// The `NPC_` FormID.
     pub id: u32,
-    /// The race FormID, or `0` when the base carries no `RNAM`.
+    /// The effective Traits root's race FormID, or `0` when it carries no `RNAM`.
     pub race_id: u32,
-    /// `male` or `female`, from `NPC_/ACBS` bit 0.
+    /// `male` or `female`, from the effective Traits root's `NPC_/ACBS` bit 0.
     pub sex: &'static str,
-    /// The `RACE/WNAM` skin armor FormID.
+    /// Effective `ARMO` FormID: appearance-root `WNAM`, else effective-race `WNAM`.
     pub skin_armo_id: Option<u32>,
     /// FaceGen geometry or the race/sex default head NIF.
     pub head_model: Option<String>,
@@ -140,10 +167,10 @@ pub struct ActorModelCatalog {
 
 /// Resolves every `NPC_` base in `records` into a body/head catalog.
 ///
-/// `plugin_ids` maps an `NPC_` FormID to its owning plugin filename and
+/// `plugin_ids` maps an `NPC_` FormID to its defining plugin filename and
 /// plugin-local FormID (`formid_map.plugin_name`/`formid_map.internal_id`),
-/// which the FaceGen path needs. A base with no entry still resolves a body,
-/// but its head falls back to the default NIF.
+/// which the FaceGen path needs. An effective Traits root with no entry still
+/// resolves a body, but its head tries the default NIF.
 #[must_use]
 pub fn resolve_actor_models(
     records: &HashMap<u32, RawRecord>,
@@ -158,8 +185,11 @@ pub fn resolve_actor_models(
     npc_ids.sort_unstable();
 
     for id in npc_ids {
-        let record = &records[&id];
-        let view = SubrecordView::new(&record.subrecords);
+        let Some(root_id) = traits_root(id, records, &mut catalog) else {
+            catalog.models.push(unresolved_row(id));
+            continue;
+        };
+        let view = SubrecordView::new(&records[&root_id].subrecords);
         let (female, acbs_missing) = npc_sex(&view);
         if acbs_missing {
             catalog.diagnostics.push(ActorModelDiagnostic {
@@ -177,7 +207,7 @@ pub fn resolve_actor_models(
             resolution: "unresolved",
         };
 
-        let Some(race_id) = view.get_form_id(b"RNAM") else {
+        let Some(race_id) = view.get_form_id(b"RNAM").filter(|race_id| *race_id != 0) else {
             catalog.diagnostics.push(ActorModelDiagnostic {
                 npc_id: id,
                 reason: UnresolvedReason::NoRnam,
@@ -200,8 +230,9 @@ pub fn resolve_actor_models(
         };
         let race_view = SubrecordView::new(&race.subrecords);
 
-        let mut parts = resolve_body(records, &race_view, race_id, female, id, &mut catalog);
-        let head = resolve_head(&race_view, female, plugin_ids.get(&id), &parts);
+        let skin_id = effective_skin(records, &view, &race_view, id, &mut catalog);
+        let mut parts = resolve_body(records, skin_id, race_id, female, id, &mut catalog);
+        let head = resolve_head(&race_view, female, plugin_ids.get(&root_id), &parts);
         if head.is_none() {
             catalog.diagnostics.push(ActorModelDiagnostic {
                 npc_id: id,
@@ -219,7 +250,7 @@ pub fn resolve_actor_models(
         } else {
             "body"
         };
-        row.skin_armo_id = race_view.get_form_id(b"WNAM");
+        row.skin_armo_id = skin_id;
         catalog.models.push(row);
         catalog.parts.append(&mut parts);
     }
@@ -230,6 +261,121 @@ pub fn resolve_actor_models(
         .diagnostics
         .sort_by_key(|diagnostic| (diagnostic.npc_id, diagnostic.reason));
     catalog
+}
+
+fn unresolved_row(id: u32) -> ActorModelRow {
+    ActorModelRow {
+        id,
+        race_id: 0,
+        sex: "male",
+        skin_armo_id: None,
+        head_model: None,
+        head_source: None,
+        resolution: "unresolved",
+    }
+}
+
+/// Follows Use Traits links without a depth cap. Bit 0 is ACBS `u16` at 0x12.
+fn traits_root(
+    npc_id: u32,
+    records: &HashMap<u32, RawRecord>,
+    catalog: &mut ActorModelCatalog,
+) -> Option<u32> {
+    let mut current = npc_id;
+    let mut visited = HashSet::from([npc_id]);
+    loop {
+        let record = records.get(&current)?;
+        let view = SubrecordView::new(&record.subrecords);
+        if !traits_enabled(&view) {
+            return Some(current);
+        }
+        let template_id = view.get_form_id(b"TPLT").filter(|id| *id != 0);
+        let Some(template_id) = template_id else {
+            catalog.diagnostics.push(ActorModelDiagnostic {
+                npc_id,
+                reason: UnresolvedReason::MissingTraitsTemplate,
+            });
+            return None;
+        };
+        let Some(template_record) = records.get(&template_id) else {
+            catalog.diagnostics.push(ActorModelDiagnostic {
+                npc_id,
+                reason: UnresolvedReason::MissingTraitsTemplate,
+            });
+            return None;
+        };
+        if template_record.is_deleted() {
+            catalog.diagnostics.push(ActorModelDiagnostic {
+                npc_id,
+                reason: UnresolvedReason::DeletedTraitsTemplate,
+            });
+            return None;
+        }
+        match &template_record.record_type {
+            b"LVLN" => {
+                catalog.diagnostics.push(ActorModelDiagnostic {
+                    npc_id,
+                    reason: UnresolvedReason::LeveledTraitsTemplate,
+                });
+                return None;
+            }
+            b"NPC_" => {}
+            _ => {
+                catalog.diagnostics.push(ActorModelDiagnostic {
+                    npc_id,
+                    reason: UnresolvedReason::WrongTypeTraitsTemplate,
+                });
+                return None;
+            }
+        }
+        if !visited.insert(template_id) {
+            catalog.diagnostics.push(ActorModelDiagnostic {
+                npc_id,
+                reason: UnresolvedReason::TraitsTemplateCycle,
+            });
+            return None;
+        }
+        current = template_id;
+    }
+}
+
+fn traits_enabled(view: &SubrecordView<'_>) -> bool {
+    view.find(b"ACBS")
+        .filter(|data| data.len() >= 20)
+        .is_some_and(|data| u16::from_le_bytes([data[18], data[19]]) & 0x0001 != 0)
+}
+
+fn effective_skin(
+    records: &HashMap<u32, RawRecord>,
+    appearance: &SubrecordView<'_>,
+    race: &SubrecordView<'_>,
+    npc_id: u32,
+    catalog: &mut ActorModelCatalog,
+) -> Option<u32> {
+    if let Some(data) = appearance.find(b"WNAM") {
+        let override_id =
+            (data.len() >= 4).then(|| u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
+        let reason = match override_id {
+            Some(0) => Some(UnresolvedReason::ZeroNpcSkinOverride),
+            Some(id) => match records.get(&id) {
+                None => Some(UnresolvedReason::MissingNpcSkinOverride),
+                Some(record) if record.is_deleted() => {
+                    Some(UnresolvedReason::DeletedNpcSkinOverride)
+                }
+                Some(record) if &record.record_type != b"ARMO" => {
+                    Some(UnresolvedReason::WrongTypeNpcSkinOverride)
+                }
+                Some(_) => return override_id,
+            },
+            None => Some(UnresolvedReason::MissingNpcSkinOverride),
+        };
+        if let Some(reason) = reason {
+            catalog
+                .diagnostics
+                .push(ActorModelDiagnostic { npc_id, reason });
+        }
+    }
+    race.get_form_id(b"WNAM").filter(|id| *id != 0)
 }
 
 /// `NPC_/ACBS` bit 0 is female; a missing `ACBS` defaults to male.
@@ -243,16 +389,16 @@ fn npc_sex(view: &SubrecordView<'_>) -> (bool, bool) {
     }
 }
 
-/// Follows `RACE/WNAM` -> `ARMO/MODL` -> each `ARMA`, and fills the biped slots.
+/// Follows effective skin armor -> `ARMO/MODL` -> compatible `ARMA` tiers, and fills biped slots.
 fn resolve_body(
     records: &HashMap<u32, RawRecord>,
-    race_view: &SubrecordView<'_>,
+    skin_id: Option<u32>,
     race_id: u32,
     female: bool,
     npc_id: u32,
     catalog: &mut ActorModelCatalog,
 ) -> Vec<ActorModelPartRow> {
-    let Some(skin_id) = race_view.get_form_id(b"WNAM") else {
+    let Some(skin_id) = skin_id else {
         catalog.diagnostics.push(ActorModelDiagnostic {
             npc_id,
             reason: UnresolvedReason::RaceNoWnam,
@@ -278,9 +424,8 @@ fn resolve_body(
         return Vec::new();
     }
 
-    // Exact-race armatures take priority over `DefaultRace`, whatever order the
-    // armor lists them in, so the shared humanoid body never shadows a race's own.
-    let mut exact = Vec::new();
+    // Preserve authored order across exact and additional-race compatible entries.
+    let mut compatible = Vec::new();
     let mut default = Vec::new();
     for armature_id in armatures {
         let Some(armature) = records
@@ -289,16 +434,25 @@ fn resolve_body(
         else {
             continue;
         };
-        match SubrecordView::new(&armature.subrecords).get_form_id(b"RNAM") {
-            Some(id) if id == race_id => exact.push(armature_id),
-            Some(DEFAULT_RACE_FORM_ID) => default.push(armature_id),
-            _ => {}
+        let armature_view = SubrecordView::new(&armature.subrecords);
+        let exact_race = armature_view.get_form_id(b"RNAM") == Some(race_id);
+        let additional_race = armature_view.get_form_ids(b"MODL").into_iter().any(|id| {
+            id != 0
+                && id == race_id
+                && records
+                    .get(&id)
+                    .is_some_and(|race| &race.record_type == b"RACE" && !race.is_deleted())
+        });
+        if exact_race || additional_race {
+            compatible.push(armature_id);
+        } else if armature_view.get_form_id(b"RNAM") == Some(DEFAULT_RACE_FORM_ID) {
+            default.push(armature_id);
         }
     }
 
     let mut parts: Vec<ActorModelPartRow> = Vec::new();
     let mut seen_paths: BTreeSet<String> = BTreeSet::new();
-    for armature_id in exact.into_iter().chain(default) {
+    for armature_id in compatible.into_iter().chain(default) {
         let armature = &records[&armature_id];
         let view = SubrecordView::new(&armature.subrecords);
         let slot = match classify_slot(view.find(b"BOD2").or_else(|| view.find(b"BODT"))) {
