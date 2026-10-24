@@ -211,7 +211,7 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              id INTEGER PRIMARY KEY,          -- NPC_ FormID
              race_id INTEGER NOT NULL,
              sex TEXT NOT NULL,               -- 'male' | 'female'
-             skin_armo_id INTEGER,            -- RACE/WNAM
+             skin_armo_id INTEGER,            -- effective NPC WNAM override, else effective RACE/WNAM
              head_model TEXT,                 -- FaceGen or default head NIF path
              head_source TEXT,                -- 'facegen' | 'default'
              resolution TEXT NOT NULL         -- 'body', 'body_head', 'unresolved'
