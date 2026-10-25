@@ -396,3 +396,26 @@ fn prepass_mirrors_bevys_premultiplied_alpha_cutoff_locally() {
         format!("const PREMULTIPLIED_ALPHA_CUTOFF: f32 = {SHADOW_ALPHA_CUTOFF};")
     );
 }
+
+#[test]
+fn prepass_applies_the_local_cutoff_at_each_comparison_site() {
+    // The test above shows the declaration exists, not where it is used. Pin the scalar guard
+    // inside the BLEND/ADD/ALPHA_TO_COVERAGE branch and the all-channel guard inside the
+    // PREMULTIPLIED branch, so a literal or a different cutoff at either site fails here.
+    let blend = PREPASS
+        .find("STANDARD_MATERIAL_FLAGS_ALPHA_MODE_BLEND ||")
+        .expect("the prepass shader branches on BLEND");
+    let scalar = PREPASS
+        .find("if color.a < PREMULTIPLIED_ALPHA_CUTOFF {")
+        .expect("the BLEND branch compares alpha to the local cutoff");
+    let premultiplied = PREPASS
+        .find("STANDARD_MATERIAL_FLAGS_ALPHA_MODE_PREMULTIPLIED {")
+        .expect("the prepass shader branches on PREMULTIPLIED");
+    let all_channels = PREPASS
+        .find("if all(color < vec4<f32>(PREMULTIPLIED_ALPHA_CUTOFF)) {")
+        .expect("the PREMULTIPLIED branch compares every channel to the local cutoff");
+    assert!(
+        blend < scalar && scalar < premultiplied && premultiplied < all_channels,
+        "each cutoff comparison must sit in its own alpha-mode branch, in order"
+    );
+}
