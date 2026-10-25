@@ -1145,6 +1145,163 @@ fn shifted_light_patch_template_skin_and_additional_race_links_match_frontends()
     );
 }
 
+/// An `NPC_` like [`items::npc`] that also carries a `QNAM` skin tone.
+fn npc_with_skin_tone(id: u32, race_id: u32, tone: [f32; 3]) -> Vec<u8> {
+    items::record(
+        b"NPC_",
+        id,
+        &[
+            (b"EDID", items::text("TonedNpc")),
+            (b"ACBS", vec![0u8; 24]),
+            (b"RNAM", race_id.to_le_bytes().to_vec()),
+            (
+                b"QNAM",
+                tone.iter()
+                    .flat_map(|channel| channel.to_le_bytes())
+                    .collect(),
+            ),
+        ],
+    )
+}
+
+/// The `actor_models` skin tone columns of `id`.
+fn stored_skin_tone(connection: &Connection, id: u32) -> [Option<f64>; 3] {
+    connection
+        .query_row(
+            "SELECT skin_tone_r, skin_tone_g, skin_tone_b FROM actor_models WHERE id=?1",
+            [id],
+            |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?]),
+        )
+        .unwrap()
+}
+
+#[test]
+fn qnam_skin_tone_is_published_and_absent_qnam_stays_null() {
+    let directory = tempfile::tempdir().unwrap();
+    let tone = [198.0 / 255.0, 176.0 / 255.0, 168.0 / 255.0];
+    let mut records = vec![
+        npc_with_skin_tone(0x100, 0x200, tone),
+        items::npc(0x101, 0x200, false),
+        npc_with_skin_tone(0x102, 0x200, [0.0; 3]),
+    ];
+    records.extend(nord_body_only(0x300));
+    let path = write_plugin(directory.path(), "Skyrim.esm", &records);
+
+    let catalog = resolve(&path);
+    let toned = catalog.models.iter().find(|row| row.id == 0x100).unwrap();
+    assert_eq!(toned.skin_tone, Some(tone));
+    let plain = catalog.models.iter().find(|row| row.id == 0x101).unwrap();
+    assert_eq!(plain.skin_tone, None);
+    assert_eq!(
+        catalog
+            .models
+            .iter()
+            .find(|row| row.id == 0x102)
+            .unwrap()
+            .skin_tone,
+        Some([0.0; 3])
+    );
+
+    let connection = export(directory.path(), &path);
+    assert_eq!(
+        stored_skin_tone(&connection, 0x100),
+        tone.map(|channel| Some(f64::from(channel)))
+    );
+    assert_eq!(stored_skin_tone(&connection, 0x101), [None; 3]);
+    assert_eq!(stored_skin_tone(&connection, 0x102), [Some(0.0); 3]);
+}
+
+/// QNAM is not a confirmed Traits inheritance field. Neither the child's own tone nor the root's
+/// tone is published for this source NPC.
+#[test]
+fn traits_enabled_source_does_not_inherit_qnam_from_child_or_root() {
+    let directory = tempfile::tempdir().unwrap();
+    // QNAM inheritance for Traits-enabled NPCs is unproved.
+    let root = items::record(
+        b"NPC_",
+        0x101,
+        &[
+            (b"ACBS", vec![0u8; 24]),
+            (b"RNAM", 0x200u32.to_le_bytes().to_vec()),
+            (
+                b"QNAM",
+                [0.25_f32, 0.5, 0.75]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            ),
+        ],
+    );
+    let child = items::record(
+        b"NPC_",
+        0x100,
+        &[
+            (b"ACBS", {
+                let mut v = vec![0u8; 24];
+                v[18] = 1;
+                v
+            }),
+            (b"TPLT", 0x101u32.to_le_bytes().to_vec()),
+            (b"RNAM", 0x200u32.to_le_bytes().to_vec()),
+            (
+                b"QNAM",
+                [0.1_f32, 0.2, 0.3]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            ),
+        ],
+    );
+    let records = vec![
+        child,
+        root,
+        items::race(0x200, "NordRace", Some(0x300), false),
+        items::skin_armor(0x300, &[0x400]),
+        items::armature(0x400, 0x200, items::BIPED_BODY, Some(MALE_BODY), None),
+    ];
+    let path = write_plugin(directory.path(), "TraitsQnam.esp", &records);
+    let catalog = resolve(&path);
+    assert_eq!(
+        catalog
+            .models
+            .iter()
+            .find(|row| row.id == 0x100)
+            .unwrap()
+            .skin_tone,
+        None
+    );
+    assert_eq!(
+        catalog
+            .models
+            .iter()
+            .find(|row| row.id == 0x101)
+            .unwrap()
+            .skin_tone,
+        Some([0.25, 0.5, 0.75])
+    );
+}
+
+/// A database whose `actor_models` predates the skin tone gains the columns when the tables are
+/// created again, so a subset export into it can still insert its rows.
+#[test]
+fn an_older_actor_models_table_gains_the_skin_tone_columns() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE actor_models (
+                 id INTEGER PRIMARY KEY, race_id INTEGER NOT NULL, sex TEXT NOT NULL,
+                 skin_armo_id INTEGER, head_model TEXT, head_source TEXT,
+                 resolution TEXT NOT NULL
+             );
+             INSERT INTO actor_models(id, race_id, sex, resolution)
+                 VALUES (0x100, 0x200, 'male', 'body');",
+        )
+        .unwrap();
+    converter::esm::exporter::create_tables(&connection).unwrap();
+    converter::esm::exporter::create_tables(&connection).unwrap();
+    assert_eq!(stored_skin_tone(&connection, 0x100), [None; 3]);
+}
+
 /// Retail bodies: the full resolved/unresolved breakdown, Alvor's row and the
 /// `statics` invariant. The 2,392 count is printed, not asserted.
 #[test]
@@ -1219,6 +1376,21 @@ fn referenced_npc_bases_resolve_bodies() {
         .expect("Sigrid's row");
     println!("Sigrid (0x00013476) ACBS sex: {}", sigrid.sex);
     println!("Alvor: {alvor:?}");
+    // Retail `QNAM` bytes are whole steps of 1/255: Alvor 198,176,168 and Sigrid 221,221,221.
+    for (row, encoded) in [(alvor, [198.0_f32, 176.0, 168.0]), (sigrid, [221.0; 3])] {
+        let tone = row.skin_tone.expect("retail NPC_ carries QNAM");
+        for (channel, expected) in tone.iter().zip(encoded) {
+            assert!(
+                (channel * 255.0 - expected).abs() < 1e-3,
+                "{:08X}: {tone:?}",
+                row.id
+            );
+        }
+        assert_eq!(
+            stored_skin_tone(&connection, row.id),
+            tone.map(|channel| Some(f64::from(channel)))
+        );
+    }
     for part in &parts {
         println!("Alvor part {}: {}", part.slot.as_str(), part.model_path);
     }
