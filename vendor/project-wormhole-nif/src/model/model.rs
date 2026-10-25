@@ -813,20 +813,16 @@ impl Model {
                 let mut targets = Vec::with_capacity(smesh.morph_targets.len());
 
                 for target in &smesh.morph_targets {
-                    assert_eq!(
-                        target.positions.len(),
-                        vertex_count,
-                        "morph target {:?} of skeletal mesh {index} has {} positions, expected {vertex_count}",
-                        target.name,
-                        target.positions.len()
-                    );
-                    assert_eq!(
-                        target.normals.len(),
-                        vertex_count,
-                        "morph target {:?} of skeletal mesh {index} has {} normals, expected {vertex_count}",
-                        target.name,
-                        target.normals.len()
-                    );
+                    if target.positions.len() != vertex_count
+                        || target.normals.len() != vertex_count
+                    {
+                        return Err(format!(
+                            "morph target {:?} of skeletal mesh {index} has {} positions and {} normals, expected {vertex_count} each",
+                            target.name,
+                            target.positions.len(),
+                            target.normals.len()
+                        ));
+                    }
 
                     let (min, max) = vec3_min_max(&target.positions);
                     let positions_bytes = vec3_as_bytes(&target.positions);
@@ -2436,5 +2432,47 @@ mod morph_target_tests {
         assert!(mesh.get("extras").is_none());
         assert!(mesh["primitives"][0].get("targets").is_none());
         assert_eq!(json["accessors"].as_array().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn malformed_morph_targets_return_errors_from_both_writers() {
+        for (field, target, expected_lengths) in [
+            (
+                "positions",
+                MorphTarget {
+                    positions: vec![],
+                    ..thin_target()
+                },
+                "0 positions and 3 normals, expected 3 each",
+            ),
+            (
+                "normals",
+                MorphTarget {
+                    normals: vec![],
+                    ..thin_target()
+                },
+                "3 positions and 0 normals, expected 3 each",
+            ),
+        ] {
+            let model = skeletal_model(vec![target]);
+            let gltf_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                model.to_gltf("morph".to_owned())
+            }));
+            assert!(
+                gltf_result.is_ok(),
+                "to_gltf panicked for malformed {field}"
+            );
+            let error = gltf_result.unwrap().unwrap_err();
+            assert!(error.contains("morph target \"thin\" of skeletal mesh 0"));
+            assert!(error.contains(expected_lengths));
+
+            let glb_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                model.to_glb("morph".to_owned())
+            }));
+            assert!(glb_result.is_ok(), "to_glb panicked for malformed {field}");
+            let error = glb_result.unwrap().unwrap_err();
+            assert!(error.contains("morph target \"thin\" of skeletal mesh 0"));
+            assert!(error.contains(expected_lengths));
+        }
     }
 }
