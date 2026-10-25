@@ -590,10 +590,10 @@ fn check_inputs(demo: &Path, sex: ActorSex) -> Result<(), String> {
 /// Mesh entities whose material the flat preview replaces.
 type MaterialBound = Or<(
     With<MeshMaterial3d<StandardMaterial>>,
+    With<MeshMaterial3d<SkyrimSkinMaterial>>,
     With<MeshMaterial3d<NifDepthMaterial>>,
     With<MeshMaterial3d<EffectPaletteMaterial>>,
     With<MeshMaterial3d<EffectPaletteDepthMaterial>>,
-    With<MeshMaterial3d<SkyrimSkinMaterial>>,
     With<MeshMaterial3d<SkyrimSkinDepthMaterial>>,
 )>;
 
@@ -1242,6 +1242,8 @@ mod tests {
             textures: false,
             msaa: Msaa::Off,
             dark_skin_check: None,
+            debug_normals: SkinDebugView::Off,
+            skin_tone: None,
             target: Handle::default(),
             body_scene: Handle::default(),
             idle_gltf: Handle::default(),
@@ -1249,8 +1251,6 @@ mod tests {
             head_scene: Some(Handle::default()),
             body_material: Handle::default(),
             head_material: Handle::default(),
-            skin_tone: None,
-            debug_normals: SkinDebugView::Off,
             phase: Phase::Loading,
             actor: None,
             body_root: None,
@@ -1470,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn neutral_preview_replaces_each_supported_material_type_once() {
+    fn neutral_preview_replaces_supported_materials_and_removes_skin_material() {
         let mut app = App::new();
         let neutral = Handle::<StandardMaterial>::default();
         let entity = app
