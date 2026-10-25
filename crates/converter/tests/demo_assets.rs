@@ -15,23 +15,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const DEFAULT_ACTOR_NIF_DIR: &str =
-    "/Users/dev/Documents/fun/rust/skyrust/scratch/assets/bsa-meshes/meshes/actors";
-const DEFAULT_ANIMATION_DIR: &str = "/Users/dev/Documents/fun/rust/skyrust/scratch/assets/animations-extract/meshes/actors/character";
-
 const GAITS: [&str; 3] = ["idle", "walkforward", "runforward"];
 const HEADS: [&str; 2] = ["00013475", "0010f5a1"];
 
-fn actor_nif_dir() -> PathBuf {
-    std::env::var_os("MUDCRAB_ACTOR_NIF_DIR")
+fn retail_path(variable: &str) -> PathBuf {
+    std::env::var_os(variable)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_ACTOR_NIF_DIR))
-}
-
-fn animation_dir() -> PathBuf {
-    std::env::var_os("MUDCRAB_ANIMATION_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_ANIMATION_DIR))
+        .unwrap_or_else(|| panic!("{variable} must point at an extracted character tree"))
 }
 
 fn glb_path(output: &Path, relative: &str) -> PathBuf {
@@ -90,8 +80,8 @@ fn materialises_the_converted_actor_assets() {
     let Some(output) = std::env::var_os("MUDCRAB_DEMO_ASSETS").map(PathBuf::from) else {
         return;
     };
-    let actor_root = actor_nif_dir();
-    let animation_root = animation_dir();
+    let actor_root = retail_path("MUDCRAB_ACTOR_NIF_DIR");
+    let animation_root = retail_path("MUDCRAB_ANIMATION_DIR");
     let character_assets = actor_root.join("character/character assets");
     let skeleton_nif = character_assets.join("skeleton.nif");
     let skeleton_hkx = animation_root.join("character assets/skeleton.hkx");

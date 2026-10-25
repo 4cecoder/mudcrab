@@ -2690,13 +2690,25 @@ fn convert_default_animations(
             .map(|(clip_name, stem)| {
                 let relative = default_animation_output(sex, stem);
                 let key = relative.to_string_lossy().replace('\\', "/");
-                manifest.failures.remove(&key);
                 (*clip_name, *stem, relative, key)
             })
             .collect();
         let skeleton_hkx = winning(assets.join("skeleton.hkx"));
         let skeleton_nif = winning(assets.join("skeleton.nif"));
         let body_path = winning(assets.join(format!("{sex}body_1.nif")));
+        let actor_work_exists = skeleton_hkx.is_file()
+            || skeleton_nif.is_file()
+            || body_path.is_file()
+            || outputs.iter().any(|(_, stem, _, _)| {
+                winning(animations.join(sex).join(format!("{stem}.hkx"))).is_file()
+            });
+        let prior_derived_work_exists = outputs.iter().any(|(_, _, relative, key)| {
+            staging.join(relative).is_file() || manifest.failures.contains_key(key)
+        });
+        let notices_are_relevant = actor_work_exists || prior_derived_work_exists;
+        for (_, _, _, key) in &outputs {
+            manifest.failures.remove(key);
+        }
         let missing = [
             ("skeleton.hkx", &skeleton_hkx),
             ("body", &body_path),
@@ -2707,11 +2719,13 @@ fn convert_default_animations(
         if let Some((label, path)) = missing {
             for (clip_name, _, relative, _) in &outputs {
                 remove_stale(&staging.join(relative))?;
-                report.notices.push(format!(
-                    "{}: skipping default {sex} {clip_name} animation: missing {label} {}",
-                    relative.display(),
-                    path.display()
-                ));
+                if notices_are_relevant {
+                    report.notices.push(format!(
+                        "{}: skipping default {sex} {clip_name} animation: missing {label} {}",
+                        relative.display(),
+                        path.display()
+                    ));
+                }
             }
             continue;
         }
@@ -7746,6 +7760,7 @@ mod tests {
             .unwrap();
 
         assert!(!staging.join("meshes").exists());
+        assert!(report.notices.is_empty());
     }
 
     #[test]
