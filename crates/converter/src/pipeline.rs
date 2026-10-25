@@ -4,7 +4,7 @@ use crate::{
         ArchiveExtractor, ExtractOptions, ExtractionProgress, ExtractionTimings,
         RawIngestionSession, prune_stale_reader_packs,
     },
-    asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
+    asset_path::{AssetKind, canonical_asset_path, normalize_separators, resolve_asset_uri},
     cache::{
         CONVERTER_SCHEMA_VERSION, CacheEntry, ConversionManifest, IngestionJournal,
         IngestionSelection, StagedOutput, StagingJournal, asset_configuration_hash_for_schema,
@@ -1273,7 +1273,9 @@ impl AssetPipeline {
         for sex in ["male", "female"] {
             let relative = compose::composed_body_path("default", sex);
             if staging.join(&relative).is_file() {
-                report.artifacts.push(relative);
+                report
+                    .artifacts
+                    .push(normalize_separators(&relative).into());
             }
         }
         if config.mo2.is_some() {
@@ -1290,7 +1292,7 @@ impl AssetPipeline {
             for (_, stem) in DEFAULT_ANIMATION_CLIPS {
                 let relative = default_animation_output(sex, stem);
                 if staging.join(&relative).is_file() {
-                    report.artifacts.push(relative);
+                    report.artifacts.push(relative.into());
                 }
             }
         }
@@ -2599,10 +2601,8 @@ fn compose_default_bodies(
             }
             Err(error) => {
                 remove_output()?;
-                let message = format!(
-                    "{}: failed to compose default {sex} actor body: {error:#}",
-                    relative.display()
-                );
+                let message =
+                    format!("{key}: failed to compose default {sex} actor body: {error:#}");
                 // Notices describe optional derived-output problems without making source
                 // repair incomplete; manifest failures are reserved for repairable inputs.
                 report.notices.push(message.clone());
@@ -2623,11 +2623,37 @@ const DEFAULT_ANIMATION_CLIPS: [(&str, &str); 3] = [
     ("runforward", "mt_runforward"),
 ];
 
-/// The staging path of one sex's converted clip.
-fn default_animation_output(sex: &str, stem: &str) -> PathBuf {
-    PathBuf::from("meshes/actors/character/animations")
-        .join(sex)
-        .join(format!("{stem}.glb"))
+/// The canonical asset key of one sex's converted clip, also used for report text.
+/// Native filesystem paths are formed only when this key is joined to staging.
+fn default_animation_output(sex: &str, stem: &str) -> String {
+    canonical_asset_path(
+        &format!("meshes/actors/character/animations/{sex}/{stem}.glb"),
+        AssetKind::Mesh,
+        "glb",
+    )
+    .expect("built-in default gait names form valid mesh asset keys")
+}
+
+/// Rejects non-directory ancestors, including those Windows masks as a missing child.
+fn validate_animation_output_parent(output: &Path) -> Result<()> {
+    for parent in output.ancestors().skip(1) {
+        match fs::metadata(parent) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                bail!(
+                    "failed to inspect {}: parent {} is not a directory",
+                    output.display(),
+                    parent.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .wrap_err_with(|| format!("failed to inspect {}", output.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Removes blocking non-regular paths at every derived gait output before the pass can skip or write.
@@ -2635,6 +2661,7 @@ fn clear_nonregular_animation_outputs(staging: &Path) -> Result<()> {
     for sex in ["male", "female"] {
         for (_, stem) in DEFAULT_ANIMATION_CLIPS {
             let output = staging.join(default_animation_output(sex, stem));
+            validate_animation_output_parent(&output)?;
             match fs::symlink_metadata(&output) {
                 Ok(metadata) if metadata.file_type().is_file() => {}
                 Ok(metadata) => {
@@ -2688,18 +2715,15 @@ fn convert_default_animations(
         .into_iter()
         .map(|sex| {
             let relevant = DEFAULT_ANIMATION_CLIPS.iter().any(|(_, stem)| {
-                let relative = default_animation_output(sex, stem);
-                let key = relative.to_string_lossy().replace('\\', "/");
-                staging.join(relative).is_file() || manifest.failures.contains_key(&key)
+                let key = default_animation_output(sex, stem);
+                staging.join(&key).is_file() || manifest.failures.contains_key(&key)
             });
             (sex, relevant)
         })
         .collect();
     for sex in ["male", "female"] {
         for (_, stem) in DEFAULT_ANIMATION_CLIPS {
-            let key = default_animation_output(sex, stem)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let key = default_animation_output(sex, stem);
             manifest.failures.remove(&key);
         }
     }
@@ -2707,11 +2731,7 @@ fn convert_default_animations(
     for sex in ["male", "female"] {
         let outputs: Vec<_> = DEFAULT_ANIMATION_CLIPS
             .iter()
-            .map(|(clip_name, stem)| {
-                let relative = default_animation_output(sex, stem);
-                let key = relative.to_string_lossy().replace('\\', "/");
-                (*clip_name, *stem, relative, key)
-            })
+            .map(|(clip_name, stem)| (*clip_name, *stem, default_animation_output(sex, stem)))
             .collect();
         let skeleton_hkx = winning(assets.join("skeleton.hkx"));
         let skeleton_nif = winning(assets.join("skeleton.nif"));
@@ -2719,7 +2739,7 @@ fn convert_default_animations(
         let actor_work_exists = skeleton_hkx.is_file()
             || skeleton_nif.is_file()
             || body_path.is_file()
-            || outputs.iter().any(|(_, stem, _, _)| {
+            || outputs.iter().any(|(_, stem, _)| {
                 winning(animations.join(sex).join(format!("{stem}.hkx"))).is_file()
             });
         let notices_are_relevant =
@@ -2732,12 +2752,11 @@ fn convert_default_animations(
         .into_iter()
         .find(|(_, path)| !path.is_file());
         if let Some((label, path)) = missing {
-            for (clip_name, _, relative, _) in &outputs {
+            for (clip_name, _, relative) in &outputs {
                 remove_stale(&staging.join(relative))?;
                 if notices_are_relevant {
                     report.notices.push(format!(
-                        "{}: skipping default {sex} {clip_name} animation: missing {label} {}",
-                        relative.display(),
+                        "{relative}: skipping default {sex} {clip_name} animation: missing {label} {}",
                         path.display()
                     ));
                 }
@@ -2761,11 +2780,10 @@ fn convert_default_animations(
         let (bones, skeleton_bytes) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                for (clip_name, _, relative, _) in &outputs {
+                for (clip_name, _, relative) in &outputs {
                     remove_stale(&staging.join(relative))?;
                     let message = format!(
-                        "{}: failed to prepare the default {sex} {clip_name} animation: {error:#}",
-                        relative.display()
+                        "{relative}: failed to prepare the default {sex} {clip_name} animation: {error:#}"
                     );
                     if fail_fast {
                         for cleanup_sex in ["male", "female"] {
@@ -2784,14 +2802,13 @@ fn convert_default_animations(
             }
         };
 
-        for (clip_name, stem, relative, _) in outputs {
+        for (clip_name, stem, relative) in outputs {
             let output = staging.join(&relative);
             let clip_path = winning(animations.join(sex).join(format!("{stem}.hkx")));
             if !clip_path.is_file() {
                 remove_stale(&output)?;
                 let message = format!(
-                    "{}: skipping default {sex} {clip_name} animation: missing clip {}",
-                    relative.display(),
+                    "{relative}: skipping default {sex} {clip_name} animation: missing clip {}",
                     clip_path.display()
                 );
                 report.notices.push(message.clone());
@@ -2828,8 +2845,7 @@ fn convert_default_animations(
             if let Err(error) = converted {
                 remove_stale(&output)?;
                 let message = format!(
-                    "{}: failed to convert the default {sex} {clip_name} animation: {error:#}",
-                    relative.display()
+                    "{relative}: failed to convert the default {sex} {clip_name} animation: {error:#}"
                 );
                 if fail_fast {
                     for cleanup_sex in ["male", "female"] {
@@ -7425,6 +7441,7 @@ mod tests {
         .unwrap();
     }
 
+    /// Keeps optional composition failures under the canonical derived asset key.
     #[test]
     fn compose_default_bodies_reports_optional_failure_as_a_notice() {
         let directory = tempfile::tempdir().unwrap();
@@ -7449,7 +7466,7 @@ mod tests {
             report
                 .notices
                 .iter()
-                .any(|notice| notice.contains("failed to compose default male")),
+                .any(|notice| notice.starts_with(&format!("{key}: failed to compose default male"))),
             "notices: {:?}",
             report.notices
         );
@@ -7748,6 +7765,7 @@ mod tests {
         }
     }
 
+    /// Keeps the six gait keys ordered and portable through report serialization.
     #[test]
     fn default_animation_clip_table_is_ordered() {
         assert_eq!(
@@ -7761,11 +7779,7 @@ mod tests {
         for sex in ["male", "female"] {
             let paths: Vec<String> = DEFAULT_ANIMATION_CLIPS
                 .iter()
-                .map(|(_, stem)| {
-                    default_animation_output(sex, stem)
-                        .to_string_lossy()
-                        .into_owned()
-                })
+                .map(|(_, stem)| default_animation_output(sex, stem))
                 .collect();
             assert_eq!(
                 paths,
@@ -7775,7 +7789,32 @@ mod tests {
                     format!("meshes/actors/character/animations/{sex}/mt_runforward.glb"),
                 ]
             );
+            let report = PipelineReport {
+                artifacts: paths.iter().map(PathBuf::from).collect(),
+                ..PipelineReport::default()
+            };
+            let serialized = serde_json::to_value(report).unwrap();
+            for (artifact, expected) in serialized["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(paths)
+            {
+                let key = artifact.as_str().unwrap();
+                assert!(!key.contains('\\'), "noncanonical gait artifact: {key}");
+                assert_eq!(key, expected);
+            }
         }
+    }
+
+    /// Exercises Windows-style key text even when CI runs on a Unix host.
+    #[test]
+    fn default_animation_output_canonicalizes_windows_asset_keys() {
+        let relative = default_animation_output("FEMALE", r"Nested\MT_IDLE");
+        assert_eq!(
+            Path::new(&relative).to_str(),
+            Some("meshes/actors/character/animations/female/nested/mt_idle.glb")
+        );
     }
 
     #[test]
@@ -7818,6 +7857,7 @@ mod tests {
         assert_eq!(report.notices.len(), outputs.len());
     }
 
+    /// Keeps missing-input notices for both sexes when only old gait markers remain.
     #[test]
     fn marker_only_gait_work_keeps_missing_actor_notices_for_both_sexes() {
         let directory = tempfile::tempdir().unwrap();
@@ -7826,9 +7866,7 @@ mod tests {
         let mut manifest = ConversionManifest::default();
         for sex in ["male", "female"] {
             for (_, stem) in DEFAULT_ANIMATION_CLIPS {
-                let key = default_animation_output(sex, stem)
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                let key = default_animation_output(sex, stem);
                 manifest.failures.insert(key, "stale gait failure".into());
             }
         }
@@ -7879,29 +7917,42 @@ mod tests {
         }
     }
 
+    /// Rejects immediate and higher file ancestors before changing manifests or notices.
     #[test]
     fn gait_output_metadata_errors_are_fatal_without_notices() {
-        let directory = tempfile::tempdir().unwrap();
-        let staging = directory.path();
-        stage_invalid_default_animation(staging);
-        let output = staging.join(default_animation_output("male", "mt_runforward"));
-        fs::create_dir_all(output.parent().unwrap()).unwrap();
-        fs::remove_dir(output.parent().unwrap()).unwrap();
-        fs::write(output.parent().unwrap(), b"not a directory").unwrap();
+        for relative in [
+            "meshes",
+            "meshes/actors/character/animations",
+            "meshes/actors/character/animations/male",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let staging = directory.path();
+            stage_invalid_default_animation(staging);
+            let blocker = staging.join(relative);
+            fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+            fs::write(&blocker, b"not a directory").unwrap();
 
-        let mut report = PipelineReport::default();
-        let mut manifest = ConversionManifest::default();
-        let error = convert_default_animations(
-            staging,
-            &BTreeMap::new(),
-            false,
-            &mut report,
-            &mut manifest,
-        )
-        .expect_err("metadata error must abort preflight without fail-fast");
+            for fail_fast in [false, true] {
+                let mut report = PipelineReport::default();
+                let mut manifest = ConversionManifest::default();
+                manifest
+                    .failures
+                    .insert(MALE_IDLE_GLB.into(), "old failure".into());
+                let error = convert_default_animations(
+                    staging,
+                    &BTreeMap::new(),
+                    fail_fast,
+                    &mut report,
+                    &mut manifest,
+                )
+                .expect_err("metadata error must abort preflight with either fail-fast setting");
 
-        assert!(format!("{error:#}").contains("failed to inspect"));
-        assert!(report.notices.is_empty(), "notices: {:?}", report.notices);
+                assert!(format!("{error:#}").contains("failed to inspect"));
+                assert!(report.notices.is_empty(), "notices: {:?}", report.notices);
+                assert_eq!(manifest.failures.get(MALE_IDLE_GLB).unwrap(), "old failure");
+                assert_eq!(fs::read(&blocker).unwrap(), b"not a directory");
+            }
+        }
     }
 
     #[test]
@@ -7932,6 +7983,7 @@ mod tests {
         }
     }
 
+    /// Reports a canonical asset prefix while preserving unrelated source repairs.
     #[test]
     fn animation_preparation_failure_is_a_notice_and_keeps_source_repairs() {
         let directory = tempfile::tempdir().unwrap();
@@ -7969,6 +8021,11 @@ mod tests {
         assert!(report.notices.iter().any(|notice| {
             notice.contains(MALE_IDLE_GLB) && notice.contains("failed to prepare")
         }));
+        for notice in &report.notices {
+            let (key, _) = notice.split_once(": ").unwrap();
+            assert!(!key.contains('\\'), "noncanonical gait notice: {key}");
+            assert_eq!(key, key.to_ascii_lowercase());
+        }
     }
 
     #[test]
