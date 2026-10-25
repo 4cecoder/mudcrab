@@ -10878,8 +10878,33 @@ mod tests {
         assert_eq!(fs::read(root.join(relative)).unwrap(), b"sealed batch");
     }
 
+    /// Persist a relative cache destination from a private cwd independent of checkout depth.
     #[test]
     fn durable_cache_persistence_accepts_relative_destinations() {
+        const CHILD: &str = "MUDCRAB_TEST_RELATIVE_CACHE_CHILD";
+        const TEST: &str =
+            "pipeline::tests::durable_cache_persistence_accepts_relative_destinations";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            // Keep process-global cwd unchanged for other tests running in parallel.
+            let directory = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .current_dir(directory.path())
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                result.status.success(),
+                "relative-cache subprocess failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                stdout.contains(TEST) && stdout.contains("1 passed"),
+                "subprocess did not run the relative-cache test\nstdout:\n{stdout}"
+            );
+            return;
+        }
         let directory = tempfile::tempdir_in(".").unwrap();
         let staging = directory.path().join("staging-cache");
         let current_directory = std::env::current_dir().unwrap();
