@@ -1369,20 +1369,40 @@ fn nam7_with_non_four_byte_payloads_is_rejected_as_malformed() {
 #[test]
 fn a_templated_npc_keeps_its_own_nam7_and_never_inherits_one() {
     let directory = tempfile::tempdir().unwrap();
+    let traits_npc = |id: u32, race: u32, weight: Option<f32>| {
+        let mut acbs = vec![0u8; 24];
+        acbs[18..20].copy_from_slice(&1u16.to_le_bytes());
+        let mut fields = vec![
+            (b"ACBS", acbs),
+            (b"TPLT", 0x900u32.to_le_bytes().to_vec()),
+            (b"RNAM", race.to_le_bytes().to_vec()),
+        ];
+        if let Some(weight) = weight {
+            fields.push((b"NAM7", weight.to_le_bytes().to_vec()));
+        }
+        items::record(b"NPC_", id, &fields)
+    };
     let mut records = vec![
-        // The template itself is light, but a templated base reads only its own NAM7.
-        items::npc_with_weight(0x900, 0x200, false, 80.0),
-        items::npc_with_template(0x100, 0x200, false, 0x900, Some(20.0)),
-        items::npc_with_template(0x101, 0x200, false, 0x900, None),
+        // Traits inherit race from template; NAM7 remains own-record only.
+        items::npc_with_weight(0x900, 0x201, false, 80.0),
+        traits_npc(0x100, 0x200, Some(20.0)),
+        traits_npc(0x101, 0x200, None),
+        items::race(0x200, "OwnRace", Some(0x300), false),
+        items::race(0x201, "TemplateRace", Some(0x301), false),
     ];
     records.extend(nord_body_only(0x300));
     let path = write_plugin(directory.path(), "Skyrim.esm", &records);
 
     let catalog = resolve(&path);
-    let own = catalog.models.iter().find(|row| row.id == 0x100).unwrap();
-    assert_eq!(own.weight, Some(20.0));
     let no_nam7 = catalog.models.iter().find(|row| row.id == 0x101).unwrap();
+    assert_eq!(
+        no_nam7.race_id, 0x201,
+        "traits must resolve through template"
+    );
     assert_eq!(no_nam7.weight, None);
+    let own = catalog.models.iter().find(|row| row.id == 0x100).unwrap();
+    assert_eq!(own.race_id, 0x201, "traits must resolve through template");
+    assert_eq!(own.weight, Some(20.0));
 
     let connection = export(directory.path(), &path);
     assert_eq!(stored_weight(&connection, 0x100), Some(20.0));

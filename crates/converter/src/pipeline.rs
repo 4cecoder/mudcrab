@@ -2597,14 +2597,11 @@ fn compose_default_bodies(
                     skin_textures: compose::skin_texture_set_for(&skins, *kind, path),
                 })
                 .collect();
-            let thin_paths: Vec<(PathBuf, BodyPartKind)> = part_paths
+            let thin_paths: Vec<(PathBuf, BodyPartKind)> = PARTS
                 .iter()
-                .map(|(path, kind)| {
-                    let file_name = path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().replace("_1.nif", "_0.nif"))
-                        .unwrap_or_default();
-                    (winning(path.with_file_name(file_name)), *kind)
+                .map(|(suffix, kind)| {
+                    let thin_name = suffix.replace("_1.nif", "_0.nif");
+                    (winning(assets.join(format!("{sex}{thin_name}"))), *kind)
                 })
                 .collect();
             let mut model = compose::compose_body(&parts, &skeleton)?;
@@ -7545,6 +7542,57 @@ mod tests {
             assert!((body.1[1][0] + 0.2).abs() < 1e-5, "{:?}", body.1);
             assert!(body.1[1][1].abs() < 1e-5, "{:?}", body.1);
         }
+    }
+
+    #[test]
+    fn compose_default_bodies_resolves_thin_sources_from_logical_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        stage_default_actor_parts(staging);
+        let heavy_mod = staging.join("heavy-mod");
+        let thin_mod = staging.join("thin-mod");
+        fs::create_dir_all(&heavy_mod).unwrap();
+        fs::create_dir_all(&thin_mod).unwrap();
+        write_actor_body_part_scaled(&heavy_mod, "malebody_1.nif", 0.7);
+        write_actor_body_part_scaled(&heavy_mod, "malebody_0.nif", 0.5);
+        write_actor_body_part_scaled(&thin_mod, "malebody_0.nif", 0.3);
+
+        let assets = actor_assets(staging);
+        let mut sources = staged_sources(staging);
+        sources.insert(
+            assets.join("malebody_1.nif"),
+            heavy_mod.join("malebody_1.nif"),
+        );
+        sources.insert(
+            assets.join("malebody_0.nif"),
+            thin_mod.join("malebody_0.nif"),
+        );
+        let mut report = PipelineReport::default();
+        let mut manifest = ConversionManifest::default();
+        compose_default_bodies(staging, &sources, false, &mut report, &mut manifest).unwrap();
+        let output = staging.join(crate::compose::composed_body_path("default", "male"));
+        let body = glb_thin_morphs(&output)
+            .into_iter()
+            .find(|(name, _)| name == "BodyShapeA")
+            .unwrap();
+        assert!(
+            (body.1[1][0] + 0.4).abs() < 1e-5,
+            "thin source delta: {:?}",
+            body.1
+        );
+
+        // The heavy winner's physical sibling must not beat staged thin fallback.
+        sources.remove(&assets.join("malebody_0.nif"));
+        compose_default_bodies(staging, &sources, false, &mut report, &mut manifest).unwrap();
+        let body = glb_thin_morphs(&output)
+            .into_iter()
+            .find(|(name, _)| name == "BodyShapeA")
+            .unwrap();
+        assert!(
+            (body.1[1][0] - 0.1).abs() < 1e-5,
+            "staged thin delta: {:?}",
+            body.1
+        );
     }
 
     #[test]

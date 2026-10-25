@@ -308,13 +308,14 @@ fn main() {
         eprintln!("actor preview: {error}");
         std::process::exit(2);
     }
+    let body_path = body.unwrap_or_else(|| composed_body_scene(sex).to_owned());
     let npc = npc.unwrap_or(match sex {
         ActorSex::Male => MALE_NPC,
         ActorSex::Female => FEMALE_NPC,
     });
     let skin_tone = resolve_skin_tone(skin_tone, database.as_deref(), npc);
     let body_weight = resolve_body_weight(weight, database.as_deref(), npc);
-    if let Err(error) = check_inputs(&demo, sex) {
+    if let Err(error) = check_inputs(&demo, sex, &body_path) {
         eprintln!("actor preview: {error}");
         std::process::exit(2);
     }
@@ -406,7 +407,6 @@ fn main() {
         HeadChoice::None => None,
         HeadChoice::Path(path) => Some(path),
     };
-    let body_path = body.unwrap_or_else(|| composed_body_scene(sex).to_owned());
     let body_scene = asset_server.load(GltfAssetLabel::Scene(0).from_asset(body_path));
     let idle_gltf = asset_server.load(idle_clip_scene(sex));
     let head_scene = head_path
@@ -769,13 +769,10 @@ fn check_debug_normals(textures: bool, debug_normals: SkinDebugView) -> Result<(
     Ok(())
 }
 
-fn check_inputs(demo: &Path, sex: ActorSex) -> Result<(), String> {
+fn check_inputs(demo: &Path, sex: ActorSex, body: &str) -> Result<(), String> {
     let sex_name = sex.as_str();
-    if !demo.join(composed_body_scene(sex)).is_file() {
-        return Err(format!(
-            "{} has no {sex_name} composed body",
-            demo.display()
-        ));
+    if !demo.join(body).is_file() {
+        return Err(format!("{} has no {sex_name} body {body}", demo.display()));
     }
     if !demo.join(idle_clip_scene(sex)).is_file() {
         return Err(format!("{} has no {sex_name} idle clip", demo.display()));
@@ -1730,22 +1727,52 @@ mod tests {
     }
 
     #[test]
-    fn input_check_requires_the_selected_sex_body_and_idle() {
+    fn input_check_requires_selected_body_and_selected_sex_idle() {
         let demo = tempfile::tempdir().unwrap();
         write_asset(demo.path(), composed_body_scene(ActorSex::Male));
         write_asset(demo.path(), idle_clip_scene(ActorSex::Male));
         write_asset(demo.path(), composed_body_scene(ActorSex::Female));
 
         assert_eq!(
-            check_inputs(demo.path(), ActorSex::Female).unwrap_err(),
+            check_inputs(
+                demo.path(),
+                ActorSex::Female,
+                composed_body_scene(ActorSex::Female)
+            )
+            .unwrap_err(),
             format!("{} has no female idle clip", demo.path().display())
         );
 
         write_asset(demo.path(), idle_clip_scene(ActorSex::Female));
         std::fs::remove_file(demo.path().join(composed_body_scene(ActorSex::Female))).unwrap();
         assert_eq!(
-            check_inputs(demo.path(), ActorSex::Female).unwrap_err(),
-            format!("{} has no female composed body", demo.path().display())
+            check_inputs(
+                demo.path(),
+                ActorSex::Female,
+                composed_body_scene(ActorSex::Female)
+            )
+            .unwrap_err(),
+            format!(
+                "{} has no female body {}",
+                demo.path().display(),
+                composed_body_scene(ActorSex::Female)
+            )
+        );
+
+        write_asset(demo.path(), "custom/body.glb");
+        assert!(check_inputs(demo.path(), ActorSex::Female, "custom/body.glb").is_ok());
+        write_asset(demo.path(), composed_body_scene(ActorSex::Female));
+        assert_eq!(
+            check_inputs(demo.path(), ActorSex::Female, "missing/body.glb").unwrap_err(),
+            format!(
+                "{} has no female body missing/body.glb",
+                demo.path().display()
+            )
+        );
+        std::fs::remove_file(demo.path().join(idle_clip_scene(ActorSex::Male))).unwrap();
+        assert_eq!(
+            check_inputs(demo.path(), ActorSex::Male, "custom/body.glb").unwrap_err(),
+            format!("{} has no male idle clip", demo.path().display())
         );
     }
 
