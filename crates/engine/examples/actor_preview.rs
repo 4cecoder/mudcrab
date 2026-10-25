@@ -25,11 +25,12 @@
 //! as a tangent-space one shows up as large near-black patches on the back and shoulders, which
 //! this catches without comparing against a reference image.
 //!
-//! `--debug-normals msn|vertex` renders the skin materials' normals as colour (`N * 0.5 + 0.5`,
-//! written so the PNG holds that value) instead of lighting them: `msn` the shading normal decoded
-//! from the model-space map, `vertex` the interpolated vertex normal. Red is world +X, green +Y
-//! (up), blue +Z. The actor faces -Z, where the camera stands at yaw 0, so the front has almost no
-//! blue and the back (seen at yaw 180) is blue.
+//! `--debug-normals msn|vertex` requires `--textures` and renders the skin materials' normals as
+//! colour (`N * 0.5 + 0.5`, written so the PNG holds that value) instead of lighting them: `msn`
+//! the shading normal decoded from the model-space map, `vertex` the interpolated vertex normal.
+//! Red is world +X, green +Y (up), blue +Z. The actor faces -Z, where the camera stands at yaw 0,
+//! so the front has almost no blue and the back (seen at yaw 180) is blue. `--debug-normals off`
+//! keeps the normal lit rendering and does not require `--textures`.
 
 use bevy::{
     animation::{
@@ -198,6 +199,10 @@ fn main() {
     } = parse_args();
     if let Some([red, green, blue]) = skin_tone {
         println!("actor preview: skin tone {red:.3},{green:.3},{blue:.3} (not applied yet)");
+    }
+    if let Err(error) = check_debug_normals(textures, debug_normals) {
+        eprintln!("actor preview: {error}");
+        std::process::exit(2);
     }
     if let Err(error) = check_inputs(&demo, sex) {
         eprintln!("actor preview: {error}");
@@ -370,7 +375,7 @@ fn parse_skin_tone(value: Option<String>) -> [f32; 3] {
 
 fn parse_args() -> Options {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: actor_preview <converted_assets_dir> <output.png> [--sex male|female] [--head PATH|none] [--textures] [--window] [--yaw DEG] [--pitch DEG] [--focus body|head] [--msaa 1|2|4|8] [--skin-tone R,G,B] [--dark-skin-check MAX_FRACTION] [--dark-floor LUMINANCE] [--debug-normals msn|vertex]";
+    let usage = "usage: actor_preview <converted_assets_dir> <output.png> [--sex male|female] [--head PATH|none] [--textures] [--window] [--yaw DEG] [--pitch DEG] [--focus body|head] [--msaa 1|2|4|8] [--skin-tone R,G,B] [--dark-skin-check MAX_FRACTION] [--dark-floor LUMINANCE] [--debug-normals msn|vertex|off (msn and vertex require --textures)]";
     let Some(demo) = args.next() else {
         eprintln!("{usage}");
         std::process::exit(2);
@@ -468,6 +473,13 @@ fn parse_args() -> Options {
         dark_floor,
         debug_normals,
     }
+}
+
+fn check_debug_normals(textures: bool, debug_normals: SkinDebugView) -> Result<(), String> {
+    if !textures && debug_normals != SkinDebugView::Off {
+        return Err("--debug-normals msn|vertex requires --textures".to_owned());
+    }
+    Ok(())
 }
 
 fn check_inputs(demo: &Path, sex: ActorSex) -> Result<(), String> {
@@ -1196,6 +1208,20 @@ mod tests {
             check_inputs(demo.path(), ActorSex::Female).unwrap_err(),
             format!("{} has no female composed body", demo.path().display())
         );
+    }
+
+    #[test]
+    fn normal_debug_views_require_textures() {
+        for view in [SkinDebugView::WorldNormal, SkinDebugView::VertexNormal] {
+            assert_eq!(
+                check_debug_normals(false, view).unwrap_err(),
+                "--debug-normals msn|vertex requires --textures"
+            );
+            assert!(check_debug_normals(true, view).is_ok());
+        }
+
+        assert!(check_debug_normals(false, SkinDebugView::Off).is_ok());
+        assert!(check_debug_normals(true, SkinDebugView::Off).is_ok());
     }
 
     #[test]

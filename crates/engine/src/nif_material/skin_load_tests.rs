@@ -5,7 +5,10 @@ use super::*;
 use crate::skin_material::SkyrimSkinFlags;
 use bevy::{
     asset::{LoadState, RenderAssetUsages},
-    image::{CompressedImageFormats, ImageAddressMode, ImageLoader, ImagePlugin, ImageSampler},
+    image::{
+        CompressedImageFormats, ImageAddressMode, ImageFilterMode, ImageLoader, ImagePlugin,
+        ImageSampler, ImageSamplerDescriptor,
+    },
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
     world_serialization::{WorldAsset, WorldSerializationPlugin},
 };
@@ -189,6 +192,7 @@ fn write_two_sampler_skin_gltf(directory: &Path, reverse_material_order: bool) {
 
 fn loader_app(directory: &Path) -> App {
     let mut app = App::new();
+    let default_sampler = configured_default_sampler();
     app.add_plugins((
         MinimalPlugins,
         AssetPlugin {
@@ -197,7 +201,10 @@ fn loader_app(directory: &Path) -> App {
         },
         ImagePlugin::default(),
         WorldSerializationPlugin,
-        bevy::gltf::GltfPlugin::default(),
+        bevy::gltf::GltfPlugin {
+            default_sampler: default_sampler.clone(),
+            ..default()
+        },
     ))
     .init_asset::<Mesh>()
     .init_asset::<StandardMaterial>()
@@ -208,9 +215,37 @@ fn loader_app(directory: &Path) -> App {
         .write_blocking()
         .push(Box::new(StockStandardHandler));
     app.add_plugins(NifMaterialPlugin);
+    assert!(
+        !app.world().contains_resource::<DefaultGltfImageSampler>(),
+        "GltfPlugin creates its configured sampler in finish, after build hooks"
+    );
     app.finish();
+    let installed = app.world().resource::<DefaultGltfImageSampler>().get();
+    assert_eq!(installed, default_sampler);
     app.cleanup();
     app
+}
+
+/// A distinctive real glTF default. Fixture textures specify wrapping only, so their linear
+/// aliases must inherit these unspecified filter and anisotropy settings.
+fn configured_default_sampler() -> ImageSamplerDescriptor {
+    ImageSamplerDescriptor {
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        anisotropy_clamp: 8,
+        ..ImageSamplerDescriptor::linear()
+    }
+}
+
+fn assert_configured_sampler(image: &Image) {
+    let ImageSampler::Descriptor(sampler) = &image.sampler else {
+        panic!("the glTF sampler is passed to the linear load");
+    };
+    assert_eq!(sampler.mag_filter, ImageFilterMode::Linear);
+    assert_eq!(sampler.min_filter, ImageFilterMode::Linear);
+    assert_eq!(sampler.mipmap_filter, ImageFilterMode::Linear);
+    assert_eq!(sampler.anisotropy_clamp, 8);
 }
 
 fn wait_for_dependencies<A: Asset>(app: &mut App, handle: &Handle<A>) {
@@ -308,8 +343,9 @@ fn model_space_material_loads_as_a_skin_material_with_a_linear_gloss_mask() {
     );
     let linear = images.get(linear).unwrap();
     assert_eq!(linear.texture_descriptor.format, TextureFormat::Rgba8Unorm);
+    assert_configured_sampler(linear);
     let ImageSampler::Descriptor(sampler) = &linear.sampler else {
-        panic!("the glTF sampler is passed to the linear load");
+        unreachable!("assert_configured_sampler checks this variant");
     };
     assert_eq!(sampler.address_mode_u, ImageAddressMode::ClampToEdge);
     assert_eq!(sampler.address_mode_v, ImageAddressMode::ClampToEdge);
@@ -489,8 +525,9 @@ fn facegen_head_binds_its_tint_and_detail_maps_linear() {
         assert_eq!(server.get_path(handle.id()).unwrap(), path.into());
         let image = images.get(handle).unwrap();
         assert_eq!(image.texture_descriptor.format, TextureFormat::Rgba8Unorm);
+        assert_configured_sampler(image);
         let ImageSampler::Descriptor(sampler) = &image.sampler else {
-            panic!("the glTF sampler is passed to the linear load");
+            unreachable!("assert_configured_sampler checks this variant");
         };
         assert_eq!(sampler.address_mode_u, ImageAddressMode::ClampToEdge);
     }

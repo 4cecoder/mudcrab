@@ -47,6 +47,12 @@ impl Plugin for NifMaterialPlugin {
             .register_type::<NifNativeMaterialSource>()
             .register_type::<EffectPaletteDepthSource>()
             .register_type::<ExternalEmittance>();
+    }
+
+    fn finish(&self, app: &mut App) {
+        // GltfPlugin creates this resource in its own `finish`. Capture its shared descriptor
+        // only after that lifecycle hook has run so native linear twins inherit the configured
+        // defaults instead of silently falling back to Bevy's linear sampler.
         let default_sampler = app
             .world()
             .get_resource::<DefaultGltfImageSampler>()
@@ -613,6 +619,10 @@ mod palette_shader_check;
 mod skin_load_tests;
 
 #[cfg(test)]
+#[path = "nif_material/skin_shader_check.rs"]
+mod skin_shader_check;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::nif_depth::{CAST_SHADOWS, DECAL, DEPTH_TEST, DEPTH_WRITE, DYNAMIC_DECAL};
@@ -630,6 +640,8 @@ mod tests {
         app.add_plugins((MinimalPlugins, AssetPlugin::default()))
             .init_resource::<GltfExtensionHandlers>()
             .add_plugins(NifMaterialPlugin);
+        // Finish without a GltfPlugin: the native handler keeps its linear-sampler fallback.
+        app.finish();
 
         assert!(
             app.world()
