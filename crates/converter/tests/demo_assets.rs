@@ -80,6 +80,10 @@ fn materialises_the_converted_actor_assets() {
     let Some(output) = std::env::var_os("MUDCRAB_DEMO_ASSETS").map(PathBuf::from) else {
         return;
     };
+    assert!(
+        !output.as_os_str().is_empty(),
+        "MUDCRAB_DEMO_ASSETS must not be empty"
+    );
     let actor_root = retail_path("MUDCRAB_ACTOR_NIF_DIR");
     let animation_root = retail_path("MUDCRAB_ANIMATION_DIR");
     let character_assets = actor_root.join("character/character assets");

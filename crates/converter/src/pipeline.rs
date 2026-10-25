@@ -2684,6 +2684,26 @@ fn convert_default_animations(
 
     clear_nonregular_animation_outputs(staging)?;
 
+    let prior_derived_relevance: BTreeMap<_, _> = ["male", "female"]
+        .into_iter()
+        .map(|sex| {
+            let relevant = DEFAULT_ANIMATION_CLIPS.iter().any(|(_, stem)| {
+                let relative = default_animation_output(sex, stem);
+                let key = relative.to_string_lossy().replace('\\', "/");
+                staging.join(relative).is_file() || manifest.failures.contains_key(&key)
+            });
+            (sex, relevant)
+        })
+        .collect();
+    for sex in ["male", "female"] {
+        for (_, stem) in DEFAULT_ANIMATION_CLIPS {
+            let key = default_animation_output(sex, stem)
+                .to_string_lossy()
+                .replace('\\', "/");
+            manifest.failures.remove(&key);
+        }
+    }
+
     for sex in ["male", "female"] {
         let outputs: Vec<_> = DEFAULT_ANIMATION_CLIPS
             .iter()
@@ -2702,13 +2722,8 @@ fn convert_default_animations(
             || outputs.iter().any(|(_, stem, _, _)| {
                 winning(animations.join(sex).join(format!("{stem}.hkx"))).is_file()
             });
-        let prior_derived_work_exists = outputs.iter().any(|(_, _, relative, key)| {
-            staging.join(relative).is_file() || manifest.failures.contains_key(key)
-        });
-        let notices_are_relevant = actor_work_exists || prior_derived_work_exists;
-        for (_, _, _, key) in &outputs {
-            manifest.failures.remove(key);
-        }
+        let notices_are_relevant =
+            actor_work_exists || prior_derived_relevance.get(sex).copied().unwrap_or(false);
         let missing = [
             ("skeleton.hkx", &skeleton_hkx),
             ("body", &body_path),
@@ -2753,6 +2768,13 @@ fn convert_default_animations(
                         relative.display()
                     );
                     if fail_fast {
+                        for cleanup_sex in ["male", "female"] {
+                            for (_, stem) in DEFAULT_ANIMATION_CLIPS {
+                                remove_stale(
+                                    &staging.join(default_animation_output(cleanup_sex, stem)),
+                                )?;
+                            }
+                        }
                         return Err(eyre!("{message}"));
                     }
                     report.notices.push(message.clone());
@@ -2810,6 +2832,13 @@ fn convert_default_animations(
                     relative.display()
                 );
                 if fail_fast {
+                    for cleanup_sex in ["male", "female"] {
+                        for (_, stem) in DEFAULT_ANIMATION_CLIPS {
+                            remove_stale(
+                                &staging.join(default_animation_output(cleanup_sex, stem)),
+                            )?;
+                        }
+                    }
                     return Err(eyre!("{message}"));
                 }
                 report.notices.push(message.clone());
@@ -7790,6 +7819,40 @@ mod tests {
     }
 
     #[test]
+    fn marker_only_gait_work_keeps_missing_actor_notices_for_both_sexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        let mut report = PipelineReport::default();
+        let mut manifest = ConversionManifest::default();
+        for sex in ["male", "female"] {
+            for (_, stem) in DEFAULT_ANIMATION_CLIPS {
+                let key = default_animation_output(sex, stem)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                manifest.failures.insert(key, "stale gait failure".into());
+            }
+        }
+
+        convert_default_animations(staging, &BTreeMap::new(), false, &mut report, &mut manifest)
+            .unwrap();
+
+        assert_eq!(report.notices.len(), 6);
+        for sex in ["male", "female"] {
+            assert_eq!(
+                report
+                    .notices
+                    .iter()
+                    .filter(|notice| notice.contains(&format!("default {sex} ")))
+                    .count(),
+                3,
+                "notices: {:?}",
+                report.notices
+            );
+        }
+        assert!(manifest.failures.is_empty());
+    }
+
+    #[test]
     fn gait_output_directory_collision_is_fatal_and_preserved_with_or_without_fail_fast() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path();
@@ -7913,15 +7976,59 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path();
         stage_invalid_default_animation(staging);
+        let outputs = write_staged_gait_clips(staging);
         let mut report = PipelineReport::default();
         let mut manifest = ConversionManifest::default();
+        for output in &outputs {
+            let key = output
+                .strip_prefix(staging)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            manifest.failures.insert(key, "stale gait failure".into());
+        }
 
         let error =
             convert_default_animations(staging, &BTreeMap::new(), true, &mut report, &mut manifest)
                 .expect_err("fail-fast must propagate an optional-output preparation error");
 
         assert!(format!("{error:#}").contains("failed to build the default male actor body"));
-        assert!(!manifest.failures.contains_key(MALE_IDLE_GLB));
+        assert!(outputs.iter().all(|output| !output.exists()));
+        assert!(manifest.failures.is_empty());
+        assert!(report.notices.is_empty(), "notices: {:?}", report.notices);
+    }
+
+    #[test]
+    fn animation_conversion_failure_propagates_with_fail_fast_and_cleans_all_gaits() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        let assets = actor_assets(staging);
+        let animations = staging.join("vfs/meshes/actors/character/animations/male");
+        fs::create_dir_all(&assets).unwrap();
+        fs::create_dir_all(&animations).unwrap();
+        write_actor_skeleton(&assets, "SkeletonRoot", &["Bone0", "Bone1"]);
+        write_actor_body_part(&assets, "malebody_1.nif");
+        fs::write(assets.join("skeleton.hkx"), b"synthetic skeleton").unwrap();
+        fs::write(animations.join("mt_idle.hkx"), b"invalid clip").unwrap();
+        let outputs = write_staged_gait_clips(staging);
+        let mut report = PipelineReport::default();
+        let mut manifest = ConversionManifest::default();
+        for output in &outputs {
+            let key = output
+                .strip_prefix(staging)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            manifest.failures.insert(key, "stale gait failure".into());
+        }
+
+        let error =
+            convert_default_animations(staging, &BTreeMap::new(), true, &mut report, &mut manifest)
+                .expect_err("fail-fast must propagate a default clip conversion error");
+
+        assert!(format!("{error:#}").contains("failed to convert the default male idle animation"));
+        assert!(outputs.iter().all(|output| !output.exists()));
+        assert!(manifest.failures.is_empty());
         assert!(report.notices.is_empty(), "notices: {:?}", report.notices);
     }
 
