@@ -77,13 +77,94 @@ fn texture_requests(output: &Path, glbs: &[PathBuf]) -> BTreeMap<String, Texture
     requests
 }
 
-fn link_or_copy(from: &Path, to: &Path) {
+fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
     if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent).unwrap();
+        fs::create_dir_all(parent)?;
     }
-    fs::hard_link(from, to)
-        .or_else(|_| fs::copy(from, to).map(|_| ()))
-        .unwrap_or_else(|error| panic!("write {}: {error}", to.display()));
+    match fs::symlink_metadata(to) {
+        Ok(_) => {
+            // Removing the source itself would lose its bytes; a dangling destination symlink
+            // must still be removed before the copy fallback can follow it.
+            if same_path(from, to) {
+                return Ok(());
+            }
+            fs::remove_file(to)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::hard_link(from, to).or_else(|_| fs::copy(from, to).map(|_| ()))
+}
+
+/// Whether `from` and `to` name the same file, so removing `to` cannot delete `from`.
+fn same_path(from: &Path, to: &Path) -> bool {
+    match fs::canonicalize(from) {
+        Ok(from) => fs::canonicalize(to).is_ok_and(|to| to == from),
+        Err(_) => false,
+    }
+}
+
+#[test]
+fn link_or_copy_retries_an_existing_hard_link_without_changing_source_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source.dds");
+    let destination = directory.path().join(".texture-source/source.dds");
+    fs::write(&source, b"synthetic texture bytes").unwrap();
+    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    fs::hard_link(&source, &destination).unwrap();
+
+    link_or_copy(&source, &destination).unwrap();
+    link_or_copy(&source, &destination).unwrap();
+
+    assert_eq!(fs::read(&source).unwrap(), b"synthetic texture bytes");
+    assert_eq!(fs::read(&destination).unwrap(), b"synthetic texture bytes");
+}
+
+#[test]
+fn link_or_copy_replaces_stale_regular_destination() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source.dds");
+    let destination = directory.path().join("destination.dds");
+    fs::write(&source, b"synthetic texture bytes").unwrap();
+    fs::write(&destination, b"stale bytes").unwrap();
+
+    link_or_copy(&source, &destination).unwrap();
+
+    assert_eq!(fs::read(&source).unwrap(), b"synthetic texture bytes");
+    assert_eq!(fs::read(&destination).unwrap(), b"synthetic texture bytes");
+}
+
+#[cfg(unix)]
+#[test]
+fn link_or_copy_replaces_destination_symlink_without_changing_target() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source.dds");
+    let target = directory.path().join("symlink-target.dds");
+    let destination = directory.path().join("destination.dds");
+    fs::write(&source, b"synthetic texture bytes").unwrap();
+    fs::write(&target, b"symlink target bytes").unwrap();
+    symlink(&target, &destination).unwrap();
+
+    link_or_copy(&source, &destination).unwrap();
+
+    assert_eq!(fs::read(&source).unwrap(), b"synthetic texture bytes");
+    assert_eq!(fs::read(&destination).unwrap(), b"synthetic texture bytes");
+    assert_eq!(fs::read(&target).unwrap(), b"symlink target bytes");
+}
+
+#[test]
+fn link_or_copy_keeps_directory_destination_and_returns_cleanup_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source.dds");
+    let destination = directory.path().join("destination.dds");
+    fs::write(&source, b"synthetic texture bytes").unwrap();
+    fs::create_dir(&destination).unwrap();
+
+    assert!(link_or_copy(&source, &destination).is_err());
+    assert!(destination.is_dir());
+    assert_eq!(fs::read(&source).unwrap(), b"synthetic texture bytes");
 }
 
 /// Orders the retail archives so texture banks are read first; the rest are only needed if a
@@ -119,7 +200,9 @@ fn stage_textures(source: &Path, staging: &Path, needed: &mut BTreeSet<PathBuf>)
         for relative in needed.iter() {
             let from = source.join(relative);
             if from.is_file() {
-                link_or_copy(&from, &staging.join(relative));
+                link_or_copy(&from, &staging.join(relative)).unwrap_or_else(|error| {
+                    panic!("write {}: {error}", staging.join(relative).display())
+                });
             }
         }
         needed.retain(|relative| !staging.join(relative).is_file());
@@ -171,7 +254,8 @@ fn materialise_textures(source: &Path, output: &Path, glbs: &[PathBuf]) {
             if alias_path == ktx2 {
                 continue;
             }
-            link_or_copy(&ktx2, &alias_path);
+            link_or_copy(&ktx2, &alias_path)
+                .unwrap_or_else(|error| panic!("write {}: {error}", alias_path.display()));
             assert_written(&alias_path);
             aliases += 1;
         }

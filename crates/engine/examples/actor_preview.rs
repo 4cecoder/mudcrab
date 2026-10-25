@@ -40,12 +40,13 @@ use bevy::{
         view::screenshot::{Screenshot, ScreenshotCaptured},
     },
     window::{ExitCondition, Window, WindowPlugin, WindowRef},
-    world_serialization::{WorldAsset, WorldAssetRoot},
+    world_serialization::{WorldAsset, WorldAssetRoot, WorldInstanceReady},
 };
 use engine::{
     actor_animation::{AnimationTarget, IDLE_ANIMATION, animation_targets, idle_clip_scene},
     actors::{ActorSex, composed_body_scene},
-    nif_material::NifMaterialPlugin,
+    nif_depth::NifDepthMaterial,
+    nif_material::{EffectPaletteDepthMaterial, EffectPaletteMaterial, NifMaterialPlugin},
 };
 use std::{
     collections::HashMap,
@@ -77,6 +78,7 @@ const DEFAULT_DARK_FLOOR: f64 = 0.10;
 /// Height of the head framing box centre above the head bone. The camera sits and aims above the
 /// box centre, so a small lift keeps the face mid-frame with the crown and chin in view.
 const HEAD_FRAME_LIFT: f32 = 2.0;
+const HEAD_SCENE_TIMEOUT_FRAMES: u32 = 300;
 
 #[derive(Debug, Clone)]
 enum HeadChoice {
@@ -157,6 +159,12 @@ struct Preview {
     camera_frames: u32,
     started: Instant,
 }
+
+#[derive(Component)]
+struct HeadPreviewRoot;
+
+#[derive(Component)]
+struct HeadPreviewReady;
 
 impl Preview {
     fn fail(&self, message: &str) {
@@ -304,6 +312,7 @@ fn main() {
         camera_frames: 0,
         started: Instant::now(),
     })
+    .add_observer(mark_head_preview_ready)
     .add_systems(Update, drive);
 
     let result = app.run();
@@ -456,6 +465,105 @@ fn check_inputs(demo: &Path, sex: ActorSex) -> Result<(), String> {
     Ok(())
 }
 
+fn mark_head_preview_ready(
+    ready: On<WorldInstanceReady>,
+    roots: Query<(), With<HeadPreviewRoot>>,
+    mut commands: Commands,
+) {
+    if roots.contains(ready.entity) {
+        commands.entity(ready.entity).insert(HeadPreviewReady);
+    }
+}
+
+fn rehost_head_skins(
+    skins: &[(Entity, SkinnedMesh)],
+    joint_names: &HashMap<Entity, String>,
+    body_bones: &HashMap<String, Entity>,
+) -> Result<Vec<(Entity, SkinnedMesh)>, usize> {
+    let mut missing = 0;
+    let mut rehosted = Vec::with_capacity(skins.len());
+    for (entity, skin) in skins {
+        let mut joints = Vec::with_capacity(skin.joints.len());
+        for joint in &skin.joints {
+            match joint_names.get(joint).and_then(|name| body_bones.get(name)) {
+                Some(body_bone) => joints.push(*body_bone),
+                None => missing += 1,
+            }
+        }
+        rehosted.push((
+            *entity,
+            SkinnedMesh {
+                inverse_bindposes: skin.inverse_bindposes.clone(),
+                joints,
+            },
+        ));
+    }
+    if missing == 0 {
+        Ok(rehosted)
+    } else {
+        Err(missing)
+    }
+}
+
+fn install_neutral_material(commands: &mut EntityCommands, material: &Handle<StandardMaterial>) {
+    commands
+        .remove::<MeshMaterial3d<NifDepthMaterial>>()
+        .remove::<MeshMaterial3d<EffectPaletteMaterial>>()
+        .remove::<MeshMaterial3d<EffectPaletteDepthMaterial>>()
+        .insert(MeshMaterial3d(material.clone()));
+}
+
+fn abandon_head(commands: &mut Commands, preview: &mut Preview, head_root: Entity) {
+    commands.entity(head_root).despawn();
+    preview.head_root = None;
+    preview.head_scene = None;
+}
+
+fn apply_head_skin_mappings(
+    commands: &mut Commands,
+    preview: &mut Preview,
+    head_root: Entity,
+    head_nodes: usize,
+    skins: &[(Entity, SkinnedMesh)],
+    joint_names: &HashMap<Entity, String>,
+) {
+    match rehost_head_skins(skins, joint_names, &preview.bone_names) {
+        Ok(rehosted) => {
+            for (entity, skin) in &rehosted {
+                commands.entity(*entity).insert(skin.clone());
+            }
+            preview.head_skins = rehosted.len();
+            preview.head_nodes = head_nodes;
+            println!(
+                "actor preview: rehosted {} head skins onto the body bones",
+                rehosted.len()
+            );
+            preview.head_scene = None;
+        }
+        Err(missing) => {
+            preview.fail(&format!(
+                "the head scene has {missing} unresolved skin joint(s)"
+            ));
+            abandon_head(commands, preview, head_root);
+        }
+    }
+}
+
+type PreviewMaterialComponents<'a> = (
+    Option<&'a MeshMaterial3d<StandardMaterial>>,
+    Option<&'a MeshMaterial3d<NifDepthMaterial>>,
+    Option<&'a MeshMaterial3d<EffectPaletteMaterial>>,
+    Option<&'a MeshMaterial3d<EffectPaletteDepthMaterial>>,
+);
+
+fn timeout_empty_head(commands: &mut Commands, preview: &mut Preview, head_root: Entity) {
+    preview.head_wait_frames += 1;
+    if preview.head_wait_frames > HEAD_SCENE_TIMEOUT_FRAMES {
+        preview.fail("the head scene produced no skinned mesh");
+        abandon_head(commands, preview, head_root);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drive(
     mut commands: Commands,
@@ -465,13 +573,16 @@ fn drive(
     mut preview: ResMut<Preview>,
     names: Query<&Name>,
     children: Query<&Children>,
-    mut skins: Query<&mut SkinnedMesh>,
+    skins: Query<&SkinnedMesh>,
+    head_ready: Query<(), With<HeadPreviewReady>>,
     globals: Query<&GlobalTransform>,
-    material_entities: Query<&MeshMaterial3d<StandardMaterial>>,
+    material_entities: Query<'_, '_, PreviewMaterialComponents<'_>>,
     transforms: Query<&Transform>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    if preview.started.elapsed() > TIME_LIMIT {
+    if !(preview.windowed && preview.phase == Phase::Captured)
+        && preview.started.elapsed() > TIME_LIMIT
+    {
         preview.fail("timed out before the frame was captured");
         exit.write(AppExit::error());
         return;
@@ -581,6 +692,7 @@ fn drive(
                 let head_root = commands
                     .spawn((
                         Name::new("Actor preview head"),
+                        HeadPreviewRoot,
                         WorldAssetRoot(head_scene),
                         ChildOf(actor),
                     ))
@@ -597,48 +709,39 @@ fn drive(
 
     if let Some(head_root) = preview.head_root
         && preview.head_skins == 0
+        && head_ready.contains(head_root)
     {
-        let mut rehosted = 0;
-        let mut missing = 0;
-        for entity in std::iter::once(head_root).chain(children.iter_descendants(head_root)) {
-            let Ok(mut skin) = skins.get_mut(entity) else {
-                continue;
-            };
-            let mut joints = Vec::with_capacity(skin.joints.len());
-            let mut unresolved = 0;
-            for joint in skin.joints.iter() {
-                match names
-                    .get(*joint)
+        let head_entities: Vec<_> = std::iter::once(head_root)
+            .chain(children.iter_descendants(head_root))
+            .collect();
+        let head_skins: Vec<_> = head_entities
+            .iter()
+            .filter_map(|entity| skins.get(*entity).ok().map(|skin| (*entity, skin.clone())))
+            .collect();
+        let joint_names: HashMap<_, _> = head_entities
+            .iter()
+            .filter_map(|entity| {
+                names
+                    .get(*entity)
                     .ok()
-                    .and_then(|name| preview.bone_names.get(name.as_str()))
-                {
-                    Some(body_bone) => joints.push(*body_bone),
-                    None => unresolved += 1,
-                }
-            }
-            if unresolved == 0 {
-                skin.joints = joints;
-                rehosted += 1;
-            } else {
-                missing += unresolved;
-            }
-        }
-        if rehosted > 0 {
-            preview.head_skins = rehosted;
-            preview.head_nodes = std::iter::once(head_root)
-                .chain(children.iter_descendants(head_root))
-                .filter(|entity| names.contains(*entity))
-                .count();
-            println!(
-                "actor preview: rehosted {rehosted} head skins onto the body bones ({missing} unresolved joints)"
-            );
-            preview.head_scene = None;
+                    .map(|name| (*entity, name.as_str().to_owned()))
+            })
+            .collect();
+        if head_skins.is_empty() {
+            timeout_empty_head(&mut commands, &mut preview, head_root);
         } else {
-            preview.head_wait_frames += 1;
-            if preview.head_wait_frames > 300 {
-                preview.fail("the head scene produced no skinned mesh");
-                preview.head_scene = None;
-            }
+            let head_nodes = head_entities
+                .iter()
+                .filter(|entity| names.contains(**entity))
+                .count();
+            apply_head_skin_mappings(
+                &mut commands,
+                &mut preview,
+                head_root,
+                head_nodes,
+                &head_skins,
+                &joint_names,
+            );
         }
     }
 
@@ -665,10 +768,16 @@ fn drive(
                         for entity in
                             std::iter::once(body_root).chain(children.iter_descendants(body_root))
                         {
-                            if material_entities.contains(entity) {
-                                commands
-                                    .entity(entity)
-                                    .insert(MeshMaterial3d(preview.body_material.clone()));
+                            if material_entities.get(entity).is_ok_and(|materials| {
+                                materials.0.is_some()
+                                    || materials.1.is_some()
+                                    || materials.2.is_some()
+                                    || materials.3.is_some()
+                            }) {
+                                install_neutral_material(
+                                    &mut commands.entity(entity),
+                                    &preview.body_material,
+                                );
                             }
                         }
                     }
@@ -676,10 +785,16 @@ fn drive(
                         for entity in
                             std::iter::once(head_root).chain(children.iter_descendants(head_root))
                         {
-                            if material_entities.contains(entity) {
-                                commands
-                                    .entity(entity)
-                                    .insert(MeshMaterial3d(preview.head_material.clone()));
+                            if material_entities.get(entity).is_ok_and(|materials| {
+                                materials.0.is_some()
+                                    || materials.1.is_some()
+                                    || materials.2.is_some()
+                                    || materials.3.is_some()
+                            }) {
+                                install_neutral_material(
+                                    &mut commands.entity(entity),
+                                    &preview.head_material,
+                                );
                             }
                         }
                     }
@@ -978,6 +1093,46 @@ fn corner_color(image: &image::RgbImage) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::animation::{AnimatedBy, AnimationTargetId};
+
+    #[derive(Component)]
+    struct NeutralFixture;
+
+    #[derive(Resource)]
+    struct NeutralMaterial(Handle<StandardMaterial>);
+
+    fn empty_preview() -> Preview {
+        Preview {
+            output: PathBuf::new(),
+            view: View::default(),
+            windowed: false,
+            textures: false,
+            msaa: Msaa::Off,
+            dark_skin_check: None,
+            target: Handle::default(),
+            body_scene: Handle::default(),
+            idle_gltf: Handle::default(),
+            head_path: Some("head.glb".to_owned()),
+            head_scene: Some(Handle::default()),
+            body_material: Handle::default(),
+            head_material: Handle::default(),
+            phase: Phase::Loading,
+            actor: None,
+            body_root: None,
+            head_root: None,
+            targets: Vec::new(),
+            body_nodes: 0,
+            bone_names: HashMap::new(),
+            bind_transforms: Vec::new(),
+            moved_bones: 0,
+            head_nodes: 0,
+            head_skins: 0,
+            head_wait_frames: 0,
+            settle_frames: 0,
+            camera_frames: 0,
+            started: Instant::now(),
+        }
+    }
 
     fn write_asset(root: &Path, relative: &str) {
         let path = root.join(relative);
@@ -1002,6 +1157,211 @@ mod tests {
         assert_eq!(
             check_inputs(demo.path(), ActorSex::Female).unwrap_err(),
             format!("{} has no female composed body", demo.path().display())
+        );
+    }
+
+    #[test]
+    fn mixed_head_skin_mapping_is_rejected_without_mutating_any_skin() {
+        let mut app = App::new();
+        let head_root = app.world_mut().spawn_empty().id();
+        let valid_joint = app.world_mut().spawn(Name::new("NPC Spine [Spn0]")).id();
+        let missing_joint = app.world_mut().spawn(Name::new("head-only bone")).id();
+        let body_spine = app.world_mut().spawn(Name::new("body spine")).id();
+        let first_mesh = app
+            .world_mut()
+            .spawn((
+                ChildOf(head_root),
+                SkinnedMesh {
+                    inverse_bindposes: Handle::default(),
+                    joints: vec![valid_joint],
+                },
+            ))
+            .id();
+        let second_mesh = app
+            .world_mut()
+            .spawn((
+                ChildOf(head_root),
+                SkinnedMesh {
+                    inverse_bindposes: Handle::default(),
+                    joints: vec![missing_joint],
+                },
+            ))
+            .id();
+        let skins = vec![
+            (
+                first_mesh,
+                SkinnedMesh {
+                    inverse_bindposes: Handle::default(),
+                    joints: vec![valid_joint],
+                },
+            ),
+            (
+                second_mesh,
+                SkinnedMesh {
+                    inverse_bindposes: Handle::default(),
+                    joints: vec![missing_joint],
+                },
+            ),
+        ];
+        let joint_names = HashMap::from([
+            (valid_joint, "NPC Spine [Spn0]".to_owned()),
+            (missing_joint, "head-only bone".to_owned()),
+        ]);
+        let mut preview = empty_preview();
+        preview.head_root = Some(head_root);
+        preview.bone_names = HashMap::from([("NPC Spine [Spn0]".to_owned(), body_spine)]);
+        app.insert_resource(preview);
+        app.add_systems(
+            Update,
+            move |mut commands: Commands, mut preview: ResMut<Preview>| {
+                apply_head_skin_mappings(
+                    &mut commands,
+                    &mut preview,
+                    head_root,
+                    2,
+                    &skins,
+                    &joint_names,
+                );
+            },
+        );
+
+        app.update();
+
+        let preview = app.world().resource::<Preview>();
+        assert!(preview.head_root.is_none());
+        assert!(preview.head_scene.is_none());
+        assert_eq!(preview.head_skins, 0);
+        assert!(app.world().get_entity(head_root).is_err());
+        assert!(app.world().get_entity(first_mesh).is_err());
+        assert!(app.world().get_entity(second_mesh).is_err());
+    }
+
+    #[test]
+    fn fully_mapped_head_uses_body_bones_with_animation_bindings() {
+        let mut app = App::new();
+        let actor = app.world_mut().spawn_empty().id();
+        let body_bone = app
+            .world_mut()
+            .spawn((
+                Name::new("NPC Spine [Spn0]"),
+                AnimatedBy(actor),
+                AnimationTargetId::from_name(&Name::new("NPC Spine [Spn0]")),
+            ))
+            .id();
+        let joint = app.world_mut().spawn(Name::new("NPC Spine [Spn0]")).id();
+        let head_root = app.world_mut().spawn_empty().id();
+        let mesh = app
+            .world_mut()
+            .spawn((
+                ChildOf(head_root),
+                SkinnedMesh {
+                    inverse_bindposes: Handle::default(),
+                    joints: vec![joint],
+                },
+            ))
+            .id();
+        let skins = vec![(
+            mesh,
+            SkinnedMesh {
+                inverse_bindposes: Handle::default(),
+                joints: vec![joint],
+            },
+        )];
+        let joint_names = HashMap::from([(joint, "NPC Spine [Spn0]".to_owned())]);
+        let mut preview = empty_preview();
+        preview.head_root = Some(head_root);
+        preview.bone_names = HashMap::from([("NPC Spine [Spn0]".to_owned(), body_bone)]);
+        app.insert_resource(preview);
+        app.add_systems(
+            Update,
+            move |mut commands: Commands, mut preview: ResMut<Preview>| {
+                apply_head_skin_mappings(
+                    &mut commands,
+                    &mut preview,
+                    head_root,
+                    1,
+                    &skins,
+                    &joint_names,
+                );
+            },
+        );
+
+        app.update();
+
+        assert_eq!(
+            app.world().get::<SkinnedMesh>(mesh).unwrap().joints,
+            vec![body_bone]
+        );
+        assert_eq!(app.world().get::<AnimatedBy>(body_bone).unwrap().0, actor);
+        assert!(app.world().get::<AnimationTargetId>(body_bone).is_some());
+        assert_eq!(app.world().resource::<Preview>().head_skins, 1);
+    }
+
+    #[test]
+    fn missing_skin_timeout_despawns_head_and_clears_pending_state() {
+        let mut app = App::new();
+        let head_root = app.world_mut().spawn_empty().id();
+        let mut preview = empty_preview();
+        preview.head_root = Some(head_root);
+        preview.head_wait_frames = HEAD_SCENE_TIMEOUT_FRAMES;
+        app.insert_resource(preview);
+        app.add_systems(
+            Update,
+            move |mut commands: Commands, mut preview: ResMut<Preview>| {
+                timeout_empty_head(&mut commands, &mut preview, head_root);
+            },
+        );
+
+        app.update();
+
+        let preview = app.world().resource::<Preview>();
+        assert!(preview.head_root.is_none());
+        assert!(preview.head_scene.is_none());
+        assert!(app.world().get_entity(head_root).is_err());
+    }
+
+    #[test]
+    fn neutral_preview_replaces_each_supported_material_type_once() {
+        let mut app = App::new();
+        let neutral = Handle::<StandardMaterial>::default();
+        let entity = app
+            .world_mut()
+            .spawn((
+                NeutralFixture,
+                MeshMaterial3d::<NifDepthMaterial>(Handle::default()),
+                MeshMaterial3d::<EffectPaletteMaterial>(Handle::default()),
+                MeshMaterial3d::<EffectPaletteDepthMaterial>(Handle::default()),
+            ))
+            .id();
+        app.insert_resource(NeutralMaterial(neutral.clone()));
+        app.add_systems(
+            Update,
+            |mut commands: Commands,
+             fixtures: Query<Entity, With<NeutralFixture>>,
+             neutral: Res<NeutralMaterial>| {
+                for entity in &fixtures {
+                    install_neutral_material(&mut commands.entity(entity), &neutral.0);
+                }
+            },
+        );
+
+        app.update();
+
+        let entity = app.world().entity(entity);
+        assert_eq!(
+            entity.get::<MeshMaterial3d<StandardMaterial>>().unwrap().0,
+            neutral
+        );
+        assert!(entity.get::<MeshMaterial3d<NifDepthMaterial>>().is_none());
+        assert!(
+            entity
+                .get::<MeshMaterial3d<EffectPaletteMaterial>>()
+                .is_none()
+        );
+        assert!(
+            entity
+                .get::<MeshMaterial3d<EffectPaletteDepthMaterial>>()
+                .is_none()
         );
     }
 }
