@@ -18,6 +18,7 @@ use converter::{
     mesh::MeshConverter,
     texture::{TextureConverter, TextureEncoding, TextureSemantic},
 };
+use dummy_content::{Entry, ba2, bsa};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -196,18 +197,6 @@ fn archive_paths(root: &Path) -> Vec<PathBuf> {
 
 fn stage_textures(source: &Path, staging: &Path, needed: &mut BTreeSet<PathBuf>) {
     let archives = archive_paths(source);
-    if archives.is_empty() {
-        for relative in needed.iter() {
-            let from = source.join(relative);
-            if from.is_file() {
-                link_or_copy(&from, &staging.join(relative)).unwrap_or_else(|error| {
-                    panic!("write {}: {error}", staging.join(relative).display())
-                });
-            }
-        }
-        needed.retain(|relative| !staging.join(relative).is_file());
-        return;
-    }
     for archive in archives {
         if needed.is_empty() {
             break;
@@ -218,6 +207,102 @@ fn stage_textures(source: &Path, staging: &Path, needed: &mut BTreeSet<PathBuf>)
             needed.remove(&file.path);
         }
     }
+
+    let loose_files: Vec<_> = needed
+        .iter()
+        .filter(|relative| source.join(relative).is_file())
+        .cloned()
+        .collect();
+    for relative in loose_files {
+        let from = source.join(&relative);
+        let to = staging.join(&relative);
+        link_or_copy(&from, &to).unwrap_or_else(|error| panic!("write {}: {error}", to.display()));
+        needed.remove(&relative);
+    }
+}
+
+#[test]
+fn stage_textures_falls_back_to_loose_files_after_bsa_and_ba2() {
+    let archived_path = PathBuf::from("textures/archive.dds");
+    let loose_path = PathBuf::from("textures/loose.dds");
+    let missing_path = PathBuf::from("textures/missing.dds");
+    let archived_bytes = b"archive texture bytes";
+    let loose_bytes = b"loose texture bytes";
+    let archive_entries = [Entry::new("textures/archive.dds", archived_bytes)];
+    let fixtures = [
+        (
+            "texture-bank.bsa",
+            bsa::v105(&archive_entries, bsa::Compression::None).unwrap(),
+        ),
+        (
+            "texture-bank.ba2",
+            ba2::general(&archive_entries, ba2::Compression::None).unwrap(),
+        ),
+    ];
+
+    for (archive_name, archive_bytes) in fixtures {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let staging = directory.path().join("staging");
+        fs::create_dir_all(source.join("textures")).unwrap();
+        fs::write(source.join(archive_name), archive_bytes).unwrap();
+        fs::write(source.join(&archived_path), b"conflicting loose bytes").unwrap();
+        fs::write(source.join(&loose_path), loose_bytes).unwrap();
+        let mut needed = BTreeSet::from([
+            archived_path.clone(),
+            loose_path.clone(),
+            missing_path.clone(),
+        ]);
+
+        stage_textures(&source, &staging, &mut needed);
+
+        assert_eq!(
+            fs::read(staging.join(&archived_path)).unwrap(),
+            archived_bytes
+        );
+        assert_eq!(fs::read(staging.join(&loose_path)).unwrap(), loose_bytes);
+        assert!(!staging.join(&missing_path).exists());
+        assert_eq!(needed, BTreeSet::from([missing_path.clone()]));
+    }
+}
+
+#[test]
+fn stage_textures_stages_loose_files_without_archives() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let staging = directory.path().join("staging");
+    let relative = PathBuf::from("textures/loose.dds");
+    fs::create_dir_all(source.join("textures")).unwrap();
+    fs::write(source.join(&relative), b"loose texture bytes").unwrap();
+    let mut needed = BTreeSet::from([relative.clone()]);
+
+    stage_textures(&source, &staging, &mut needed);
+
+    assert_eq!(
+        fs::read(staging.join(&relative)).unwrap(),
+        b"loose texture bytes"
+    );
+    assert!(needed.is_empty());
+}
+
+#[test]
+fn stage_textures_keeps_missing_path_needed_when_staging_has_stale_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let staging = directory.path().join("staging");
+    let relative = PathBuf::from("textures/missing.dds");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(staging.join("textures")).unwrap();
+    fs::write(staging.join(&relative), b"stale bytes from interrupted run").unwrap();
+    let mut needed = BTreeSet::from([relative.clone()]);
+
+    stage_textures(&source, &staging, &mut needed);
+
+    assert_eq!(needed, BTreeSet::from([relative.clone()]));
+    assert_eq!(
+        fs::read(staging.join(&relative)).unwrap(),
+        b"stale bytes from interrupted run"
+    );
 }
 
 fn materialise_textures(source: &Path, output: &Path, glbs: &[PathBuf]) {
