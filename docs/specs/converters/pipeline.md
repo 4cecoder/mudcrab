@@ -107,6 +107,16 @@ proofs. Retained models/textures keep their verified bytes and may carry older
 TXST role encodings. Explicit retention does not upgrade their producer or grant
 normal cache eligibility: a later normal conversion checks the original producer
 and current settings, source dependencies and resolved texture encoding.
+Composed default bodies and generated default gait clips carry separate
+`derived_outputs` proofs. Metadata reuse copies only derived files whose supported
+recipe, logical input hashes, output size and final SHA-256 are recorded. It
+preserves those original proofs across repeated rebuilds, including runtime packs
+without raw VFS inputs. It does not regenerate them from unauthenticated current
+Data. Historical derived files without proof, unavailable individual derived
+outputs and unknown stray runtime files are omitted with one counted, bounded
+notice; verified neighboring assets remain unchanged. These optional omissions
+do not make the metadata rebuild incomplete. Use normal conversion to regenerate
+derived outputs. Recorded ordinary assets retain their checksum requirements.
 Unknown source producer identities are rejected by the retained-asset route.
 Plugin filename keys use Unicode lowercase after native Windows-1252 decoding,
 including accented case pairs. The same shared function supplies player and MO2 selection, the merged MO2 Data index, master and identity lookup, and archive attachment keys. Record signatures and GMST EditorIDs retain their
@@ -334,6 +344,22 @@ that affect that kind's bytes:
 | NIF -> GLB | Mesh producer contract | NIF and available skeleton bytes, plus scoped material-repair revision and source-texture presence |
 | DDS -> KTX2 | Texture producer, fallback quality, UASTC level, Zstd level and CPU/GPU encoder quality | DDS bytes, resolved `TextureEncoding` from the freshly rebuilt database and accepted GLBs, plus the applicable GPU encoding label |
 | PEX -> Luau | Script ABI | PEX bytes; known producer eligibility is checked separately |
+
+`derived_outputs` is an optional map keyed by canonical output path, separate
+from single-source `entries`. Each proof records a versioned recipe, a map of
+canonical logical input paths to winning raw SHA-256 hashes, and the final
+output's size and SHA-256. `body-compose-v1` consumes that sex's body, hands and
+feet NIFs plus the shared skeleton NIF. `default-gait-v1` consumes the body NIF,
+skeleton NIF, skeleton HKX and the sex-specific gait HKX; it builds its bone tree
+from the NIF inputs. Original asset producer/settings provenance remains on the
+manifest. Material repair and texture pruning refresh the derived output hash
+to describe the published bytes.
+
+Normal conversion continues to regenerate these optional derived outputs and
+records a proof only on success; these records do not introduce derived warm
+cache hits. Absent or malformed individual proofs establish no eligibility.
+Adding this provenance does not change asset bytes or the existing global cache
+identities; future recipe byte changes require their own identity change.
 
 Worker counts, GPU batch size and `--no-lod` do not affect these settings proofs.
 A reader/schema edit that leaves the actual asset dependencies and encoding
