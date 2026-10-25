@@ -128,6 +128,150 @@ fn derived_body_proof(bytes: &[u8]) -> converter::cache::DerivedOutput {
     }
 }
 
+/// Hold a Windows source file open without sharing reads until the guard is dropped.
+#[cfg(windows)]
+fn block_file_reads(path: &Path) -> Option<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    Some(
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap(),
+    )
+}
+
+/// Restore a Unix fixture's permissions even if the rebuild or an assertion panics.
+#[cfg(unix)]
+struct RestoreFilePermissions<'a> {
+    path: &'a Path,
+    permissions: fs::Permissions,
+}
+
+#[cfg(unix)]
+impl Drop for RestoreFilePermissions<'_> {
+    /// Best-effort restoration must not hide the original assertion failure.
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(self.path, self.permissions.clone());
+    }
+}
+
+/// Deny Unix reads, skipping root or another process that bypasses file permissions.
+#[cfg(unix)]
+fn block_file_reads(path: &Path) -> Option<RestoreFilePermissions<'_>> {
+    use std::os::unix::fs::PermissionsExt;
+    let restore = RestoreFilePermissions {
+        path,
+        permissions: fs::metadata(path).unwrap().permissions(),
+    };
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(path).is_ok() {
+        eprintln!("skipping unreadable-file fixture: file permissions are bypassed (root)");
+        return None;
+    }
+    Some(restore)
+}
+
+/// An unreadable optional body with a valid proof cannot block verified neighboring publication.
+#[cfg(any(windows, unix))]
+#[tokio::test]
+async fn metadata_rebuild_omits_unreadable_proven_derived_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    let source = directory.path().join("source");
+    let output = directory.path().join("rebuilt");
+    generate(&data);
+    convert(&data, &source).await;
+    let manifest_path = source.join("conversion-manifest.json");
+    let mut manifest = ConversionManifest::load(&manifest_path).unwrap();
+    let neighbor = manifest.entries[layout::GENERATED_MODEL_PATH].clone();
+    let neighbor_hash = hash_file(&source.join(&neighbor.output)).unwrap();
+    let bytes = fs::read(source.join(&neighbor.output)).unwrap();
+    let relative = "meshes/actors/character/composed/default/male/body.glb";
+    let body = source.join(relative);
+    fs::create_dir_all(body.parent().unwrap()).unwrap();
+    fs::write(&body, &bytes).unwrap();
+    manifest
+        .derived_outputs
+        .insert(relative.into(), derived_body_proof(&bytes));
+    manifest.save(&manifest_path).unwrap();
+    let source_manifest_hash = hash_file(&manifest_path).unwrap();
+    let Some(unreadable) = block_file_reads(&body) else {
+        return;
+    };
+    assert!(fs::read(&body).is_err(), "fixture must actually deny reads");
+    let result = rebuild(&data, &source, &output).await;
+    drop(unreadable);
+    assert!(
+        result.is_ok(),
+        "unreadable optional derived output aborted publication: {result:?}"
+    );
+    let report = result.unwrap();
+    assert!(report.complete, "{:?}", report.warnings);
+    assert!(report.warnings.is_empty());
+    let omissions: Vec<_> = report
+        .notices
+        .iter()
+        .filter(|notice| notice.contains("unproven retained assets"))
+        .collect();
+    assert_eq!(omissions.len(), 1, "{:?}", report.notices);
+    assert!(omissions[0].contains("1 unproven retained assets"));
+    assert!(omissions[0].contains(relative));
+    assert!(
+        !output.join(relative).exists(),
+        "partial body must not publish"
+    );
+    assert_eq!(
+        hash_file(&output.join(&neighbor.output)).unwrap(),
+        neighbor_hash
+    );
+    let published = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+    assert!(published.complete);
+    assert!(published.derived_outputs.is_empty());
+    assert_eq!(
+        published.entries[layout::GENERATED_MODEL_PATH].output_hash,
+        neighbor_hash
+    );
+    assert_eq!(fs::read(&body).unwrap(), bytes);
+    assert_eq!(
+        hash_file(&source.join(&neighbor.output)).unwrap(),
+        neighbor_hash
+    );
+    assert_eq!(hash_file(&manifest_path).unwrap(), source_manifest_hash);
+}
+
+/// The optional-output recovery must never hide an unreadable ordinary recorded asset.
+#[cfg(any(windows, unix))]
+#[tokio::test]
+async fn metadata_rebuild_rejects_unreadable_ordinary_asset() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    let source = directory.path().join("source");
+    let output = directory.path().join("rebuilt");
+    generate(&data);
+    convert(&data, &source).await;
+    let manifest = ConversionManifest::load(&source.join("conversion-manifest.json")).unwrap();
+    let relative = &manifest.entries[layout::GENERATED_MODEL_PATH].output;
+    let path = source.join(relative);
+    let original_hash = hash_file(&path).unwrap();
+    let Some(unreadable) = block_file_reads(&path) else {
+        return;
+    };
+    assert!(fs::read(&path).is_err(), "fixture must actually deny reads");
+    let result = rebuild(&data, &source, &output).await;
+    drop(unreadable);
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains(&format!("failed to copy retained asset {relative}")),
+        "{error}"
+    );
+    assert!(
+        !output.exists(),
+        "unverified ordinary bytes must not publish"
+    );
+    assert_eq!(hash_file(&path).unwrap(), original_hash);
+}
+
 /// Unproven symlinks are omitted without following or modifying their external target.
 #[cfg(unix)]
 #[tokio::test]

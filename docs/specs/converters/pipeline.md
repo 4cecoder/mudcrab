@@ -113,8 +113,10 @@ recipe, logical input hashes, output size and final SHA-256 are recorded. It
 preserves those original proofs across repeated rebuilds, including runtime packs
 without raw VFS inputs. It does not regenerate them from unauthenticated current
 Data. Historical derived files without proof, unavailable individual derived
-outputs and unknown stray runtime files are omitted with one counted, bounded
-notice; verified neighboring assets remain unchanged. These optional omissions
+outputs (including read, copy or hash failures) and unknown stray runtime files
+are omitted with one counted, bounded notice; verified neighboring assets remain
+unchanged. Partial derived copies are removed when possible; cleanup failures
+are counted in that same notice without aborting the rebuild. These optional omissions
 do not make the metadata rebuild incomplete. Use normal conversion to regenerate
 derived outputs. Recorded ordinary assets retain their checksum requirements.
 Unknown source producer identities are rejected by the retained-asset route.

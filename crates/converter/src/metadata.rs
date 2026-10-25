@@ -733,6 +733,8 @@ async fn rebuild_into(
 struct UnprovenAssets {
     count: u64,
     first: String,
+    cleanup_failures: u64,
+    first_cleanup_failure: String,
 }
 
 impl UnprovenAssets {
@@ -741,6 +743,19 @@ impl UnprovenAssets {
         self.count += 1;
         if self.count == 1 {
             self.first = path.chars().take(256).collect();
+        }
+    }
+
+    /// Omit an optional output and report any failed partial-copy cleanup without aborting.
+    fn omit_derived(&mut self, path: &str, destination: &Path) {
+        self.record(path);
+        if let Err(error) = fs::remove_file(destination)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            self.cleanup_failures += 1;
+            if self.cleanup_failures == 1 {
+                self.first_cleanup_failure = format!("{path}: {error}").chars().take(256).collect();
+            }
         }
     }
 }
@@ -777,7 +792,7 @@ pub(crate) fn supported_derived_proof(path: &str, proof: &crate::cache::DerivedO
 }
 
 /// Copies verified runtime bytes, reproducing historical pruning for stale output hashes.
-/// Unproven optional derived outputs and strays are omitted with a bounded notice;
+/// Unproven or unreadable optional derived outputs and strays are omitted with a bounded notice;
 /// metadata retention never invents a producer proof from observed file bytes.
 /// Repair presence bits come from the complete source manifest rather than current Data.
 fn copy_verified_assets(
@@ -895,18 +910,25 @@ fn copy_verified_assets(
                 continue;
             };
             let destination = staging.join(&relative);
-            fs::create_dir_all(destination.parent().unwrap())?;
-            let actual_size = fs::copy(entry.path(), &destination)
-                .wrap_err_with(|| format!("failed to copy retained asset {relative}"))?;
-            let actual_hash = hash_file(&destination)?;
+            let copied: Result<_> = (|| {
+                fs::create_dir_all(destination.parent().unwrap())?;
+                let actual_size = fs::copy(entry.path(), &destination)
+                    .wrap_err_with(|| format!("failed to copy retained asset {relative}"))?;
+                Ok((actual_size, hash_file(&destination)?))
+            })();
+            if derived.contains(&relative)
+                && !copied.as_ref().is_ok_and(|(actual_size, actual_hash)| {
+                    actual_size == size && actual_hash == hash
+                })
+            {
+                unproven.omit_derived(&relative, &destination);
+                // Do not diagnose this same output again in the missing-file check.
+                excluded_derived.insert(relative.clone());
+                continue;
+            }
+            // Ordinary recorded assets retain strict copy, hash and integrity errors.
+            let (actual_size, actual_hash) = copied?;
             if actual_size != *size || actual_hash != *hash {
-                if derived.contains(&relative) {
-                    fs::remove_file(&destination)?;
-                    unproven.record(&relative);
-                    // Do not diagnose this same output again in the missing-file check.
-                    excluded_derived.insert(relative.clone());
-                    continue;
-                }
                 ensure!(
                     relative.ends_with(".glb")
                         && manifest.pruned_texture_references.contains_key(&relative),
@@ -945,8 +967,16 @@ fn copy_verified_assets(
         .pruned_texture_references
         .retain(|path, _| retained.contains_key(path));
     if unproven.count > 0 {
+        let cleanup = if unproven.cleanup_failures > 0 {
+            format!(
+                " Could not remove {} partial derived copies; first: {}.",
+                unproven.cleanup_failures, unproven.first_cleanup_failure
+            )
+        } else {
+            String::new()
+        };
         let notice = format!(
-            "Omitted {} unproven retained assets (optional derived outputs or stray files); first: {}. Run normal conversion to regenerate derived outputs.",
+            "Omitted {} unproven retained assets (optional derived outputs or stray files); first: {}.{cleanup} Run normal conversion to regenerate derived outputs.",
             unproven.count, unproven.first
         );
         eprintln!("note: {notice}");
@@ -1030,6 +1060,90 @@ async fn progress_event(progress: &Sender<ProgressEvent>, stage: ProgressStage, 
 mod tests {
     use super::*;
     use crate::cache::CacheEntry;
+
+    /// Failed optional-copy cleanup is counted once per output while verified neighbors survive.
+    #[test]
+    fn retained_derived_copy_cleanup_failures_are_bounded_notices() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let staging = directory.path().join("staging");
+        fs::create_dir_all(source.join("scripts")).unwrap();
+        fs::write(
+            source.join("scripts/papyrus_runtime.luau"),
+            include_bytes!("../../shared/src/papyrus_runtime.luau"),
+        )
+        .unwrap();
+        let neighbor = "scripts/neighbor.luau";
+        let bytes = b"verified neighbor";
+        fs::write(source.join(neighbor), bytes).unwrap();
+        let mut manifest = ConversionManifest::default();
+        manifest.entries.insert(
+            "scripts/neighbor.pex".into(),
+            CacheEntry {
+                source_hash: hash_bytes(b"source"),
+                output: neighbor.into(),
+                output_size: bytes.len() as u64,
+                output_hash: hash_bytes(bytes),
+            },
+        );
+        for sex in ["male", "female"] {
+            let relative = format!("meshes/actors/character/composed/default/{sex}/body.glb");
+            fs::create_dir_all(source.join(&relative).parent().unwrap()).unwrap();
+            fs::write(source.join(&relative), b"proven body").unwrap();
+            manifest.derived_outputs.insert(
+                relative.clone(),
+                crate::cache::DerivedOutput {
+                    recipe: BODY_COMPOSE_RECIPE.into(),
+                    inputs: body_compose_inputs(sex)
+                        .into_iter()
+                        .map(|path| (path, hash_bytes(b"input")))
+                        .collect(),
+                    output_size: 11,
+                    output_hash: hash_bytes(b"proven body"),
+                },
+            );
+            // A nonempty destination directory makes both copy and remove_file fail
+            // deterministically, without relying on permissions or a timing race.
+            let blocked = staging.join(relative);
+            fs::create_dir_all(&blocked).unwrap();
+            fs::write(blocked.join("keep"), b"unrelated destination bytes").unwrap();
+        }
+        let mut notices = Vec::new();
+        let (retained, _) =
+            copy_verified_assets(&source, &staging, &mut manifest, &mut notices).unwrap();
+        assert_eq!(
+            retained.len(),
+            2,
+            "only the ordinary neighbor and runtime remain"
+        );
+        assert_eq!(retained[neighbor], hash_bytes(bytes));
+        assert_eq!(fs::read(staging.join(neighbor)).unwrap(), bytes);
+        assert!(manifest.derived_outputs.is_empty());
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].contains("2 unproven retained assets"),
+            "{notices:?}"
+        );
+        assert!(
+            notices[0].contains("Could not remove 2 partial derived copies; first:"),
+            "{notices:?}"
+        );
+        // Both diagnostic categories keep one example, rather than listing every failure.
+        assert_ne!(
+            notices[0].contains("/female/body.glb"),
+            notices[0].contains("/male/body.glb"),
+            "{notices:?}"
+        );
+        for sex in ["male", "female"] {
+            assert_eq!(
+                fs::read(staging.join(format!(
+                    "meshes/actors/character/composed/default/{sex}/body.glb/keep"
+                )))
+                .unwrap(),
+                b"unrelated destination bytes"
+            );
+        }
+    }
 
     /// Sampler aliases retain the canonical texture's exact bytes and reject tampering.
     #[test]
