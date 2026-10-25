@@ -195,15 +195,19 @@ impl ActorCatalog {
                     }
                 }
                 Err(error) => {
-                    info!(
-                        "actors: no usable `actor_model_parts` table ({error}); actors keep no parts"
-                    );
+                    info!("actors: no usable `actor_model_parts` table ({error}); no actors spawn");
+                    return Self {
+                        models: HashMap::new(),
+                        assets_root,
+                    };
                 }
             },
             Err(error) => {
-                info!(
-                    "actors: no usable `actor_model_parts` table ({error}); actors keep no parts"
-                );
+                info!("actors: no usable `actor_model_parts` table ({error}); no actors spawn");
+                return Self {
+                    models: HashMap::new(),
+                    assets_root,
+                };
             }
         }
 
@@ -426,6 +430,70 @@ mod tests {
         let catalog = ActorCatalog::from_connection(&connection);
         assert!(catalog.is_empty());
         assert!(catalog.get(0x13475).is_none());
+    }
+
+    #[test]
+    fn missing_parts_table_makes_catalog_unavailable_atomically() {
+        let connection = connection();
+        insert_actor(&connection, 0x13475, 79686, "male", "body", None, None);
+        connection
+            .execute_batch("DROP TABLE actor_model_parts;")
+            .unwrap();
+        let assets_root = PathBuf::from("converted-assets");
+
+        let catalog = ActorCatalog::from_connection_with_assets_root(&connection, &assets_root);
+
+        assert!(catalog.is_empty());
+        assert!(catalog.get(0x13475).is_none());
+        assert_eq!(catalog.assets_root.as_deref(), Some(assets_root.as_path()));
+    }
+
+    #[test]
+    fn incompatible_parts_columns_make_catalog_unavailable_atomically() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE actor_models (
+                    id INTEGER PRIMARY KEY, race_id INTEGER NOT NULL, sex TEXT NOT NULL,
+                    skin_armo_id INTEGER, head_model TEXT, head_source TEXT,
+                    resolution TEXT NOT NULL
+                 );
+                 INSERT INTO actor_models VALUES (0x13475, 79686, 'male', NULL, NULL, NULL, 'body');
+                 CREATE TABLE actor_model_parts (npc_id INTEGER, slot TEXT, wrong_column TEXT);",
+            )
+            .unwrap();
+        let catalog = ActorCatalog::from_connection(&connection);
+
+        assert!(catalog.is_empty());
+        assert!(catalog.get(0x13475).is_none());
+    }
+
+    #[test]
+    fn usable_parts_schema_keeps_rows_with_no_parts_and_skips_malformed_parts() {
+        let connection = connection();
+        insert_actor(&connection, 0x1, 1, "male", "body", None, None);
+        insert_actor(&connection, 0x2, 1, "female", "unresolved", None, None);
+        connection
+            .execute(
+                "INSERT INTO actor_model_parts(npc_id, slot, model_path) VALUES (?1, ?2, ?3)",
+                params![0x1_u32, 42_i64, "malformed-slot"],
+            )
+            .unwrap();
+
+        let catalog = ActorCatalog::from_connection(&connection);
+
+        assert_eq!(catalog.len(), 2);
+        let resolved = catalog.get(0x1).expect("resolved row with no usable parts");
+        assert!(resolved.parts.is_empty());
+        assert_eq!(
+            catalog.spawn_plan(resolved).unwrap_err().reason,
+            ActorSpawnSkip::NoBody
+        );
+        let unresolved = catalog.get(0x2).expect("unresolved row");
+        assert_eq!(
+            catalog.spawn_plan(unresolved).unwrap_err().reason,
+            ActorSpawnSkip::Unresolved
+        );
     }
 
     #[test]

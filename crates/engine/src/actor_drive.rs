@@ -8,6 +8,7 @@
 //! [`ActorDrive`] is the only thing a caller sets. Every resolved actor starts at speed zero and
 //! keeps the idle clip until something drives it; no AI, navigation, or input feeds this module.
 
+use crate::streaming::PendingAssetProfile;
 use bevy::{
     animation::{
         AnimationPlayer,
@@ -156,7 +157,10 @@ fn select_actor_gait(
 }
 
 /// Moves each driven actor along its facing by `speed * dt`.
-fn translate_driven_actors(time: Res<Time>, mut actors: Query<(&ActorDrive, &mut Transform)>) {
+fn translate_driven_actors(
+    time: Res<Time>,
+    mut actors: Query<(&ActorDrive, &mut Transform), Without<PendingAssetProfile>>,
+) {
     let delta = time.delta_secs();
     for (drive, mut transform) in &mut actors {
         advance_actor(&mut transform, drive.speed, delta);
@@ -519,6 +523,92 @@ mod tests {
             moved.translation.x < -99.9,
             "a quarter turn faces local forward down -X, got {:?}",
             moved.translation
+        );
+    }
+
+    #[test]
+    fn driven_streaming_actor_waits_for_asset_readiness_before_moving() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(ActorDrivePlugin);
+        let authored = Transform::from_translation(Vec3::new(3.0, -4.0, 5.0));
+        let actor = app
+            .world_mut()
+            .spawn((
+                ActorDrive::new(200.0),
+                authored,
+                crate::world::components::WorldTransform(authored.to_matrix()),
+                PendingAssetProfile::test_actor(),
+            ))
+            .id();
+        let idle = app
+            .world_mut()
+            .spawn((ActorDrive::default(), Transform::from_xyz(7.0, 8.0, 9.0)))
+            .id();
+        let nonfinite = app
+            .world_mut()
+            .spawn((
+                ActorDrive::new(f32::INFINITY),
+                Transform::from_xyz(-2.0, 6.0, 4.0),
+            ))
+            .id();
+        let pending = app.world().get::<PendingAssetProfile>(actor).unwrap();
+        assert!(
+            !pending.instance_spawned_for_test(),
+            "unarmed/loading reference"
+        );
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(1));
+        app.world_mut()
+            .run_system_once(translate_driven_actors)
+            .unwrap();
+        assert_eq!(app.world().get::<Transform>(actor), Some(&authored));
+        assert_eq!(
+            app.world()
+                .get::<crate::world::components::WorldTransform>(actor)
+                .unwrap()
+                .0,
+            authored.to_matrix(),
+            "authored placement remains valid during loading"
+        );
+
+        // Instance exists, but track_asset_readiness has not validated it or removed the marker.
+        app.world_mut()
+            .entity_mut(actor)
+            .get_mut::<PendingAssetProfile>()
+            .unwrap()
+            .mark_instance_spawned_for_test();
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(1));
+        app.world_mut()
+            .run_system_once(translate_driven_actors)
+            .unwrap();
+        assert_eq!(app.world().get::<Transform>(actor), Some(&authored));
+
+        // Readiness completion removes PendingAssetProfile; ordinary driving resumes next run.
+        app.world_mut()
+            .entity_mut(actor)
+            .remove::<PendingAssetProfile>();
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_secs(1));
+        app.world_mut()
+            .run_system_once(translate_driven_actors)
+            .unwrap();
+        let moved = app.world().get::<Transform>(actor).unwrap();
+        assert!((moved.translation - (authored.translation + Vec3::NEG_Z * 200.0)).length() < 0.01);
+        assert_eq!(
+            app.world().get::<Transform>(idle).unwrap().translation,
+            Vec3::new(7.0, 8.0, 9.0),
+            "zero speed remains still"
+        );
+        assert_eq!(
+            app.world().get::<Transform>(nonfinite).unwrap().translation,
+            Vec3::new(-2.0, 6.0, 4.0),
+            "non-finite speed remains still"
         );
     }
 }

@@ -2477,7 +2477,7 @@ struct PendingModel {
 }
 
 #[derive(Component)]
-struct PendingAssetProfile {
+pub(crate) struct PendingAssetProfile {
     started: Instant,
     scene_spawned: bool,
     path: String,
@@ -2489,6 +2489,31 @@ struct PendingAssetProfile {
     /// An actor scene has no `statics` row, so its bounds come from the spawned hierarchy instead
     /// of the converter's aggregate bounds.
     actor_scene: bool,
+}
+
+#[cfg(test)]
+impl PendingAssetProfile {
+    pub(crate) fn test_actor() -> Self {
+        Self {
+            started: Instant::now(),
+            scene_spawned: false,
+            path: "meshes/actors/test.glb".to_owned(),
+            form_id: 1,
+            base_form_id: 1,
+            base_record_type: Some("NPC_".to_owned()),
+            static_physics: false,
+            cell_id: 1,
+            actor_scene: true,
+        }
+    }
+
+    pub(crate) fn mark_instance_spawned_for_test(&mut self) {
+        self.scene_spawned = true;
+    }
+
+    pub(crate) fn instance_spawned_for_test(&self) -> bool {
+        self.scene_spawned
+    }
 }
 
 #[derive(Component)]
