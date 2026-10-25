@@ -3033,8 +3033,21 @@ pub(crate) fn publish_texture_aliases(staging: &Path) -> Result<Vec<PathBuf>> {
             let relative = destination.strip_prefix(staging)?.to_owned();
             let runtime_key =
                 canonical_asset_path(&relative.to_string_lossy(), AssetKind::Texture, "ktx2")?;
-            if source_texture_key(&runtime_key)? != runtime_key {
-                aliases.insert(PathBuf::from(runtime_key));
+            let source_key = source_texture_key(&runtime_key)?;
+            if source_key != runtime_key {
+                aliases.insert(PathBuf::from(&runtime_key));
+                // Bevy's skin material loads the same bytes with linear decoding. Publish its
+                // companion path as well, retaining `.opensky-wrapN` so clamp/repeat images keep
+                // distinct AssetServer identities and sampler settings.
+                if let Some(linear) = runtime_key.strip_suffix(".ktx2") {
+                    let linear = linear.replace(".opensky-srgb", "");
+                    let linear = format!("{linear}.ktx2");
+                    // The canonical source is already the default linear path. Never republish
+                    // it over itself; only sampler-specific companion aliases need a file.
+                    if linear != source_key {
+                        aliases.insert(PathBuf::from(linear));
+                    }
+                }
             }
         }
     }
@@ -6244,9 +6257,14 @@ mod tests {
 
     #[test]
     fn v15_wrap_aliases_resolve_to_sources_for_publication_and_restoration() {
-        for mode in 0..3 {
+        for mode in 0..=3 {
             for transfer in ["", ".opensky-srgb"] {
-                let alias = format!("textures/shared{transfer}.opensky-wrap{mode}.ktx2");
+                let sampler = if mode == 3 {
+                    String::new()
+                } else {
+                    format!(".opensky-wrap{mode}")
+                };
+                let alias = format!("textures/shared{transfer}{sampler}.ktx2");
                 assert_eq!(source_texture_key(&alias).unwrap(), "textures/shared.ktx2");
                 assert_eq!(
                     texture_reference_source_key(&alias).as_deref(),
@@ -6269,11 +6287,27 @@ mod tests {
                 glb.extend_from_slice(b"JSON");
                 glb.extend_from_slice(&json);
                 fs::write(root.join("meshes/alias.glb"), glb).unwrap();
-                assert_eq!(
-                    publish_texture_aliases(root).unwrap(),
+                let expected = if transfer.is_empty() && mode == 3 {
+                    vec![]
+                } else if transfer.is_empty() || mode == 3 {
                     vec![PathBuf::from(&alias)]
-                );
+                } else {
+                    let linear = alias.replace(".opensky-srgb", "");
+                    vec![PathBuf::from(&alias), PathBuf::from(linear)]
+                };
+                let published = publish_texture_aliases(root).unwrap();
+                assert_eq!(published, expected);
                 assert_eq!(fs::read(root.join(alias)).unwrap(), b"source");
+                for linear in published
+                    .iter()
+                    .filter(|path| !path.to_string_lossy().contains("srgb"))
+                {
+                    assert_eq!(fs::read(root.join(linear)).unwrap(), b"source");
+                }
+                assert_eq!(
+                    fs::read(root.join("textures/shared.ktx2")).unwrap(),
+                    b"source"
+                );
             }
         }
     }

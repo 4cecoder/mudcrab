@@ -24,6 +24,12 @@
 //! non-zero when more than `MAX_FRACTION` of them fall below it. A model-space normal map decoded
 //! as a tangent-space one shows up as large near-black patches on the back and shoulders, which
 //! this catches without comparing against a reference image.
+//!
+//! `--debug-normals msn|vertex` renders the skin materials' normals as colour (`N * 0.5 + 0.5`,
+//! written so the PNG holds that value) instead of lighting them: `msn` the shading normal decoded
+//! from the model-space map, `vertex` the interpolated vertex normal. Red is world +X, green +Y
+//! (up), blue +Z. The actor faces -Z, where the camera stands at yaw 0, so the front has almost no
+//! blue and the back (seen at yaw 180) is blue.
 
 use bevy::{
     animation::{
@@ -47,6 +53,7 @@ use engine::{
     actors::{ActorSex, composed_body_scene},
     nif_depth::NifDepthMaterial,
     nif_material::{EffectPaletteDepthMaterial, EffectPaletteMaterial, NifMaterialPlugin},
+    skin_material::{SkinDebugView, SkyrimSkinMaterial},
 };
 use std::{
     collections::HashMap,
@@ -125,6 +132,7 @@ struct Options {
     skin_tone: Option<[f32; 3]>,
     dark_skin_check: Option<f64>,
     dark_floor: f64,
+    debug_normals: SkinDebugView,
 }
 
 #[derive(Resource)]
@@ -135,6 +143,7 @@ struct Preview {
     textures: bool,
     msaa: Msaa,
     dark_skin_check: Option<DarkSkinCheck>,
+    debug_normals: SkinDebugView,
     target: Handle<Image>,
     body_scene: Handle<WorldAsset>,
     idle_gltf: Handle<Gltf>,
@@ -185,6 +194,7 @@ fn main() {
         skin_tone,
         dark_skin_check,
         dark_floor,
+        debug_normals,
     } = parse_args();
     if let Some([red, green, blue]) = skin_tone {
         println!("actor preview: skin tone {red:.3},{green:.3},{blue:.3} (not applied yet)");
@@ -296,6 +306,7 @@ fn main() {
             max_fraction,
             floor: dark_floor,
         }),
+        debug_normals,
         phase: Phase::Loading,
         actor: None,
         body_root: None,
@@ -359,7 +370,7 @@ fn parse_skin_tone(value: Option<String>) -> [f32; 3] {
 
 fn parse_args() -> Options {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: actor_preview <converted_assets_dir> <output.png> [--sex male|female] [--head PATH|none] [--textures] [--window] [--yaw DEG] [--pitch DEG] [--focus body|head] [--msaa 1|2|4|8] [--skin-tone R,G,B] [--dark-skin-check MAX_FRACTION] [--dark-floor LUMINANCE]";
+    let usage = "usage: actor_preview <converted_assets_dir> <output.png> [--sex male|female] [--head PATH|none] [--textures] [--window] [--yaw DEG] [--pitch DEG] [--focus body|head] [--msaa 1|2|4|8] [--skin-tone R,G,B] [--dark-skin-check MAX_FRACTION] [--dark-floor LUMINANCE] [--debug-normals msn|vertex]";
     let Some(demo) = args.next() else {
         eprintln!("{usage}");
         std::process::exit(2);
@@ -377,8 +388,15 @@ fn parse_args() -> Options {
     let mut skin_tone = None;
     let mut dark_skin_check = None;
     let mut dark_floor = DEFAULT_DARK_FLOOR;
+    let mut debug_normals = SkinDebugView::Off;
     while let Some(flag) = args.next() {
         match flag.as_str() {
+            "--debug-normals" => {
+                debug_normals = match args.next().as_deref().and_then(SkinDebugView::parse) {
+                    Some(view) => view,
+                    None => usage_error("--debug-normals needs msn, vertex or off"),
+                }
+            }
             "--msaa" => msaa = parse_msaa(args.next()),
             "--skin-tone" => skin_tone = Some(parse_skin_tone(args.next())),
             "--dark-skin-check" => dark_skin_check = Some(parse_fraction(&flag, args.next())),
@@ -448,6 +466,7 @@ fn parse_args() -> Options {
         skin_tone,
         dark_skin_check,
         dark_floor,
+        debug_normals,
     }
 }
 
@@ -510,6 +529,7 @@ fn install_neutral_material(commands: &mut EntityCommands, material: &Handle<Sta
         .remove::<MeshMaterial3d<NifDepthMaterial>>()
         .remove::<MeshMaterial3d<EffectPaletteMaterial>>()
         .remove::<MeshMaterial3d<EffectPaletteDepthMaterial>>()
+        .remove::<MeshMaterial3d<SkyrimSkinMaterial>>()
         .insert(MeshMaterial3d(material.clone()));
 }
 
@@ -554,6 +574,7 @@ type PreviewMaterialComponents<'a> = (
     Option<&'a MeshMaterial3d<NifDepthMaterial>>,
     Option<&'a MeshMaterial3d<EffectPaletteMaterial>>,
     Option<&'a MeshMaterial3d<EffectPaletteDepthMaterial>>,
+    Option<&'a MeshMaterial3d<SkyrimSkinMaterial>>,
 );
 
 fn timeout_empty_head(commands: &mut Commands, preview: &mut Preview, head_root: Entity) {
@@ -577,6 +598,7 @@ fn drive(
     head_ready: Query<(), With<HeadPreviewReady>>,
     globals: Query<&GlobalTransform>,
     material_entities: Query<'_, '_, PreviewMaterialComponents<'_>>,
+    mut skin_materials: ResMut<Assets<SkyrimSkinMaterial>>,
     transforms: Query<&Transform>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -773,6 +795,7 @@ fn drive(
                                     || materials.1.is_some()
                                     || materials.2.is_some()
                                     || materials.3.is_some()
+                                    || materials.4.is_some()
                             }) {
                                 install_neutral_material(
                                     &mut commands.entity(entity),
@@ -790,6 +813,7 @@ fn drive(
                                     || materials.1.is_some()
                                     || materials.2.is_some()
                                     || materials.3.is_some()
+                                    || materials.4.is_some()
                             }) {
                                 install_neutral_material(
                                     &mut commands.entity(entity),
@@ -798,6 +822,19 @@ fn drive(
                             }
                         }
                     }
+                }
+                if preview.debug_normals != SkinDebugView::Off {
+                    let mut count = 0;
+                    for (_, material) in skin_materials.iter_mut() {
+                        preview
+                            .debug_normals
+                            .apply(&mut material.extension.settings);
+                        count += 1;
+                    }
+                    println!(
+                        "actor preview: {count} skin materials render {:?}",
+                        preview.debug_normals
+                    );
                 }
                 spawn_camera(&mut commands, &preview, bounds);
                 preview.phase = Phase::Rendering;
@@ -1109,6 +1146,7 @@ mod tests {
             textures: false,
             msaa: Msaa::Off,
             dark_skin_check: None,
+            debug_normals: SkinDebugView::Off,
             target: Handle::default(),
             body_scene: Handle::default(),
             idle_gltf: Handle::default(),
@@ -1331,6 +1369,7 @@ mod tests {
                 MeshMaterial3d::<NifDepthMaterial>(Handle::default()),
                 MeshMaterial3d::<EffectPaletteMaterial>(Handle::default()),
                 MeshMaterial3d::<EffectPaletteDepthMaterial>(Handle::default()),
+                MeshMaterial3d::<SkyrimSkinMaterial>(Handle::default()),
             ))
             .id();
         app.insert_resource(NeutralMaterial(neutral.clone()));
@@ -1363,5 +1402,6 @@ mod tests {
                 .get::<MeshMaterial3d<EffectPaletteDepthMaterial>>()
                 .is_none()
         );
+        assert!(entity.get::<MeshMaterial3d<SkyrimSkinMaterial>>().is_none());
     }
 }

@@ -1,5 +1,7 @@
 use super::*;
 use crate::{
+    nif_depth::{NifDepthExtension, NifDepthState},
+    skin_material::SkyrimSkinExtension,
     streaming::{
         RenderOrigin, StaticCollisionCache, admission::SceneDemand, control::ControllerReasons,
     },
@@ -533,6 +535,91 @@ fn startup_usefulness_counts_unadmitted_scene_demand() {
             .reasons
             .startup_useful
     );
+}
+
+#[test]
+fn orphan_watch_accounts_for_depth_and_skin_material_lifetimes() {
+    let (mut app, _directory) = fixture(true);
+    app.init_asset::<NifDepthMaterial>();
+    app.init_asset::<SkyrimSkinMaterial>();
+    let depth = app
+        .world_mut()
+        .resource_mut::<Assets<NifDepthMaterial>>()
+        .add(NifDepthMaterial {
+            base: default(),
+            extension: NifDepthExtension {
+                state: NifDepthState {
+                    depth_test: true,
+                    depth_write: false,
+                    decal: false,
+                    alpha_mask: false,
+                    cast_shadows: true,
+                },
+            },
+        });
+    let skin = app
+        .world_mut()
+        .resource_mut::<Assets<SkyrimSkinMaterial>>()
+        .add(SkyrimSkinMaterial {
+            base: default(),
+            extension: SkyrimSkinExtension::default(),
+        });
+    let watch = |materials: Vec<_>| ResourceWatch {
+        demand: PreparationDemand {
+            key: PreparationKey::Resource(1),
+            meshes: vec![],
+            images: vec![],
+            materials,
+        },
+        root_scene: None,
+        root_entity: None,
+        texture_path: None,
+        orphaned_frame: Some(0),
+        unobserved_scenes: HashSet::new(),
+    };
+    let depth_watch = watch(vec![depth.id().untyped()]);
+    let skin_watch = watch(vec![skin.id().untyped()]);
+    let mixed_watch = watch(vec![depth.id().untyped(), skin.id().untyped()]);
+
+    assert!(!cpu_absent(app.world(), &depth_watch));
+    assert!(!cpu_absent(app.world(), &skin_watch));
+    assert!(!cpu_absent(app.world(), &mixed_watch));
+
+    app.world_mut()
+        .resource_mut::<Assets<NifDepthMaterial>>()
+        .remove(depth.id());
+    assert!(cpu_absent(app.world(), &depth_watch));
+    assert!(!cpu_absent(app.world(), &skin_watch));
+    assert!(!cpu_absent(app.world(), &mixed_watch));
+
+    app.world_mut()
+        .resource_mut::<Assets<SkyrimSkinMaterial>>()
+        .remove(skin.id());
+    assert!(cpu_absent(app.world(), &mixed_watch));
+}
+
+#[test]
+fn orphan_watch_treats_missing_extended_material_resources_as_unknown() {
+    let (app, _directory) = fixture(true);
+    for id in [
+        Handle::<NifDepthMaterial>::default().id().untyped(),
+        Handle::<SkyrimSkinMaterial>::default().id().untyped(),
+    ] {
+        let watch = ResourceWatch {
+            demand: PreparationDemand {
+                key: PreparationKey::Resource(1),
+                meshes: vec![],
+                images: vec![],
+                materials: vec![id],
+            },
+            root_scene: None,
+            root_entity: None,
+            texture_path: None,
+            orphaned_frame: Some(0),
+            unobserved_scenes: HashSet::new(),
+        };
+        assert!(!cpu_absent(app.world(), &watch));
+    }
 }
 
 #[test]

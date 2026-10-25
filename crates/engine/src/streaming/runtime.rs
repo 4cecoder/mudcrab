@@ -12,6 +12,7 @@ use super::{
     reservations::{MemoryLedger, ResourceReservation},
 };
 use crate::nif_depth::NifDepthMaterial;
+use crate::skin_material::SkyrimSkinMaterial;
 use crate::{
     config::EngineConfig,
     profiling::ProfilingState,
@@ -963,6 +964,16 @@ fn cpu_absent(world: &World, watch: &ResourceWatch) -> bool {
             world
                 .resource::<Assets<WaterMaterial>>()
                 .contains(id.typed_debug_checked::<WaterMaterial>())
+        } else if id.type_id() == TypeId::of::<NifDepthMaterial>() {
+            world
+                .get_resource::<Assets<NifDepthMaterial>>()
+                .is_none_or(|assets| assets.contains(id.typed_debug_checked::<NifDepthMaterial>()))
+        } else if id.type_id() == TypeId::of::<SkyrimSkinMaterial>() {
+            world
+                .get_resource::<Assets<SkyrimSkinMaterial>>()
+                .is_none_or(|assets| {
+                    assets.contains(id.typed_debug_checked::<SkyrimSkinMaterial>())
+                })
         } else {
             true
         }
@@ -1084,6 +1095,7 @@ pub(super) fn observe_streaming_ownership(world: &mut World) {
                 asset,
                 world.resource::<Assets<StandardMaterial>>(),
                 world.get_resource::<Assets<NifDepthMaterial>>(),
+                world.get_resource::<Assets<SkyrimSkinMaterial>>(),
             );
             for resource in &scene.resources {
                 // Shared textures can have several source scenes. Discovering
@@ -1106,6 +1118,7 @@ pub(super) fn observe_streaming_ownership(world: &mut World) {
                 asset,
                 world.resource::<Assets<StandardMaterial>>(),
                 world.get_resource::<Assets<NifDepthMaterial>>(),
+                world.get_resource::<Assets<SkyrimSkinMaterial>>(),
             )
         {
             let demand = scene_demand(
@@ -1113,6 +1126,7 @@ pub(super) fn observe_streaming_ownership(world: &mut World) {
                 asset,
                 world.resource::<Assets<StandardMaterial>>(),
                 world.get_resource::<Assets<NifDepthMaterial>>(),
+                world.get_resource::<Assets<SkyrimSkinMaterial>>(),
             );
             // Every material dependency must have an exact loader identity
             // before catalog entries can be proved unused. Embedded images
