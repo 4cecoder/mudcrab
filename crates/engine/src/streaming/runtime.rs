@@ -974,6 +974,12 @@ fn cpu_absent(world: &World, watch: &ResourceWatch) -> bool {
                 .is_none_or(|assets| {
                     assets.contains(id.typed_debug_checked::<SkyrimSkinMaterial>())
                 })
+        } else if id.type_id() == TypeId::of::<SkyrimSkinDepthMaterial>() {
+            world
+                .get_resource::<Assets<SkyrimSkinDepthMaterial>>()
+                .is_none_or(|assets| {
+                    assets.contains(id.typed_debug_checked::<SkyrimSkinDepthMaterial>())
+                })
         } else {
             true
         }
