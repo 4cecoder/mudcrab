@@ -776,8 +776,8 @@ impl UnprovenAssets {
     }
 }
 
-/// Copies one optional output into scratch, proves its exact bytes, then links it into an absent
-/// destination. Rename never replaces an entry, so the verified scratch file is the only candidate.
+/// Copies one optional output into scratch, proves its exact bytes, then moves it into an absent
+/// destination. The absence check precedes the rename, which would otherwise replace an entry.
 fn link_verified_derived(
     source: &Path,
     candidate: &Path,
