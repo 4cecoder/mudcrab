@@ -2534,6 +2534,7 @@ fn compose_default_bodies(
     let assets = staging.join("vfs/meshes/actors/character/character assets");
     let winning = |logical: PathBuf| sources.get(&logical).cloned().unwrap_or(logical);
     let skeleton = winning(assets.join("skeleton.nif"));
+    let database = staging.join("skyrim_world.db");
     for sex in ["male", "female"] {
         let relative = compose::composed_body_path("default", sex);
         let output = staging.join(&relative);
@@ -2560,7 +2561,8 @@ fn compose_default_bodies(
             }
             _ => {}
         }
-        let attempt = || -> Result<Option<usize>> {
+
+        let mut attempt = || -> Result<Option<usize>> {
             let part_paths =
                 PARTS.map(|(suffix, kind)| (winning(assets.join(format!("{sex}{suffix}"))), kind));
             if !part_paths.iter().any(|(path, _)| path.is_file()) {
@@ -2580,11 +2582,32 @@ fn compose_default_bodies(
                 );
                 return Ok(None);
             }
+            // Apply sex and slot-matched DefaultRace skin sets to validated skin shapes.
+            // Old catalogs or a missing database keep each NIF's original textures.
+            let skins = if database.is_file() {
+                compose::default_skin_texture_sets(&database, sex).wrap_err_with(|| {
+                    format!("failed to read the default {sex} armature skin texture sets")
+                })?
+            } else {
+                Vec::new()
+            };
             let parts: Vec<_> = part_paths
                 .iter()
-                .map(|(path, kind)| BodyPart { path, kind: *kind })
+                .map(|(path, kind)| BodyPart {
+                    path,
+                    kind: *kind,
+                    skin_textures: compose::skin_texture_set_for(&skins, *kind, path),
+                })
                 .collect();
-            let model = compose::compose_body(&parts, &skeleton)?;
+            let thin_paths: Vec<(PathBuf, BodyPartKind)> = PARTS
+                .iter()
+                .map(|(suffix, kind)| {
+                    let thin_name = suffix.replace("_1.nif", "_0.nif");
+                    (winning(assets.join(format!("{sex}{thin_name}"))), *kind)
+                })
+                .collect();
+            let mut model = compose::compose_body(&parts, &skeleton)?;
+            attach_default_body_weight(&mut model, &thin_paths, &skeleton, &skins, sex, report)?;
             compose::write_composed_body(&model, &output)?;
             Ok(Some(parts.len()))
         };
@@ -2608,6 +2631,51 @@ fn compose_default_bodies(
                 report.notices.push(message.clone());
                 warn!("{message}");
             }
+        }
+    }
+    Ok(())
+}
+
+/// Adds the weight-0 body as a `thin` morph target, or records why it cannot and leaves the
+/// heavy body alone. A missing or differently shaped thin part never fails a conversion.
+fn attach_default_body_weight(
+    model: &mut compose::ComposedBody,
+    thin_paths: &[(PathBuf, BodyPartKind)],
+    skeleton: &Path,
+    skins: &[compose::DefaultSkinTextureSet],
+    sex: &str,
+    report: &mut PipelineReport,
+) -> Result<()> {
+    let unavailable = |report: &mut PipelineReport, reason: String| {
+        let message = format!("actor_body_weight_unavailable: {sex} body: {reason}");
+        warn!("{message}");
+        report.notices.push(message);
+    };
+
+    if let Some((missing, _)) = thin_paths.iter().find(|(path, _)| !path.is_file()) {
+        unavailable(report, format!("thin part missing: {}", missing.display()));
+        return Ok(());
+    }
+    let thin_parts: Vec<_> = thin_paths
+        .iter()
+        .map(|(path, kind)| BodyPart {
+            path,
+            kind: *kind,
+            skin_textures: compose::skin_texture_set_for(skins, *kind, path),
+        })
+        .collect();
+    let part_names = thin_paths
+        .iter()
+        .filter_map(|(path, _)| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let thin = compose::compose_body(&thin_parts, skeleton)
+        .wrap_err_with(|| format!("failed to prepare thin {sex} body parts {part_names}"))?;
+    match compose::attach_thin_target(model, &thin)? {
+        compose::ThinTargetOutcome::Attached => {}
+        compose::ThinTargetOutcome::Unavailable(reason) => {
+            unavailable(report, format!("thin parts {part_names}: {reason}"));
         }
     }
     Ok(())
@@ -3049,8 +3117,21 @@ pub(crate) fn publish_texture_aliases(staging: &Path) -> Result<Vec<PathBuf>> {
             let relative = destination.strip_prefix(staging)?.to_owned();
             let runtime_key =
                 canonical_asset_path(&relative.to_string_lossy(), AssetKind::Texture, "ktx2")?;
-            if source_texture_key(&runtime_key)? != runtime_key {
-                aliases.insert(PathBuf::from(runtime_key));
+            let source_key = source_texture_key(&runtime_key)?;
+            if source_key != runtime_key {
+                aliases.insert(PathBuf::from(&runtime_key));
+                // Bevy's skin material loads the same bytes with linear decoding. Publish its
+                // companion path as well, retaining `.opensky-wrapN` so clamp/repeat images keep
+                // distinct AssetServer identities and sampler settings.
+                if let Some(linear) = runtime_key.strip_suffix(".ktx2") {
+                    let linear = linear.replace(".opensky-srgb", "");
+                    let linear = format!("{linear}.ktx2");
+                    // The canonical source is already the default linear path. Never republish
+                    // it over itself; only sampler-specific companion aliases need a file.
+                    if linear != source_key {
+                        aliases.insert(PathBuf::from(linear));
+                    }
+                }
             }
         }
     }
@@ -6260,9 +6341,14 @@ mod tests {
 
     #[test]
     fn v15_wrap_aliases_resolve_to_sources_for_publication_and_restoration() {
-        for mode in 0..3 {
+        for mode in 0..=3 {
             for transfer in ["", ".opensky-srgb"] {
-                let alias = format!("textures/shared{transfer}.opensky-wrap{mode}.ktx2");
+                let sampler = if mode == 3 {
+                    String::new()
+                } else {
+                    format!(".opensky-wrap{mode}")
+                };
+                let alias = format!("textures/shared{transfer}{sampler}.ktx2");
                 assert_eq!(source_texture_key(&alias).unwrap(), "textures/shared.ktx2");
                 assert_eq!(
                     texture_reference_source_key(&alias).as_deref(),
@@ -6285,11 +6371,27 @@ mod tests {
                 glb.extend_from_slice(b"JSON");
                 glb.extend_from_slice(&json);
                 fs::write(root.join("meshes/alias.glb"), glb).unwrap();
-                assert_eq!(
-                    publish_texture_aliases(root).unwrap(),
+                let expected = if transfer.is_empty() && mode == 3 {
+                    vec![]
+                } else if transfer.is_empty() || mode == 3 {
                     vec![PathBuf::from(&alias)]
-                );
+                } else {
+                    let linear = alias.replace(".opensky-srgb", "");
+                    vec![PathBuf::from(&alias), PathBuf::from(linear)]
+                };
+                let published = publish_texture_aliases(root).unwrap();
+                assert_eq!(published, expected);
                 assert_eq!(fs::read(root.join(alias)).unwrap(), b"source");
+                for linear in published
+                    .iter()
+                    .filter(|path| !path.to_string_lossy().contains("srgb"))
+                {
+                    assert_eq!(fs::read(root.join(linear)).unwrap(), b"source");
+                }
+                assert_eq!(
+                    fs::read(root.join("textures/shared.ktx2")).unwrap(),
+                    b"source"
+                );
             }
         }
     }
@@ -7026,8 +7128,10 @@ mod tests {
     }
 
     use dummy_content::nif::{
-        BodyShape, BoxBody, LegacySkin, SkinInstanceKind, StaticShape, legacy_skinned_shape,
-        legacy_skinned_shapes, static_shape, static_shape_with_bodies,
+        BodyShape, BoxBody, LegacySkin, SkinInstanceKind, SkinNormals, StaticShape,
+        legacy_skin_tint_shape, legacy_skinned_shape, legacy_skinned_shape_with_normals,
+        legacy_skinned_shapes, legacy_skinned_shapes_scaled, static_shape,
+        static_shape_with_bodies,
     };
 
     const ACTOR_BONE_TRANSFORMS: [([f32; 3], [f32; 4], f32); 2] = [
@@ -7077,12 +7181,30 @@ mod tests {
         .unwrap();
     }
 
+    fn write_actor_part_with_normals(assets: &Path, file_name: &str, normals: SkinNormals) {
+        fs::write(
+            assets.join(file_name),
+            legacy_skinned_shape_with_normals(&actor_part_spec(file_name), normals).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn write_actor_body_part(assets: &Path, file_name: &str) {
         let first = actor_part_spec("BodyShapeA");
         let second = actor_part_spec("BodyShapeB");
         fs::write(
             assets.join(file_name),
             legacy_skinned_shapes(&[first, second]).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_actor_body_part_scaled(assets: &Path, file_name: &str, scale: f32) {
+        let first = actor_part_spec("BodyShapeA");
+        let second = actor_part_spec("BodyShapeB");
+        fs::write(
+            assets.join(file_name),
+            legacy_skinned_shapes_scaled(&[first, second], scale).unwrap(),
         )
         .unwrap();
     }
@@ -7231,6 +7353,9 @@ mod tests {
             write_actor_body_part(&assets, &format!("{sex}body_1.nif"));
             write_actor_part(&assets, &format!("{sex}hands_1.nif"));
             write_actor_part(&assets, &format!("{sex}feet_1.nif"));
+            write_actor_body_part_scaled(&assets, &format!("{sex}body_0.nif"), 0.8);
+            write_actor_part(&assets, &format!("{sex}hands_0.nif"));
+            write_actor_part(&assets, &format!("{sex}feet_0.nif"));
         }
     }
 
@@ -7384,6 +7509,305 @@ mod tests {
         );
     }
 
+    /// Every morph target in `glb`, as the mesh name and its POSITION deltas.
+    fn glb_thin_morphs(glb: &Path) -> Vec<(String, Vec<[f32; 3]>)> {
+        let bytes = fs::read(glb).unwrap();
+        let gltf = gltf::Gltf::from_slice(&bytes).unwrap();
+        let blob = gltf.blob.as_deref().unwrap();
+        let mut morphs = Vec::new();
+        for mesh in gltf.document.meshes() {
+            let name = mesh.name().unwrap_or_default().to_owned();
+            for primitive in mesh.primitives() {
+                let reader = primitive.reader(|buffer| (buffer.index() == 0).then_some(blob));
+                for (positions, _, _) in reader.read_morph_targets() {
+                    morphs.push((name.clone(), positions.unwrap().collect()));
+                }
+            }
+        }
+        morphs
+    }
+
+    #[test]
+    fn compose_default_bodies_attaches_a_thin_morph_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        stage_default_actor_parts(staging);
+
+        compose_staged_bodies(staging, false);
+
+        for sex in ["male", "female"] {
+            let output = staging.join(crate::compose::composed_body_path("default", sex));
+            let bytes = fs::read(&output).unwrap();
+            let json = crate::mesh::glb_json_from_bytes(&bytes).unwrap();
+            for mesh in json["meshes"].as_array().unwrap() {
+                assert_eq!(mesh["weights"], serde_json::json!([0.0]), "{sex}: {mesh}");
+                assert_eq!(
+                    mesh["extras"]["targetNames"],
+                    serde_json::json!(["thin"]),
+                    "{sex}: {mesh}"
+                );
+            }
+
+            let morphs = glb_thin_morphs(&output);
+            assert_eq!(morphs.len(), 4, "{sex} must morph four shapes: {morphs:?}");
+            let body = morphs
+                .iter()
+                .find(|(name, _)| name.as_str() == "BodyShapeA")
+                .unwrap();
+            assert_eq!(body.1[0], [0.0, 0.0, 0.0]);
+            assert!((body.1[1][0] + 0.2).abs() < 1e-5, "{:?}", body.1);
+            assert!(body.1[1][1].abs() < 1e-5, "{:?}", body.1);
+        }
+    }
+
+    #[test]
+    fn compose_default_bodies_resolves_thin_sources_from_logical_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        stage_default_actor_parts(staging);
+        let heavy_mod = staging.join("heavy-mod");
+        let thin_mod = staging.join("thin-mod");
+        fs::create_dir_all(&heavy_mod).unwrap();
+        fs::create_dir_all(&thin_mod).unwrap();
+        write_actor_body_part_scaled(&heavy_mod, "malebody_1.nif", 0.7);
+        write_actor_body_part_scaled(&heavy_mod, "malebody_0.nif", 0.5);
+        write_actor_body_part_scaled(&thin_mod, "malebody_0.nif", 0.3);
+
+        let assets = actor_assets(staging);
+        let mut sources = staged_sources(staging);
+        sources.insert(
+            assets.join("malebody_1.nif"),
+            heavy_mod.join("malebody_1.nif"),
+        );
+        sources.insert(
+            assets.join("malebody_0.nif"),
+            thin_mod.join("malebody_0.nif"),
+        );
+        let mut report = PipelineReport::default();
+        let mut manifest = ConversionManifest::default();
+        compose_default_bodies(staging, &sources, false, &mut report, &mut manifest).unwrap();
+        let output = staging.join(crate::compose::composed_body_path("default", "male"));
+        let body = glb_thin_morphs(&output)
+            .into_iter()
+            .find(|(name, _)| name == "BodyShapeA")
+            .unwrap();
+        assert!(
+            (body.1[1][0] + 0.4).abs() < 1e-5,
+            "thin source delta: {:?}",
+            body.1
+        );
+
+        // The heavy winner's physical sibling must not beat staged thin fallback.
+        sources.remove(&assets.join("malebody_0.nif"));
+        compose_default_bodies(staging, &sources, false, &mut report, &mut manifest).unwrap();
+        let body = glb_thin_morphs(&output)
+            .into_iter()
+            .find(|(name, _)| name == "BodyShapeA")
+            .unwrap();
+        assert!(
+            (body.1[1][0] - 0.1).abs() < 1e-5,
+            "staged thin delta: {:?}",
+            body.1
+        );
+    }
+
+    #[test]
+    fn compose_default_bodies_without_thin_parts_keeps_the_heavy_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        stage_default_actor_parts(staging);
+        fs::remove_file(actor_assets(staging).join("malebody_0.nif")).unwrap();
+
+        let (report, _) = compose_staged_bodies(staging, false);
+
+        let male = staging.join(crate::compose::composed_body_path("default", "male"));
+        assert!(glb_thin_morphs(&male).is_empty());
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|notice| notice.contains("actor_body_weight_unavailable")
+                    && notice.contains("thin part missing")),
+            "notices: {:?}",
+            report.notices
+        );
+        let female = staging.join(crate::compose::composed_body_path("default", "female"));
+        assert_eq!(glb_thin_morphs(&female).len(), 4);
+    }
+
+    #[test]
+    fn compose_default_bodies_with_mismatched_thin_parts_keeps_the_heavy_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        stage_default_actor_parts(staging);
+        fs::write(
+            actor_assets(staging).join("malebody_0.nif"),
+            legacy_skinned_shape(&actor_part_spec("BodyShapeA")).unwrap(),
+        )
+        .unwrap();
+
+        let (report, _) = compose_staged_bodies(staging, false);
+
+        let male = staging.join(crate::compose::composed_body_path("default", "male"));
+        assert!(glb_thin_morphs(&male).is_empty());
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|notice| notice.contains("actor_body_weight_unavailable")
+                    && notice.contains("skeletal mesh counts differ")),
+            "notices: {:?}",
+            report.notices
+        );
+    }
+
+    #[test]
+    fn compose_default_bodies_with_thin_parts_missing_normals_keeps_the_heavy_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        stage_default_actor_parts(staging);
+        write_actor_part_with_normals(
+            &actor_assets(staging),
+            "malehands_0.nif",
+            SkinNormals::Omitted,
+        );
+
+        let (report, _) = compose_staged_bodies(staging, false);
+
+        let male = staging.join(crate::compose::composed_body_path("default", "male"));
+        assert!(male.is_file(), "heavy body must remain available");
+        assert!(glb_thin_morphs(&male).is_empty());
+        assert!(report.notices.iter().any(|notice| {
+            notice.contains("actor_body_weight_unavailable")
+                && notice.contains("per-vertex normals are missing or incomplete")
+        }));
+    }
+
+    /// The `KHR_materials_specular` of every material in `glb` whose name is `shape`.
+    fn glb_specular(glb: &Path, shape: &str) -> Vec<(f64, Option<String>)> {
+        let bytes = fs::read(glb).unwrap();
+        let json = crate::mesh::glb_json_from_bytes(&bytes).unwrap();
+        json["materials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|material| material["name"] == shape)
+            .map(|material| {
+                let specular = &material["extensions"]["KHR_materials_specular"];
+                let uri = specular["specularColorTexture"]["index"]
+                    .as_u64()
+                    .map(|texture| {
+                        let image = json["textures"][texture as usize]["source"]
+                            .as_u64()
+                            .unwrap();
+                        json["images"][image as usize]["uri"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned()
+                    });
+                (specular["specularFactor"].as_f64().unwrap(), uri)
+            })
+            .collect()
+    }
+
+    /// A world database holding one female Nord whose `DefaultRace` hands armature carries
+    /// `SkinHandFemale_1`, written with the catalog columns or, when `with_skin_columns` is
+    /// false, as a database from before them.
+    fn write_skin_catalog(staging: &Path, with_skin_columns: bool) {
+        let connection = rusqlite::Connection::open(staging.join("skyrim_world.db")).unwrap();
+        let skin_columns = if with_skin_columns {
+            ", armature_race_id INTEGER, skin_texture_set_id INTEGER"
+        } else {
+            ""
+        };
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE actor_models (id INTEGER PRIMARY KEY, race_id INTEGER NOT NULL, \
+                 sex TEXT NOT NULL, skin_armo_id INTEGER, head_model TEXT, head_source TEXT, \
+                 resolution TEXT NOT NULL);
+                 CREATE TABLE actor_model_parts (npc_id INTEGER NOT NULL, slot TEXT NOT NULL, \
+                 model_path TEXT NOT NULL{skin_columns}, PRIMARY KEY (npc_id, slot));
+                 CREATE TABLE texture_sets (id INTEGER PRIMARY KEY, editor_id TEXT, \
+                 diffuse_path TEXT, normal_path TEXT, glow_path TEXT, height_path TEXT, \
+                 environment_path TEXT, mask_path TEXT, specular_path TEXT, detail_path TEXT);
+                 INSERT INTO actor_models VALUES (256, 79686, 'female', 3428, NULL, NULL, 'body');
+                 INSERT INTO texture_sets VALUES (257001, 'SkinHandFemale_1', \
+                 'Actors\\Character\\Female\\FemaleHands_1.dds', \
+                 'Actors\\Character\\Female\\FemaleHands_1_msn.dds', \
+                 'Actors\\Character\\Female\\FemaleHands_1_sk.dds', NULL, NULL, NULL, \
+                 'Actors\\Character\\Female\\FemaleHands_1_S.dds', NULL);"
+            ))
+            .unwrap();
+        if with_skin_columns {
+            connection
+                .execute(
+                    "INSERT INTO actor_model_parts VALUES (256, 'hands', \
+                     'Actors\\Character\\Character Assets\\FemaleHands_1.nif', 25, 257001)",
+                    [],
+                )
+                .unwrap();
+        } else {
+            connection
+                .execute(
+                    "INSERT INTO actor_model_parts VALUES (256, 'hands', \
+                     'Actors\\Character\\Character Assets\\FemaleHands_1.nif')",
+                    [],
+                )
+                .unwrap();
+        }
+    }
+
+    fn stage_skin_tint_hands(staging: &Path) {
+        stage_default_actor_parts(staging);
+        let assets = actor_assets(staging);
+        for sex in ["male", "female"] {
+            let file_name = format!("{sex}hands_1.nif");
+            fs::write(
+                assets.join(&file_name),
+                legacy_skin_tint_shape(&actor_part_spec(&file_name)).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn compose_default_bodies_applies_the_default_armature_skin_texture_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        stage_skin_tint_hands(staging);
+        write_skin_catalog(staging, true);
+
+        compose_staged_bodies(staging, true);
+
+        let female = staging.join(crate::compose::composed_body_path("default", "female"));
+        let hands = glb_specular(&female, "femalehands_1.nif");
+        assert_eq!(hands.len(), 1, "{hands:?}");
+        let (factor, uri) = &hands[0];
+        assert_eq!(*factor, 1.0);
+        // The specular colour texture is the sRGB alias; the engine loads its linear twin.
+        assert!(
+            uri.as_deref().is_some_and(|uri| uri
+                .contains("/textures/actors/character/female/femalehands_1_s.opensky-srgb.")),
+            "{uri:?}"
+        );
+        // No male row: the male hands keep their NIF textures, and without `_s` no specular.
+        let male = staging.join(crate::compose::composed_body_path("default", "male"));
+        assert_eq!(glb_specular(&male, "malehands_1.nif"), [(0.0, None)]);
+    }
+
+    #[test]
+    fn compose_default_bodies_keeps_nif_textures_with_an_older_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        stage_skin_tint_hands(staging);
+        write_skin_catalog(staging, false);
+
+        compose_staged_bodies(staging, true);
+
+        let female = staging.join(crate::compose::composed_body_path("default", "female"));
+        assert_eq!(glb_specular(&female, "femalehands_1.nif"), [(0.0, None)]);
+    }
+
     #[test]
     fn compose_default_bodies_skips_a_sex_without_its_parts() {
         let directory = tempfile::tempdir().unwrap();
@@ -7439,6 +7863,10 @@ mod tests {
             static_shape(&actor_skeleton_shape("StaticHands")).unwrap(),
         )
         .unwrap();
+    }
+
+    fn stage_a_malformed_male_thin_body(staging: &Path) {
+        fs::write(actor_assets(staging).join("malebody_0.nif"), []).unwrap();
     }
 
     /// Keeps optional composition failures under the canonical derived asset key.
@@ -7647,6 +8075,77 @@ mod tests {
         assert!(
             format!("{error:#}").contains("failed to compose default male"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn malformed_thin_preparation_reaches_fail_fast_and_clears_stale_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        stage_default_actor_parts(staging);
+        compose_staged_bodies(staging, false);
+        let key = "meshes/actors/character/composed/default/male/body.glb";
+        let output = staging.join(key);
+        assert!(output.is_file());
+        stage_a_malformed_male_thin_body(staging);
+        let mut report = PipelineReport::default();
+        let mut manifest = ConversionManifest::default();
+        manifest
+            .failures
+            .insert(key.into(), "old derived failure".into());
+
+        let error = compose_default_bodies(
+            staging,
+            &staged_sources(staging),
+            true,
+            &mut report,
+            &mut manifest,
+        )
+        .expect_err("malformed thin NIF preparation must fail fast");
+
+        assert!(format!("{error:#}").contains("failed to compose default male"));
+        assert!(
+            !output.exists(),
+            "stale heavy body must be removed on failure"
+        );
+        assert!(!manifest.failures.contains_key(key));
+    }
+
+    #[test]
+    fn malformed_thin_preparation_is_a_derived_notice_without_fail_fast() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        stage_default_actor_parts(staging);
+        compose_staged_bodies(staging, false);
+        let key = "meshes/actors/character/composed/default/male/body.glb";
+        let output = staging.join(key);
+        assert!(output.is_file());
+        stage_a_malformed_male_thin_body(staging);
+        let mut report = PipelineReport::default();
+        let mut manifest = ConversionManifest::default();
+        manifest
+            .failures
+            .insert(key.into(), "old derived failure".into());
+
+        compose_default_bodies(
+            staging,
+            &staged_sources(staging),
+            false,
+            &mut report,
+            &mut manifest,
+        )
+        .unwrap();
+
+        assert!(!output.exists(), "failed body must not keep stale output");
+        assert!(!manifest.failures.contains_key(key));
+        assert!(report.notices.iter().any(|notice| {
+            notice.contains("failed to compose default male")
+                && !notice.contains("actor_body_weight_unavailable")
+        }));
+        assert!(
+            staging
+                .join(crate::compose::composed_body_path("default", "female"))
+                .is_file()
         );
     }
 
