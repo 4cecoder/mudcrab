@@ -1,5 +1,6 @@
 //! Headless contract checks for the actual effect palette forward and prepass shaders.
 
+use naga_oil::compose::comment_strip_iter::CommentReplaceExt;
 use naga_oil::compose::{
     ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderDefValue, ShaderLanguage,
     ShaderType,
@@ -10,6 +11,8 @@ const FUNCTIONS: &str = include_str!("../shaders/effect_palette_functions.wgsl")
 const MAIN: &str = include_str!("../shaders/effect_palette.wgsl");
 const PREPASS: &str = include_str!("../shaders/effect_palette_prepass.wgsl");
 const SHADOW_ALPHA_CUTOFF: f32 = 0.05;
+const SCALAR_CUTOFF_CHECK: &str = "if color.a < PREMULTIPLIED_ALPHA_CUTOFF {";
+const ALL_CHANNELS_CUTOFF_CHECK: &str = "if all(color < vec4<f32>(PREMULTIPLIED_ALPHA_CUTOFF)) {";
 
 const PBR_TYPES: &str = r#"
 #define_import_path bevy_pbr::pbr_types
@@ -397,25 +400,127 @@ fn prepass_mirrors_bevys_premultiplied_alpha_cutoff_locally() {
     );
 }
 
+/// Source with WGSL comments blanked to whitespace, so a commented-out line cannot satisfy a guard.
+fn active_source(source: &str) -> String {
+    let mut lines = source.lines();
+    let mut active = String::new();
+    for line in lines.replace_comments() {
+        active.push_str(&line);
+        active.push('\n');
+    }
+    active
+}
+
+/// The `{ ... }` body that follows `marker` in comment-free source, without its braces.
+fn branch_body<'a>(active: &'a str, marker: &str) -> Result<&'a str, String> {
+    let start = active
+        .find(marker)
+        .ok_or_else(|| format!("the active shader lacks {marker}"))?;
+    let open = start + active[start..].find('{').ok_or("the branch lacks a body")?;
+    let mut depth = 0;
+    for (offset, character) in active[open..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(&active[open + 1..open + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(format!("the body after {marker} is not closed"))
+}
+
+/// Each local-cutoff comparison must be active code inside its own alpha-mode branch body.
+fn local_cutoff_sites(source: &str) -> Result<(), String> {
+    let active = active_source(source);
+    let scalar_body = branch_body(&active, "STANDARD_MATERIAL_FLAGS_ALPHA_MODE_BLEND")?;
+    if !scalar_body.contains(SCALAR_CUTOFF_CHECK) {
+        return Err(format!(
+            "the BLEND/ADD/ALPHA_TO_COVERAGE body lacks `{SCALAR_CUTOFF_CHECK}`"
+        ));
+    }
+    let all_channels_body =
+        branch_body(&active, "STANDARD_MATERIAL_FLAGS_ALPHA_MODE_PREMULTIPLIED")?;
+    if !all_channels_body.contains(ALL_CHANNELS_CUTOFF_CHECK) {
+        return Err(format!(
+            "the PREMULTIPLIED body lacks `{ALL_CHANNELS_CUTOFF_CHECK}`"
+        ));
+    }
+    Ok(())
+}
+
 #[test]
 fn prepass_applies_the_local_cutoff_at_each_comparison_site() {
     // The test above shows the declaration exists, not where it is used. Pin the scalar guard
     // inside the BLEND/ADD/ALPHA_TO_COVERAGE branch and the all-channel guard inside the
     // PREMULTIPLIED branch, so a literal or a different cutoff at either site fails here.
-    let blend = PREPASS
+    let active = active_source(PREPASS);
+    let blend = active
         .find("STANDARD_MATERIAL_FLAGS_ALPHA_MODE_BLEND ||")
         .expect("the prepass shader branches on BLEND");
-    let scalar = PREPASS
-        .find("if color.a < PREMULTIPLIED_ALPHA_CUTOFF {")
+    let scalar = active
+        .find(SCALAR_CUTOFF_CHECK)
         .expect("the BLEND branch compares alpha to the local cutoff");
-    let premultiplied = PREPASS
+    let premultiplied = active
         .find("STANDARD_MATERIAL_FLAGS_ALPHA_MODE_PREMULTIPLIED {")
         .expect("the prepass shader branches on PREMULTIPLIED");
-    let all_channels = PREPASS
-        .find("if all(color < vec4<f32>(PREMULTIPLIED_ALPHA_CUTOFF)) {")
+    let all_channels = active
+        .find(ALL_CHANNELS_CUTOFF_CHECK)
         .expect("the PREMULTIPLIED branch compares every channel to the local cutoff");
     assert!(
         blend < scalar && scalar < premultiplied && premultiplied < all_channels,
         "each cutoff comparison must sit in its own alpha-mode branch, in order"
     );
+    local_cutoff_sites(PREPASS).unwrap_or_else(|error| panic!("{error}"));
+}
+
+#[test]
+fn prepass_cutoff_guard_rejects_literals_behind_commented_originals() {
+    // Each mutant keeps the correct comparison in a line or block comment and makes one active
+    // site a literal. compose() must accept each mutant, so a rejection cannot be a syntax error.
+    let mut mutants = Vec::new();
+    for (original, literal) in [
+        (SCALAR_CUTOFF_CHECK, "if color.a < 0.5 {"),
+        (
+            ALL_CHANNELS_CUTOFF_CHECK,
+            "if all(color < vec4<f32>(0.5)) {",
+        ),
+    ] {
+        assert_eq!(
+            PREPASS.matches(original).count(),
+            1,
+            "{original} occurs once"
+        );
+        for comment in [format!("// {original}"), format!("/* {original} */")] {
+            let replacement = format!("{comment}\n        {literal}");
+            mutants.push(PREPASS.replacen(original, &replacement, 1));
+        }
+    }
+    // The exact BLEND comparison moves into the PREMULTIPLIED body, and BLEND keeps a literal.
+    mutants.push(
+        PREPASS
+            .replacen(SCALAR_CUTOFF_CHECK, "if color.a < 0.5 {", 1)
+            .replacen(
+                "STANDARD_MATERIAL_FLAGS_ALPHA_MODE_PREMULTIPLIED {",
+                "STANDARD_MATERIAL_FLAGS_ALPHA_MODE_PREMULTIPLIED {\n        if color.a < PREMULTIPLIED_ALPHA_CUTOFF {\n            discard;\n        }",
+                1,
+            ),
+    );
+
+    assert_eq!(local_cutoff_sites(PREPASS), Ok(()));
+    for mutant in &mutants {
+        compose(
+            mutant,
+            "effect_palette_prepass.wgsl",
+            &["MAY_DISCARD", "VERTEX_UVS_A", "VERTEX_COLORS"],
+        )
+        .unwrap_or_else(|error| panic!("mutant must stay valid WGSL:\n{error}"));
+        assert!(
+            local_cutoff_sites(mutant).is_err(),
+            "the guard accepted a literal cutoff behind a commented original"
+        );
+    }
 }
