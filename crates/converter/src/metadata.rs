@@ -1347,6 +1347,13 @@ mod tests {
         };
         set_readonly(parent.as_path(), true);
         set_readonly(destination.as_path(), true);
+        // Root can unlink through a read-only parent; skip rather than assert rejection.
+        #[cfg(unix)]
+        if fs::remove_file(&destination).is_ok() {
+            set_readonly(parent.as_path(), false);
+            eprintln!("skipping: Unix permissions allow root to remove the fixture");
+            return;
+        }
         let result = copy_verified_assets(&source, &staging, &mut manifest, &mut Vec::new());
         set_readonly(destination.as_path(), false);
         set_readonly(parent.as_path(), false);
