@@ -2854,6 +2854,16 @@ fn default_animation_input_hashes(
     )
 }
 
+/// Checks every built-in gait ancestor before a pass changes manifest markers or staged files.
+fn validate_animation_output_parents(staging: &Path) -> Result<()> {
+    for sex in ["male", "female"] {
+        for (_, stem) in DEFAULT_ANIMATION_CLIPS {
+            validate_animation_output_parent(&staging.join(default_animation_output(sex, stem)))?;
+        }
+    }
+    Ok(())
+}
+
 /// Removes blocking non-regular paths at every derived gait output before the pass can skip or write.
 fn clear_nonregular_animation_outputs(staging: &Path) -> Result<()> {
     for sex in ["male", "female"] {
@@ -2908,6 +2918,9 @@ fn convert_default_animations(
         }
     };
 
+    // Every ancestor is checked before any marker or staged path changes, so a rejected pass keeps
+    // its incoming failure and proof maps for both sexes.
+    validate_animation_output_parents(staging)?;
     let prior_derived_relevance: BTreeMap<_, _> = ["male", "female"]
         .into_iter()
         .map(|sex| {
@@ -9027,6 +9040,63 @@ mod tests {
                 assert!(format!("{error:#}").contains("failed to inspect"));
                 assert!(report.notices.is_empty(), "notices: {:?}", report.notices);
                 assert_eq!(manifest.failures.get(MALE_IDLE_GLB).unwrap(), "old failure");
+                assert_eq!(fs::read(&blocker).unwrap(), b"not a directory");
+            }
+        }
+    }
+
+    /// A rejected gait preflight leaves the complete failure and proof maps for both sexes intact.
+    #[test]
+    fn gait_preflight_rejection_preserves_complete_manifest_maps() {
+        for blocked in [
+            "meshes",
+            "meshes/actors/character/animations",
+            "meshes/actors/character/animations/male",
+            "meshes/actors/character/animations/female",
+        ] {
+            for fail_fast in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let staging = directory.path();
+                stage_invalid_default_animation(staging);
+                let blocker = staging.join(blocked);
+                fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+                fs::write(&blocker, b"not a directory").unwrap();
+
+                let mut manifest = ConversionManifest::default();
+                for sex in ["male", "female"] {
+                    for (_, stem) in DEFAULT_ANIMATION_CLIPS {
+                        let key = default_animation_output(sex, stem);
+                        manifest
+                            .failures
+                            .insert(key.clone(), format!("old {sex} failure"));
+                        manifest.derived_outputs.insert(
+                            key,
+                            DerivedOutput {
+                                recipe: DEFAULT_GAIT_RECIPE.into(),
+                                inputs: BTreeMap::new(),
+                                output_size: 1,
+                                output_hash: hash_bytes(b"old gait"),
+                            },
+                        );
+                    }
+                }
+                let incoming = manifest.clone();
+                let mut report = PipelineReport::default();
+                let error = convert_default_animations(
+                    staging,
+                    &BTreeMap::new(),
+                    fail_fast,
+                    &mut report,
+                    &mut manifest,
+                )
+                .expect_err("blocked ancestor must abort before any map mutation");
+
+                assert!(
+                    format!("{error:#}").contains("failed to inspect"),
+                    "{blocked}: {error:#}"
+                );
+                assert!(report.notices.is_empty(), "{blocked}: {:?}", report.notices);
+                assert_eq!(manifest, incoming, "{blocked} fail_fast={fail_fast}");
                 assert_eq!(fs::read(&blocker).unwrap(), b"not a directory");
             }
         }
