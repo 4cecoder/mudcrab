@@ -747,16 +747,103 @@ impl UnprovenAssets {
         }
     }
 
-    /// Omit an optional output and report any failed partial-copy cleanup without aborting.
-    fn omit_derived(&mut self, path: &str, destination: &Path) {
+    /// Count a failed scratch cleanup and keep only the first bounded example.
+    fn record_cleanup_failure(&mut self, path: &str, error: &std::io::Error) {
+        self.cleanup_failures += 1;
+        if self.cleanup_failures == 1 {
+            self.first_cleanup_failure = format!("{path}: {error}").chars().take(256).collect();
+        }
+    }
+
+    /// Omit an unpublished optional output. A leftover directory is a bounded cleanup notice;
+    /// any other surviving entry could be a publishable file, so that case fails closed.
+    fn omit_derived(&mut self, path: &str, destination: &Path) -> Result<()> {
         self.record(path);
         if let Err(error) = fs::remove_file(destination)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            self.cleanup_failures += 1;
-            if self.cleanup_failures == 1 {
-                self.first_cleanup_failure = format!("{path}: {error}").chars().take(256).collect();
+            match fs::symlink_metadata(destination) {
+                Ok(metadata) if metadata.is_dir() => self.record_cleanup_failure(path, &error),
+                Err(lookup) if lookup.kind() == std::io::ErrorKind::NotFound => {}
+                _ => {
+                    return Err(error).wrap_err_with(|| {
+                        format!("failed to remove unpublished derived output {path}")
+                    });
+                }
             }
+        }
+        Ok(())
+    }
+}
+
+/// Copies one optional output into scratch, proves its exact bytes, then links it into an absent
+/// destination. Rename never replaces an entry, so the verified scratch file is the only candidate.
+fn link_verified_derived(
+    source: &Path,
+    candidate: &Path,
+    destination: &Path,
+    (expected_hash, expected_size): (&str, u64),
+) -> Result<()> {
+    let copied = {
+        let mut reader = fs::File::open(source)?;
+        let mut writer = fs::File::create(candidate)?;
+        std::io::copy(&mut reader, &mut writer)?
+    };
+    ensure!(
+        copied == expected_size && hash_file(candidate)? == expected_hash,
+        "derived output {} does not match its proof",
+        source.display()
+    );
+    match fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => bail!("refusing to replace existing {}", destination.display()),
+        Err(error) => return Err(error.into()),
+    }
+    fs::create_dir_all(destination.parent().unwrap())?;
+    fs::rename(candidate, destination)?;
+    Ok(())
+}
+
+/// Publishes an optional derived output only after verification in private scratch beside staging.
+/// Returns `false` for a local omission. Only a failure that could leave bytes at the final path
+/// (an unremovable non-directory) is an error, so the whole conversion fails closed.
+fn publish_derived_output(
+    source: &Path,
+    staging: &Path,
+    relative: &str,
+    expected: (&str, u64),
+    unproven: &mut UnprovenAssets,
+) -> Result<bool> {
+    let destination = staging.join(relative);
+    let Some(parent) = staging.parent() else {
+        bail!(
+            "staging {} has no parent for derived verification",
+            staging.display()
+        );
+    };
+    let outcome = match tempfile::Builder::new()
+        .prefix(".derived-verify-")
+        .tempdir_in(parent)
+    {
+        Ok(scratch) => {
+            let outcome = link_verified_derived(
+                source,
+                &scratch.path().join("candidate.bin"),
+                &destination,
+                expected,
+            );
+            if let Err(error) = scratch.close() {
+                unproven.record_cleanup_failure(relative, &error);
+            }
+            outcome
+        }
+        Err(error) => Err(error.into()),
+    };
+    match outcome {
+        Ok(()) => Ok(true),
+        Err(_) => {
+            unproven.omit_derived(relative, &destination)?;
+            Ok(false)
         }
     }
 }
@@ -916,24 +1003,30 @@ fn copy_verified_assets(
                 unproven.record(&relative);
                 continue;
             };
+            if derived.contains(&relative) {
+                // Optional bytes reach staging only after their scratch copy matches the proof.
+                if !publish_derived_output(
+                    entry.path(),
+                    staging,
+                    &relative,
+                    (hash.as_str(), *size),
+                    &mut unproven,
+                )? {
+                    // Do not diagnose this same output again in the missing-file check.
+                    excluded_derived.insert(relative);
+                    continue;
+                }
+                retained.insert(relative, hash.clone());
+                continue;
+            }
             let destination = staging.join(&relative);
+            // Ordinary recorded assets retain strict copy, hash and integrity errors.
             let copied: Result<_> = (|| {
                 fs::create_dir_all(destination.parent().unwrap())?;
                 let actual_size = fs::copy(entry.path(), &destination)
                     .wrap_err_with(|| format!("failed to copy retained asset {relative}"))?;
                 Ok((actual_size, hash_file(&destination)?))
             })();
-            if derived.contains(&relative)
-                && !copied.as_ref().is_ok_and(|(actual_size, actual_hash)| {
-                    actual_size == size && actual_hash == hash
-                })
-            {
-                unproven.omit_derived(&relative, &destination);
-                // Do not diagnose this same output again in the missing-file check.
-                excluded_derived.insert(relative.clone());
-                continue;
-            }
-            // Ordinary recorded assets retain strict copy, hash and integrity errors.
             let (actual_size, actual_hash) = copied?;
             if actual_size != *size || actual_hash != *hash {
                 ensure!(
@@ -985,6 +1078,13 @@ fn copy_verified_assets(
         let notice = format!(
             "Omitted {} unproven retained assets (optional derived outputs or stray files); first: {}.{cleanup} Run normal conversion to regenerate derived outputs.",
             unproven.count, unproven.first
+        );
+        eprintln!("note: {notice}");
+        notices.push(notice);
+    } else if unproven.cleanup_failures > 0 {
+        let notice = format!(
+            "Could not remove {} derived verification scratch entries; first: {}.",
+            unproven.cleanup_failures, unproven.first_cleanup_failure
         );
         eprintln!("note: {notice}");
         notices.push(notice);
@@ -1150,6 +1250,108 @@ mod tests {
                 b"unrelated destination bytes"
             );
         }
+    }
+
+    /// A mismatched optional copy never occupies its final path while a verified sibling publishes.
+    #[test]
+    fn rejected_derived_copy_never_reaches_staging_beside_verified_neighbor() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let staging = directory.path().join("staging");
+        fs::create_dir_all(source.join("scripts")).unwrap();
+        fs::write(
+            source.join("scripts/papyrus_runtime.luau"),
+            include_bytes!("../../shared/src/papyrus_runtime.luau"),
+        )
+        .unwrap();
+        let proven = b"proven body";
+        let mut manifest = ConversionManifest::default();
+        for (sex, source_bytes) in [("male", &b"rejected body"[..]), ("female", &proven[..])] {
+            let relative = format!("meshes/actors/character/composed/default/{sex}/body.glb");
+            fs::create_dir_all(source.join(&relative).parent().unwrap()).unwrap();
+            fs::write(source.join(&relative), source_bytes).unwrap();
+            manifest.derived_outputs.insert(
+                relative,
+                crate::cache::DerivedOutput {
+                    recipe: "body-compose-v1".into(),
+                    inputs: body_compose_inputs(sex)
+                        .into_iter()
+                        .map(|path| (path, hash_bytes(b"input")))
+                        .collect(),
+                    output_size: proven.len() as u64,
+                    output_hash: hash_bytes(proven),
+                },
+            );
+        }
+        let mut notices = Vec::new();
+        let (retained, _) =
+            copy_verified_assets(&source, &staging, &mut manifest, &mut notices).unwrap();
+        let male = "meshes/actors/character/composed/default/male/body.glb";
+        let female = "meshes/actors/character/composed/default/female/body.glb";
+        assert_eq!(retained[female], hash_bytes(proven));
+        assert_eq!(fs::read(staging.join(female)).unwrap(), proven);
+        assert!(!retained.contains_key(male));
+        assert!(
+            !staging.join(male).exists(),
+            "rejected bytes reached staging"
+        );
+        assert_eq!(manifest.derived_outputs.len(), 1);
+        assert!(manifest.derived_outputs.contains_key(female));
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("1 unproven retained assets"),
+            "{notices:?}"
+        );
+        assert!(!notices[0].contains("Could not remove"), "{notices:?}");
+    }
+
+    /// An unpublished output whose stale occupant cannot be removed fails closed without overwrite.
+    #[test]
+    fn unremovable_rejected_derived_file_fails_closed_without_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let staging = directory.path().join("staging");
+        fs::create_dir_all(source.join("scripts")).unwrap();
+        fs::write(
+            source.join("scripts/papyrus_runtime.luau"),
+            include_bytes!("../../shared/src/papyrus_runtime.luau"),
+        )
+        .unwrap();
+        let relative = "meshes/actors/character/composed/default/male/body.glb";
+        let proven = b"proven body";
+        fs::create_dir_all(source.join(relative).parent().unwrap()).unwrap();
+        fs::write(source.join(relative), b"rejected body").unwrap();
+        let mut manifest = ConversionManifest::default();
+        manifest.derived_outputs.insert(
+            relative.into(),
+            crate::cache::DerivedOutput {
+                recipe: "body-compose-v1".into(),
+                inputs: body_compose_inputs("male")
+                    .into_iter()
+                    .map(|path| (path, hash_bytes(b"input")))
+                    .collect(),
+                output_size: proven.len() as u64,
+                output_hash: hash_bytes(proven),
+            },
+        );
+        // A writable occupant with a read-only parent makes the old overwrite-then-unlink path
+        // leave rejected bytes, while Windows denies the same unlink through the read-only file.
+        let destination = staging.join(relative);
+        let parent = destination.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(&destination, b"stale occupant").unwrap();
+        let set_readonly = |path: &Path, readonly: bool| {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_readonly(readonly);
+            fs::set_permissions(path, permissions).unwrap();
+        };
+        set_readonly(parent.as_path(), true);
+        set_readonly(destination.as_path(), true);
+        let result = copy_verified_assets(&source, &staging, &mut manifest, &mut Vec::new());
+        set_readonly(destination.as_path(), false);
+        set_readonly(parent.as_path(), false);
+        assert!(result.is_err(), "unremovable occupant must fail closed");
+        assert_eq!(fs::read(&destination).unwrap(), b"stale occupant");
     }
 
     /// Sampler aliases retain the canonical texture's exact bytes and reject tampering.
