@@ -373,3 +373,26 @@ fn palette_effect_shadow_cutoffs_match_bevy_alpha_modes() {
         0.5
     ));
 }
+
+#[test]
+fn prepass_mirrors_bevys_premultiplied_alpha_cutoff_locally() {
+    // naga_oil substitutes an imported `pbr_prepass_functions` constant with its qualified name
+    // but never emits the definition, so an imported cutoff only fails when a real pipeline
+    // compiles against Bevy's shader. The stub module above accepts it, which is why the
+    // composition tests cannot see it.
+    assert!(
+        !PREPASS.contains("pbr_prepass_functions::PREMULTIPLIED_ALPHA_CUTOFF"),
+        "importing the cutoff from pbr_prepass_functions fails at pipeline creation"
+    );
+    let declaration = PREPASS
+        .lines()
+        .find(|line| {
+            line.trim_start()
+                .starts_with("const PREMULTIPLIED_ALPHA_CUTOFF")
+        })
+        .expect("the prepass shader declares its own alpha cutoff");
+    assert_eq!(
+        declaration.trim(),
+        format!("const PREMULTIPLIED_ALPHA_CUTOFF: f32 = {SHADOW_ALPHA_CUTOFF};")
+    );
+}

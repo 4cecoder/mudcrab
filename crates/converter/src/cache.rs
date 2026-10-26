@@ -171,10 +171,13 @@ pub struct CacheEntry {
     pub output_hash: String,
 }
 
-/// Versioned body-composition recipe and its canonical raw input contract.
-pub(crate) const BODY_COMPOSE_RECIPE: &str = "body-compose-v1";
+/// Body composition with thin morph inputs and effective catalog skin choices.
+pub(crate) const BODY_COMPOSE_RECIPE: &str = "body-compose-v2";
 
-/// The complete input set shared by body proof production and reuse validation.
+/// Recipe-owned context digest, alongside the four canonical raw input hashes.
+pub(crate) const BODY_COMPOSE_CONTEXT: &str = "recipes/body-compose-v2/context.json";
+
+/// The heavy parts and skeleton shared by historical and current body recipes.
 pub(crate) fn body_compose_inputs(sex: &str) -> [String; 4] {
     let assets = "meshes/actors/character/character assets";
     [
@@ -205,7 +208,8 @@ pub(crate) fn default_gait_inputs(sex: &str, stem: &str) -> [String; 4] {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DerivedOutput {
     pub recipe: String,
-    /// Canonical logical source paths and SHA-256 hashes of their winning bytes.
+    /// Canonical logical source paths and SHA-256 hashes of their winning bytes,
+    /// plus any recipe-owned context digest required by the versioned recipe.
     pub inputs: BTreeMap<String, String>,
     pub output_size: u64,
     pub output_hash: String,
@@ -429,6 +433,8 @@ pub(crate) const MESH_OUTPUT_CONTRACTS: &[&str] = &[
     "legacy-skin-export",
     "msn-vertex-normals",
     "facegen-tint-slot",
+    "lighting-type-data",
+    "msn-specular-default",
 ];
 
 /// Whether `schema`'s mesh settings proof carries [`MESH_OUTPUT_CONTRACTS`]. Historical

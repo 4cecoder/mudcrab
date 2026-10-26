@@ -2,7 +2,7 @@ mod common;
 
 use converter::{
     AssetPipeline, PipelineConfig,
-    cache::{ConversionManifest, hash_file},
+    cache::{ConversionManifest, hash_bytes, hash_file},
 };
 use dummy_content::{Entry, bsa, esm, layout, nif};
 use rusqlite::Connection;
@@ -308,6 +308,13 @@ async fn metadata_rebuild_skips_stray_symlinks_without_following_them() {
 /// Runtime-only packs preserve authenticated derived bytes and their original proof repeatedly.
 #[tokio::test]
 async fn metadata_rebuild_retains_proven_derived_bytes_without_raw_inputs() {
+    for recipe in ["body-compose-v1", "body-compose-v2"] {
+        assert_runtime_only_derived_reuse(recipe).await;
+    }
+}
+
+/// Publishes each supported body recipe twice without consulting its original inputs.
+async fn assert_runtime_only_derived_reuse(recipe: &str) {
     let directory = tempfile::tempdir().unwrap();
     let data = directory.path().join("Data");
     let source = directory.path().join("source");
@@ -331,7 +338,14 @@ async fn metadata_rebuild_retains_proven_derived_bytes_without_raw_inputs() {
     assert_eq!(pruned.len(), 1);
     assert_eq!(pruned[0].glb, relative);
     let bytes = fs::read(source.join(relative)).unwrap();
-    let proof = derived_body_proof(&bytes);
+    let mut proof = derived_body_proof(&bytes);
+    proof.recipe = recipe.into();
+    if recipe == "body-compose-v2" {
+        proof.inputs.insert(
+            "recipes/body-compose-v2/context.json".into(),
+            hash_bytes(b"[[[\"body\",null],[\"hands\",null],[\"feet\",null]],[]]"),
+        );
+    }
     manifest
         .derived_outputs
         .insert(relative.into(), proof.clone());

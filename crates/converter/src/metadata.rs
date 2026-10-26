@@ -9,9 +9,10 @@ use crate::{
     archive::ArchiveExtractor,
     asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
     cache::{
-        BODY_COMPOSE_RECIPE, CONVERTER_SCHEMA_VERSION, ConversionManifest, DEFAULT_GAIT_RECIPE,
-        body_compose_inputs, can_reuse_meshes_for_producer, configuration_hash,
-        default_gait_inputs, hash_bytes, hash_file, retained_configuration_matches_for_reader,
+        BODY_COMPOSE_CONTEXT, BODY_COMPOSE_RECIPE, CONVERTER_SCHEMA_VERSION, ConversionManifest,
+        DEFAULT_GAIT_RECIPE, body_compose_inputs, can_reuse_meshes_for_producer,
+        configuration_hash, default_gait_inputs, hash_bytes, hash_file,
+        retained_configuration_matches_for_reader,
     },
     esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database},
     integration::finalize_world_database,
@@ -766,9 +767,15 @@ pub(crate) fn supported_derived_proof(path: &str, proof: &crate::cache::DerivedO
     let mut inputs = BTreeSet::new();
     for sex in ["male", "female"] {
         if path == format!("meshes/actors/character/composed/default/{sex}/body.glb")
-            && proof.recipe == BODY_COMPOSE_RECIPE
+            && matches!(
+                proof.recipe.as_str(),
+                "body-compose-v1" | BODY_COMPOSE_RECIPE
+            )
         {
             inputs.extend(body_compose_inputs(sex));
+            if proof.recipe == BODY_COMPOSE_RECIPE {
+                inputs.insert(BODY_COMPOSE_CONTEXT.into());
+            }
         }
         for stem in ["mt_idle", "mt_walkforward", "mt_runforward"] {
             if path == format!("meshes/actors/character/animations/{sex}/{stem}.glb")
@@ -1093,7 +1100,7 @@ mod tests {
             manifest.derived_outputs.insert(
                 relative.clone(),
                 crate::cache::DerivedOutput {
-                    recipe: BODY_COMPOSE_RECIPE.into(),
+                    recipe: "body-compose-v1".into(),
                     inputs: body_compose_inputs(sex)
                         .into_iter()
                         .map(|path| (path, hash_bytes(b"input")))

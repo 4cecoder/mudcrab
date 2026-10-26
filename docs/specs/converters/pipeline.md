@@ -349,9 +349,20 @@ that affect that kind's bytes:
 
 `derived_outputs` is an optional map keyed by canonical output path, separate
 from single-source `entries`. Each proof records a versioned recipe, a map of
-canonical logical input paths to winning raw SHA-256 hashes, and the final
-output's size and SHA-256. `body-compose-v1` consumes that sex's body, hands and
-feet NIFs plus the shared skeleton NIF. `default-gait-v1` consumes the body NIF,
+canonical logical input paths to winning raw SHA-256 hashes, any recipe-owned
+context digest, and the final output's size and SHA-256. `body-compose-v1`
+records that sex's heavy body, hands and feet NIFs plus the shared skeleton NIF.
+Current producers emit `body-compose-v2`, adding
+`recipes/body-compose-v2/context.json`: the SHA-256 of compact JSON containing
+the ordered heavy skin choices and thin preparation inputs. Each heavy entry
+is `[slot, skin]`; each thin entry is `[slot, winning_raw_sha256, skin]`, in
+body/hands/feet order. A skin is null or `[TXST_FormID, eight_NIF_texture_slots]`.
+The outer JSON is `[heavy_entries, thin_entries]`. Thin entries are empty when
+any thin part is missing, matching the existing preparation gate. These choices
+describe main's existing catalog skin selection and thin morph generation;
+physical source paths and unrelated database rows are excluded. Historical v1
+proofs remain eligible for package-snapshot retention.
+`default-gait-v1` consumes the body NIF,
 skeleton NIF, skeleton HKX and the sex-specific gait HKX; it builds its bone tree
 from the NIF inputs. Original asset producer/settings provenance remains on the
 manifest. Material repair and texture pruning refresh the derived output hash
