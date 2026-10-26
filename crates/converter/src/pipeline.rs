@@ -2918,8 +2918,8 @@ fn convert_default_animations(
         }
     };
 
-    // Every ancestor is checked before any marker or staged path changes, so a rejected pass keeps
-    // its incoming failure and proof maps for both sexes.
+    // Ancestors and exact outputs are rejected before any marker is removed, so a rejected pass
+    // keeps its incoming failure and proof maps for both sexes.
     validate_animation_output_parents(staging)?;
     let prior_derived_relevance: BTreeMap<_, _> = ["male", "female"]
         .into_iter()
@@ -2933,6 +2933,7 @@ fn convert_default_animations(
             (sex, relevant)
         })
         .collect();
+    clear_nonregular_animation_outputs(staging)?;
     for sex in ["male", "female"] {
         for (_, stem) in DEFAULT_ANIMATION_CLIPS {
             let key = default_animation_output(sex, stem);
@@ -2940,8 +2941,6 @@ fn convert_default_animations(
             manifest.derived_outputs.remove(&key);
         }
     }
-
-    clear_nonregular_animation_outputs(staging)?;
 
     for sex in ["male", "female"] {
         let outputs: Vec<_> = DEFAULT_ANIMATION_CLIPS
@@ -9048,19 +9047,36 @@ mod tests {
     /// A rejected gait preflight leaves the complete failure and proof maps for both sexes intact.
     #[test]
     fn gait_preflight_rejection_preserves_complete_manifest_maps() {
-        for blocked in [
+        // File ancestors are rejected by the early parent check; directories at exact outputs are
+        // rejected by the output cleanup that runs before any map entry is removed.
+        let mut blockers: Vec<(String, bool)> = [
             "meshes",
             "meshes/actors/character/animations",
             "meshes/actors/character/animations/male",
             "meshes/actors/character/animations/female",
-        ] {
+        ]
+        .into_iter()
+        .map(|blocked| (blocked.to_owned(), false))
+        .collect();
+        for sex in ["male", "female"] {
+            for (_, stem) in DEFAULT_ANIMATION_CLIPS {
+                blockers.push((default_animation_output(sex, stem), true));
+            }
+        }
+        for (blocked, is_directory) in blockers {
             for fail_fast in [false, true] {
                 let directory = tempfile::tempdir().unwrap();
                 let staging = directory.path();
                 stage_invalid_default_animation(staging);
-                let blocker = staging.join(blocked);
+                let blocker = staging.join(&blocked);
+                let contents = blocker.join("blocker");
                 fs::create_dir_all(blocker.parent().unwrap()).unwrap();
-                fs::write(&blocker, b"not a directory").unwrap();
+                if is_directory {
+                    fs::create_dir_all(&blocker).unwrap();
+                    fs::write(&contents, b"staged generated assets").unwrap();
+                } else {
+                    fs::write(&blocker, b"not a directory").unwrap();
+                }
 
                 let mut manifest = ConversionManifest::default();
                 for sex in ["male", "female"] {
@@ -9089,15 +9105,34 @@ mod tests {
                     &mut report,
                     &mut manifest,
                 )
-                .expect_err("blocked ancestor must abort before any map mutation");
+                .expect_err("blocked gait path must abort before any map mutation");
 
+                let expected = if is_directory {
+                    "refusing to remove directory"
+                } else {
+                    "failed to inspect"
+                };
                 assert!(
-                    format!("{error:#}").contains("failed to inspect"),
+                    format!("{error:#}").contains(expected),
                     "{blocked}: {error:#}"
                 );
                 assert!(report.notices.is_empty(), "{blocked}: {:?}", report.notices);
                 assert_eq!(manifest, incoming, "{blocked} fail_fast={fail_fast}");
-                assert_eq!(fs::read(&blocker).unwrap(), b"not a directory");
+                if is_directory {
+                    assert!(blocker.is_dir(), "{blocked} fail_fast={fail_fast}");
+                    assert_eq!(
+                        fs::read(&contents).unwrap(),
+                        b"staged generated assets",
+                        "{blocked} fail_fast={fail_fast}"
+                    );
+                    assert_eq!(
+                        fs::read_dir(&blocker).unwrap().count(),
+                        1,
+                        "{blocked} fail_fast={fail_fast}"
+                    );
+                } else {
+                    assert_eq!(fs::read(&blocker).unwrap(), b"not a directory");
+                }
             }
         }
     }
